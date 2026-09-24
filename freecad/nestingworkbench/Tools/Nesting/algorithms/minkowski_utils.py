@@ -8,6 +8,7 @@ placement zones for nesting operations.
 import math
 import time
 import threading
+from concurrent.futures import Future
 from shapely.geometry import Polygon, MultiPoint
 from shapely.ops import unary_union, triangulate
 from shapely.affinity import rotate, scale, translate
@@ -15,6 +16,7 @@ from shapely.affinity import rotate, scale, translate
 from ....datatypes.shape import Shape
 
 _decomposition_lock = threading.Lock()
+
 
 def decompose_if_needed(polygon, logger):
     """Decomposes a non-convex polygon into convex parts (triangles)."""
@@ -30,14 +32,43 @@ def decompose_if_needed(polygon, logger):
     with _decomposition_lock:
         if cache_key in Shape.decomposition_cache:
             return Shape.decomposition_cache[cache_key]
+    with Shape.decomposition_inflight_lock:
+        future = Shape.decomposition_inflight.get(cache_key)
+        if future is None:
+            future = Future()
+            Shape.decomposition_inflight[cache_key] = future
+            is_owner = True
+        else:
+            is_owner = False
 
-    source_vertices = max(0, len(polygon.exterior.coords) - 1)
+    if not is_owner:
+        return future.result()
 
-    def cache_result(parts, triangles=0, clipped_pieces=0):
+    try:
+        parts = _decompose_uncached(polygon, logger, cache_key)
+        future.set_result(parts)
+        return parts
+    except BaseException as exc:
+        future.set_exception(exc)
+        raise
+    finally:
+        with Shape.decomposition_inflight_lock:
+            Shape.decomposition_inflight.pop(cache_key, None)
+
+
+def _decompose_uncached(polygon, logger, cache_key):
+    def cache_result(
+        parts,
+        source_vertices=0,
+        triangles=0,
+        clipped_pieces=0,
+        merged_pieces=0,
+    ):
         stats = {
             "source_vertices": source_vertices,
             "triangles": triangles,
             "clipped_pieces": clipped_pieces,
+            "merged_pieces": merged_pieces,
             "retained_pieces": len(parts),
         }
         with _decomposition_lock:
@@ -47,9 +78,22 @@ def decompose_if_needed(polygon, logger):
 
     if polygon.geom_type == 'MultiPolygon':
         all_decomposed_parts = []
+        combined_stats = {
+            "source_vertices": 0,
+            "triangles": 0,
+            "clipped_pieces": 0,
+            "merged_pieces": 0,
+        }
         for p in polygon.geoms:
-            all_decomposed_parts.extend(decompose_if_needed(p, logger))
-        return cache_result(all_decomposed_parts)
+            child_parts = decompose_if_needed(p, logger)
+            all_decomposed_parts.extend(child_parts)
+            with _decomposition_lock:
+                child_stats = Shape.decomposition_stats.get(p.wkt, {})
+            for name in combined_stats:
+                combined_stats[name] += child_stats.get(name, 0)
+        return cache_result(all_decomposed_parts, **combined_stats)
+
+    source_vertices = max(0, len(polygon.exterior.coords) - 1)
 
     # If already convex-ish (triangle or area match convex hull), return as is
     # Using a strict tolerance for robustness
@@ -61,7 +105,7 @@ def decompose_if_needed(polygon, logger):
             is_convex = True
             
     if is_convex:
-        return cache_result([polygon])
+        return cache_result([polygon], source_vertices=source_vertices)
     
     try:
         # Delaunay triangulation is unconstrained (ignores polygon edges), so
@@ -95,11 +139,16 @@ def decompose_if_needed(polygon, logger):
             # never return that for a real polygon.
             decomposed = [polygon.convex_hull]
 
-        return cache_result(decomposed, len(triangles), clipped_pieces)
+        return cache_result(
+            decomposed,
+            source_vertices=source_vertices,
+            triangles=len(triangles),
+            clipped_pieces=clipped_pieces,
+        )
     except Exception as e:
         logger(f"      - Triangulation failed: {e}. Falling back to convex hull.", level="warning")
 
-    return cache_result([polygon.convex_hull])
+    return cache_result([polygon.convex_hull], source_vertices=source_vertices)
 
 def _minkowski_sum_convex_reference(poly1, poly2):
     """Reference implementation retained for fallback and geometry checks."""
@@ -289,6 +338,7 @@ def minkowski_sum(master_poly1, angle1, reflect1, master_poly2, angle2, reflect2
             timings[f"source_vertices_{name}"] = stats.get("source_vertices", 0)
             timings[f"triangles_{name}"] = stats.get("triangles", 0)
             timings[f"clipped_pieces_{name}"] = stats.get("clipped_pieces", 0)
+            timings[f"merged_pieces_{name}"] = stats.get("merged_pieces", 0)
 
     # CRITICAL: Use the MASTER polygon's centroid for all transformations
     # to keep the decomposed convex parts in their correct relative positions.

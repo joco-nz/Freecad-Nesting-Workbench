@@ -124,7 +124,8 @@ def _compute_nfp_uncached(shape_A, angle_A, part_to_place, angle_B, cache_key, l
         "parts={parts_a}x{parts_b} pairs={convex_pairs} "
         "vertices={source_vertices_a}x{source_vertices_b} "
         "triangles={triangles_a}x{triangles_b} "
-        "clipped={clipped_pieces_a}x{clipped_pieces_b}".format(
+        "clipped={clipped_pieces_a}x{clipped_pieces_b} "
+        "merged={merged_pieces_a}x{merged_pieces_b}".format(
             cache_key[:3],
             **{
                 "total_ms": timings.get("total_ms", 0.0),
@@ -145,6 +146,8 @@ def _compute_nfp_uncached(shape_A, angle_A, part_to_place, angle_B, cache_key, l
                 "triangles_b": timings.get("triangles_b", 0),
                 "clipped_pieces_a": timings.get("clipped_pieces_a", 0),
                 "clipped_pieces_b": timings.get("clipped_pieces_b", 0),
+                "merged_pieces_a": timings.get("merged_pieces_a", 0),
+                "merged_pieces_b": timings.get("merged_pieces_b", 0),
             },
         )
     )

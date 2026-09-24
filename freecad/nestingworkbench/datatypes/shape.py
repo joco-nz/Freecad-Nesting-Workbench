@@ -38,6 +38,8 @@ class Shape:
     nfp_inflight_lock = threading.Lock()
     decomposition_cache = {}
     decomposition_stats = {}
+    decomposition_inflight = {}
+    decomposition_inflight_lock = threading.Lock()
     
     @classmethod
     def clear_caches(cls):
