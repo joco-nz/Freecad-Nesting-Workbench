@@ -29,12 +29,24 @@ def compute_and_cache_nfp(shape_A, angle_A, part_to_place, angle_B, cache_key, l
         cached_nfp_data = Shape.nfp_cache.get(cache_key)
         if cached_nfp_data:
             return cached_nfp_data
+    t_total = time.perf_counter()
+    timings = {}
     try:
+        t_prepare = time.perf_counter()
         mA, mB = shape_A.original_polygon, part_to_place.original_polygon
         cA, cB = mA.centroid, mB.centroid
         poly_A_centered = translate(mA, -cA.x, -cA.y)
         poly_B_centered = translate(mB, -cB.x, -cB.y)
-        nfp_exterior = minkowski_utils.minkowski_sum(poly_A_centered, angle_A, False, poly_B_centered, angle_B, True, log)
+        timings["prepare_ms"] = (time.perf_counter() - t_prepare) * 1000
+
+        minkowski_timings = {}
+        nfp_exterior = minkowski_utils.minkowski_sum(
+            poly_A_centered, angle_A, False, poly_B_centered, angle_B, True, log,
+            timings=minkowski_timings,
+        )
+        timings.update(minkowski_timings)
+
+        t_holes = time.perf_counter()
         nfp_interiors = []
         if poly_A_centered.interiors:
             B_rot = rotate(poly_B_centered, angle_B, origin=(0, 0))
@@ -50,17 +62,50 @@ def compute_and_cache_nfp(shape_A, angle_A, part_to_place, angle_B, cache_key, l
                         elif ifp.geom_type == 'MultiPolygon':
                             for p in ifp.geoms:
                                 nfp_interiors.append(p.exterior)
+        timings["holes_ifp_ms"] = (time.perf_counter() - t_holes) * 1000
+
+        t_assemble = time.perf_counter()
         master_nfp = Polygon(nfp_exterior.exterior, nfp_interiors) if nfp_exterior and nfp_exterior.area > 0 else None
+        timings["assemble_ms"] = (time.perf_counter() - t_assemble) * 1000
+
         if master_nfp:
+            t_discretize = time.perf_counter()
             rings = [master_nfp.exterior] + list(master_nfp.interiors)
             pts_parts = [MinkowskiEngine._discretize_ring_np(r, step_size) for r in rings]
             local_pts = np.concatenate(pts_parts, axis=0) if pts_parts else np.empty((0, 2), dtype=np.float64)
             nfp_data = {"polygon": master_nfp, "local_points": local_pts}
+            timings["discretize_ms"] = (time.perf_counter() - t_discretize) * 1000
         else:
             nfp_data = {}
+            timings["discretize_ms"] = 0.0
     except Exception as e:
         log(f"Error calculating NFP for {cache_key}: {e}", level="error")
         nfp_data = {'error': str(e)}
+    timings["total_ms"] = (time.perf_counter() - t_total) * 1000
+    log(
+        "[PERF] NFP phases key={} total={total_ms:.1f}ms "
+        "prepare={prepare_ms:.1f} decompose={decompose_ms:.1f} "
+        "transform={transform_ms:.1f} convex_sum={convex_sum_ms:.1f} "
+        "union={union_ms:.1f} holes_ifp={holes_ifp_ms:.1f} "
+        "assemble={assemble_ms:.1f} discretize={discretize_ms:.1f} "
+        "parts={parts_a}x{parts_b} pairs={convex_pairs}".format(
+            cache_key[:3],
+            **{
+                "total_ms": timings.get("total_ms", 0.0),
+                "prepare_ms": timings.get("prepare_ms", 0.0),
+                "decompose_ms": timings.get("decompose_ms", 0.0),
+                "transform_ms": timings.get("transform_ms", 0.0),
+                "convex_sum_ms": timings.get("convex_sum_ms", 0.0),
+                "union_ms": timings.get("union_ms", 0.0),
+                "holes_ifp_ms": timings.get("holes_ifp_ms", 0.0),
+                "assemble_ms": timings.get("assemble_ms", 0.0),
+                "discretize_ms": timings.get("discretize_ms", 0.0),
+                "parts_a": timings.get("parts_a", 0),
+                "parts_b": timings.get("parts_b", 0),
+                "convex_pairs": timings.get("convex_pairs", 0),
+            },
+        )
+    )
     with Shape.nfp_cache_lock:
         Shape.nfp_cache[cache_key] = nfp_data
     return nfp_data
@@ -437,4 +482,3 @@ class MinkowskiEngine:
         xs = np.interp(sample_dists, cum_dist, coords[:, 0])
         ys = np.interp(sample_dists, cum_dist, coords[:, 1])
         return np.column_stack([xs, ys])
-

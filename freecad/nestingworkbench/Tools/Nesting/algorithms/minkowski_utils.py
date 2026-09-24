@@ -6,6 +6,7 @@ and differences (including containment/erosion for IFP) to determine valid
 placement zones for nesting operations.
 """
 import math
+import time
 import threading
 from shapely.geometry import Polygon, MultiPoint
 from shapely.ops import unary_union, triangulate
@@ -185,7 +186,8 @@ def calculate_inner_fit_polygon(master_poly1, angle1, master_poly2, angle2, logg
         final_difference = final_difference.buffer(0)
     return final_difference if not final_difference.is_empty else None
 
-def minkowski_sum(master_poly1, angle1, reflect1, master_poly2, angle2, reflect2, logger, rot_origin1=None, rot_origin2=None):
+def minkowski_sum(master_poly1, angle1, reflect1, master_poly2, angle2, reflect2, logger,
+                  rot_origin1=None, rot_origin2=None, timings=None):
     """
     Computes the Minkowski sum of two polygons.
     It uses the pre-cached decomposition of the master polygons and rotates
@@ -194,15 +196,21 @@ def minkowski_sum(master_poly1, angle1, reflect1, master_poly2, angle2, reflect2
     if master_poly1.is_empty or master_poly2.is_empty:
         return master_poly1.buffer(0) if master_poly2.is_empty else master_poly2.buffer(0)
 
+    t_decompose = time.perf_counter()
     # Get the pre-decomposed convex parts from the cache.
     poly1_convex_parts = decompose_if_needed(master_poly1, logger)
     poly2_convex_parts = decompose_if_needed(master_poly2, logger)
+    if timings is not None:
+        timings["decompose_ms"] = (time.perf_counter() - t_decompose) * 1000
+        timings["parts_a"] = len(poly1_convex_parts)
+        timings["parts_b"] = len(poly2_convex_parts)
 
     # CRITICAL: Use the MASTER polygon's centroid for all transformations
     # to keep the decomposed convex parts in their correct relative positions.
     c1 = master_poly1.centroid
     c2 = master_poly2.centroid
 
+    t_transform = time.perf_counter()
     poly1_convex_transformed = []
     for p in poly1_convex_parts:
         # Use master centroid for rotation to preserve relative positions of parts
@@ -224,10 +232,20 @@ def minkowski_sum(master_poly1, angle1, reflect1, master_poly2, angle2, reflect2
             # This keeps all convex parts in correct relative positions after reflection
             p_new = scale(p_new, xfact=-1.0, yfact=-1.0, origin=(c2.x, c2.y))
         poly2_convex_transformed.append(p_new)
+    if timings is not None:
+        timings["transform_ms"] = (time.perf_counter() - t_transform) * 1000
 
+    t_sum = time.perf_counter()
     minkowski_parts = []
     for p1 in poly1_convex_transformed:
         for p2 in poly2_convex_transformed:
             minkowski_parts.append(minkowski_sum_convex(p1, p2))
+    if timings is not None:
+        timings["convex_sum_ms"] = (time.perf_counter() - t_sum) * 1000
+        timings["convex_pairs"] = len(minkowski_parts)
 
-    return unary_union(minkowski_parts)
+    t_union = time.perf_counter()
+    result = unary_union(minkowski_parts)
+    if timings is not None:
+        timings["union_ms"] = (time.perf_counter() - t_union) * 1000
+    return result

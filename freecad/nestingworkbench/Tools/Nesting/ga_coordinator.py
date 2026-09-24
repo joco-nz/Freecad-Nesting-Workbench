@@ -10,39 +10,6 @@ import random
 from ...datatypes.shape import Shape
 from .layout_manager import LayoutManager
 from .algorithms import genetic_utils
-def enumerate_nfp_jobs(parts):
-    """Enumerates every NFP cache key the placement loop can request for
-    these parts, as {cache_key: (rep_A, rep_B, relative_angle)}.
-
-    Part type identity is source_freecad_object.Label — the same field the
-    cache key uses (never parse part.id). The placed part A is always keyed
-    at angle 0 with the rotation folded into relative_angle, matching
-    get_incremental_candidates / _calculate_and_cache_nfp.
-    """
-    reps = {}
-    for p in parts:
-        reps.setdefault(p.source_freecad_object.Label, p)
-
-    def angle_grid(part):
-        steps = max(1, getattr(part, 'rotation_steps', 1) or 1)
-        return [i * (360.0 / steps) for i in range(steps)]
-
-    jobs = {}
-    for a in reps.values():
-        for b in reps.values():
-            rel_angles = set()
-            for ang_a in angle_grid(a):
-                for ang_b in angle_grid(b):
-                    rel = (ang_b - ang_a) % 360.0
-                    if abs(rel - 360.0) < 1e-5:
-                        rel = 0.0
-                    rel_angles.add(round(rel, 4))
-            for rel in rel_angles:
-                key = (a.source_freecad_object.Label,
-                       b.source_freecad_object.Label,
-                       rel, b.spacing, b.deflection, b.simplification)
-                jobs.setdefault(key, (a, b, rel))
-    return jobs
 
 class GACoordinator:
     """Runs the GA optimization loop and returns the best Layout."""
@@ -157,9 +124,6 @@ class GACoordinator:
                 master_map, quantities, ui_params, population_size, rotation_steps, verbose=verbose
             )
         
-        if layouts and layouts[0].parts:
-            self._precompute_all_nfps(layouts[0].parts, cancel_callback)
-
         best_layout = None
         best_efficiency = 0
         generations_without_improvement = 0
@@ -344,34 +308,6 @@ class GACoordinator:
         self.draw_callback({'spawn_fill_part': True, 'spawn_fn': spawn_fn,
                             'result_holder': result_holder})
         return result_holder[0]
-
-    def _precompute_all_nfps(self, parts, cancel_callback):
-        """Fills Shape.nfp_cache with every NFP the run can request, before
-        the generation loop starts. Runs on the GA worker thread; workers
-        touch only Shapely geometry, so no main-thread marshaling is needed.
-        Progress goes through the worker signals so the UI stays live."""
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-        import os
-        from .algorithms.minkowski_engine import compute_and_cache_nfp
-
-        jobs = enumerate_nfp_jobs(parts)
-        with Shape.nfp_cache_lock:
-            missing = {k: v for k, v in jobs.items() if k not in Shape.nfp_cache}
-        total = len(missing)
-        if not total:
-            return
-
-        self._set_status(f"Precomputing {total} NFPs...")
-        done = 0
-        with ThreadPoolExecutor(max_workers=os.cpu_count()) as pool:
-            futures = [pool.submit(compute_and_cache_nfp, a, 0.0, b, rel, key)
-                       for key, (a, b, rel) in missing.items()]
-            for future in as_completed(futures):
-                if cancel_callback():
-                    pool.shutdown(wait=False, cancel_futures=True)
-                    return
-                done += 1
-                self._update_progress(done, total, f"Precomputing NFPs {done}/{total}")
 
     def _run_generation(self, layouts, gen, generations, ui_params, rotation_steps, algo_kwargs,
                         is_simulating, cancel_callback, verbose, viz_manager=None):
