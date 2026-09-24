@@ -89,6 +89,7 @@ class NestingController:
         self.shape_preparer = ShapePreparer(self.doc, {})
         self.is_running = False
         self.cancel_requested = False
+        self._saved_source_placements = []
         
         self.viz_manager = VisualizationManager()
         
@@ -100,15 +101,18 @@ class NestingController:
 
     def execute_nesting(self):
         FreeCAD.Console.PrintMessage("\n--- NESTING START ---\n")
-        
+
+        self._restore_source_placements()
         if self.current_job:
             self.current_job.cleanup()
             self.current_job = None
 
+        self._prepare_source_parts()
         Shape.clear_caches()
 
         target_layout = self._ensure_target_layout()
         if not target_layout:
+             self._restore_source_placements()
              return # Standard error handled in helper
              
         is_simulating = self.ui.simulate_nesting_checkbox.isChecked()
@@ -148,6 +152,38 @@ class NestingController:
         self.ui.cancel_button.setEnabled(True)
         self._execute_ga_nesting(target_layout, ui_params, quantities, master_map, 
                                  rotation_params, algo_kwargs, is_simulating, self.viz_manager)
+
+    def _prepare_source_parts(self):
+        """Save, hide, and normalize selected source parts before copying."""
+        saved = []
+        seen = set()
+        for obj in getattr(self.ui, "selected_shapes_to_process", []):
+            if obj is None or id(obj) in seen or not hasattr(obj, "Placement"):
+                continue
+            seen.add(id(obj))
+            saved.append((obj, FreeCAD.Placement(obj.Placement)))
+            obj.Placement = FreeCAD.Placement()
+            if hasattr(obj, "ViewObject"):
+                obj.ViewObject.Visibility = False
+        self._saved_source_placements = saved
+        if saved:
+            self.doc.recompute()
+
+    def _restore_source_placements(self):
+        """Restore source placements after preparation and nesting complete."""
+        if not self._saved_source_placements:
+            return
+        saved = self._saved_source_placements
+        self._saved_source_placements = []
+        for obj, placement in saved:
+            try:
+                obj.Placement = placement
+            except Exception as exc:
+                FreeCAD.Console.PrintWarning(
+                    f"[NestingController] Could not restore placement for "
+                    f"'{getattr(obj, 'Label', obj)}': {exc}\n"
+                )
+        self.doc.recompute()
     
     def load_selection(self):
         FreeCAD.Console.PrintMessage("Loading selection via Controller...\n")
@@ -529,6 +565,7 @@ class NestingController:
             self.cancel_job()
         else:
             self.current_job = job
+            self._restore_source_placements()
             
         self.is_running = False
         self.cancel_requested = False
@@ -540,6 +577,7 @@ class NestingController:
     def _on_nesting_error(self, error_msg):
         """Main-thread handler for nesting errors."""
         FreeCAD.Console.PrintError(f"Nesting Error: {error_msg}\n")
+        self._restore_source_placements()
         self.ui.status_label.setText(f"Error: {error_msg.split(chr(10))[0]}")
         self.is_running = False
         self.cancel_requested = False
@@ -592,6 +630,7 @@ class NestingController:
 
     def cancel_job(self):
         """Called when User clicks Cancel."""
+        self._restore_source_placements()
         if self.current_job:
             target = self.current_job.target_layout
             
@@ -855,6 +894,4 @@ class NestingController:
             algo_kwargs['log_callback'] = self.ui.log_message
             
         return algo_kwargs
-
-
 
