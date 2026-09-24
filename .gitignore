@@ -34,3 +34,23 @@ Thumbs.db
 
 # Machine-local agent settings
 .claude/settings.local.json
+
+*.so
+
+freecad/nestingworkbench/Tools/Nesting/algorithms/minkowski_cpp/bin/
+
+freecad/nestingworkbench/Tools/Nesting/algorithms/minkowski_cpp/build/
+
+squashfs-root/
+
+opencode.json
+
+freecad/nestingworkbench/Tools/Nesting/algorithms/minkowski_cpp/test_erosion_debug
+
+freecad/nestingworkbench/Tools/Nesting/algorithms/minkowski_cpp/test_nfp_debug
+
+freecad/nestingworkbench/Tools/Nesting/algorithms/minkowski_cpp/test_nfp_verbose
+
+.opencode/plans/
+
+tests/Test_Files/n70-intercooler-spacer-bottle-nesting.FCStd
