@@ -119,6 +119,10 @@ def _compute_nfp_uncached(shape_A, angle_A, part_to_place, angle_B, cache_key, l
         "[PERF] NFP phases key={} total={total_ms:.1f}ms "
         "prepare={prepare_ms:.1f} decompose={decompose_ms:.1f} "
         "transform={transform_ms:.1f} convex_sum={convex_sum_ms:.1f} "
+        "convex_prepare={convex_prepare_ms:.1f} "
+        "convex_merge={convex_merge_ms:.1f} "
+        "convex_polygon={convex_polygon_create_ms:.1f} "
+        "convex_fallbacks={convex_fallbacks} "
         "union={union_ms:.1f} holes_ifp={holes_ifp_ms:.1f} "
         "assemble={assemble_ms:.1f} discretize={discretize_ms:.1f} "
         "parts={parts_a}x{parts_b} pairs={convex_pairs} "
@@ -135,6 +139,10 @@ def _compute_nfp_uncached(shape_A, angle_A, part_to_place, angle_B, cache_key, l
                 "decompose_ms": timings.get("decompose_ms", 0.0),
                 "transform_ms": timings.get("transform_ms", 0.0),
                 "convex_sum_ms": timings.get("convex_sum_ms", 0.0),
+                "convex_prepare_ms": timings.get("convex_prepare_ms", 0.0),
+                "convex_merge_ms": timings.get("convex_merge_ms", 0.0),
+                "convex_polygon_create_ms": timings.get("convex_polygon_create_ms", 0.0),
+                "convex_fallbacks": timings.get("convex_fallbacks", 0),
                 "union_ms": timings.get("union_ms", 0.0),
                 "holes_ifp_ms": timings.get("holes_ifp_ms", 0.0),
                 "assemble_ms": timings.get("assemble_ms", 0.0),

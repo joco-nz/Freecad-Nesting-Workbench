@@ -222,21 +222,24 @@ def _convex_ring_vertices(polygon):
     return vertices[start:] + vertices[:start]
 
 
-def _minkowski_sum_convex_linear(poly1, poly2):
-    """Compute a convex Minkowski sum by merging edge vectors."""
-    vertices_a = _convex_ring_vertices(poly1)
-    vertices_b = _convex_ring_vertices(poly2)
-    edges_a = [
-        (vertices_a[(i + 1) % len(vertices_a)][0] - x,
-         vertices_a[(i + 1) % len(vertices_a)][1] - y)
-        for i, (x, y) in enumerate(vertices_a)
+def _prepare_convex_ring(polygon):
+    """Prepare normalized vertices and edge vectors for repeated sums."""
+    vertices = _convex_ring_vertices(polygon)
+    edges = [
+        (
+            vertices[(i + 1) % len(vertices)][0] - x,
+            vertices[(i + 1) % len(vertices)][1] - y,
+        )
+        for i, (x, y) in enumerate(vertices)
     ]
-    edges_b = [
-        (vertices_b[(i + 1) % len(vertices_b)][0] - x,
-         vertices_b[(i + 1) % len(vertices_b)][1] - y)
-        for i, (x, y) in enumerate(vertices_b)
-    ]
+    return vertices, edges
 
+
+def _minkowski_sum_convex_prepared(prepared_a, prepared_b, phase_stats=None):
+    """Compute a convex Minkowski sum from prepared convex rings."""
+    vertices_a, edges_a = prepared_a
+    vertices_b, edges_b = prepared_b
+    t_merge = time.perf_counter()
     result = [(vertices_a[0][0] + vertices_b[0][0],
                vertices_a[0][1] + vertices_b[0][1])]
     i = j = 0
@@ -265,17 +268,41 @@ def _minkowski_sum_convex_linear(poly1, poly2):
         result.append((result[-1][0] + edge[0], result[-1][1] + edge[1]))
 
     result.pop()
-    return Polygon(result)
+    if phase_stats is not None:
+        phase_stats["convex_merge_ms"] += (time.perf_counter() - t_merge) * 1000
+    t_polygon = time.perf_counter()
+    polygon = Polygon(result)
+    if phase_stats is not None:
+        phase_stats["convex_polygon_create_ms"] += (
+            time.perf_counter() - t_polygon
+        ) * 1000
+    return polygon
 
 
-def minkowski_sum_convex(poly1, poly2):
+def _minkowski_sum_convex_linear(poly1, poly2, phase_stats=None):
+    """Compute a convex Minkowski sum by preparing each ring once."""
+    t_prepare = time.perf_counter()
+    prepared_a = _prepare_convex_ring(poly1)
+    prepared_b = _prepare_convex_ring(poly2)
+    if phase_stats is not None:
+        phase_stats["convex_prepare_ms"] += (time.perf_counter() - t_prepare) * 1000
+    return _minkowski_sum_convex_prepared(prepared_a, prepared_b, phase_stats)
+
+
+def minkowski_sum_convex(poly1, poly2, phase_stats=None):
     """Compute the Minkowski sum of two convex polygons in linear time."""
     try:
-        result = _minkowski_sum_convex_linear(poly1, poly2)
+        result = _minkowski_sum_convex_linear(poly1, poly2, phase_stats)
         if result.is_valid and not result.is_empty and result.area > 0:
             return result
     except (TypeError, ValueError, IndexError):
         pass
+    if phase_stats is not None:
+        phase_stats["convex_fallbacks"] += 1
+        t_fallback = time.perf_counter()
+        result = _minkowski_sum_convex_reference(poly1, poly2)
+        phase_stats["convex_fallback_ms"] += (time.perf_counter() - t_fallback) * 1000
+        return result
     return _minkowski_sum_convex_reference(poly1, poly2)
 
 def minkowski_difference_convex(poly1, poly2):
@@ -409,10 +436,21 @@ def minkowski_sum(master_poly1, angle1, reflect1, master_poly2, angle2, reflect2
     t_sum = time.perf_counter()
     minkowski_parts = []
     pair_keys = set()
+    phase_stats = {
+        "convex_prepare_ms": 0.0,
+        "convex_merge_ms": 0.0,
+        "convex_polygon_create_ms": 0.0,
+        "convex_fallback_ms": 0.0,
+        "convex_fallbacks": 0,
+    }
+    t_pair_prepare = time.perf_counter()
+    prepared_a = [_prepare_convex_ring(piece) for piece in poly1_convex_transformed]
+    prepared_b = [_prepare_convex_ring(piece) for piece in poly2_convex_transformed]
+    phase_stats["convex_prepare_ms"] += (time.perf_counter() - t_pair_prepare) * 1000
     polygon_key_a = master_poly1.wkb
     polygon_key_b = master_poly2.wkb
-    for index_a, p1 in enumerate(poly1_convex_transformed):
-        for index_b, p2 in enumerate(poly2_convex_transformed):
+    for index_a, prepared_piece_a in enumerate(prepared_a):
+        for index_b, prepared_piece_b in enumerate(prepared_b):
             pair_key = (
                 polygon_key_a,
                 round(angle1 % 360.0, 10),
@@ -424,9 +462,27 @@ def minkowski_sum(master_poly1, angle1, reflect1, master_poly2, angle2, reflect2
                 index_b,
             )
             pair_keys.add(pair_key)
-            minkowski_parts.append(minkowski_sum_convex(p1, p2))
+            try:
+                result = _minkowski_sum_convex_prepared(
+                    prepared_piece_a, prepared_piece_b, phase_stats
+                )
+                if result.is_valid and not result.is_empty and result.area > 0:
+                    minkowski_parts.append(result)
+                    continue
+            except (TypeError, ValueError, IndexError):
+                pass
+            phase_stats["convex_fallbacks"] += 1
+            t_fallback = time.perf_counter()
+            minkowski_parts.append(
+                _minkowski_sum_convex_reference(
+                    poly1_convex_transformed[index_a],
+                    poly2_convex_transformed[index_b],
+                )
+            )
+            phase_stats["convex_fallback_ms"] += (time.perf_counter() - t_fallback) * 1000
     if timings is not None:
         timings["convex_sum_ms"] = (time.perf_counter() - t_sum) * 1000
+        timings.update(phase_stats)
         timings["convex_pairs"] = len(minkowski_parts)
         timings["convex_pair_requests"] = len(minkowski_parts)
         timings["convex_pair_unique"] = len(pair_keys)
