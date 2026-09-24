@@ -93,20 +93,90 @@ def decompose_if_needed(polygon, logger):
         Shape.decomposition_cache[cache_key] = result
     return result
 
-def minkowski_sum_convex(poly1, poly2):
-    """Computes the Minkowski sum of two convex polygons."""
-    # The Minkowski sum of two convex polygons is the convex hull of the sum of their vertices.
-    # This is a standard and robust method.
+def _minkowski_sum_convex_reference(poly1, poly2):
+    """Reference implementation retained for fallback and geometry checks."""
     v1 = poly1.exterior.coords
     v2 = poly2.exterior.coords
-    
-    sum_vertices = []
-    for p1 in v1:
-        for p2 in v2:
-            sum_vertices.append((p1[0] + p2[0], p1[1] + p2[1]))
-    
-    # The convex hull of these summed points is the Minkowski sum.
+    sum_vertices = [
+        (p1[0] + p2[0], p1[1] + p2[1])
+        for p1 in v1
+        for p2 in v2
+    ]
     return MultiPoint(sum_vertices).convex_hull
+
+
+def _convex_ring_vertices(polygon):
+    """Return unique vertices in counter-clockwise order without closure."""
+    vertices = list(polygon.exterior.coords[:-1])
+    if len(vertices) < 3:
+        raise ValueError("Convex polygon must have at least three vertices")
+
+    area2 = sum(
+        x1 * y2 - x2 * y1
+        for (x1, y1), (x2, y2) in zip(vertices, vertices[1:] + vertices[:1])
+    )
+    if area2 < 0:
+        vertices.reverse()
+
+    start = min(range(len(vertices)), key=lambda i: (vertices[i][1], vertices[i][0]))
+    return vertices[start:] + vertices[:start]
+
+
+def _minkowski_sum_convex_linear(poly1, poly2):
+    """Compute a convex Minkowski sum by merging edge vectors."""
+    vertices_a = _convex_ring_vertices(poly1)
+    vertices_b = _convex_ring_vertices(poly2)
+    edges_a = [
+        (vertices_a[(i + 1) % len(vertices_a)][0] - x,
+         vertices_a[(i + 1) % len(vertices_a)][1] - y)
+        for i, (x, y) in enumerate(vertices_a)
+    ]
+    edges_b = [
+        (vertices_b[(i + 1) % len(vertices_b)][0] - x,
+         vertices_b[(i + 1) % len(vertices_b)][1] - y)
+        for i, (x, y) in enumerate(vertices_b)
+    ]
+
+    result = [(vertices_a[0][0] + vertices_b[0][0],
+               vertices_a[0][1] + vertices_b[0][1])]
+    i = j = 0
+    epsilon = 1e-12
+    while i < len(edges_a) or j < len(edges_b):
+        edge_a = edges_a[i] if i < len(edges_a) else None
+        edge_b = edges_b[j] if j < len(edges_b) else None
+        if edge_b is None:
+            edge = edge_a
+            i += 1
+        elif edge_a is None:
+            edge = edge_b
+            j += 1
+        else:
+            cross = edge_a[0] * edge_b[1] - edge_a[1] * edge_b[0]
+            if cross > epsilon:
+                edge = edge_a
+                i += 1
+            elif cross < -epsilon:
+                edge = edge_b
+                j += 1
+            else:
+                edge = (edge_a[0] + edge_b[0], edge_a[1] + edge_b[1])
+                i += 1
+                j += 1
+        result.append((result[-1][0] + edge[0], result[-1][1] + edge[1]))
+
+    result.pop()
+    return Polygon(result)
+
+
+def minkowski_sum_convex(poly1, poly2):
+    """Compute the Minkowski sum of two convex polygons in linear time."""
+    try:
+        result = _minkowski_sum_convex_linear(poly1, poly2)
+        if result.is_valid and not result.is_empty and result.area > 0:
+            return result
+    except (TypeError, ValueError, IndexError):
+        pass
+    return _minkowski_sum_convex_reference(poly1, poly2)
 
 def minkowski_difference_convex(poly1, poly2):
     """
