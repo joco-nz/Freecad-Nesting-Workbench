@@ -404,7 +404,8 @@ def calculate_inner_fit_polygon(master_poly1, angle1, master_poly2, angle2, logg
     return final_difference if not final_difference.is_empty else None
 
 def minkowski_sum(master_poly1, angle1, reflect1, master_poly2, angle2, reflect2, logger,
-                  rot_origin1=None, rot_origin2=None, timings=None):
+                  rot_origin1=None, rot_origin2=None, timings=None,
+                  validate_convex_pairs=True):
     """
     Computes the Minkowski sum of two polygons.
     It uses the pre-cached decomposition of the master polygons and rotates
@@ -460,6 +461,15 @@ def minkowski_sum(master_poly1, angle1, reflect1, master_poly2, angle2, reflect2
         "convex_empty_ms": 0.0,
         "convex_area_ms": 0.0,
         "convex_result_points": 0,
+        "convex_pair_loop_ms": 0.0,
+        "convex_pair_checks_ms": 0.0,
+        "convex_pair_validity_ms": 0.0,
+        "convex_pair_empty_ms": 0.0,
+        "convex_pair_area_ms": 0.0,
+        "convex_pair_append_ms": 0.0,
+        "convex_pair_valid_count": 0,
+        "convex_pair_non_empty_count": 0,
+        "convex_pair_positive_area_count": 0,
     }
     t_pair_prepare = time.perf_counter()
     prepared_a = [_prepare_convex_ring(piece) for piece in poly1_convex_transformed]
@@ -467,6 +477,7 @@ def minkowski_sum(master_poly1, angle1, reflect1, master_poly2, angle2, reflect2
     phase_stats["convex_prepare_ms"] += (time.perf_counter() - t_pair_prepare) * 1000
     polygon_key_a = master_poly1.wkb
     polygon_key_b = master_poly2.wkb
+    t_pair_loop = time.perf_counter()
     for index_a, prepared_piece_a in enumerate(prepared_a):
         for index_b, prepared_piece_b in enumerate(prepared_b):
             pair_key = (
@@ -484,20 +495,62 @@ def minkowski_sum(master_poly1, angle1, reflect1, master_poly2, angle2, reflect2
                 result = _minkowski_sum_convex_prepared(
                     prepared_piece_a, prepared_piece_b, phase_stats
                 )
-                if result.is_valid and not result.is_empty and result.area > 0:
+                if not validate_convex_pairs:
+                    t_append = time.perf_counter()
                     minkowski_parts.append(result)
+                    phase_stats["convex_pair_append_ms"] += (
+                        time.perf_counter() - t_append
+                    ) * 1000
+                    continue
+                t_check = time.perf_counter()
+                valid_result = result.is_valid
+                phase_stats["convex_pair_validity_ms"] += (
+                    time.perf_counter() - t_check
+                ) * 1000
+                if valid_result:
+                    phase_stats["convex_pair_valid_count"] += 1
+                t_check = time.perf_counter()
+                non_empty_result = not result.is_empty
+                phase_stats["convex_pair_empty_ms"] += (
+                    time.perf_counter() - t_check
+                ) * 1000
+                if non_empty_result:
+                    phase_stats["convex_pair_non_empty_count"] += 1
+                t_check = time.perf_counter()
+                positive_area = result.area > 0
+                phase_stats["convex_pair_area_ms"] += (
+                    time.perf_counter() - t_check
+                ) * 1000
+                if positive_area:
+                    phase_stats["convex_pair_positive_area_count"] += 1
+                if valid_result and non_empty_result and positive_area:
+                    t_append = time.perf_counter()
+                    minkowski_parts.append(result)
+                    phase_stats["convex_pair_append_ms"] += (
+                        time.perf_counter() - t_append
+                    ) * 1000
                     continue
             except (TypeError, ValueError, IndexError):
                 pass
             phase_stats["convex_fallbacks"] += 1
             t_fallback = time.perf_counter()
+            t_append = time.perf_counter()
             minkowski_parts.append(
                 _minkowski_sum_convex_reference(
                     poly1_convex_transformed[index_a],
                     poly2_convex_transformed[index_b],
                 )
             )
+            phase_stats["convex_pair_append_ms"] += (
+                time.perf_counter() - t_append
+            ) * 1000
             phase_stats["convex_fallback_ms"] += (time.perf_counter() - t_fallback) * 1000
+    phase_stats["convex_pair_loop_ms"] = (time.perf_counter() - t_pair_loop) * 1000
+    phase_stats["convex_pair_checks_ms"] = (
+        phase_stats["convex_pair_validity_ms"]
+        + phase_stats["convex_pair_empty_ms"]
+        + phase_stats["convex_pair_area_ms"]
+    )
     if timings is not None:
         timings["convex_sum_ms"] = (time.perf_counter() - t_sum) * 1000
         timings.update(phase_stats)

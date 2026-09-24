@@ -76,6 +76,7 @@ def _compute_nfp_uncached(shape_A, angle_A, part_to_place, angle_B, cache_key, l
         nfp_exterior = minkowski_utils.minkowski_sum(
             poly_A_centered, angle_A, False, poly_B_centered, angle_B, True, log,
             timings=minkowski_timings,
+            validate_convex_pairs=False,
         )
         timings.update(minkowski_timings)
 
@@ -99,6 +100,26 @@ def _compute_nfp_uncached(shape_A, angle_A, part_to_place, angle_B, cache_key, l
 
         t_assemble = time.perf_counter()
         master_nfp = Polygon(nfp_exterior.exterior, nfp_interiors) if nfp_exterior and nfp_exterior.area > 0 else None
+        if master_nfp is None or (
+            master_nfp.is_empty or not master_nfp.is_valid or master_nfp.area <= 0
+        ):
+            log(
+                f"[PERF] Fast convex-pair path rejected final NFP for {cache_key[:3]}; "
+                "recomputing with per-pair checks",
+                level="warning",
+            )
+            minkowski_timings = {}
+            nfp_exterior = minkowski_utils.minkowski_sum(
+                poly_A_centered, angle_A, False, poly_B_centered, angle_B, True, log,
+                timings=minkowski_timings,
+                validate_convex_pairs=True,
+            )
+            timings.update(minkowski_timings)
+            master_nfp = (
+                Polygon(nfp_exterior.exterior, nfp_interiors)
+                if nfp_exterior and nfp_exterior.area > 0
+                else None
+            )
         timings["assemble_ms"] = (time.perf_counter() - t_assemble) * 1000
 
         if master_nfp:
@@ -126,6 +147,14 @@ def _compute_nfp_uncached(shape_A, angle_A, part_to_place, angle_B, cache_key, l
         "convex_empty={convex_empty_ms:.1f} "
         "convex_area={convex_area_ms:.1f} "
         "convex_points={convex_result_points} "
+        "convex_pair_loop={convex_pair_loop_ms:.1f} "
+        "convex_pair_checks={convex_pair_checks_ms:.1f} "
+        "convex_pair_validity={convex_pair_validity_ms:.1f} "
+        "convex_pair_empty={convex_pair_empty_ms:.1f} "
+        "convex_pair_area={convex_pair_area_ms:.1f} "
+        "convex_pair_append={convex_pair_append_ms:.1f} "
+        "convex_pair_outcomes={convex_pair_valid_count}/"
+        "{convex_pair_non_empty_count}/{convex_pair_positive_area_count} "
         "convex_fallbacks={convex_fallbacks} "
         "union={union_ms:.1f} holes_ifp={holes_ifp_ms:.1f} "
         "assemble={assemble_ms:.1f} discretize={discretize_ms:.1f} "
@@ -150,6 +179,19 @@ def _compute_nfp_uncached(shape_A, angle_A, part_to_place, angle_B, cache_key, l
                 "convex_empty_ms": timings.get("convex_empty_ms", 0.0),
                 "convex_area_ms": timings.get("convex_area_ms", 0.0),
                 "convex_result_points": timings.get("convex_result_points", 0),
+                "convex_pair_loop_ms": timings.get("convex_pair_loop_ms", 0.0),
+                "convex_pair_checks_ms": timings.get("convex_pair_checks_ms", 0.0),
+                "convex_pair_validity_ms": timings.get("convex_pair_validity_ms", 0.0),
+                "convex_pair_empty_ms": timings.get("convex_pair_empty_ms", 0.0),
+                "convex_pair_area_ms": timings.get("convex_pair_area_ms", 0.0),
+                "convex_pair_append_ms": timings.get("convex_pair_append_ms", 0.0),
+                "convex_pair_valid_count": timings.get("convex_pair_valid_count", 0),
+                "convex_pair_non_empty_count": timings.get(
+                    "convex_pair_non_empty_count", 0
+                ),
+                "convex_pair_positive_area_count": timings.get(
+                    "convex_pair_positive_area_count", 0
+                ),
                 "convex_fallbacks": timings.get("convex_fallbacks", 0),
                 "union_ms": timings.get("union_ms", 0.0),
                 "holes_ifp_ms": timings.get("holes_ifp_ms", 0.0),
