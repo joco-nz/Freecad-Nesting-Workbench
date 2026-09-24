@@ -21,6 +21,8 @@ _DEFAULTS = {
     "part_spacing": 12.5,
     "sheet_thickness": 3.0,
     "deflection_angle": 30.0,
+    "add_labels": False,
+    "simulate_nesting": False,
     "verbose_logging": False,
     "rotation_angles": MINKOWSKI_ROTATION_PRESETS,
 }
@@ -304,12 +306,12 @@ class NestingPanel(QtWidgets.QWidget):
         self.physics_settings_group.setVisible(False)
 
         self.show_bounds_checkbox = QtWidgets.QCheckBox("Show Bounds"); self.show_bounds_checkbox.setChecked(True)
-        self.add_labels_checkbox = QtWidgets.QCheckBox("Add Identifier Labels"); self.add_labels_checkbox.setChecked(True)
+        self.add_labels_checkbox = QtWidgets.QCheckBox("Add Identifier Labels"); self.add_labels_checkbox.setChecked(_DEFAULTS["add_labels"])
         self.label_height_input = QtWidgets.QDoubleSpinBox(); self.label_height_input.setRange(0, 1000); self.label_height_input.setValue(25.0)
         self.label_height_input.setToolTip("The height (Z-offset) for the identifier labels.")
         self.label_size_input = QtWidgets.QDoubleSpinBox(); self.label_size_input.setRange(1, 100); self.label_size_input.setValue(10.0)
         self.label_size_input.setToolTip("The text size for identifier labels in mm.")
-        self.simulate_nesting_checkbox = QtWidgets.QCheckBox("Simulate Nesting (slower)"); self.simulate_nesting_checkbox.setChecked(True)
+        self.simulate_nesting_checkbox = QtWidgets.QCheckBox("Simulate Nesting (slower)"); self.simulate_nesting_checkbox.setChecked(_DEFAULTS["simulate_nesting"])
         self.verbose_logging_checkbox = QtWidgets.QCheckBox("Verbose Logging"); self.verbose_logging_checkbox.setChecked(_DEFAULTS["verbose_logging"])
         self.verbose_logging_checkbox.setToolTip("Enables detailed logging of the nesting process in the FreeCAD console.")
         self.sound_checkbox = QtWidgets.QCheckBox("Play sound on completion"); self.sound_checkbox.setChecked(True)
