@@ -276,6 +276,7 @@ def _minkowski_sum_convex_prepared(prepared_a, prepared_b, phase_stats=None):
         phase_stats["convex_polygon_create_ms"] += (
             time.perf_counter() - t_polygon
         ) * 1000
+        phase_stats["convex_result_points"] += len(result)
     return polygon
 
 
@@ -293,7 +294,20 @@ def minkowski_sum_convex(poly1, poly2, phase_stats=None):
     """Compute the Minkowski sum of two convex polygons in linear time."""
     try:
         result = _minkowski_sum_convex_linear(poly1, poly2, phase_stats)
-        if result.is_valid and not result.is_empty and result.area > 0:
+        if phase_stats is not None:
+            t_valid = time.perf_counter()
+        is_valid = result.is_valid
+        if phase_stats is not None:
+            phase_stats["convex_validity_ms"] += (time.perf_counter() - t_valid) * 1000
+            t_empty = time.perf_counter()
+        is_empty = result.is_empty
+        if phase_stats is not None:
+            phase_stats["convex_empty_ms"] += (time.perf_counter() - t_empty) * 1000
+            t_area = time.perf_counter()
+        area = result.area
+        if phase_stats is not None:
+            phase_stats["convex_area_ms"] += (time.perf_counter() - t_area) * 1000
+        if is_valid and not is_empty and area > 0:
             return result
     except (TypeError, ValueError, IndexError):
         pass
@@ -442,6 +456,10 @@ def minkowski_sum(master_poly1, angle1, reflect1, master_poly2, angle2, reflect2
         "convex_polygon_create_ms": 0.0,
         "convex_fallback_ms": 0.0,
         "convex_fallbacks": 0,
+        "convex_validity_ms": 0.0,
+        "convex_empty_ms": 0.0,
+        "convex_area_ms": 0.0,
+        "convex_result_points": 0,
     }
     t_pair_prepare = time.perf_counter()
     prepared_a = [_prepare_convex_ring(piece) for piece in poly1_convex_transformed]
