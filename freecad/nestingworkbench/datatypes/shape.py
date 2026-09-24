@@ -37,12 +37,14 @@ class Shape:
     nfp_inflight = {}
     nfp_inflight_lock = threading.Lock()
     decomposition_cache = {}
+    decomposition_stats = {}
     
     @classmethod
     def clear_caches(cls):
         """Clears decomposition cache between nesting runs. Does NOT clear NFP cache
         since NFP calculations are expensive and benefit from persistence."""
         cls.decomposition_cache.clear()
+        cls.decomposition_stats.clear()
 
     @classmethod
     def clear_nfp_cache(cls):

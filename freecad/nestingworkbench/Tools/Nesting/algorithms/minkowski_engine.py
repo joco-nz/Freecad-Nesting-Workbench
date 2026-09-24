@@ -121,7 +121,10 @@ def _compute_nfp_uncached(shape_A, angle_A, part_to_place, angle_B, cache_key, l
         "transform={transform_ms:.1f} convex_sum={convex_sum_ms:.1f} "
         "union={union_ms:.1f} holes_ifp={holes_ifp_ms:.1f} "
         "assemble={assemble_ms:.1f} discretize={discretize_ms:.1f} "
-        "parts={parts_a}x{parts_b} pairs={convex_pairs}".format(
+        "parts={parts_a}x{parts_b} pairs={convex_pairs} "
+        "vertices={source_vertices_a}x{source_vertices_b} "
+        "triangles={triangles_a}x{triangles_b} "
+        "clipped={clipped_pieces_a}x{clipped_pieces_b}".format(
             cache_key[:3],
             **{
                 "total_ms": timings.get("total_ms", 0.0),
@@ -136,6 +139,12 @@ def _compute_nfp_uncached(shape_A, angle_A, part_to_place, angle_B, cache_key, l
                 "parts_a": timings.get("parts_a", 0),
                 "parts_b": timings.get("parts_b", 0),
                 "convex_pairs": timings.get("convex_pairs", 0),
+                "source_vertices_a": timings.get("source_vertices_a", 0),
+                "source_vertices_b": timings.get("source_vertices_b", 0),
+                "triangles_a": timings.get("triangles_a", 0),
+                "triangles_b": timings.get("triangles_b", 0),
+                "clipped_pieces_a": timings.get("clipped_pieces_a", 0),
+                "clipped_pieces_b": timings.get("clipped_pieces_b", 0),
             },
         )
     )

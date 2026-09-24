@@ -31,11 +31,25 @@ def decompose_if_needed(polygon, logger):
         if cache_key in Shape.decomposition_cache:
             return Shape.decomposition_cache[cache_key]
 
+    source_vertices = max(0, len(polygon.exterior.coords) - 1)
+
+    def cache_result(parts, triangles=0, clipped_pieces=0):
+        stats = {
+            "source_vertices": source_vertices,
+            "triangles": triangles,
+            "clipped_pieces": clipped_pieces,
+            "retained_pieces": len(parts),
+        }
+        with _decomposition_lock:
+            Shape.decomposition_cache[cache_key] = parts
+            Shape.decomposition_stats[cache_key] = stats
+        return parts
+
     if polygon.geom_type == 'MultiPolygon':
         all_decomposed_parts = []
         for p in polygon.geoms:
             all_decomposed_parts.extend(decompose_if_needed(p, logger))
-        return all_decomposed_parts
+        return cache_result(all_decomposed_parts)
 
     # If already convex-ish (triangle or area match convex hull), return as is
     # Using a strict tolerance for robustness
@@ -47,10 +61,7 @@ def decompose_if_needed(polygon, logger):
             is_convex = True
             
     if is_convex:
-        res = [polygon]
-        with _decomposition_lock:
-            Shape.decomposition_cache[cache_key] = res
-        return res
+        return cache_result([polygon])
     
     try:
         # Delaunay triangulation is unconstrained (ignores polygon edges), so
@@ -63,6 +74,7 @@ def decompose_if_needed(polygon, logger):
         # overlap (the rep-point filter previously used here did exactly that).
         triangles = triangulate(polygon)
         decomposed = []
+        clipped_pieces = 0
         for tri in triangles:
             if tri.area <= 1e-9:
                 continue
@@ -75,6 +87,7 @@ def decompose_if_needed(polygon, logger):
                 pieces = clip.geoms if hasattr(clip, 'geoms') else [clip]
                 for piece in pieces:
                     if piece.geom_type == 'Polygon' and piece.area > 1e-9:
+                        clipped_pieces += 1
                         decomposed.append(piece.convex_hull)
 
         if not decomposed:
@@ -82,16 +95,11 @@ def decompose_if_needed(polygon, logger):
             # never return that for a real polygon.
             decomposed = [polygon.convex_hull]
 
-        with _decomposition_lock:
-            Shape.decomposition_cache[cache_key] = decomposed
-        return decomposed
+        return cache_result(decomposed, len(triangles), clipped_pieces)
     except Exception as e:
         logger(f"      - Triangulation failed: {e}. Falling back to convex hull.", level="warning")
 
-    result = [polygon.convex_hull]
-    with _decomposition_lock:
-        Shape.decomposition_cache[cache_key] = result
-    return result
+    return cache_result([polygon.convex_hull])
 
 def _minkowski_sum_convex_reference(poly1, poly2):
     """Reference implementation retained for fallback and geometry checks."""
@@ -274,6 +282,13 @@ def minkowski_sum(master_poly1, angle1, reflect1, master_poly2, angle2, reflect2
         timings["decompose_ms"] = (time.perf_counter() - t_decompose) * 1000
         timings["parts_a"] = len(poly1_convex_parts)
         timings["parts_b"] = len(poly2_convex_parts)
+        with _decomposition_lock:
+            stats_a = Shape.decomposition_stats.get(master_poly1.wkt, {})
+            stats_b = Shape.decomposition_stats.get(master_poly2.wkt, {})
+        for name, stats in (("a", stats_a), ("b", stats_b)):
+            timings[f"source_vertices_{name}"] = stats.get("source_vertices", 0)
+            timings[f"triangles_{name}"] = stats.get("triangles", 0)
+            timings[f"clipped_pieces_{name}"] = stats.get("clipped_pieces", 0)
 
     # CRITICAL: Use the MASTER polygon's centroid for all transformations
     # to keep the decomposed convex parts in their correct relative positions.
