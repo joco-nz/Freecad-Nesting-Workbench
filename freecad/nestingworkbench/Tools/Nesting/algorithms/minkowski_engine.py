@@ -4,6 +4,7 @@ import math
 import time
 import numpy as np
 import FreeCAD
+from concurrent.futures import Future
 from threading import Lock
 import shapely
 from shapely.geometry import Polygon
@@ -27,8 +28,40 @@ def compute_and_cache_nfp(shape_A, angle_A, part_to_place, angle_B, cache_key, l
 
     with Shape.nfp_cache_lock:
         cached_nfp_data = Shape.nfp_cache.get(cache_key)
-        if cached_nfp_data:
+        if cached_nfp_data is not None:
             return cached_nfp_data
+    with Shape.nfp_inflight_lock:
+        future = Shape.nfp_inflight.get(cache_key)
+        if future is None:
+            future = Future()
+            Shape.nfp_inflight[cache_key] = future
+            is_owner = True
+        else:
+            is_owner = False
+
+    if not is_owner:
+        if log:
+            log(f"[PERF] NFP in-flight JOIN key={cache_key[:3]}")
+        return future.result()
+
+    try:
+        nfp_data = _compute_nfp_uncached(
+            shape_A, angle_A, part_to_place, angle_B, cache_key, log, step_size
+        )
+        with Shape.nfp_cache_lock:
+            Shape.nfp_cache[cache_key] = nfp_data
+        future.set_result(nfp_data)
+        return nfp_data
+    except BaseException as exc:
+        future.set_exception(exc)
+        raise
+    finally:
+        with Shape.nfp_inflight_lock:
+            Shape.nfp_inflight.pop(cache_key, None)
+
+
+def _compute_nfp_uncached(shape_A, angle_A, part_to_place, angle_B, cache_key, log, step_size):
+    """Compute one NFP without consulting or updating the shared cache."""
     t_total = time.perf_counter()
     timings = {}
     try:
@@ -106,8 +139,6 @@ def compute_and_cache_nfp(shape_A, angle_A, part_to_place, angle_B, cache_key, l
             },
         )
     )
-    with Shape.nfp_cache_lock:
-        Shape.nfp_cache[cache_key] = nfp_data
     return nfp_data
 
 class MinkowskiEngine:

@@ -34,6 +34,8 @@ class Shape:
     """
     nfp_cache = {}
     nfp_cache_lock = threading.Lock()
+    nfp_inflight = {}
+    nfp_inflight_lock = threading.Lock()
     decomposition_cache = {}
     
     @classmethod
