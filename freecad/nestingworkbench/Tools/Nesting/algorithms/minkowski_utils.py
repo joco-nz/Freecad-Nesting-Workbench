@@ -152,12 +152,16 @@ def calculate_inner_fit_polygon(master_poly1, angle1, master_poly2, angle2, logg
     poly1_exterior_only = Polygon(poly1_transformed.exterior.coords)
     
     pairwise_diffs = []
-    for i, p2 in enumerate(poly2_convex_transformed):
-        # Get poly2's centroid
-        p2_centroid = p2.centroid
-        
-        # Translate poly2 so its centroid is at origin
-        p2_at_origin = translate(p2, xoff=-p2_centroid.x, yoff=-p2_centroid.y)
+    for p2 in poly2_convex_transformed:
+        # Keep every decomposed piece in the candidate part's coordinate frame.
+        # Re-centering each piece on its own centroid loses its offset from the
+        # candidate centroid and produces an IFP for the pieces independently,
+        # rather than for the complete candidate shape.
+        p2_at_origin = translate(
+            p2,
+            xoff=-poly2_centroid.x,
+            yoff=-poly2_centroid.y,
+        )
         
         # Compute Inner-Fit Polygon
         diff = minkowski_difference_convex(poly1_exterior_only, p2_at_origin)
@@ -169,9 +173,17 @@ def calculate_inner_fit_polygon(master_poly1, angle1, master_poly2, angle2, logg
     # Intersection of all pairwise differences
     final_difference = pairwise_diffs[0]
     for i in range(1, len(pairwise_diffs)):
+        if final_difference is None or final_difference.is_empty:
+            return None
+        if pairwise_diffs[i] is None or pairwise_diffs[i].is_empty:
+            return None
         final_difference = final_difference.intersection(pairwise_diffs[i])
-    
-    return final_difference
+
+    if final_difference is None or final_difference.is_empty:
+        return None
+    if not final_difference.is_valid:
+        final_difference = final_difference.buffer(0)
+    return final_difference if not final_difference.is_empty else None
 
 def minkowski_sum(master_poly1, angle1, reflect1, master_poly2, angle2, reflect2, logger, rot_origin1=None, rot_origin2=None):
     """

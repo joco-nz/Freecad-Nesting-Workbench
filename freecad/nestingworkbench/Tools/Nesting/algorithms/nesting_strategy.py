@@ -8,7 +8,8 @@ from datetime import datetime
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import numpy as np
-from shapely.affinity import rotate
+from shapely.affinity import rotate, translate
+from shapely.geometry import Polygon
 
 import FreeCAD
 from ....datatypes.sheet import Sheet
@@ -162,7 +163,11 @@ class PlacementOptimizer:
 
         best = {'metric': float('inf')}
         if pts_arr is not None and len(pts_arr):
-            valid_mask = np.ones(len(pts_arr), dtype=bool)
+            valid_mask = self._exact_candidate_mask(
+                rotated_poly,
+                pts_arr,
+                sheet,
+            )
             best_idx, metric = MinkowskiEngine.score_gravity(pts_arr, valid_mask, direction, rng=self.rng)
             if best_idx is not None:
                 best = {'x': float(pts_arr[best_idx, 0]), 'y': float(pts_arr[best_idx, 1]),
@@ -180,6 +185,55 @@ class PlacementOptimizer:
         best['_t_nfp_ms'] = (t_nfp - t0) * 1000
         best['_t_score_ms'] = (t_end - t_nfp) * 1000
         return best
+
+    @staticmethod
+    def _exact_candidate_mask(rotated_poly, points, sheet, area_tolerance=1e-7):
+        """Validate NFP candidates against the actual transformed polygons.
+
+        NFP boundaries are a candidate generator, not the final collision
+        proof. This exact check is especially important for internal-fit
+        candidates, where a discretized or invalid IFP can otherwise admit a
+        centroid whose part crosses the containing part's boundary.
+        """
+        min_x, min_y, max_x, max_y = rotated_poly.bounds
+        rotated_centroid = rotated_poly.centroid
+        rminx, rminy = min_x - rotated_centroid.x, min_y - rotated_centroid.y
+        rmaxx, rmaxy = max_x - rotated_centroid.x, max_y - rotated_centroid.y
+
+        valid = (
+            (points[:, 0] + rminx >= -area_tolerance)
+            & (points[:, 0] + rmaxx <= sheet.width + area_tolerance)
+            & (points[:, 1] + rminy >= -area_tolerance)
+            & (points[:, 1] + rmaxy <= sheet.height + area_tolerance)
+        )
+        if not valid.any():
+            return valid
+
+        existing_polygons = [
+            placed.shape.polygon
+            for placed in sheet.parts
+            if placed.shape and placed.shape.polygon
+        ]
+        if not existing_polygons:
+            return valid
+
+        bin_polygon = Polygon(
+            [(0, 0), (sheet.width, 0), (sheet.width, sheet.height), (0, sheet.height)]
+        )
+        for index in np.flatnonzero(valid):
+            candidate = translate(
+                rotated_poly,
+                xoff=float(points[index, 0] - rotated_centroid.x),
+                yoff=float(points[index, 1] - rotated_centroid.y),
+            )
+            if candidate.difference(bin_polygon).area > area_tolerance:
+                valid[index] = False
+                continue
+            if any(candidate.intersection(existing).area > area_tolerance
+                   for existing in existing_polygons):
+                valid[index] = False
+
+        return valid
 
 class Nester:
     """
