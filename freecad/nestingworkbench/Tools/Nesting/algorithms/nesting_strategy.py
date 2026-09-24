@@ -14,6 +14,7 @@ from shapely.geometry import Polygon
 import FreeCAD
 from ....datatypes.sheet import Sheet
 from ....datatypes.placed_part import PlacedPart
+from ....datatypes.shape import Shape
 from . import genetic_utils
 from .minkowski_engine import MinkowskiEngine
 
@@ -492,6 +493,14 @@ class Nester:
             f"[TIMING] {len(part_timings)} parts in {total_s:.2f}s | "
             f"NFP cache: {cache['cache_hits']} hits ({hit_pct:.0f}%) / "
             f"{cache['cache_misses']} misses, compute={cache['nfp_compute_ms']:.0f}ms"
+        )
+        with Shape.convex_pair_probe_lock:
+            pair_requests = Shape.convex_pair_probe_requests
+            pair_unique = len(Shape.convex_pair_probe_keys)
+        pair_repeats = pair_requests - pair_unique
+        self.log(
+            f"[PERF] Convex pair probe: {pair_requests} requests / "
+            f"{pair_unique} unique / {pair_repeats} repeats"
         )
         slowest = sorted(part_timings, key=lambda x: -x[1])[:5]
         self.log("[TIMING] Slowest: " + ", ".join(

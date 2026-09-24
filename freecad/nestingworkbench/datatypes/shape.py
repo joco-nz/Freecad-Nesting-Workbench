@@ -42,6 +42,9 @@ class Shape:
     decomposition_inflight_lock = threading.Lock()
     transformed_parts_cache = {}
     transformed_parts_cache_lock = threading.Lock()
+    convex_pair_probe_keys = set()
+    convex_pair_probe_lock = threading.Lock()
+    convex_pair_probe_requests = 0
     
     @classmethod
     def clear_caches(cls):
@@ -51,6 +54,9 @@ class Shape:
         cls.decomposition_stats.clear()
         with cls.transformed_parts_cache_lock:
             cls.transformed_parts_cache.clear()
+        with cls.convex_pair_probe_lock:
+            cls.convex_pair_probe_keys.clear()
+            cls.convex_pair_probe_requests = 0
 
     @classmethod
     def clear_nfp_cache(cls):

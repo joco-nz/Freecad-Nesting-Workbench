@@ -408,12 +408,32 @@ def minkowski_sum(master_poly1, angle1, reflect1, master_poly2, angle2, reflect2
 
     t_sum = time.perf_counter()
     minkowski_parts = []
-    for p1 in poly1_convex_transformed:
-        for p2 in poly2_convex_transformed:
+    pair_keys = set()
+    polygon_key_a = master_poly1.wkb
+    polygon_key_b = master_poly2.wkb
+    for index_a, p1 in enumerate(poly1_convex_transformed):
+        for index_b, p2 in enumerate(poly2_convex_transformed):
+            pair_key = (
+                polygon_key_a,
+                round(angle1 % 360.0, 10),
+                bool(reflect1),
+                polygon_key_b,
+                round(angle2 % 360.0, 10),
+                bool(reflect2),
+                index_a,
+                index_b,
+            )
+            pair_keys.add(pair_key)
             minkowski_parts.append(minkowski_sum_convex(p1, p2))
     if timings is not None:
         timings["convex_sum_ms"] = (time.perf_counter() - t_sum) * 1000
         timings["convex_pairs"] = len(minkowski_parts)
+        timings["convex_pair_requests"] = len(minkowski_parts)
+        timings["convex_pair_unique"] = len(pair_keys)
+        timings["convex_pair_repeats"] = len(minkowski_parts) - len(pair_keys)
+    with Shape.convex_pair_probe_lock:
+        Shape.convex_pair_probe_requests += len(minkowski_parts)
+        Shape.convex_pair_probe_keys.update(pair_keys)
 
     t_union = time.perf_counter()
     result = unary_union(minkowski_parts)

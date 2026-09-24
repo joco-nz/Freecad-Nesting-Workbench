@@ -122,6 +122,8 @@ def _compute_nfp_uncached(shape_A, angle_A, part_to_place, angle_B, cache_key, l
         "union={union_ms:.1f} holes_ifp={holes_ifp_ms:.1f} "
         "assemble={assemble_ms:.1f} discretize={discretize_ms:.1f} "
         "parts={parts_a}x{parts_b} pairs={convex_pairs} "
+        "pair_probe={convex_pair_requests}/{convex_pair_unique}/"
+        "{convex_pair_repeats} "
         "vertices={source_vertices_a}x{source_vertices_b} "
         "triangles={triangles_a}x{triangles_b} "
         "clipped={clipped_pieces_a}x{clipped_pieces_b} "
@@ -140,6 +142,9 @@ def _compute_nfp_uncached(shape_A, angle_A, part_to_place, angle_B, cache_key, l
                 "parts_a": timings.get("parts_a", 0),
                 "parts_b": timings.get("parts_b", 0),
                 "convex_pairs": timings.get("convex_pairs", 0),
+                "convex_pair_requests": timings.get("convex_pair_requests", 0),
+                "convex_pair_unique": timings.get("convex_pair_unique", 0),
+                "convex_pair_repeats": timings.get("convex_pair_repeats", 0),
                 "source_vertices_a": timings.get("source_vertices_a", 0),
                 "source_vertices_b": timings.get("source_vertices_b", 0),
                 "triangles_a": timings.get("triangles_a", 0),
