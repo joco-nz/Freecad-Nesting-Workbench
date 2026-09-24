@@ -40,6 +40,8 @@ class Shape:
     decomposition_stats = {}
     decomposition_inflight = {}
     decomposition_inflight_lock = threading.Lock()
+    transformed_parts_cache = {}
+    transformed_parts_cache_lock = threading.Lock()
     
     @classmethod
     def clear_caches(cls):
@@ -47,6 +49,8 @@ class Shape:
         since NFP calculations are expensive and benefit from persistence."""
         cls.decomposition_cache.clear()
         cls.decomposition_stats.clear()
+        with cls.transformed_parts_cache_lock:
+            cls.transformed_parts_cache.clear()
 
     @classmethod
     def clear_nfp_cache(cls):

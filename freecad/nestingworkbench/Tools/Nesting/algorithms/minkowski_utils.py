@@ -150,6 +150,49 @@ def _decompose_uncached(polygon, logger, cache_key):
 
     return cache_result([polygon.convex_hull], source_vertices=source_vertices)
 
+
+def _transform_convex_parts(parts, master_polygon, angle, reflect, origin):
+    """Return cached rotated/reflected convex pieces for one shape transform."""
+    if hasattr(origin, "x") and hasattr(origin, "y"):
+        origin_key = (round(origin.x, 12), round(origin.y, 12))
+        scale_origin = (origin.x, origin.y)
+    elif isinstance(origin, str):
+        origin_key = origin
+        scale_origin = origin
+    else:
+        origin_key = tuple(round(value, 12) for value in origin)
+        scale_origin = origin
+    cache_key = (
+        master_polygon.wkt,
+        round(angle % 360.0, 10),
+        bool(reflect),
+        origin_key,
+    )
+    with Shape.transformed_parts_cache_lock:
+        cached_parts = Shape.transformed_parts_cache.get(cache_key)
+    if cached_parts is not None:
+        return cached_parts
+
+    transformed_parts = []
+    for part in parts:
+        transformed = rotate(part, angle, origin=origin)
+        if reflect:
+            transformed = scale(
+                transformed,
+                xfact=-1.0,
+                yfact=-1.0,
+                origin=scale_origin,
+            )
+        transformed_parts.append(transformed)
+
+    with Shape.transformed_parts_cache_lock:
+        existing_parts = Shape.transformed_parts_cache.get(cache_key)
+        if existing_parts is not None:
+            return existing_parts
+        Shape.transformed_parts_cache[cache_key] = transformed_parts
+    return transformed_parts
+
+
 def _minkowski_sum_convex_reference(poly1, poly2):
     """Reference implementation retained for fallback and geometry checks."""
     v1 = poly1.exterior.coords
@@ -273,7 +316,13 @@ def calculate_inner_fit_polygon(master_poly1, angle1, master_poly2, angle2, logg
     poly1_transformed = rotate(master_poly1, angle1, origin='centroid')
     poly2_convex_parts = decompose_if_needed(master_poly2, logger)
     poly2_centroid = master_poly2.centroid
-    poly2_convex_transformed = [rotate(p, angle2, origin=poly2_centroid) for p in poly2_convex_parts]
+    poly2_convex_transformed = _transform_convex_parts(
+        poly2_convex_parts,
+        master_poly2,
+        angle2,
+        False,
+        poly2_centroid,
+    )
     
     # Translate both polygons so poly2's centroid is at the origin
     # This makes the Minkowski difference compute placement zones relative to poly2's centroid
@@ -346,27 +395,14 @@ def minkowski_sum(master_poly1, angle1, reflect1, master_poly2, angle2, reflect2
     c2 = master_poly2.centroid
 
     t_transform = time.perf_counter()
-    poly1_convex_transformed = []
-    for p in poly1_convex_parts:
-        # Use master centroid for rotation to preserve relative positions of parts
-        use_origin = c1 if (rot_origin1 is None or rot_origin1 == 'centroid') else rot_origin1
-        p_new = rotate(p, angle1, origin=use_origin)
-        if reflect1:
-            # CRITICAL FIX: Reflect around the MASTER centroid, not (0,0)
-            # This keeps all convex parts in correct relative positions after reflection
-            p_new = scale(p_new, xfact=-1.0, yfact=-1.0, origin=(c1.x, c1.y))
-        poly1_convex_transformed.append(p_new)
-
-    poly2_convex_transformed = []
-    for p in poly2_convex_parts:
-        # Use master centroid for rotation to preserve relative positions of parts
-        use_origin = c2 if (rot_origin2 is None or rot_origin2 == 'centroid') else rot_origin2
-        p_new = rotate(p, angle2, origin=use_origin)
-        if reflect2:
-            # CRITICAL FIX: Reflect around the MASTER centroid, not (0,0)
-            # This keeps all convex parts in correct relative positions after reflection
-            p_new = scale(p_new, xfact=-1.0, yfact=-1.0, origin=(c2.x, c2.y))
-        poly2_convex_transformed.append(p_new)
+    use_origin1 = c1 if (rot_origin1 is None or rot_origin1 == 'centroid') else rot_origin1
+    use_origin2 = c2 if (rot_origin2 is None or rot_origin2 == 'centroid') else rot_origin2
+    poly1_convex_transformed = _transform_convex_parts(
+        poly1_convex_parts, master_poly1, angle1, reflect1, use_origin1
+    )
+    poly2_convex_transformed = _transform_convex_parts(
+        poly2_convex_parts, master_poly2, angle2, reflect2, use_origin2
+    )
     if timings is not None:
         timings["transform_ms"] = (time.perf_counter() - t_transform) * 1000
 
