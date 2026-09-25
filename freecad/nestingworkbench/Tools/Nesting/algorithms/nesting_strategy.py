@@ -20,13 +20,83 @@ from ....datatypes.shape import Shape
 from . import genetic_utils
 from .minkowski_engine import MinkowskiEngine
 
+
+def _candidate_geometry_key(prefix, x, y):
+    """Build the complete run-local candidate geometry cache key."""
+    return (prefix, float(x), float(y))
+
+
+class CandidateGeometryKeyTracker:
+    """Track candidate geometry keys across one or more optimizers.
+
+    This is measurement-only. It deliberately does not retain polygons or
+    affect candidate decisions; the shared scope lets GA diagnostics measure
+    reuse across layouts as well as within a single layout.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._keys = set()
+
+    def observe(self, prefix, points, indices):
+        """Return (new, repeated) counts for the supplied candidate rows."""
+        unique_count = 0
+        repeat_count = 0
+        with self._lock:
+            for index in indices:
+                key = _candidate_geometry_key(
+                    prefix, points[index, 0], points[index, 1]
+                )
+                if key in self._keys:
+                    repeat_count += 1
+                else:
+                    self._keys.add(key)
+                    unique_count += 1
+        return unique_count, repeat_count
+
+    def clear(self):
+        """Release all diagnostic keys retained by this run."""
+        with self._lock:
+            self._keys.clear()
+
+
+class CandidateGeometryCache:
+    """Per-run cache of translated candidate polygons.
+
+    Only geometry is cached. Collision, sheet-boundary, and scoring results
+    remain dependent on the current sheet layout and are always recomputed.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._polygons = {}
+
+    def get(self, key):
+        with self._lock:
+            return self._polygons.get(key)
+
+    def put(self, key, polygon):
+        with self._lock:
+            self._polygons[key] = polygon
+
+    def clear(self):
+        """Release all translated polygons retained by this run."""
+        with self._lock:
+            self._polygons.clear()
+
+    def __len__(self):
+        with self._lock:
+            return len(self._polygons)
+
+
 class PlacementOptimizer:
     """
     Handles the geometric logic of finding the best position for a part on a sheet.
     """
     def __init__(
         self, engine, rotation_steps, search_direction, log_callback=None,
-        trial_callback=None, rng=None, performance_logging=False
+        trial_callback=None, rng=None, performance_logging=False,
+        candidate_geometry_key_tracker=None, candidate_geometry_cache=None
     ):
         self.engine = engine
         self.rotation_steps = max(1, rotation_steps)
@@ -37,6 +107,17 @@ class PlacementOptimizer:
         self.verbose = False
         self.performance_logging = performance_logging
         self._perf_lock = threading.Lock()
+        self._active_workers = 0
+        # Measurement-only tracker. A tracker can be shared by the GA
+        # coordinator to measure key reuse across layouts; it never stores
+        # geometry and is not used for caching or decisions. Avoid creating
+        # an empty tracker when Performance Logging is disabled.
+        self._candidate_geometry_key_tracker = (
+            candidate_geometry_key_tracker
+            if candidate_geometry_key_tracker is not None
+            else (CandidateGeometryKeyTracker() if performance_logging else None)
+        )
+        self._candidate_geometry_cache = candidate_geometry_cache
         self._perf_stats = {
             'rotation_evaluations': 0,
             'successful_rotations': 0,
@@ -56,6 +137,22 @@ class PlacementOptimizer:
             'candidate_geometry_ms': 0.0,
             'sheet_difference_ms': 0.0,
             'collision_intersection_ms': 0.0,
+            # Measurement-only candidate-path counters.
+            'placement_wall_ms': 0.0,
+            'rotation_wall_ms': 0.0,
+            'candidate_evaluation_wall_ms': 0.0,
+            'candidate_geometries_built': 0,
+            'candidate_geometry_observations': 0,
+            'candidate_geometry_cache_hits': 0,
+            'candidate_geometry_cache_misses': 0,
+            'candidate_geometry_cache_ms': 0.0,
+            'candidate_geometry_cache_entries': 0,
+            'bbox_checks': 0,
+            'bbox_overlap_pairs': 0,
+            'exact_collision_checks': 0,
+            'candidate_geometry_unique': 0,
+            'candidate_geometry_repeats': 0,
+            'max_concurrent_rotations': 0,
         }
 
     def log(self, message):
@@ -98,10 +195,18 @@ class PlacementOptimizer:
         import time as _time
         t0_parallel = _time.perf_counter()
         total_nfp_ms = 0.0
+        total_validity_ms = 0.0
         total_score_ms = 0.0
         with ThreadPoolExecutor() as executor:
             futures = {
-                executor.submit(self._evaluate_rotation, angle, part, placed_parts_grouped, sheet, direction): angle
+                executor.submit(
+                    self._evaluate_rotation_tracked,
+                    angle,
+                    part,
+                    placed_parts_grouped,
+                    sheet,
+                    direction,
+                ): angle
                 for angle in angles
             }
 
@@ -110,6 +215,7 @@ class PlacementOptimizer:
                     res = future.result()
                     if res:
                         total_nfp_ms += res.get('_t_nfp_ms', 0)
+                        total_validity_ms += res.get('_t_validity_ms', 0)
                         total_score_ms += res.get('_t_score_ms', 0)
                         with self._perf_lock:
                             self._perf_stats['rotation_evaluations'] += 1
@@ -137,6 +243,23 @@ class PlacementOptimizer:
                                 '_sheet_difference_ms', 0)
                             self._perf_stats['collision_intersection_ms'] += res.get(
                                 '_collision_intersection_ms', 0)
+                            self._perf_stats['rotation_wall_ms'] += res.get(
+                                '_t_wall_ms', 0)
+                            self._perf_stats['candidate_evaluation_wall_ms'] += res.get(
+                                '_t_candidate_evaluation_ms', 0)
+                            for key in (
+                                'candidate_geometries_built',
+                                'candidate_geometry_cache_hits',
+                                'candidate_geometry_cache_misses',
+                                'candidate_geometry_cache_ms',
+                                'bbox_checks', 'bbox_overlap_pairs',
+                                'exact_collision_checks',
+                            ):
+                                self._perf_stats[key] += res.get(f'_{key}', 0)
+                            self._perf_stats['candidate_geometry_cache_entries'] = max(
+                                self._perf_stats['candidate_geometry_cache_entries'],
+                                res.get('_candidate_geometry_cache_entries', 0),
+                            )
                         if res['metric'] < best_result['metric']:
                             best_result = res
                             # Call trial callback from main thread for each better result found
@@ -146,14 +269,18 @@ class PlacementOptimizer:
                     self.log(f"Error in rotation evaluation thread: {e}")
 
         dt_parallel = (_time.perf_counter() - t0_parallel) * 1000
+        with self._perf_lock:
+            self._perf_stats['placement_wall_ms'] += dt_parallel
         if self.performance_logging:
             self.log(f"[TIMING] '{getattr(part, 'id', '?')}': wall={dt_parallel:.0f}ms "
-                     f"nfp={total_nfp_ms:.0f}ms score={total_score_ms:.0f}ms "
+                     f"nfp={total_nfp_ms:.0f}ms validity={total_validity_ms:.0f}ms "
+                     f"score={total_score_ms:.0f}ms "
                      f"({len(angles)} rotations, {len(sheet.parts)} placed)")
         if self.verbose:
             self.log(f"  -> Parallel eval: {len(angles)} rotations in {dt_parallel:.1f}ms "
                      f"(ideal speedup: {len(angles)}x, pool workers: {min(len(angles), os.cpu_count() or 1)})")
         best_result['_t_nfp_ms'] = total_nfp_ms
+        best_result['_t_validity_ms'] = total_validity_ms
         best_result['_t_score_ms'] = total_score_ms
         
         if self.verbose:
@@ -167,6 +294,65 @@ class PlacementOptimizer:
              part.move(best_result['x'] - curr.x, best_result['y'] - curr.y)
              return part
         return None
+
+    def _evaluate_rotation_tracked(
+        self, angle, part, placed_parts_grouped, sheet, direction
+    ):
+        """Track rotation-worker occupancy without changing evaluation behavior."""
+        if self.performance_logging:
+            with self._perf_lock:
+                self._active_workers += 1
+                self._perf_stats['max_concurrent_rotations'] = max(
+                    self._perf_stats['max_concurrent_rotations'],
+                    self._active_workers,
+                )
+        try:
+            return self._evaluate_rotation(
+                angle, part, placed_parts_grouped, sheet, direction
+            )
+        finally:
+            if self.performance_logging:
+                with self._perf_lock:
+                    self._active_workers -= 1
+
+    @staticmethod
+    def _candidate_geometry_key_prefix(part, angle):
+        source = getattr(part, 'source_freecad_object', None)
+        document = getattr(source, 'Document', None)
+        if source is None:
+            source_identity = (None, None, id(part))
+        else:
+            source_identity = (
+                getattr(document, 'Name', ''),
+                getattr(source, 'Name', ''),
+                id(source),
+            )
+        return (
+            source_identity,
+            float(getattr(part, 'spacing', 0.0)),
+            float(getattr(part, 'deflection', 0.0)),
+            float(getattr(part, 'simplification', 0.0)),
+            angle % 360.0,
+        )
+
+    def _record_candidate_geometry_keys(self, part, angle, points, indices):
+        """Count reuse for rows that actually construct candidate geometry."""
+        if (
+            not self.performance_logging
+            or self._candidate_geometry_key_tracker is None
+            or points is None
+            or indices is None
+            or len(indices) == 0
+        ):
+            return
+        prefix = self._candidate_geometry_key_prefix(part, angle)
+        unique_count, repeat_count = self._candidate_geometry_key_tracker.observe(
+            prefix, points, indices
+        )
+        with self._perf_lock:
+            self._perf_stats['candidate_geometry_observations'] += len(indices)
+            self._perf_stats['candidate_geometry_unique'] += unique_count
+            self._perf_stats['candidate_geometry_repeats'] += repeat_count
 
     def _evaluate_rotation(self, angle, part, placed_parts_grouped, sheet, direction):
         """
@@ -220,12 +406,19 @@ class PlacementOptimizer:
         t_validity = t_nfp
         valid_mask = None
         validity_probe = {}
+        geometry_key_prefix = (
+            self._candidate_geometry_key_prefix(part, angle)
+            if self._candidate_geometry_cache is not None else None
+        )
         if pts_arr is not None and len(pts_arr):
             valid_mask = self._exact_candidate_mask(
                 rotated_poly,
                 pts_arr,
                 sheet,
                 probe=validity_probe,
+                candidate_geometry_cache=self._candidate_geometry_cache,
+                geometry_key_prefix=geometry_key_prefix,
+                performance_logging=self.performance_logging,
             )
             t_validity = _time.perf_counter()
             best_idx, metric = MinkowskiEngine.score_gravity(pts_arr, valid_mask, direction, rng=self.rng)
@@ -238,6 +431,10 @@ class PlacementOptimizer:
              self.trial_callback(part, angle, best['x'], best['y'])
 
         t_end = _time.perf_counter()
+        geometry_indices = validity_probe.pop('_geometry_candidate_indices', None)
+        self._record_candidate_geometry_keys(
+            part, angle, pts_arr, geometry_indices
+        )
         if self.performance_logging:
             self.log(f"    [{thread_id}] angle={angle:.0f}: NFP={((t_nfp-t0)*1000):.1f}ms, "
                      f"validity={((t_validity-t_nfp)*1000):.1f}ms, "
@@ -247,6 +444,8 @@ class PlacementOptimizer:
         best['_t_nfp_ms'] = (t_nfp - t0) * 1000
         best['_t_validity_ms'] = (t_validity - t_nfp) * 1000
         best['_t_score_ms'] = (t_end - t_validity) * 1000
+        best['_t_wall_ms'] = (t_end - t0) * 1000
+        best['_t_candidate_evaluation_ms'] = (t_validity - t_nfp) * 1000
         best['_candidate_points'] = len(pts_arr) if pts_arr is not None else 0
         best['_valid_candidate_points'] = int(valid_mask.sum()) if valid_mask is not None else 0
         for key, value in validity_probe.items():
@@ -255,7 +454,9 @@ class PlacementOptimizer:
 
     @staticmethod
     def _exact_candidate_mask(
-        rotated_poly, points, sheet, area_tolerance=1e-7, probe=None
+        rotated_poly, points, sheet, area_tolerance=1e-7, probe=None,
+        candidate_geometry_cache=None, geometry_key_prefix=None,
+        performance_logging=False,
     ):
         """Validate NFP candidates against the actual transformed polygons.
 
@@ -282,6 +483,9 @@ class PlacementOptimizer:
         overlapping pairs. The existing-part iteration order, the collision
         short-circuit, and the area-tolerance semantics are unchanged.
         """
+        if probe is not None:
+            probe['candidate_count'] = len(points)
+
         min_x, min_y, max_x, max_y = rotated_poly.bounds
         rotated_centroid = rotated_poly.centroid
         rminx, rminy = min_x - rotated_centroid.x, min_y - rotated_centroid.y
@@ -295,6 +499,10 @@ class PlacementOptimizer:
         )
         if probe is not None:
             probe['bounds_survivors'] = int(valid.sum())
+            probe['candidate_geometries_built'] = 0
+            probe['bbox_checks'] = 0
+            probe['bbox_overlap_pairs'] = 0
+            probe['exact_collision_checks'] = 0
         if not valid.any():
             return valid
 
@@ -304,6 +512,9 @@ class PlacementOptimizer:
             if placed.shape and placed.shape.polygon
         ]
         if not existing_polygons:
+            if probe is not None:
+                probe['sheet_candidates'] = int(valid.sum())
+                probe['collision_candidates'] = int(valid.sum())
             return valid
 
         bin_polygon = Polygon(
@@ -351,27 +562,62 @@ class PlacementOptimizer:
                 & (c_miny[sl, None] < e_maxy[None, :])
             )
             overlap_any[sl] = ov.any(axis=1)
+            if probe is not None:
+                probe['bbox_checks'] += int(ov.size)
+                probe['bbox_overlap_pairs'] += int(ov.sum())
 
         needs_geometry = needs_sheet | overlap_any
         exact_rows = np.flatnonzero(needs_geometry)
+        if probe is not None:
+            # Keep this measurement-only detail out of the public probe
+            # aggregation. The caller consumes it after validation so the
+            # key counters describe only rows that really build geometry.
+            probe['_geometry_candidate_indices'] = idx[exact_rows]
 
         geometry_ms = 0.0
+        cache_ms = 0.0
         sheet_difference_ms = 0.0
         collision_intersection_ms = 0.0
         sheet_rejections = 0
         collision_rejections = 0
         bbox_rejections = 0
         polygon_checks = 0
+        cache_hits = 0
+        cache_misses = 0
 
         for row in exact_rows:
             index = idx[row]
-            geometry_start = time.perf_counter()
-            candidate = translate(
-                rotated_poly,
-                xoff=float(points[index, 0] - rotated_centroid.x),
-                yoff=float(points[index, 1] - rotated_centroid.y),
-            )
-            geometry_ms += (time.perf_counter() - geometry_start) * 1000
+            candidate = None
+            if candidate_geometry_cache is not None and geometry_key_prefix is not None:
+                cache_key = _candidate_geometry_key(
+                    geometry_key_prefix, points[index, 0], points[index, 1]
+                )
+                if performance_logging:
+                    cache_start = time.perf_counter()
+                candidate = candidate_geometry_cache.get(cache_key)
+                if performance_logging:
+                    cache_ms += (time.perf_counter() - cache_start) * 1000
+                if candidate is not None:
+                    cache_hits += 1
+                else:
+                    cache_misses += 1
+
+            if candidate is None:
+                geometry_start = time.perf_counter()
+                candidate = translate(
+                    rotated_poly,
+                    xoff=float(points[index, 0] - rotated_centroid.x),
+                    yoff=float(points[index, 1] - rotated_centroid.y),
+                )
+                geometry_ms += (time.perf_counter() - geometry_start) * 1000
+                if candidate_geometry_cache is not None and geometry_key_prefix is not None:
+                    if performance_logging:
+                        cache_start = time.perf_counter()
+                    candidate_geometry_cache.put(cache_key, candidate)
+                    if performance_logging:
+                        cache_ms += (time.perf_counter() - cache_start) * 1000
+                if probe is not None:
+                    probe['candidate_geometries_built'] += 1
 
             if needs_sheet[row]:
                 difference_start = time.perf_counter()
@@ -406,6 +652,8 @@ class PlacementOptimizer:
                     collision_intersection_ms += (
                         time.perf_counter() - checks_start) * 1000
                     polygon_checks += 1
+                    if probe is not None:
+                        probe['exact_collision_checks'] += 1
                     if overlaps:
                         collision = True
                         break
@@ -420,6 +668,14 @@ class PlacementOptimizer:
         if probe is not None:
             probe['candidate_geometry_ms'] = probe.get(
                 'candidate_geometry_ms', 0.0) + geometry_ms
+            probe['candidate_geometry_cache_ms'] = probe.get(
+                'candidate_geometry_cache_ms', 0.0) + cache_ms
+            probe['candidate_geometry_cache_hits'] = cache_hits
+            probe['candidate_geometry_cache_misses'] = cache_misses
+            probe['candidate_geometry_cache_entries'] = (
+                len(candidate_geometry_cache)
+                if candidate_geometry_cache is not None else 0
+            )
             probe['sheet_difference_ms'] = probe.get(
                 'sheet_difference_ms', 0.0) + sheet_difference_ms
             probe['collision_intersection_ms'] = probe.get(
@@ -472,10 +728,14 @@ class Nester:
             performance_logging=self.performance_logging,
             search_direction=self.search_direction, rng=kwargs.get("rng"))
         # quiet (multi-layout GA) silences the optimizer's per-placement [TIMING] lines
-        self.optimizer = PlacementOptimizer(self.engine, rotation_steps, self.search_direction,
-                                            None if self.quiet else self.log_callback,
-                                            self.trial_callback, rng=kwargs.get("rng"),
-                                            performance_logging=self.performance_logging)
+        self.optimizer = PlacementOptimizer(
+            self.engine, rotation_steps, self.search_direction,
+            None if self.quiet else self.log_callback,
+            self.trial_callback, rng=kwargs.get("rng"),
+            performance_logging=self.performance_logging,
+            candidate_geometry_key_tracker=kwargs.get("candidate_geometry_key_tracker"),
+            candidate_geometry_cache=kwargs.get("candidate_geometry_cache")
+        )
         self.optimizer.verbose = self.verbose
 
         self.parts_to_place = []

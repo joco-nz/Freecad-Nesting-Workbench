@@ -25,6 +25,7 @@ _DEFAULTS = {
     "simulate_nesting": False,
     "verbose_logging": False,
     "performance_logging": False,
+    "candidate_geometry_cache": False,
     "rotation_angles": MINKOWSKI_ROTATION_PRESETS,
 }
 
@@ -161,6 +162,13 @@ class NestingPanel(QtWidgets.QWidget):
         self.minkowski_generations_input.setValue(1) # Default to 1 (No Genetic Loop)
         self.minkowski_generations_input.setToolTip("Set to 1 for a single pass. Increase to optimize using Genetic Algorithm.")
 
+        self.candidate_geometry_cache_checkbox = QtWidgets.QCheckBox("Candidate Geometry Cache")
+        self.candidate_geometry_cache_checkbox.setChecked(_DEFAULTS["candidate_geometry_cache"])
+        self.candidate_geometry_cache_checkbox.setToolTip(
+            "Caches translated candidate polygons within one nesting run. "
+            "Collision and validity checks are still performed for every candidate."
+        )
+
         self.minkowski_compactness_input = QtWidgets.QDoubleSpinBox()
         self.minkowski_compactness_input.setRange(0.0, 10.0)
         self.minkowski_compactness_input.setSingleStep(0.1)
@@ -202,6 +210,7 @@ class NestingPanel(QtWidgets.QWidget):
         minkowski_form_layout.addRow(QtWidgets.QLabel("--- Optimization ---"))
         minkowski_form_layout.addRow("Generations:", self.minkowski_generations_input)
         minkowski_form_layout.addRow("Population Size:", self.minkowski_population_size_input)
+        minkowski_form_layout.addRow(self.candidate_geometry_cache_checkbox)
         minkowski_form_layout.addRow("Compactness:", mink_compactness_layout)
         
         self.minkowski_settings_group.setLayout(minkowski_form_layout)
@@ -540,6 +549,9 @@ class NestingPanel(QtWidgets.QWidget):
         self.minkowski_compactness_input.setValue(prefs.GetFloat("GACompactnessWeight", 0.0))
         self.verbose_logging_checkbox.setChecked(prefs.GetBool("VerboseLogging", False))
         self.performance_logging_checkbox.setChecked(prefs.GetBool("PerformanceLogging", False))
+        self.candidate_geometry_cache_checkbox.setChecked(
+            prefs.GetBool("CandidateGeometryCache", False)
+        )
         self.physics_improvement_threshold_input.setValue(prefs.GetFloat("PhysicsStabilityTolerance", 0.01))
         
         self.physics_anneal_curve_type.setCurrentText(prefs.GetString("PhysicsAnnealCurveType", "Logarithmic"))

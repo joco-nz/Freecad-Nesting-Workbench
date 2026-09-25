@@ -36,6 +36,8 @@ class GACoordinator:
         self.layout_manager = None
         self._pending_layouts = None
         self._ga_perf = None
+        self._candidate_geometry_key_tracker = None
+        self._candidate_geometry_cache = None
 
     def _record_nest_perf(self, stats, elapsed):
         if self._ga_perf is None:
@@ -49,13 +51,28 @@ class GACoordinator:
         self._ga_perf['sheet_difference_s'] += stats.get('sheet_difference_ms', 0.0) / 1000
         self._ga_perf['collision_intersection_s'] += stats.get(
             'collision_intersection_ms', 0.0) / 1000
+        self._ga_perf['placement_wall_s'] += stats.get('placement_wall_ms', 0.0) / 1000
+        self._ga_perf['rotation_wall_s'] += stats.get('rotation_wall_ms', 0.0) / 1000
+        self._ga_perf['candidate_evaluation_wall_s'] += stats.get(
+            'candidate_evaluation_wall_ms', 0.0) / 1000
         for key in ('rotation_evaluations', 'successful_rotations',
                     'candidate_points', 'valid_candidate_points',
                     'bounds_survivors', 'sheet_candidates', 'sheet_rejections',
                     'sheet_boundary_candidates', 'collision_candidates',
                     'collision_rejections',
-                    'bbox_rejections', 'polygon_checks'):
+                    'bbox_rejections', 'polygon_checks',
+                    'candidate_geometries_built', 'candidate_geometry_observations', 'candidate_geometry_cache_hits', 'candidate_geometry_cache_misses', 'candidate_geometry_cache_ms', 'bbox_checks',
+                    'bbox_overlap_pairs', 'exact_collision_checks',
+                    'candidate_geometry_unique', 'candidate_geometry_repeats'):
             self._ga_perf[key] += stats.get(key, 0)
+        self._ga_perf['max_concurrent_rotations'] = max(
+            self._ga_perf['max_concurrent_rotations'],
+            stats.get('max_concurrent_rotations', 0),
+        )
+        self._ga_perf['candidate_geometry_cache_entries'] = max(
+            self._ga_perf['candidate_geometry_cache_entries'],
+            stats.get('candidate_geometry_cache_entries', 0),
+        )
         self._ga_perf['nfp_cache_hits'] += stats.get('nfp_cache_hits', 0)
         self._ga_perf['nfp_cache_misses'] += stats.get('nfp_cache_misses', 0)
 
@@ -97,6 +114,13 @@ class GACoordinator:
         Returns:
             NestingJob — ready to commit or cancel
         """
+        # Keep the Shapely-dependent strategy import lazy so importing the
+        # panel still works when the optional nesting dependency is missing.
+        from .algorithms.nesting_strategy import (
+            CandidateGeometryCache,
+            CandidateGeometryKeyTracker,
+        )
+
         generations = algo_kwargs.get('generations', 1)
         population_size = algo_kwargs.get('population_size', 1)
         rotation_steps = ui_params.get('rotation_steps', 1)
@@ -107,7 +131,7 @@ class GACoordinator:
         verbose = algo_kwargs.get('verbose', False)
         performance_logging = algo_kwargs.get('performance_logging', False)
         cancel_callback = algo_kwargs.get('cancel_callback', lambda: False)
-        
+
         seed = algo_kwargs.get('random_seed')
         if seed is None:
             seed = random.randrange(2**32)
@@ -163,6 +187,9 @@ class GACoordinator:
             'candidate_geometry_s': 0.0,
             'sheet_difference_s': 0.0,
             'collision_intersection_s': 0.0,
+            'placement_wall_s': 0.0,
+            'rotation_wall_s': 0.0,
+            'candidate_evaluation_wall_s': 0.0,
             'bounds_survivors': 0,
             'sheet_candidates': 0,
             'sheet_rejections': 0,
@@ -171,6 +198,18 @@ class GACoordinator:
             'collision_rejections': 0,
             'bbox_rejections': 0,
             'polygon_checks': 0,
+            'candidate_geometries_built': 0,
+            'candidate_geometry_observations': 0,
+            'candidate_geometry_cache_hits': 0,
+            'candidate_geometry_cache_misses': 0,
+            'candidate_geometry_cache_ms': 0.0,
+            'candidate_geometry_cache_entries': 0,
+            'bbox_checks': 0,
+            'bbox_overlap_pairs': 0,
+            'exact_collision_checks': 0,
+            'candidate_geometry_unique': 0,
+            'candidate_geometry_repeats': 0,
+            'max_concurrent_rotations': 0,
             'candidate_points': 0,
             'valid_candidate_points': 0,
             'rotation_evaluations': 0,
@@ -182,10 +221,37 @@ class GACoordinator:
             'offspring_layouts': 0,
             'immigrant_layouts': 0,
         }
-        
+
+        # Create run-scoped caches only after setup has completed, so setup
+        # failures cannot leave retained candidate geometry on the coordinator.
+        # The tracker is diagnostic-only and is absent when Performance Logging
+        # is disabled; the production geometry cache remains independent.
+        self._candidate_geometry_key_tracker = (
+            CandidateGeometryKeyTracker() if performance_logging else None
+        )
+        self._candidate_geometry_cache = (
+            CandidateGeometryCache()
+            if algo_kwargs.get('candidate_geometry_cache', False) else None
+        )
+        if performance_logging:
+            FreeCAD.Console.PrintMessage(
+                "Candidate Geometry Cache: enabled\n"
+                if self._candidate_geometry_cache is not None
+                else "Candidate Geometry Cache: disabled\n"
+            )
+
         try:
             for gen in range(generations):
                 generation_start = time.perf_counter()
+                generation_perf_start = {
+                    key: self._ga_perf[key]
+                    for key in (
+                        'candidate_evaluation_wall_s', 'placement_wall_s',
+                        'candidate_geometries_built', 'candidate_geometry_observations', 'candidate_geometry_cache_hits', 'candidate_geometry_cache_misses', 'candidate_geometry_cache_ms', 'bbox_checks',
+                        'bbox_overlap_pairs', 'exact_collision_checks',
+                        'candidate_geometry_unique', 'candidate_geometry_repeats',
+                    )
+                }
                 if cancel_callback():
                     FreeCAD.Console.PrintMessage("Nesting cancelled by user.\n")
                     break
@@ -283,7 +349,15 @@ class GACoordinator:
                         f"[GA PERF] generation={gen + 1} total={generation_elapsed:.2f}s "
                         f"layouts={len(layouts)} nesting={gen_time:.2f}s "
                         f"cumulative_nesting={self._ga_perf['nesting_s']:.2f}s "
-                        f"layout_management={self._ga_perf['layout_management_s']:.2f}s\n")
+                        f"layout_management={self._ga_perf['layout_management_s']:.2f}s "
+                        f"candidate_wall={self._ga_perf['candidate_evaluation_wall_s'] - generation_perf_start['candidate_evaluation_wall_s']:.2f}s "
+                        f"exact_checks={self._ga_perf['exact_collision_checks'] - generation_perf_start['exact_collision_checks']} "
+                        f"candidate_geometries={self._ga_perf['candidate_geometries_built'] - generation_perf_start['candidate_geometries_built']} "
+                        f"geometry_keys={self._ga_perf['candidate_geometry_observations'] - generation_perf_start['candidate_geometry_observations']} "
+                        f"geometry_unique={self._ga_perf['candidate_geometry_unique'] - generation_perf_start['candidate_geometry_unique']} "
+                        f"geometry_repeats={self._ga_perf['candidate_geometry_repeats'] - generation_perf_start['candidate_geometry_repeats']} "
+                        f"cache_hits={self._ga_perf['candidate_geometry_cache_hits'] - generation_perf_start['candidate_geometry_cache_hits']} "
+                        f"cache_misses={self._ga_perf['candidate_geometry_cache_misses'] - generation_perf_start['candidate_geometry_cache_misses']}\n")
             
             # Fill phase: generations nested regular parts only — fill the
             # winning layout exactly once (spawns still marshal to the main
@@ -298,6 +372,8 @@ class GACoordinator:
                     fill_kwargs.pop('clear_nfp_cache', None)
                     fill_kwargs['rng'] = self.rng
                     fill_kwargs['spawn_more_callback'] = self.request_spawn
+                    fill_kwargs['candidate_geometry_key_tracker'] = self._candidate_geometry_key_tracker
+                    fill_kwargs['candidate_geometry_cache'] = self._candidate_geometry_cache
                     fill_kwargs['cancel_callback'] = cancel_callback
                     if self.draw_callback:
                         fill_kwargs.pop('progress_callback', None)
@@ -339,6 +415,21 @@ class GACoordinator:
                     f"candidate_geometry={self._ga_perf['candidate_geometry_s']:.2f}s "
                     f"sheet_difference={self._ga_perf['sheet_difference_s']:.2f}s "
                     f"collision_intersection={self._ga_perf['collision_intersection_s']:.2f}s "
+                    f"candidate_wall={self._ga_perf['candidate_evaluation_wall_s']:.2f}s "
+                    f"placement_wall={self._ga_perf['placement_wall_s']:.2f}s "
+                    f"rotation_wall={self._ga_perf['rotation_wall_s']:.2f}s "
+                    f"max_concurrent_rotations={self._ga_perf['max_concurrent_rotations']} "
+                    f"candidate_geometries={self._ga_perf['candidate_geometries_built']} "
+                    f"geometry_key_observations={self._ga_perf['candidate_geometry_observations']} "
+                    f"geometry_unique={self._ga_perf['candidate_geometry_unique']} "
+                    f"geometry_repeats={self._ga_perf['candidate_geometry_repeats']} "
+                    f"cache_hits={self._ga_perf['candidate_geometry_cache_hits']} "
+                    f"cache_misses={self._ga_perf['candidate_geometry_cache_misses']} "
+                    f"cache_s={self._ga_perf['candidate_geometry_cache_ms'] / 1000:.2f} "
+                    f"cache_entries={self._ga_perf['candidate_geometry_cache_entries']} "
+                    f"bbox_checks={self._ga_perf['bbox_checks']} "
+                    f"bbox_overlap_pairs={self._ga_perf['bbox_overlap_pairs']} "
+                    f"exact_collision_checks={self._ga_perf['exact_collision_checks']} "
                     f"layout_management={self._ga_perf['layout_management_s']:.2f}s "
                     f"offspring={self._ga_perf['offspring_layouts']} "
                     f"immigrants={self._ga_perf['immigrant_layouts']} "
@@ -369,6 +460,13 @@ class GACoordinator:
                     self.layout_manager.delete_layout(layout)
             self._dispatch_recompute()
             return None
+        finally:
+            if self._candidate_geometry_cache is not None:
+                self._candidate_geometry_cache.clear()
+            if self._candidate_geometry_key_tracker is not None:
+                self._candidate_geometry_key_tracker.clear()
+            self._candidate_geometry_cache = None
+            self._candidate_geometry_key_tracker = None
 
     def _dispatch_finalize(self, best_layout, best_efficiency, total_time, target_layout, ui_params):
         """Runs _finalize() and doc.recompute() on the main thread if using a worker."""
@@ -428,6 +526,8 @@ class GACoordinator:
             current_kwargs = algo_kwargs.copy()
             current_kwargs['rng'] = self.rng  # Seeded fallback for search_direction=None
             current_kwargs['spawn_more_callback'] = self.request_spawn
+            current_kwargs['candidate_geometry_key_tracker'] = self._candidate_geometry_key_tracker
+            current_kwargs['candidate_geometry_cache'] = self._candidate_geometry_cache
             nest_perf = [None]
             current_kwargs['perf_stats_callback'] = lambda stats: nest_perf.__setitem__(0, stats)
             if layout.direction is not None:

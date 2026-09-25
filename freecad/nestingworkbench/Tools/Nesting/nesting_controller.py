@@ -755,6 +755,7 @@ class NestingController:
             'compactness_weight': self.ui.minkowski_compactness_input.value(),
             'verbose': self.ui.verbose_logging_checkbox.isChecked(),
             'performance_logging': self.ui.performance_logging_checkbox.isChecked(),
+            'candidate_geometry_cache': self.ui.candidate_geometry_cache_checkbox.isChecked(),
             'nesting_direction': self.ui.minkowski_direction_dial.value(),
             'algorithm': self.ui.algorithm_dropdown.currentText(),
             'use_random_direction': (self.ui.physics_random_checkbox.isChecked() if self.ui.algorithm_dropdown.currentText() == 'Physics' else self.ui.minkowski_random_checkbox.isChecked()),
@@ -782,6 +783,10 @@ class NestingController:
         prefs.SetFloat(PROP_DEFLECTION_ANGLE, float(settings.get('deflection_angle', 10)))  # Save angle, not mm
         prefs.SetFloat(PROP_SIMPLIFICATION, float(settings['simplification']))
         prefs.SetFloat("GACompactnessWeight", float(settings['compactness_weight']))
+        prefs.SetBool(
+            "CandidateGeometryCache",
+            bool(settings.get('candidate_geometry_cache', False)),
+        )
         
         mink_steps = int(360 / self.ui.rotation_angles[self.ui.minkowski_rotation_steps_slider.value()])
         prefs.SetInt("MinkowskiRotationSteps", mink_steps)
@@ -890,6 +895,9 @@ class NestingController:
             algo_kwargs['population_size'] = self.ui.minkowski_population_size_input.value()
             algo_kwargs['generations'] = self.ui.minkowski_generations_input.value()
             algo_kwargs['clear_nfp_cache'] = self.ui.clear_cache_checkbox.isChecked()
+            algo_kwargs['candidate_geometry_cache'] = ui_params.get(
+                'candidate_geometry_cache', False
+            )
 
         algo_kwargs['spacing'] = ui_params['spacing']
         algo_kwargs['random_seed'] = ui_params.get('random_seed')
