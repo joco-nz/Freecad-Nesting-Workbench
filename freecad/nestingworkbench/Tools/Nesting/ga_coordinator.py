@@ -12,6 +12,35 @@ from ...datatypes.shape import Shape
 from .layout_manager import LayoutManager
 from .algorithms import genetic_utils
 
+
+def _safe_ratio(numerator, denominator):
+    """Guarded division for report lines.
+
+    A measurement counter can legitimately be zero -- e.g. no candidate-mask
+    call did any collision work, so there is no batch to average. Printing must
+    never be the thing that breaks a run, and an unguarded division here
+    silently aborted the post-loop cleanup in the GA-loop harness.
+    """
+    try:
+        return float(numerator) / float(denominator)
+    except (ZeroDivisionError, TypeError, ValueError):
+        return 0.0
+
+
+def _hole_vertex_pct(perf):
+    """Share of collision-mask vertices that live in interior rings.
+
+    Reporting a ratio rather than raw counts keeps the two accumulator keys
+    plain sums (so they need no special aggregation) while still answering the
+    only question that matters: are holes a large or a small part of the
+    geometry the collision predicates have to walk?
+    """
+    holes = perf.get('mask_hole_vertices', 0)
+    total = holes + perf.get('mask_exterior_vertices', 0)
+    if not total:
+        return 0.0
+    return 100.0 * holes / total
+
 # Sub-phase breakdown of layout management. These keys are cumulative for the
 # whole run and are only populated when Performance Logging is enabled; the
 # dict itself is None otherwise, so every writer below short-circuits to a
@@ -182,8 +211,16 @@ class GACoordinator:
                     'bbox_overlap_pairs', 'exact_collision_checks',
                     'collision_intersects_true', 'collision_intersects_false',
                     'collision_grazing_pairs',
+                    'mask_hole_rings', 'mask_hole_vertices',
+                    'mask_exterior_vertices', 'mask_hole_sensitive_pairs',
+                    'mask_hole_exploiting_placements', 'mask_candidate_rings',
+                    'mask_calls', 'mask_batch_candidates',
                     'candidate_geometry_unique', 'candidate_geometry_repeats'):
             self._ga_perf[key] += stats.get(key, 0)
+        self._ga_perf['mask_batch_max'] = max(
+            self._ga_perf.get('mask_batch_max', 0),
+            stats.get('mask_batch_max', 0),
+        )
         self._ga_perf['max_concurrent_rotations'] = max(
             self._ga_perf['max_concurrent_rotations'],
             stats.get('max_concurrent_rotations', 0),
@@ -343,6 +380,18 @@ class GACoordinator:
             'collision_intersects_true': 0,
             'collision_intersects_false': 0,
             'collision_grazing_pairs': 0,
+            # Interior-ring population of the collision mask. Measurement-only;
+            # see _exact_candidate_mask. These are summed, not maxed, except
+            # mask_batch_max.
+            'mask_hole_rings': 0,
+            'mask_hole_vertices': 0,
+            'mask_exterior_vertices': 0,
+            'mask_hole_sensitive_pairs': 0,
+            'mask_hole_exploiting_placements': 0,
+            'mask_candidate_rings': 0,
+            'mask_calls': 0,
+            'mask_batch_candidates': 0,
+            'mask_batch_max': 0,
             'candidate_geometry_unique': 0,
             'candidate_geometry_repeats': 0,
             'max_concurrent_rotations': 0,
@@ -387,6 +436,10 @@ class GACoordinator:
                         'bbox_overlap_pairs', 'exact_collision_checks',
                         'collision_intersects_true', 'collision_intersects_false',
                         'collision_grazing_pairs',
+                        'mask_hole_rings', 'mask_hole_vertices',
+                        'mask_exterior_vertices', 'mask_hole_sensitive_pairs',
+                        'mask_hole_exploiting_placements', 'mask_candidate_rings',
+                        'mask_calls', 'mask_batch_candidates', 'mask_batch_max',
                         'candidate_geometry_unique', 'candidate_geometry_repeats',
                     )
                 }
@@ -609,6 +662,22 @@ class GACoordinator:
                     # by sub-tolerance slivers too, and on the fixture that
                     # is nearly all of it. See collision_grazing_pairs.
                     f"grazing_pairs={self._ga_perf['collision_grazing_pairs']} "
+                    # Interior-ring population of the collision mask. hole_pct is
+                    # the share of mask vertices that live in holes; if it is
+                    # small, hole-driven cost and hole-filling are both dead
+                    # ends. batch_avg is what decides whether shapely.prepare()
+                    # on the existing polygons could amortise. exploiting counts
+                    # placements that are legal ONLY because a hole is empty
+                    # space, i.e. the sheet yield that filling holes would
+                    # destroy.
+                    f"mask_calls={self._ga_perf['mask_calls']} "
+                    f"batch_avg={_safe_ratio(self._ga_perf['mask_batch_candidates'], self._ga_perf['mask_calls']):.1f}"
+                    f"/{self._ga_perf['mask_batch_max']} "
+                    f"hole_rings={self._ga_perf['mask_hole_rings']} "
+                    f"hole_vertices={self._ga_perf['mask_hole_vertices']} "
+                    f"hole_pct={_hole_vertex_pct(self._ga_perf):.1f}% "
+                    f"hole_sensitive_pairs={self._ga_perf['mask_hole_sensitive_pairs']} "
+                    f"hole_exploiting_placements={self._ga_perf['mask_hole_exploiting_placements']} "
                     f"layout_management={self._ga_perf['layout_management_s']:.2f}s "
                     f"offspring={self._ga_perf['offspring_layouts']} "
                     f"immigrants={self._ga_perf['immigrant_layouts']} "

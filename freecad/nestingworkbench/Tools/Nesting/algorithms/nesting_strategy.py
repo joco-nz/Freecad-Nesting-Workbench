@@ -11,7 +11,7 @@ from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import numpy as np
 from shapely.affinity import rotate, translate
-from shapely.geometry import Polygon
+from shapely.geometry import Polygon, GeometryCollection
 
 import FreeCAD
 from ....datatypes.sheet import Sheet
@@ -170,6 +170,18 @@ class PlacementOptimizer:
             # found it could only settle 2.8% of it, and was reverted as a
             # net loss. See the revert of 34bbe67 before proposing it again.
             'collision_grazing_pairs': 0,
+            # Interior-ring population of the collision mask, and the number of
+            # placements that are legal only because a hole is empty space.
+            # Summed, except mask_batch_max which is a max.
+            'mask_hole_rings': 0,
+            'mask_hole_vertices': 0,
+            'mask_exterior_vertices': 0,
+            'mask_hole_sensitive_pairs': 0,
+            'mask_hole_exploiting_placements': 0,
+            'mask_candidate_rings': 0,
+            'mask_calls': 0,
+            'mask_batch_candidates': 0,
+            'mask_batch_max': 0,
             'candidate_geometry_unique': 0,
             'candidate_geometry_repeats': 0,
             'max_concurrent_rotations': 0,
@@ -277,8 +289,18 @@ class PlacementOptimizer:
                                 'collision_intersects_true',
                                 'collision_intersects_false',
                                 'collision_grazing_pairs',
+                                'mask_hole_rings', 'mask_hole_vertices',
+                                'mask_exterior_vertices',
+                                'mask_hole_sensitive_pairs',
+                                'mask_hole_exploiting_placements',
+                                'mask_candidate_rings',
+                                'mask_calls', 'mask_batch_candidates',
                             ):
                                 self._perf_stats[key] += res.get(f'_{key}', 0)
+                            self._perf_stats['mask_batch_max'] = max(
+                                self._perf_stats['mask_batch_max'],
+                                res.get('_mask_batch_max', 0),
+                            )
                             self._perf_stats['candidate_geometry_cache_entries'] = max(
                                 self._perf_stats['candidate_geometry_cache_entries'],
                                 res.get('_candidate_geometry_cache_entries', 0),
@@ -529,6 +551,16 @@ class PlacementOptimizer:
             probe['collision_intersects_true'] = 0
             probe['collision_intersects_false'] = 0
             probe['collision_grazing_pairs'] = 0
+            # Hole-population measurement. See the annotated block below.
+            probe['mask_hole_rings'] = 0
+            probe['mask_hole_vertices'] = 0
+            probe['mask_exterior_vertices'] = 0
+            probe['mask_hole_sensitive_pairs'] = 0
+            probe['mask_hole_exploiting_placements'] = 0
+            probe['mask_candidate_rings'] = 0
+            probe['mask_calls'] = 0
+            probe['mask_batch_candidates'] = 0
+            probe['mask_batch_max'] = 0
         if not valid.any():
             return valid
 
@@ -543,6 +575,50 @@ class PlacementOptimizer:
                 probe['collision_candidates'] = int(valid.sum())
             return valid
 
+        # ---- Measurement-only: interior-ring population of the collision mask.
+        # Nothing in this block influences `valid`, `overlaps` or candidate
+        # ordering; it exists to size the hole population before deciding
+        # whether any hole-related change is worth making.
+        #
+        # `hole_geoms[i]` is existing part i's interior rings as a geometry, or
+        # None. `all_holes` is every existing ring in one collection, used to
+        # classify accepted placements. It is deliberately NOT unioned: a union
+        # would cost real time on every call, and `intersects` against a
+        # GeometryCollection answers the same question.
+        hole_geoms = None
+        all_holes = None
+        if probe is not None:
+            hole_geoms = []
+            hole_polys = []
+            for poly in existing_polygons:
+                rings = list(poly.interiors)
+                if rings:
+                    probe['mask_hole_rings'] += len(rings)
+                    for ring in rings:
+                        probe['mask_hole_vertices'] += len(ring.coords)
+                    hole_polys.extend(Polygon(r) for r in rings)
+                    if len(rings) == 1:
+                        hole_geoms.append(hole_polys[-1])
+                    else:
+                        hole_geoms.append(GeometryCollection(
+                            hole_polys[-len(rings):]))
+                else:
+                    hole_geoms.append(None)
+                probe['mask_exterior_vertices'] += len(poly.exterior.coords)
+
+            if hole_polys:
+                all_holes = (hole_polys[0] if len(hole_polys) == 1
+                             else GeometryCollection(hole_polys))
+
+            # The candidate's own rings matter for `existing.intersects(...)`
+            # cost, and for a candidate that is itself re-tested as an existing
+            # part in a later call of the same run.
+            cand_rings = list(rotated_poly.interiors)
+            probe['mask_candidate_rings'] += len(cand_rings)
+            probe['mask_hole_vertices'] += sum(
+                len(r.coords) for r in cand_rings)
+            probe['mask_exterior_vertices'] += len(rotated_poly.exterior.coords)
+
         bin_polygon = Polygon(
             [(0, 0), (sheet.width, 0), (sheet.width, sheet.height), (0, sheet.height)]
         )
@@ -552,6 +628,17 @@ class PlacementOptimizer:
         # Candidate bounding boxes are exact arithmetic on the known rotated
         # extents — no Shapely geometry or GEOS call is required.
         idx = np.flatnonzero(valid)
+        if probe is not None:
+            # Batch size decides whether shapely.prepare() on the existing
+            # polygons could amortise: preparing costs real time, so it only
+            # pays if one call tests many candidates. Counted after the
+            # no-existing-parts early return, so it reflects only calls that
+            # actually do collision work.
+            batch = int(idx.size)
+            probe['mask_calls'] += 1
+            probe['mask_batch_candidates'] += batch
+            probe['mask_batch_max'] = max(
+                probe.get('mask_batch_max', 0), batch)
         c_minx = points[idx, 0] + rminx
         c_miny = points[idx, 1] + rminy
         c_maxx = points[idx, 0] + rmaxx
@@ -700,6 +787,14 @@ class PlacementOptimizer:
                                 # necessarily an exact touch -- see the
                                 # collision_grazing_pairs comment.
                                 probe['collision_grazing_pairs'] += 1
+                            # Measurement-only: the pair's verdict depends on
+                            # this part's interior rings rather than its solid
+                            # body, so filling holes could flip it.
+                            if hole_geoms is not None:
+                                holes = hole_geoms[e_pos]
+                                if holes is not None and candidate.intersects(
+                                        holes):
+                                    probe['mask_hole_sensitive_pairs'] += 1
                     else:
                         overlaps = False
                         if probe is not None:
@@ -719,6 +814,21 @@ class PlacementOptimizer:
             if collision:
                 valid[index] = False
                 collision_rejections += 1
+            elif probe is not None and all_holes is not None:
+                # Measurement-only, and the cost side of any hole-filling
+                # proposal. This placement is legal only because it occupies
+                # empty space: a hole in an existing part, or the free space
+                # beside one. Filling holes would forbid the hole case
+                # outright, so this counter is the sheet yield that filling
+                # would destroy.
+                #
+                # It has to be tested here, on the accepted candidate, rather
+                # than inside the intersects branch: a candidate lying wholly
+                # inside a hole returns intersects=False and never reaches
+                # that branch, yet it is the most hole-dependent placement of
+                # all.
+                if candidate.intersects(all_holes):
+                    probe['mask_hole_exploiting_placements'] += 1
 
         if probe is not None:
             probe['candidate_geometry_ms'] = probe.get(
