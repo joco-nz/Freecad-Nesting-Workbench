@@ -52,7 +52,8 @@ class GACoordinator:
         for key in ('rotation_evaluations', 'successful_rotations',
                     'candidate_points', 'valid_candidate_points',
                     'bounds_survivors', 'sheet_candidates', 'sheet_rejections',
-                    'collision_candidates', 'collision_rejections',
+                    'sheet_boundary_candidates', 'collision_candidates',
+                    'collision_rejections',
                     'bbox_rejections', 'polygon_checks'):
             self._ga_perf[key] += stats.get(key, 0)
         self._ga_perf['nfp_cache_hits'] += stats.get('nfp_cache_hits', 0)
@@ -165,6 +166,7 @@ class GACoordinator:
             'bounds_survivors': 0,
             'sheet_candidates': 0,
             'sheet_rejections': 0,
+            'sheet_boundary_candidates': 0,
             'collision_candidates': 0,
             'collision_rejections': 0,
             'bbox_rejections': 0,
@@ -346,6 +348,7 @@ class GACoordinator:
                     f"bounds_survivors={self._ga_perf['bounds_survivors']} "
                     f"sheet_candidates={self._ga_perf['sheet_candidates']} "
                     f"sheet_rejections={self._ga_perf['sheet_rejections']} "
+                    f"sheet_boundary={self._ga_perf['sheet_boundary_candidates']} "
                     f"collision_candidates={self._ga_perf['collision_candidates']} "
                     f"collision_rejections={self._ga_perf['collision_rejections']} "
                     f"bbox_rejections={self._ga_perf['bbox_rejections']} "

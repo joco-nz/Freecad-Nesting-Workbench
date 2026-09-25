@@ -48,6 +48,7 @@ class PlacementOptimizer:
             'bounds_survivors': 0,
             'sheet_candidates': 0,
             'sheet_rejections': 0,
+            'sheet_boundary_candidates': 0,
             'collision_candidates': 0,
             'collision_rejections': 0,
             'bbox_rejections': 0,
@@ -124,7 +125,8 @@ class PlacementOptimizer:
                             self._perf_stats['score_ms'] += res.get('_t_score_ms', 0)
                             for key in (
                                 'bounds_survivors', 'sheet_candidates',
-                                'sheet_rejections', 'collision_candidates',
+                                'sheet_rejections', 'sheet_boundary_candidates',
+                                'collision_candidates',
                                 'collision_rejections', 'bbox_rejections',
                                 'polygon_checks',
                             ):
@@ -261,6 +263,24 @@ class PlacementOptimizer:
         proof. This exact check is especially important for internal-fit
         candidates, where a discretized or invalid IFP can otherwise admit a
         centroid whose part crosses the containing part's boundary.
+
+        Two redundant geometry steps are skipped without changing acceptance:
+
+        - The GEOS ``candidate.difference(bin_polygon)`` sheet check only runs
+          for candidates whose bounding box crosses the actual sheet boundary.
+          A polygon is always contained in its own bbox, so a candidate whose
+          bbox lies wholly inside the sheet rectangle has a provably empty
+          difference; the bounds pre-filter already guarantees that hold to
+          within ``area_tolerance``.
+        - A translated candidate geometry is constructed lazily, only when it
+          is actually needed: candidates whose bbox crosses the sheet boundary
+          or whose bbox overlaps an existing part's bbox.
+
+        Candidate bounding boxes are computed from the already-known rotated
+        extents with numpy, so the collision stage screens bbox overlaps
+        vectorially and only runs exact ``intersection`` checks for the
+        overlapping pairs. The existing-part iteration order, the collision
+        short-circuit, and the area-tolerance semantics are unchanged.
         """
         min_x, min_y, max_x, max_y = rotated_poly.bounds
         rotated_centroid = rotated_poly.centroid
@@ -289,66 +309,136 @@ class PlacementOptimizer:
         bin_polygon = Polygon(
             [(0, 0), (sheet.width, 0), (sheet.width, sheet.height), (0, sheet.height)]
         )
-        existing_bounds = [polygon.bounds for polygon in existing_polygons]
         if probe is not None:
             probe['sheet_candidates'] = int(valid.sum())
-        for index in np.flatnonzero(valid):
+
+        # Candidate bounding boxes are exact arithmetic on the known rotated
+        # extents — no Shapely geometry or GEOS call is required.
+        idx = np.flatnonzero(valid)
+        c_minx = points[idx, 0] + rminx
+        c_miny = points[idx, 1] + rminy
+        c_maxx = points[idx, 0] + rmaxx
+        c_maxy = points[idx, 1] + rmaxy
+
+        # The difference check can only ever reject candidates whose bbox
+        # actually crosses the sheet boundary within the tolerance window.
+        needs_sheet = (
+            (c_minx < 0.0)
+            | (c_miny < 0.0)
+            | (c_maxx > sheet.width)
+            | (c_maxy > sheet.height)
+        )
+
+        existing_bounds = np.asarray(
+            [polygon.bounds for polygon in existing_polygons], dtype=np.float64
+        )
+        e_minx = existing_bounds[:, 0]
+        e_miny = existing_bounds[:, 1]
+        e_maxx = existing_bounds[:, 2]
+        e_maxy = existing_bounds[:, 3]
+
+        # Vectorially screen every candidate against every existing bbox. Only
+        # candidates with at least one bbox overlap (or a boundary-crossing
+        # bbox that needs the sheet check) require a translated geometry.
+        overlap_any = np.zeros(len(idx), dtype=bool)
+        overlap_chunk = 4096
+        for start in range(0, len(idx), overlap_chunk):
+            sl = slice(start, start + overlap_chunk)
+            ov = (
+                (c_maxx[sl, None] > e_minx[None, :])
+                & (c_minx[sl, None] < e_maxx[None, :])
+                & (c_maxy[sl, None] > e_miny[None, :])
+                & (c_miny[sl, None] < e_maxy[None, :])
+            )
+            overlap_any[sl] = ov.any(axis=1)
+
+        needs_geometry = needs_sheet | overlap_any
+        exact_rows = np.flatnonzero(needs_geometry)
+
+        geometry_ms = 0.0
+        sheet_difference_ms = 0.0
+        collision_intersection_ms = 0.0
+        sheet_rejections = 0
+        collision_rejections = 0
+        bbox_rejections = 0
+        polygon_checks = 0
+
+        for row in exact_rows:
+            index = idx[row]
             geometry_start = time.perf_counter()
             candidate = translate(
                 rotated_poly,
                 xoff=float(points[index, 0] - rotated_centroid.x),
                 yoff=float(points[index, 1] - rotated_centroid.y),
             )
-            if probe is not None:
-                probe['candidate_geometry_ms'] = probe.get(
-                    'candidate_geometry_ms', 0.0) + (
-                    time.perf_counter() - geometry_start) * 1000
-            difference_start = time.perf_counter()
-            if candidate.difference(bin_polygon).area > area_tolerance:
-                valid[index] = False
-                if probe is not None:
-                    probe['sheet_rejections'] = probe.get('sheet_rejections', 0) + 1
-                    probe['sheet_difference_ms'] = probe.get(
-                        'sheet_difference_ms', 0.0) + (
+            geometry_ms += (time.perf_counter() - geometry_start) * 1000
+
+            if needs_sheet[row]:
+                difference_start = time.perf_counter()
+                if candidate.difference(bin_polygon).area > area_tolerance:
+                    valid[index] = False
+                    sheet_rejections += 1
+                    sheet_difference_ms += (
                         time.perf_counter() - difference_start) * 1000
-                continue
-            if probe is not None:
-                probe['sheet_difference_ms'] = probe.get(
-                    'sheet_difference_ms', 0.0) + (
-                    time.perf_counter() - difference_start) * 1000
-                probe['collision_candidates'] = probe.get(
-                    'collision_candidates', 0) + 1
-            collision = False
-            candidate_min_x, candidate_min_y, candidate_max_x, candidate_max_y = (
-                candidate.bounds)
-            for existing, (
-                existing_min_x, existing_min_y, existing_max_x, existing_max_y
-            ) in zip(existing_polygons, existing_bounds):
-                if (
-                    candidate_max_x <= existing_min_x
-                    or candidate_min_x >= existing_max_x
-                    or candidate_max_y <= existing_min_y
-                    or candidate_min_y >= existing_max_y
-                ):
-                    if probe is not None:
-                        probe['bbox_rejections'] = probe.get(
-                            'bbox_rejections', 0) + 1
                     continue
-                probe_checks_start = time.perf_counter()
-                overlaps = candidate.intersection(existing).area > area_tolerance
-                if probe is not None:
-                    probe['polygon_checks'] = probe.get('polygon_checks', 0) + 1
-                    probe['collision_intersection_ms'] = probe.get(
-                        'collision_intersection_ms', 0.0) + (
-                        time.perf_counter() - probe_checks_start) * 1000
-                if overlaps:
-                    collision = True
-                    break
+                sheet_difference_ms += (
+                    time.perf_counter() - difference_start) * 1000
+
+            # Collision stage: overlapping existing parts in ascending original
+            # order, short-circuiting on the first overlap, exactly as before.
+            # bbox_rejections counts the non-overlap pairs encountered before
+            # any collision break (one pair per existing part otherwise).
+            prev_overlap = -1
+            collision = False
+            if overlap_any[row]:
+                overlapping = np.flatnonzero(
+                    (c_maxx[row] > e_minx)
+                    & (c_minx[row] < e_maxx)
+                    & (c_maxy[row] > e_miny)
+                    & (c_miny[row] < e_maxy)
+                )
+                for e_pos in overlapping:
+                    bbox_rejections += int(e_pos) - prev_overlap - 1
+                    prev_overlap = int(e_pos)
+                    checks_start = time.perf_counter()
+                    overlaps = candidate.intersection(
+                        existing_polygons[e_pos]).area > area_tolerance
+                    collision_intersection_ms += (
+                        time.perf_counter() - checks_start) * 1000
+                    polygon_checks += 1
+                    if overlaps:
+                        collision = True
+                        break
+                if not collision:
+                    bbox_rejections += len(existing_polygons) - prev_overlap - 1
+            else:
+                bbox_rejections += len(existing_polygons)
             if collision:
                 valid[index] = False
-                if probe is not None:
-                    probe['collision_rejections'] = probe.get(
-                        'collision_rejections', 0) + 1
+                collision_rejections += 1
+
+        if probe is not None:
+            probe['candidate_geometry_ms'] = probe.get(
+                'candidate_geometry_ms', 0.0) + geometry_ms
+            probe['sheet_difference_ms'] = probe.get(
+                'sheet_difference_ms', 0.0) + sheet_difference_ms
+            probe['collision_intersection_ms'] = probe.get(
+                'collision_intersection_ms', 0.0) + collision_intersection_ms
+            probe['sheet_rejections'] = probe.get('sheet_rejections', 0) + sheet_rejections
+            probe['collision_rejections'] = probe.get('collision_rejections', 0) + collision_rejections
+            # Skipped candidates (no overlap, inside sheet) were screened
+            # vectorially against every existing bbox — one bbox rejection each.
+            probe['bbox_rejections'] = probe.get('bbox_rejections', 0) + (
+                (len(idx) - len(exact_rows)) * len(existing_polygons)
+                + bbox_rejections
+            )
+            probe['polygon_checks'] = probe.get('polygon_checks', 0) + polygon_checks
+            # Every bounds survivor that passes the sheet check reaches the
+            # collision stage (either via exact intersection or bbox screening).
+            probe['collision_candidates'] = probe.get(
+                'collision_candidates', 0) + len(idx) - sheet_rejections
+            probe['sheet_boundary_candidates'] = probe.get(
+                'sheet_boundary_candidates', 0) + int(needs_sheet.sum())
 
         return valid
 

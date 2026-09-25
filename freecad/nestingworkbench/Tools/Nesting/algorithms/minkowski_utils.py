@@ -9,6 +9,8 @@ import math
 import time
 import threading
 from concurrent.futures import Future
+import numpy as np
+from shapely import GeometryType, from_ragged_array
 from shapely.geometry import Polygon, MultiPoint
 from shapely.ops import unary_union, triangulate
 from shapely.affinity import rotate, scale, translate
@@ -235,11 +237,17 @@ def _prepare_convex_ring(polygon):
     return vertices, edges
 
 
-def _minkowski_sum_convex_prepared(prepared_a, prepared_b, phase_stats=None):
-    """Compute a convex Minkowski sum from prepared convex rings."""
+def _minkowski_merge_ring(prepared_a, prepared_b):
+    """Edge-merge two prepared convex rings into the open result ring.
+
+    Returns the list of unique vertices (no closing point). Building the
+    Shapely ``Polygon`` from the ring is intentionally left to the caller so
+    that bulk construction can batch every pair polygon into a single
+    ``from_ragged_array`` call instead of constructing one Polygon object per
+    pair.
+    """
     vertices_a, edges_a = prepared_a
     vertices_b, edges_b = prepared_b
-    t_merge = time.perf_counter()
     result = [(vertices_a[0][0] + vertices_b[0][0],
                vertices_a[0][1] + vertices_b[0][1])]
     i = j = 0
@@ -268,6 +276,13 @@ def _minkowski_sum_convex_prepared(prepared_a, prepared_b, phase_stats=None):
         result.append((result[-1][0] + edge[0], result[-1][1] + edge[1]))
 
     result.pop()
+    return result
+
+
+def _minkowski_sum_convex_prepared(prepared_a, prepared_b, phase_stats=None):
+    """Compute a convex Minkowski sum from prepared convex rings."""
+    t_merge = time.perf_counter()
+    result = _minkowski_merge_ring(prepared_a, prepared_b)
     if phase_stats is not None:
         phase_stats["convex_merge_ms"] += (time.perf_counter() - t_merge) * 1000
     t_polygon = time.perf_counter()
@@ -478,6 +493,13 @@ def minkowski_sum(master_poly1, angle1, reflect1, master_poly2, angle2, reflect2
     polygon_key_a = master_poly1.wkb
     polygon_key_b = master_poly2.wkb
     t_pair_loop = time.perf_counter()
+    # Phase 1: merge every convex pair into a raw open ring. This is pure
+    # Python arithmetic (no per-pair Shapely geometry objects), which keeps
+    # the GIL held only briefly; the Polygon construction is deferred and
+    # batched in one call below.
+    rings = []              # open result rings, aligned with pair_indexes
+    pair_indexes = []       # (index_a, index_b) aligned with rings
+    fallback_indexes = []   # (index_a, index_b) needing the reference result
     for index_a, prepared_piece_a in enumerate(prepared_a):
         for index_b, prepared_piece_b in enumerate(prepared_b):
             pair_key = (
@@ -491,47 +513,79 @@ def minkowski_sum(master_poly1, angle1, reflect1, master_poly2, angle2, reflect2
                 index_b,
             )
             pair_keys.add(pair_key)
+            t_merge = time.perf_counter()
             try:
-                result = _minkowski_sum_convex_prepared(
-                    prepared_piece_a, prepared_piece_b, phase_stats
-                )
-                if not validate_convex_pairs:
-                    t_append = time.perf_counter()
-                    minkowski_parts.append(result)
-                    phase_stats["convex_pair_append_ms"] += (
-                        time.perf_counter() - t_append
-                    ) * 1000
-                    continue
-                t_check = time.perf_counter()
-                valid_result = result.is_valid
-                phase_stats["convex_pair_validity_ms"] += (
-                    time.perf_counter() - t_check
-                ) * 1000
-                if valid_result:
-                    phase_stats["convex_pair_valid_count"] += 1
-                t_check = time.perf_counter()
-                non_empty_result = not result.is_empty
-                phase_stats["convex_pair_empty_ms"] += (
-                    time.perf_counter() - t_check
-                ) * 1000
-                if non_empty_result:
-                    phase_stats["convex_pair_non_empty_count"] += 1
-                t_check = time.perf_counter()
-                positive_area = result.area > 0
-                phase_stats["convex_pair_area_ms"] += (
-                    time.perf_counter() - t_check
-                ) * 1000
-                if positive_area:
-                    phase_stats["convex_pair_positive_area_count"] += 1
-                if valid_result and non_empty_result and positive_area:
-                    t_append = time.perf_counter()
-                    minkowski_parts.append(result)
-                    phase_stats["convex_pair_append_ms"] += (
-                        time.perf_counter() - t_append
-                    ) * 1000
-                    continue
+                ring = _minkowski_merge_ring(prepared_piece_a, prepared_piece_b)
             except (TypeError, ValueError, IndexError):
-                pass
+                fallback_indexes.append((index_a, index_b))
+                continue
+            phase_stats["convex_merge_ms"] += (time.perf_counter() - t_merge) * 1000
+            if len(ring) < 3:
+                # A ring with fewer than 3 vertices cannot form a polygon;
+                # pair polygon construction would raise for it, so it falls
+                # back to the reference result exactly as the legacy
+                # per-pair Polygon() path did.
+                fallback_indexes.append((index_a, index_b))
+                continue
+            phase_stats["convex_result_points"] += len(ring)
+            rings.append(ring)
+            pair_indexes.append((index_a, index_b))
+
+    # Phase 2: construct every pair polygon in a single Shapely call. One
+    # from_ragged_array call builds the whole batch from the flat coordinate
+    # buffer instead of constructing a Polygon per pair, which serialized on
+    # the GIL across the GA's concurrent rotation threads.
+    t_polygon = time.perf_counter()
+    if rings:
+        coords = []
+        ring_offsets = [0]
+        for ring in rings:
+            coords.extend(ring)
+            ring_offsets.append(len(coords))
+        coord_arr = np.asarray(coords, dtype=np.float64)
+        ring_idx = np.asarray(ring_offsets, dtype=np.int64)
+        poly_idx = np.arange(len(rings) + 1, dtype=np.int64)
+        result_polygons = from_ragged_array(
+            GeometryType.POLYGON, coord_arr, offsets=(ring_idx, poly_idx)
+        )
+    else:
+        result_polygons = np.empty(0, dtype=object)
+    phase_stats["convex_polygon_create_ms"] += (time.perf_counter() - t_polygon) * 1000
+
+    # Phase 3: assemble minkowski_parts, applying the per-pair checks only
+    # when requested (validate_convex_pairs) and falling back to the
+    # reference result for any pair that failed to merge or failed the checks.
+    minkowski_parts = []
+    if validate_convex_pairs:
+        for (index_a, index_b), result in zip(pair_indexes, result_polygons):
+            t_check = time.perf_counter()
+            valid_result = result.is_valid
+            phase_stats["convex_pair_validity_ms"] += (
+                time.perf_counter() - t_check
+            ) * 1000
+            if valid_result:
+                phase_stats["convex_pair_valid_count"] += 1
+            t_check = time.perf_counter()
+            non_empty_result = not result.is_empty
+            phase_stats["convex_pair_empty_ms"] += (
+                time.perf_counter() - t_check
+            ) * 1000
+            if non_empty_result:
+                phase_stats["convex_pair_non_empty_count"] += 1
+            t_check = time.perf_counter()
+            positive_area = result.area > 0
+            phase_stats["convex_pair_area_ms"] += (
+                time.perf_counter() - t_check
+            ) * 1000
+            if positive_area:
+                phase_stats["convex_pair_positive_area_count"] += 1
+            if valid_result and non_empty_result and positive_area:
+                t_append = time.perf_counter()
+                minkowski_parts.append(result)
+                phase_stats["convex_pair_append_ms"] += (
+                    time.perf_counter() - t_append
+                ) * 1000
+                continue
             phase_stats["convex_fallbacks"] += 1
             t_fallback = time.perf_counter()
             t_append = time.perf_counter()
@@ -545,6 +599,27 @@ def minkowski_sum(master_poly1, angle1, reflect1, master_poly2, angle2, reflect2
                 time.perf_counter() - t_append
             ) * 1000
             phase_stats["convex_fallback_ms"] += (time.perf_counter() - t_fallback) * 1000
+    else:
+        for result in result_polygons:
+            t_append = time.perf_counter()
+            minkowski_parts.append(result)
+            phase_stats["convex_pair_append_ms"] += (
+                time.perf_counter() - t_append
+            ) * 1000
+    for index_a, index_b in fallback_indexes:
+        phase_stats["convex_fallbacks"] += 1
+        t_fallback = time.perf_counter()
+        t_append = time.perf_counter()
+        minkowski_parts.append(
+            _minkowski_sum_convex_reference(
+                poly1_convex_transformed[index_a],
+                poly2_convex_transformed[index_b],
+            )
+        )
+        phase_stats["convex_pair_append_ms"] += (
+            time.perf_counter() - t_append
+        ) * 1000
+        phase_stats["convex_fallback_ms"] += (time.perf_counter() - t_fallback) * 1000
     phase_stats["convex_pair_loop_ms"] = (time.perf_counter() - t_pair_loop) * 1000
     phase_stats["convex_pair_checks_ms"] = (
         phase_stats["convex_pair_validity_ms"]
