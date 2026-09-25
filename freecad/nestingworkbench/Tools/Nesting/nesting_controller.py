@@ -554,9 +554,14 @@ class NestingController:
                     payload['total_time'], payload['target_layout'], payload['ui_params']
                 )
                 payload['result_holder'][0] = job
+                recompute_start = time.perf_counter()
                 coordinator.doc.recompute()
+                coordinator._record_doc_recompute(time.perf_counter() - recompute_start)
             elif payload.get('doc_recompute_only'):
-                self._worker.coordinator.doc.recompute()
+                coordinator = self._worker.coordinator
+                recompute_start = time.perf_counter()
+                coordinator.doc.recompute()
+                coordinator._record_doc_recompute(time.perf_counter() - recompute_start)
         finally:
             self._worker.notify_draw_complete()
 

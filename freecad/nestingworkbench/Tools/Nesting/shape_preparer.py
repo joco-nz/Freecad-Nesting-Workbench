@@ -4,6 +4,7 @@ import FreeCAD
 import Part
 import copy
 import Draft
+import time
 import traceback
 from .algorithms import shape_processor
 from ...datatypes.shape_object import create_shape_object
@@ -17,9 +18,21 @@ class ShapePreparer:
     - Manages the 'MasterShapes' group.
     - Creates the temporary Shape instances used by the algorithm.
     """
-    def __init__(self, doc, processed_shape_cache):
+    def __init__(self, doc, processed_shape_cache, perf_stats=None):
         self.doc = doc
         self.processed_shape_cache = processed_shape_cache
+        # Optional run-scoped measurement sink (Performance Logging only).
+        self._perf_stats = perf_stats
+
+    def _perf_add(self, key, seconds):
+        stats = self._perf_stats
+        if stats is not None:
+            stats[key] = stats.get(key, 0.0) + seconds
+
+    def _perf_inc(self, key, count=1):
+        stats = self._perf_stats
+        if stats is not None:
+            stats[key] = stats.get(key, 0) + count
 
     def prepare_parts(self, ui_global_settings, quantities, master_shapes_map, layout_obj, parts_group):
         """
@@ -39,13 +52,14 @@ class ShapePreparer:
         deflection = ui_global_settings.get('deflection', 0.05)
         simplification = ui_global_settings.get('simplification', 0.1)
         verbose = ui_global_settings.get('verbose', False)
-        
+
         master_shapes_group = self._get_or_create_master_group(layout_obj)
 
         master_shape_obj_map = {} # Maps original FreeCAD object ID to the new master ShapeObject
         master_geometry_cache = {} # Maps original FreeCAD object ID to the processed Shape wrapper
         masters_to_place = []
 
+        master_start = time.perf_counter()
         for label, master_obj in master_shapes_map.items():
             try:
                 # Get up_direction for cache key
@@ -89,7 +103,10 @@ class ShapePreparer:
                 continue
         
         self._arrange_masters(masters_to_place, spacing)
+        self._perf_add('lm_master_prepare_s', time.perf_counter() - master_start)
+        self._perf_inc('lm_masters_processed', len(master_shapes_map))
 
+        instances_start = time.perf_counter()
         parts_to_nest = self._create_nesting_instances(
             master_shapes_map, 
             quantities, 
@@ -98,6 +115,7 @@ class ShapePreparer:
             ui_global_settings,
             parts_group
         )
+        self._perf_add('lm_part_instances_s', time.perf_counter() - instances_start)
         
         return parts_to_nest
 
@@ -112,6 +130,7 @@ class ShapePreparer:
             master_shapes_group = self.doc.addObject("App::DocumentObjectGroup", "MasterShapes")
             master_shapes_group.Label = "MasterShapes"
             layout_obj.addObject(master_shapes_group)
+            self._perf_inc('lm_master_group_objects_created')
         
         # Make MasterShapes visible during nesting (will be hidden after commit)
         if hasattr(master_shapes_group, "ViewObject"):
@@ -134,6 +153,7 @@ class ShapePreparer:
         
         temp_container = self.doc.addObject("App::Part", f"temp_master_{original_label}")
         master_shapes_group.addObject(temp_container)
+        self._perf_inc('lm_master_containers_created')
         
         # *** CLEAN OFFSET DESIGN ***
         temp_container.addProperty("App::PropertyVector", "SourceCentroid", "Nesting", "Original geometry center")
@@ -150,6 +170,7 @@ class ShapePreparer:
         temp_master_obj = create_part_feature(
             self.doc, f"temp_shape_{original_label}", master_obj.Shape.copy(), group=temp_container, visible=True
         )
+        self._perf_inc('lm_master_part_features_created')
         temp_master_obj.Label = f"master_shape_{original_label}"
         # Center the shape at the container's origin
         source_centroid = temp_container.SourceCentroid
@@ -159,6 +180,7 @@ class ShapePreparer:
             temp_bound = create_part_feature(
                 self.doc, f"temp_boundary_{original_label}", master_obj.BoundaryObject.Shape.copy(), group=temp_container, visible=False
             )
+            self._perf_inc('lm_master_boundary_features_created')
             
             if not hasattr(temp_master_obj, "BoundaryObject"):
                 temp_master_obj.addProperty("App::PropertyLink", "BoundaryObject", "Nesting", "Boundary object")
@@ -240,6 +262,7 @@ class ShapePreparer:
         master_shape_obj = create_part_feature(
             self.doc, f"master_shape_{label}", original_shape, group=master_container, visible=True
         )
+        self._perf_inc('lm_master_part_features_created')
         if not hasattr(master_shape_obj, "ShowBounds"):
             master_shape_obj.addProperty("App::PropertyBool", "ShowBounds", "Display", "").ShowBounds = False
         if not hasattr(master_shape_obj, "BoundaryObject"):
@@ -255,6 +278,7 @@ class ShapePreparer:
     def _create_master_container(self, label, quantities, source_centroid):
         """Creates the App::Part container and populates it with metadata properties."""
         master_container = self.doc.addObject("App::Part", f"master_{label}")
+        self._perf_inc('lm_master_containers_created')
         
         part_params = quantities.get(label, {'quantity': 1, 'up_direction': 'Z+', 'fill_sheet': False})
         if isinstance(part_params, tuple):
@@ -343,6 +367,7 @@ class ShapePreparer:
             boundary_obj = temp_shape_wrapper.draw_bounds(self.doc, FreeCAD.Vector(0,0,0), None)
             if boundary_obj:
                 master_container.addObject(boundary_obj)
+                self._perf_inc('lm_master_boundary_features_created')
                 # Bounds are centered at origin - no placement needed
                 boundary_obj.Placement = FreeCAD.Placement()
                 master_shape_obj.BoundaryObject = boundary_obj
@@ -432,6 +457,7 @@ class ShapePreparer:
                 part_copy = create_part_feature(
                     self.doc, f"part_{shape_instance.id}", master_shape_obj.Shape.copy(), group=parts_to_place_group, visible=False
                 )
+                self._perf_inc('lm_part_features_created')
                 part_copy.Placement = master_shape_obj.Placement
 
                 # Debug: Check what geometry we're getting
@@ -443,6 +469,7 @@ class ShapePreparer:
                     boundary_copy = create_part_feature(
                         self.doc, f"boundary_{shape_instance.id}", master_shape_obj.BoundaryObject.Shape.copy(), group=parts_to_place_group, visible=False
                     )
+                    self._perf_inc('lm_part_boundary_features_created')
                     part_copy.addProperty("App::PropertyLink", "BoundaryObject", "Nesting", "Boundary object")
                     part_copy.BoundaryObject = boundary_copy
 

@@ -15,6 +15,7 @@ import FreeCAD
 import copy
 import random
 import math
+import time
 from .shape_preparer import ShapePreparer
 from ...datatypes.shape import Shape
 from ...freecad_helpers import recursive_delete
@@ -103,11 +104,25 @@ class LayoutManager:
     Acts as a factory for Layout objects used in nesting.
     """
     
-    def __init__(self, doc, processed_shape_cache=None, rng=None):
+    def __init__(self, doc, processed_shape_cache=None, rng=None, perf_stats=None):
         self.doc = doc
         self.processed_shape_cache = processed_shape_cache or {}
         self._layout_counter = 0
         self.rng = rng or random
+        # Optional run-scoped measurement sink. When None (the default) every
+        # hook below is a no-op, so production runs pay nothing for this
+        # instrumentation. Only the Performance Logging path passes a dict.
+        self._perf_stats = perf_stats
+
+    def _perf_add(self, key, seconds):
+        stats = self._perf_stats
+        if stats is not None:
+            stats[key] = stats.get(key, 0.0) + seconds
+
+    def _perf_inc(self, key, count=1):
+        stats = self._perf_stats
+        if stats is not None:
+            stats[key] = stats.get(key, 0) + count
     
     def create_layout(self, name, master_shapes_map, quantities, ui_params, 
                       chromosome_ordering=None) -> Layout:
@@ -124,7 +139,10 @@ class LayoutManager:
         Returns:
             Layout object containing the layout group and prepared parts
         """
+        create_start = time.perf_counter()
+
         # Create layout group
+        group_start = time.perf_counter()
         layout_group = self.doc.addObject("App::DocumentObjectGroup", name)
         layout_group.Label = name
         if hasattr(layout_group, "ViewObject"):
@@ -133,16 +151,22 @@ class LayoutManager:
         # Create parts bin
         parts_group = self.doc.addObject("App::DocumentObjectGroup", "PartsToPlace")
         layout_group.addObject(parts_group)
-        
+        self._perf_add('lm_group_s', time.perf_counter() - group_start)
+        self._perf_inc('lm_group_objects_created', 2)
+
         # Create shape preparer for this layout
-        preparer = ShapePreparer(self.doc, self.processed_shape_cache)
+        preparer = ShapePreparer(self.doc, self.processed_shape_cache,
+                                 perf_stats=self._perf_stats)
         
         # Prepare parts (creates masters and instances)
+        prepare_start = time.perf_counter()
         parts = preparer.prepare_parts(
             ui_params, quantities, master_shapes_map, 
             layout_group, parts_group
         )
-        
+        self._perf_add('lm_prepare_parts_s', time.perf_counter() - prepare_start)
+        self._perf_inc('lm_parts_created', len(parts))
+
         # Get master shapes group
         master_shapes_group = None
         for child in layout_group.Group:
@@ -151,10 +175,13 @@ class LayoutManager:
                 break
         
         # Apply chromosome ordering if provided
+        order_start = time.perf_counter()
         if chromosome_ordering and parts:
             parts = self._apply_ordering(parts, chromosome_ordering)
+        self._perf_add('lm_ordering_s', time.perf_counter() - order_start)
         
         self._layout_counter += 1
+        self._perf_inc('lm_layouts_created')
         
         layout = Layout(layout_group, parts_group, parts, master_shapes_group)
         if chromosome_ordering and parts:
@@ -162,12 +189,15 @@ class LayoutManager:
             # and never for fill parts (they are placed greedily after the genome)
             layout.genes = [(p.id, getattr(p, '_angle', 0)) for p in parts
                             if getattr(p, 'fill_sheet', False) is not True]
+        # create_s is the sum of the three sub-phases above plus the small
+        # amount of Layout construction that is not separately attributed.
+        self._perf_add('lm_create_s', time.perf_counter() - create_start)
         return layout
     
     def _apply_ordering(self, parts, chromosome_ordering):
         """
         Reorders and rotates parts according to a chromosome.
-        
+
         Args:
             parts: List of Shape objects
             chromosome_ordering: List of (part_id, angle) tuples
@@ -231,7 +261,10 @@ class LayoutManager:
         
         # Recursively delete the group and all children
         if group_obj:
-            recursive_delete(self.doc, group_obj)
+            delete_start = time.perf_counter()
+            recursive_delete(self.doc, group_obj, perf_stats=self._perf_stats)
+            self._perf_add('lm_delete_s', time.perf_counter() - delete_start)
+            self._perf_inc('lm_layouts_deleted')
             if verbose:
                 FreeCAD.Console.PrintMessage(f"  Deleted: {layout_label}\n")
 
@@ -325,6 +358,8 @@ class LayoutManager:
             List of Layout objects
         """
         population = []
+        population_start = time.perf_counter()
+        self._perf_inc('lm_populations_created')
         
         for i in range(population_size):
             name = f"Layout_GA_{i+1}"
@@ -365,5 +400,6 @@ class LayoutManager:
             if verbose:
                 FreeCAD.Console.PrintMessage(f"Created layout {name} with {len(layout.parts)} parts\n")
         
+        self._perf_add('lm_population_s', time.perf_counter() - population_start)
         return population
     

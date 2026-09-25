@@ -12,6 +12,53 @@ from ...datatypes.shape import Shape
 from .layout_manager import LayoutManager
 from .algorithms import genetic_utils
 
+# Sub-phase breakdown of layout management. These keys are cumulative for the
+# whole run and are only populated when Performance Logging is enabled; the
+# dict itself is None otherwise, so every writer below short-circuits to a
+# no-op in production runs.
+_LAYOUT_PERF_TIMERS = (
+    'lm_population_s',       # initial GA population creation
+    'lm_next_generation_s',  # whole selection/crossover/mutation/offspring build
+    'lm_create_s',           # create_layout total (group + prepare + ordering)
+    'lm_group_s',            #   doc groups for the layout
+    'lm_prepare_parts_s',    #   ShapePreparer.prepare_parts total
+    'lm_master_prepare_s',   #     master shape prep/cache lookup
+    'lm_part_instances_s',   #     per-part FreeCAD instance creation
+    'lm_ordering_s',         #   chromosome ordering / rotation application
+    'lm_delete_s',           # delete_layout / recursive_delete
+    'lm_gene_ops_s',         # selection + crossover + mutation + immigrants
+    'lm_cleanup_s',          # final discard of non-winning layouts
+    'lm_post_nest_rebind_s', # per-part placement rebind after nest() returns
+    'lm_efficiency_s',       # calculate_efficiency (fitness/tie-break)
+    'lm_fill_s',             # fill_existing_sheets on the winner
+    'lm_materialize_s',      # FreeCAD objects built for the winning layout
+    'lm_finalize_s',         # _finalize: drawing the winning layout to the doc
+    'lm_doc_recompute_s',    # doc.recompute() on the main thread
+)
+
+_LAYOUT_PERF_COUNTERS = (
+    'lm_populations_created',
+    'lm_layouts_created',
+    'lm_layouts_deleted',
+    'lm_parts_created',
+    'lm_masters_processed',
+    'lm_master_group_objects_created',
+    'lm_group_objects_created',
+    'lm_master_containers_created',
+    'lm_master_part_features_created',
+    'lm_master_boundary_features_created',
+    'lm_part_features_created',
+    'lm_part_boundary_features_created',
+    'doc_objects_deleted',
+)
+
+
+def _new_layout_perf_stats():
+    return {key: 0.0 for key in _LAYOUT_PERF_TIMERS} | {
+        key: 0 for key in _LAYOUT_PERF_COUNTERS
+    }
+
+
 class GACoordinator:
     """Runs the GA optimization loop and returns the best Layout."""
 
@@ -38,6 +85,71 @@ class GACoordinator:
         self._ga_perf = None
         self._candidate_geometry_key_tracker = None
         self._candidate_geometry_cache = None
+        self._layout_perf = None
+
+    def _record_layout_time(self, key, seconds):
+        """Adds to a layout-management sub-phase timer (Performance Logging only)."""
+        stats = self._layout_perf
+        if stats is not None:
+            stats[key] = stats.get(key, 0.0) + seconds
+
+    def _format_layout_generation(self, snapshot):
+        """Per-generation layout-management deltas, appended to the [GA PERF] line."""
+        return (
+            f" lm_create={self._layout_delta(snapshot, 'lm_create_s'):.2f}s"
+            f" lm_delete={self._layout_delta(snapshot, 'lm_delete_s'):.2f}s"
+            f" lm_gene_ops={self._layout_delta(snapshot, 'lm_gene_ops_s'):.2f}s"
+            f" lm_nextgen={self._layout_delta(snapshot, 'lm_next_generation_s'):.2f}s"
+            f" lm_rebind={self._layout_delta(snapshot, 'lm_post_nest_rebind_s'):.2f}s"
+            f" lm_eff={self._layout_delta(snapshot, 'lm_efficiency_s'):.2f}s"
+        )
+
+    def _format_layout_totals(self):
+        """Cumulative layout-management breakdown, appended to [GA PERF TOTAL]."""
+        if self._layout_perf is None:
+            return ""
+        lm = self._layout_perf
+        return (
+            " [LAYOUT PERF] "
+            f"population={lm['lm_population_s']:.2f}s "
+            f"next_generation={lm['lm_next_generation_s']:.2f}s "
+            f"create={lm['lm_create_s']:.2f}s "
+            f"(group={lm['lm_group_s']:.2f}s "
+            f"prepare={lm['lm_prepare_parts_s']:.2f}s "
+            f"masters={lm['lm_master_prepare_s']:.2f}s "
+            f"instances={lm['lm_part_instances_s']:.2f}s "
+            f"ordering={lm['lm_ordering_s']:.2f}s) "
+            f"delete={lm['lm_delete_s']:.2f}s "
+            f"gene_ops={lm['lm_gene_ops_s']:.2f}s "
+            f"cleanup={lm['lm_cleanup_s']:.2f}s "
+            f"post_nest_rebind={lm['lm_post_nest_rebind_s']:.2f}s "
+            f"efficiency={lm['lm_efficiency_s']:.2f}s "
+            f"fill={lm['lm_fill_s']:.2f}s "
+            f"materialize={lm['lm_materialize_s']:.2f}s "
+            f"layouts_created={lm['lm_layouts_created']} "
+            f"layouts_deleted={lm['lm_layouts_deleted']} "
+            f"parts_created={lm['lm_parts_created']} "
+            f"part_features={lm['lm_part_features_created']} "
+            f"part_boundary_features={lm['lm_part_boundary_features_created']} "
+            f"master_containers={lm['lm_master_containers_created']} "
+            f"master_part_features={lm['lm_master_part_features_created']} "
+            f"master_boundary_features={lm['lm_master_boundary_features_created']} "
+            f"master_groups={lm['lm_master_group_objects_created']} "
+            f"group_objects={lm['lm_group_objects_created']} "
+            f"doc_objects_deleted={lm['doc_objects_deleted']}"
+        )
+
+    def _record_doc_recompute(self, seconds):
+        """Records main-thread doc.recompute() cost (called by the controller)."""
+        self._record_layout_time('lm_doc_recompute_s', seconds)
+
+    def _layout_delta(self, snapshot, key):
+        """Per-generation delta for a cumulative layout perf key."""
+        return self._get_lm(self._layout_perf, key) - self._get_lm(snapshot, key)
+
+    @staticmethod
+    def _get_lm(stats, key):
+        return stats.get(key, 0) if stats is not None else 0
 
     def _record_nest_perf(self, stats, elapsed):
         if self._ga_perf is None:
@@ -147,7 +259,13 @@ class GACoordinator:
         if verbose:
             FreeCAD.Console.PrintMessage(f"GA Mode: {generations} generations, {population_size} population\n")
         
-        self.layout_manager = LayoutManager(self.doc, self.shape_preparer.processed_shape_cache, rng=self.rng)
+        # Layout-management sub-phase instrumentation. Only materialized when
+        # Performance Logging is on; LayoutManager/ShapePreparer/recursive_delete
+        # all take the dict by reference and no-op when it is None.
+        self._layout_perf = _new_layout_perf_stats() if performance_logging else None
+
+        self.layout_manager = LayoutManager(self.doc, self.shape_preparer.processed_shape_cache,
+                                            rng=self.rng, perf_stats=self._layout_perf)
         
         self._set_status(f"Creating {population_size} layouts...")
         if self.draw_callback:
@@ -252,6 +370,7 @@ class GACoordinator:
                         'candidate_geometry_unique', 'candidate_geometry_repeats',
                     )
                 }
+                layout_perf_start = dict(self._layout_perf) if self._layout_perf else {}
                 if cancel_callback():
                     FreeCAD.Console.PrintMessage("Nesting cancelled by user.\n")
                     break
@@ -290,8 +409,8 @@ class GACoordinator:
                 
                 # Early Stopping / Stagnation Check:
                 # An early stopping threshold of 5 generations is selected because nesting jobs typically
-                # operate with relatively small chromosome/population sizes where genetic diversity 
-                # converges quickly. If no elite child (improved ordering/rotation layout) is found 
+                # operate with relatively small chromosome/population sizes where genetic diversity
+                # converges quickly. If no elite child (improved ordering/rotation layout) is found
                 # after 5 generations, the population has converged to a local optimum, and continuing
                 # to run more generations would waste CPU/GPU resources without realistic chance of improvement.
                 if generations_without_improvement >= early_stop_threshold:
@@ -327,20 +446,6 @@ class GACoordinator:
                         )
                     self._ga_perf['layout_management_s'] += (
                         time.perf_counter() - layout_management_start)
-                else:
-                    # Final cleanup
-                    if self.draw_callback:
-                         self.draw_callback({
-                             'cleanup_layouts': True,
-                             'layouts': layouts,
-                             'best_layout': best_layout,
-                             'verbose': verbose
-                         })
-                    else:
-                        for layout in layouts:
-                            if layout != best_layout:
-                                self.layout_manager.delete_layout(layout, verbose=verbose)
-                    layouts = [best_layout]
 
                 generation_elapsed = time.perf_counter() - generation_start
                 self._ga_perf['generation_s'] += generation_elapsed
@@ -357,8 +462,27 @@ class GACoordinator:
                         f"geometry_unique={self._ga_perf['candidate_geometry_unique'] - generation_perf_start['candidate_geometry_unique']} "
                         f"geometry_repeats={self._ga_perf['candidate_geometry_repeats'] - generation_perf_start['candidate_geometry_repeats']} "
                         f"cache_hits={self._ga_perf['candidate_geometry_cache_hits'] - generation_perf_start['candidate_geometry_cache_hits']} "
-                        f"cache_misses={self._ga_perf['candidate_geometry_cache_misses'] - generation_perf_start['candidate_geometry_cache_misses']}\n")
-            
+                        f"cache_misses={self._ga_perf['candidate_geometry_cache_misses'] - generation_perf_start['candidate_geometry_cache_misses']}"
+                        + (self._format_layout_generation(layout_perf_start) if self._layout_perf else "")
+                        + "\n")
+                else:
+                    # Final cleanup
+                    cleanup_start = time.perf_counter()
+                    if self.draw_callback:
+                         self.draw_callback({
+                             'cleanup_layouts': True,
+                             'layouts': layouts,
+                             'best_layout': best_layout,
+                             'verbose': verbose
+                         })
+                    else:
+                        for layout in layouts:
+                            if layout != best_layout:
+                                self.layout_manager.delete_layout(layout, verbose=verbose)
+                    layouts = [best_layout]
+                    self._record_layout_time(
+                        'lm_cleanup_s', time.perf_counter() - cleanup_start)
+
             # Fill phase: generations nested regular parts only — fill the
             # winning layout exactly once (spawns still marshal to the main
             # thread via request_spawn).
@@ -382,11 +506,14 @@ class GACoordinator:
                     if best_layout.sheets is None:
                         best_layout.sheets = []
                     pre_counts = [len(s.parts) for s in best_layout.sheets]
+                    fill_start = time.perf_counter()
                     _, fill_time = fill_existing_sheets(
                         best_layout.sheets, fill_parts,
                         ui_params['sheet_width'], ui_params['sheet_height'],
                         rotation_steps, simulate=is_simulating,
                         viz_manager=viz_manager, **fill_kwargs)
+                    self._record_layout_time(
+                        'lm_fill_s', time.perf_counter() - fill_start)
                     total_nesting_time += fill_time
                     if not is_simulating:
                         # Fill parts placed here never went through the
@@ -410,7 +537,11 @@ class GACoordinator:
                     f"layouts={self._ga_perf['layout_evaluations']} "
                     f"nesting={self._ga_perf['nesting_s']:.2f}s "
                     f"nfp_compute={self._ga_perf['nfp_compute_s']:.2f}s "
-                    f"validity={self._ga_perf['candidate_validity_s']:.2f}s "
+                    # validity_stage is the same window as candidate_wall below
+                    # (PlacementOptimizer assigns both from t_validity-t_nfp):
+                    # it is the post-NFP stage, which decomposes into
+                    # candidate_geometry + sheet_difference + collision.
+                    f"validity_stage={self._ga_perf['candidate_validity_s']:.2f}s "
                     f"score={self._ga_perf['candidate_score_s']:.2f}s "
                     f"candidate_geometry={self._ga_perf['candidate_geometry_s']:.2f}s "
                     f"sheet_difference={self._ga_perf['sheet_difference_s']:.2f}s "
@@ -445,10 +576,24 @@ class GACoordinator:
                     f"bbox_rejections={self._ga_perf['bbox_rejections']} "
                     f"polygon_checks={self._ga_perf['polygon_checks']} "
                     f"nfp_hits={self._ga_perf['nfp_cache_hits']} "
-                    f"nfp_misses={self._ga_perf['nfp_cache_misses']}\n")
+                    f"nfp_misses={self._ga_perf['nfp_cache_misses']}"
+                    + self._format_layout_totals()
+                    + "\n")
             
             # STEP 4: Finalize result — dispatch to main thread (ViewObject + recompute)
+            finalize_start = time.perf_counter()
             job = self._dispatch_finalize(best_layout, best_efficiency, total_nesting_time, target_layout, ui_params)
+            # _finalize runs on the main thread when a worker is active, so its
+            # own cost is recorded by the controller; the dispatch wait is
+            # charged here.
+            self._record_layout_time(
+                'lm_finalize_s', time.perf_counter() - finalize_start)
+            if performance_logging and self._layout_perf is not None:
+                # Recompute happens after the totals line, so report it separately.
+                FreeCAD.Console.PrintMessage(
+                    "[GA PERF FINALIZE] "
+                    f"finalize_dispatch={self._layout_perf['lm_finalize_s']:.2f}s "
+                    f"doc_recompute={self._layout_perf['lm_doc_recompute_s']:.2f}s\n")
             return job
 
         except Exception as e:
@@ -484,7 +629,9 @@ class GACoordinator:
             return result_holder[0]
         else:
             job = self._finalize(best_layout, best_efficiency, total_time, target_layout, ui_params)
+            recompute_start = time.perf_counter()
             self.doc.recompute()
+            self._record_doc_recompute(time.perf_counter() - recompute_start)
             return job
 
     def _dispatch_recompute(self):
@@ -492,7 +639,9 @@ class GACoordinator:
         if self.draw_callback:
             self.draw_callback({'doc_recompute_only': True})
         else:
+            recompute_start = time.perf_counter()
             self.doc.recompute()
+            self._record_doc_recompute(time.perf_counter() - recompute_start)
 
     def request_spawn(self, spawn_fn):
         """Runs spawn_fn() on the main thread (it creates FreeCAD doc objects)
@@ -560,6 +709,7 @@ class GACoordinator:
                 self._record_nest_perf(nest_perf[0], elapsed)
 
             if not is_simulating:
+                 rebind_start = time.perf_counter()
                  original_parts_map = {p.id: p for p in layout.parts}
                  for s in sheets:
                      for i, placed_part in enumerate(s.parts):
@@ -577,6 +727,8 @@ class GACoordinator:
                               original_part.polygon = placed_part.shape.polygon
                               original_part._angle = placed_part.shape._angle
                           s.parts[i].shape = original_part
+                 self._record_layout_time(
+                     'lm_post_nest_rebind_s', time.perf_counter() - rebind_start)
             total_time += elapsed
             layout.sheets, layout.unplaced = sheets, unplaced
 
@@ -591,9 +743,12 @@ class GACoordinator:
                                 for p in gene_parts] if gene_parts else []
             
             # Efficiency/Fitness
+            efficiency_start = time.perf_counter()
             self.layout_manager.calculate_efficiency(
                 layout, ui_params['sheet_width'], ui_params['sheet_height'],
                 ui_params.get('compactness_weight', 0.0))
+            self._record_layout_time(
+                'lm_efficiency_s', time.perf_counter() - efficiency_start)
             unplaced_regular = [p for p in unplaced if getattr(p, 'fill_sheet', False) is not True]
             if unplaced_regular:
                 layout.fitness += len(unplaced_regular) * ui_params['sheet_width'] * ui_params['sheet_height'] * 10
@@ -627,23 +782,31 @@ class GACoordinator:
                                rotation_steps, mutation_rate, immigrant_ratio, verbose):
         """Handles selection, crossover, mutation, and immigrants."""
         from .algorithms import genetic_utils
+
+        next_gen_start = time.perf_counter()
         
         use_random_direction = ui_params.get('use_random_direction', False)
         ranked_pool = [(e.fitness, (e.genes, e.direction)) for e in elites if e.genes]
         new_layouts = [elites[0]] # Champion carries forward
 
+        # Discarding the outgoing layouts is charged to lm_delete_s (measured
+        # inside delete_layout); gene bookkeeping starts after it so the
+        # sub-phase timers stay disjoint.
         for e in elites[1:]: self.layout_manager.delete_layout(e, verbose=verbose)
         for layout in layouts:
             if layout not in elites: self.layout_manager.delete_layout(layout, verbose=verbose)
 
+        gene_ops_start = time.perf_counter()
         population_size = len(layouts)
         n_immigrants = max(1, int((population_size - 1) * immigrant_ratio))
         n_offspring = max(0, (population_size - 1) - n_immigrants)
         if self._ga_perf is not None:
             self._ga_perf['offspring_layouts'] += n_offspring
             self._ga_perf['immigrant_layouts'] += n_immigrants
+        self._record_layout_time('lm_gene_ops_s', time.perf_counter() - gene_ops_start)
 
         for i in range(n_offspring):
+            gene_start = time.perf_counter()
             k = min(3, len(ranked_pool))
             if len(ranked_pool) >= 2:
                 winner1 = genetic_utils.tournament_selection(ranked_pool, k=k, rng=self.rng)
@@ -657,6 +820,7 @@ class GACoordinator:
                 child_genes = list(p1_genes)
                 parent_direction = p1_dir
             child_genes = genetic_utils.mutate_genes(child_genes, mutation_rate, rotation_steps, rng=self.rng)
+            self._record_layout_time('lm_gene_ops_s', time.perf_counter() - gene_start)
             child_layout = self.layout_manager.create_layout(
                 f"Layout_GA_{gen+2}_c{i+1}", master_map, quantities, ui_params, chromosome_ordering=child_genes
             )
@@ -673,6 +837,7 @@ class GACoordinator:
 
         for i in range(n_immigrants):
             imm = self.layout_manager.create_layout(f"Layout_GA_{gen+2}_i{i+1}", master_map, quantities, ui_params)
+            gene_start = time.perf_counter()
             if imm.parts:
                 regular = [p for p in imm.parts if getattr(p, 'fill_sheet', False) is not True]
                 fill = [p for p in imm.parts if getattr(p, 'fill_sheet', False) is True]
@@ -699,7 +864,9 @@ class GACoordinator:
                     imm.direction = (math.cos(angle_rad), math.sin(angle_rad))
                 else:
                     imm.direction = None
+            self._record_layout_time('lm_gene_ops_s', time.perf_counter() - gene_start)
             new_layouts.append(imm)
+        self._record_layout_time('lm_next_generation_s', time.perf_counter() - next_gen_start)
         return new_layouts
 
     def _finalize(self, best_layout, best_efficiency, total_time, target_layout, ui_params):

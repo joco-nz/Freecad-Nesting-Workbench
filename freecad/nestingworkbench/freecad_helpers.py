@@ -35,7 +35,7 @@ def get_up_direction_rotation(up_direction):
         FreeCAD.Console.PrintWarning(f"Unknown up_direction '{up_direction}', using Z+\n")
         return FreeCAD.Rotation()
 
-def recursive_delete(doc, obj, protected_names=None):
+def recursive_delete(doc, obj, protected_names=None, perf_stats=None):
     """
     Recursively deletes a FreeCAD object and all its children from the document.
     Children are deleted first since FreeCAD doesn't cascade deletes.
@@ -44,6 +44,9 @@ def recursive_delete(doc, obj, protected_names=None):
         doc: The FreeCAD document.
         obj: The FreeCAD object to delete.
         protected_names: Optional set of object names to skip (not delete).
+        perf_stats: Optional measurement dict. When supplied, a 'doc_objects_deleted'
+                    counter is incremented per removeObject call. When None the
+                    counting branch is skipped entirely.
     """
     if not obj:
         return
@@ -59,12 +62,15 @@ def recursive_delete(doc, obj, protected_names=None):
     # Recursively delete all children first (if it's a group-like object)
     if hasattr(obj, "Group"):
         for child in list(obj.Group):  # Copy list to avoid modification during iteration
-            recursive_delete(doc, child, protected_names)
+            recursive_delete(doc, child, protected_names, perf_stats)
 
     # Delete the object itself
     try:
         if doc.getObject(obj_name):
             doc.removeObject(obj_name)
+            if perf_stats is not None:
+                perf_stats['doc_objects_deleted'] = \
+                    perf_stats.get('doc_objects_deleted', 0) + 1
     except Exception:
         pass  # Already deleted
 
