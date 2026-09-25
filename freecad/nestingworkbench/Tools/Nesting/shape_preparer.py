@@ -120,10 +120,24 @@ class ShapePreparer:
                 pooled = self.master_pool.get(cache_key) \
                     if self.pool_masters else None
                 if pooled is not None:
-                    master_shape_obj, temp_shape_wrapper = pooled
-                    # source_freecad_object is rebound to this layout's source
-                    # object (same object every time, but keep the invariant
-                    # explicit rather than relying on that).
+                    master_shape_obj, pooled_wrapper = pooled
+                    # Only the FreeCAD master object is shared. The geometry
+                    # wrapper is copied per layout, exactly as the
+                    # processed_shape_cache path below does.
+                    #
+                    # Measured, not assumed: with the wrapper shared outright,
+                    # all 122 part polygons ARE the same objects across
+                    # layouts. Nothing leaks, because set_rotation() and
+                    # move()/move_to() rebind shape.polygon from
+                    # shape.original_polygon rather than mutating in place
+                    # (/tmp/opencode/probe_alias.py). So this copy is not
+                    # fixing an observed bug -- it is keeping the per-layout
+                    # isolation the cache path already provided, for the cost
+                    # of one small 2D deepcopy. The saving here is entirely
+                    # the avoided master_obj.Shape.copy() on a 192-face
+                    # solid, so paying microseconds to not weaken an
+                    # invariant is the right trade.
+                    temp_shape_wrapper = copy.deepcopy(pooled_wrapper)
                     temp_shape_wrapper.source_freecad_object = master_obj
                     self._perf_inc('lm_masters_pooled')
                     master_shape_obj_map[id(master_obj)] = master_shape_obj
