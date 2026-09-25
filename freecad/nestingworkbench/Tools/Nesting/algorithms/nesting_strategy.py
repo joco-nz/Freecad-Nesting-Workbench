@@ -154,6 +154,22 @@ class PlacementOptimizer:
             # Their sum must equal exact_collision_checks.
             'collision_intersects_true': 0,
             'collision_intersects_false': 0,
+            # Subset of collision_intersects_true whose overlay area came out
+            # within tolerance. The remainder are genuine overlaps, and
+            # intersects_true - grazing_pairs == collision_rejections holds
+            # exactly because the loop breaks at the first real overlap, so
+            # each rejected candidate consumes exactly one overlapping pair.
+            #
+            # DO NOT read this as "the interiors touch". A grazing pair only
+            # means the overlay reported area <= tolerance, and a tolerance of
+            # 1e-7 is equally satisfied by an overlap of area 1e-8. On the
+            # 122-part fixture the grazing set is overwhelmingly sub-micron
+            # slivers with genuinely overlapping interiors -- 148,124 of
+            # 152,431, measured -- not exact contacts. A DE-9IM zero-area gate
+            # was built on the mistaken reading that this set was exact touch,
+            # found it could only settle 2.8% of it, and was reverted as a
+            # net loss. See the revert of 34bbe67 before proposing it again.
+            'collision_grazing_pairs': 0,
             'candidate_geometry_unique': 0,
             'candidate_geometry_repeats': 0,
             'max_concurrent_rotations': 0,
@@ -260,6 +276,7 @@ class PlacementOptimizer:
                                 'exact_collision_checks',
                                 'collision_intersects_true',
                                 'collision_intersects_false',
+                                'collision_grazing_pairs',
                             ):
                                 self._perf_stats[key] += res.get(f'_{key}', 0)
                             self._perf_stats['candidate_geometry_cache_entries'] = max(
@@ -511,6 +528,7 @@ class PlacementOptimizer:
             probe['exact_collision_checks'] = 0
             probe['collision_intersects_true'] = 0
             probe['collision_intersects_false'] = 0
+            probe['collision_grazing_pairs'] = 0
         if not valid.any():
             return valid
 
@@ -677,6 +695,11 @@ class PlacementOptimizer:
                             existing).area > area_tolerance
                         if probe is not None:
                             probe['collision_intersects_true'] += 1
+                            if not overlaps:
+                                # Within tolerance. Note this is not
+                                # necessarily an exact touch -- see the
+                                # collision_grazing_pairs comment.
+                                probe['collision_grazing_pairs'] += 1
                     else:
                         overlaps = False
                         if probe is not None:

@@ -176,6 +176,7 @@ class GACoordinator:
                     'candidate_geometries_built', 'candidate_geometry_observations', 'candidate_geometry_cache_hits', 'candidate_geometry_cache_misses', 'candidate_geometry_cache_ms', 'bbox_checks',
                     'bbox_overlap_pairs', 'exact_collision_checks',
                     'collision_intersects_true', 'collision_intersects_false',
+                    'collision_grazing_pairs',
                     'candidate_geometry_unique', 'candidate_geometry_repeats'):
             self._ga_perf[key] += stats.get(key, 0)
         self._ga_perf['max_concurrent_rotations'] = max(
@@ -336,6 +337,7 @@ class GACoordinator:
             'exact_collision_checks': 0,
             'collision_intersects_true': 0,
             'collision_intersects_false': 0,
+            'collision_grazing_pairs': 0,
             'candidate_geometry_unique': 0,
             'candidate_geometry_repeats': 0,
             'max_concurrent_rotations': 0,
@@ -379,6 +381,7 @@ class GACoordinator:
                         'candidate_geometries_built', 'candidate_geometry_observations', 'candidate_geometry_cache_hits', 'candidate_geometry_cache_misses', 'candidate_geometry_cache_ms', 'bbox_checks',
                         'bbox_overlap_pairs', 'exact_collision_checks',
                         'collision_intersects_true', 'collision_intersects_false',
+                        'collision_grazing_pairs',
                         'candidate_geometry_unique', 'candidate_geometry_repeats',
                     )
                 }
@@ -594,6 +597,13 @@ class GACoordinator:
                     # exact_collision_checks.
                     f"intersects_false={self._ga_perf['collision_intersects_false']} "
                     f"intersects_true={self._ga_perf['collision_intersects_true']} "
+                    # Subset of intersects_true whose overlay area landed
+                    # within tolerance. intersects_true - grazing_pairs must
+                    # equal collision_rejections exactly. Do not read this as
+                    # "the interiors touch": the area tolerance is satisfied
+                    # by sub-tolerance slivers too, and on the fixture that
+                    # is nearly all of it. See collision_grazing_pairs.
+                    f"grazing_pairs={self._ga_perf['collision_grazing_pairs']} "
                     f"layout_management={self._ga_perf['layout_management_s']:.2f}s "
                     f"offspring={self._ga_perf['offspring_layouts']} "
                     f"immigrants={self._ga_perf['immigrant_layouts']} "
