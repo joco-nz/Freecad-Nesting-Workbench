@@ -150,6 +150,10 @@ class PlacementOptimizer:
             'bbox_checks': 0,
             'bbox_overlap_pairs': 0,
             'exact_collision_checks': 0,
+            # Split of exact_collision_checks by the intersects prefilter.
+            # Their sum must equal exact_collision_checks.
+            'collision_intersects_true': 0,
+            'collision_intersects_false': 0,
             'candidate_geometry_unique': 0,
             'candidate_geometry_repeats': 0,
             'max_concurrent_rotations': 0,
@@ -254,6 +258,8 @@ class PlacementOptimizer:
                                 'candidate_geometry_cache_ms',
                                 'bbox_checks', 'bbox_overlap_pairs',
                                 'exact_collision_checks',
+                                'collision_intersects_true',
+                                'collision_intersects_false',
                             ):
                                 self._perf_stats[key] += res.get(f'_{key}', 0)
                             self._perf_stats['candidate_geometry_cache_entries'] = max(
@@ -503,6 +509,8 @@ class PlacementOptimizer:
             probe['bbox_checks'] = 0
             probe['bbox_overlap_pairs'] = 0
             probe['exact_collision_checks'] = 0
+            probe['collision_intersects_true'] = 0
+            probe['collision_intersects_false'] = 0
         if not valid.any():
             return valid
 
@@ -647,8 +655,32 @@ class PlacementOptimizer:
                     bbox_rejections += int(e_pos) - prev_overlap - 1
                     prev_overlap = int(e_pos)
                     checks_start = time.perf_counter()
-                    overlaps = candidate.intersection(
-                        existing_polygons[e_pos]).area > area_tolerance
+                    # Boolean prefilter. `intersects` is True whenever the two
+                    # interiors overlap, so any pair whose intersection area
+                    # exceeds the tolerance always reaches the area test. A
+                    # False result means the geometries meet at most along a
+                    # boundary, where the intersection has zero area and the
+                    # area comparison would also have been False -- so the
+                    # accept/reject decision is unchanged.
+                    #
+                    # Measured on the 122-part fixture (551,931 exact checks):
+                    # 67.7% return False and skip the overlay. End-to-end this
+                    # is worth 9.3% of collision cost (282.3 -> 256.0 us per
+                    # exact check) -- much less than the skip rate suggests,
+                    # because `intersects` is itself not free on parts this
+                    # complex. An earlier 96.8% figure was a measurement
+                    # error: it conflated "disjoint" with "touching", since
+                    # area <= tol holds for both. See make-faster.md.
+                    existing = existing_polygons[e_pos]
+                    if existing.intersects(candidate):
+                        overlaps = candidate.intersection(
+                            existing).area > area_tolerance
+                        if probe is not None:
+                            probe['collision_intersects_true'] += 1
+                    else:
+                        overlaps = False
+                        if probe is not None:
+                            probe['collision_intersects_false'] += 1
                     collision_intersection_ms += (
                         time.perf_counter() - checks_start) * 1000
                     polygon_checks += 1

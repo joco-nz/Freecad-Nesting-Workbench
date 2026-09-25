@@ -175,6 +175,7 @@ class GACoordinator:
                     'bbox_rejections', 'polygon_checks',
                     'candidate_geometries_built', 'candidate_geometry_observations', 'candidate_geometry_cache_hits', 'candidate_geometry_cache_misses', 'candidate_geometry_cache_ms', 'bbox_checks',
                     'bbox_overlap_pairs', 'exact_collision_checks',
+                    'collision_intersects_true', 'collision_intersects_false',
                     'candidate_geometry_unique', 'candidate_geometry_repeats'):
             self._ga_perf[key] += stats.get(key, 0)
         self._ga_perf['max_concurrent_rotations'] = max(
@@ -333,6 +334,8 @@ class GACoordinator:
             'bbox_checks': 0,
             'bbox_overlap_pairs': 0,
             'exact_collision_checks': 0,
+            'collision_intersects_true': 0,
+            'collision_intersects_false': 0,
             'candidate_geometry_unique': 0,
             'candidate_geometry_repeats': 0,
             'max_concurrent_rotations': 0,
@@ -375,6 +378,7 @@ class GACoordinator:
                         'candidate_evaluation_wall_s', 'placement_wall_s',
                         'candidate_geometries_built', 'candidate_geometry_observations', 'candidate_geometry_cache_hits', 'candidate_geometry_cache_misses', 'candidate_geometry_cache_ms', 'bbox_checks',
                         'bbox_overlap_pairs', 'exact_collision_checks',
+                        'collision_intersects_true', 'collision_intersects_false',
                         'candidate_geometry_unique', 'candidate_geometry_repeats',
                     )
                 }
@@ -585,6 +589,11 @@ class GACoordinator:
                     f"bbox_checks={self._ga_perf['bbox_checks']} "
                     f"bbox_overlap_pairs={self._ga_perf['bbox_overlap_pairs']} "
                     f"exact_collision_checks={self._ga_perf['exact_collision_checks']} "
+                    # Prefilter split: false means the intersects guard proved
+                    # the pair disjoint without an overlay. The two must sum to
+                    # exact_collision_checks.
+                    f"intersects_false={self._ga_perf['collision_intersects_false']} "
+                    f"intersects_true={self._ga_perf['collision_intersects_true']} "
                     f"layout_management={self._ga_perf['layout_management_s']:.2f}s "
                     f"offspring={self._ga_perf['offspring_layouts']} "
                     f"immigrants={self._ga_perf['immigrant_layouts']} "
