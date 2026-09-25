@@ -24,7 +24,10 @@ class PlacementOptimizer:
     """
     Handles the geometric logic of finding the best position for a part on a sheet.
     """
-    def __init__(self, engine, rotation_steps, search_direction, log_callback=None, trial_callback=None, rng=None):
+    def __init__(
+        self, engine, rotation_steps, search_direction, log_callback=None,
+        trial_callback=None, rng=None, performance_logging=False
+    ):
         self.engine = engine
         self.rotation_steps = max(1, rotation_steps)
         self.search_direction = search_direction
@@ -32,6 +35,7 @@ class PlacementOptimizer:
         self.trial_callback = trial_callback  # Called for each trial placement in simulation mode
         self.rng = rng or random  # Seeded random.Random for reproducible runs, or the global module
         self.verbose = False
+        self.performance_logging = performance_logging
         self._perf_lock = threading.Lock()
         self._perf_stats = {
             'rotation_evaluations': 0,
@@ -140,9 +144,10 @@ class PlacementOptimizer:
                     self.log(f"Error in rotation evaluation thread: {e}")
 
         dt_parallel = (_time.perf_counter() - t0_parallel) * 1000
-        self.log(f"[TIMING] '{getattr(part, 'id', '?')}': wall={dt_parallel:.0f}ms "
-                 f"nfp={total_nfp_ms:.0f}ms score={total_score_ms:.0f}ms "
-                 f"({len(angles)} rotations, {len(sheet.parts)} placed)")
+        if self.performance_logging:
+            self.log(f"[TIMING] '{getattr(part, 'id', '?')}': wall={dt_parallel:.0f}ms "
+                     f"nfp={total_nfp_ms:.0f}ms score={total_score_ms:.0f}ms "
+                     f"({len(angles)} rotations, {len(sheet.parts)} placed)")
         if self.verbose:
             self.log(f"  -> Parallel eval: {len(angles)} rotations in {dt_parallel:.1f}ms "
                      f"(ideal speedup: {len(angles)}x, pool workers: {min(len(angles), os.cpu_count() or 1)})")
@@ -231,7 +236,7 @@ class PlacementOptimizer:
              self.trial_callback(part, angle, best['x'], best['y'])
 
         t_end = _time.perf_counter()
-        if self.verbose:
+        if self.performance_logging:
             self.log(f"    [{thread_id}] angle={angle:.0f}: NFP={((t_nfp-t0)*1000):.1f}ms, "
                      f"validity={((t_validity-t_nfp)*1000):.1f}ms, "
                      f"score={((t_end-t_validity)*1000):.1f}ms, "
@@ -361,6 +366,7 @@ class Nester:
         # Logging control
         self.quiet = kwargs.get("quiet", False)  # If True, suppress per-part logs
         self.verbose = kwargs.get("verbose", False)  # If True, enable extra detailed logs
+        self.performance_logging = kwargs.get("performance_logging", False)
         self.log_callback = kwargs.get("log_callback")
         self.trial_callback = kwargs.get("trial_callback")  # For visualizing trial placements
         self.part_start_callback = kwargs.get("part_start_callback")  # Called when starting to place a part
@@ -370,11 +376,16 @@ class Nester:
         self.spawn_more_callback = kwargs.get("spawn_more_callback")  # Mints fill-part instances on the main thread
         
         step_size = kwargs.get("step_size", 5.0) 
-        self.engine = MinkowskiEngine(width, height, step_size, log_callback=self.log_callback, verbose=self.verbose, search_direction=self.search_direction, rng=kwargs.get("rng"))
+        self.engine = MinkowskiEngine(
+            width, height, step_size, log_callback=self.log_callback,
+            verbose=self.verbose,
+            performance_logging=self.performance_logging,
+            search_direction=self.search_direction, rng=kwargs.get("rng"))
         # quiet (multi-layout GA) silences the optimizer's per-placement [TIMING] lines
         self.optimizer = PlacementOptimizer(self.engine, rotation_steps, self.search_direction,
                                             None if self.quiet else self.log_callback,
-                                            self.trial_callback, rng=kwargs.get("rng"))
+                                            self.trial_callback, rng=kwargs.get("rng"),
+                                            performance_logging=self.performance_logging)
         self.optimizer.verbose = self.verbose
 
         self.parts_to_place = []
@@ -510,7 +521,7 @@ class Nester:
             self._nest_fill_parts(sheets, fill_parts, unplaced_parts, quiet, _part_timings)
 
 
-        if not quiet and _part_timings:
+        if self.performance_logging and not quiet and _part_timings:
             self._log_timing_summary(_part_timings)
 
         return sheets, unplaced_parts
@@ -590,7 +601,7 @@ class Nester:
             _dt_part = _time.perf_counter() - _t0_part
             if part_timings is not None:
                 part_timings.append((part.id, _dt_part, placed))
-            if not quiet:
+            if self.performance_logging and not quiet:
                 self.log(f"[TIMING] fill '{part.id}' ({part_type}): "
                          f"{_dt_part * 1000:.0f}ms {'placed' if placed else 'FAILED'} "
                          f"(attempt {attempts[part_type]})")
@@ -602,7 +613,7 @@ class Nester:
                 active.append(part_type)  # round-robin: give the next type a turn
             else:
                 unplaced_parts.append(part)
-                if not quiet:
+                if self.performance_logging and not quiet:
                     self.log(f"Fill type '{part_type}' retired after {attempts[part_type]} attempts.")
 
     def _log_timing_summary(self, part_timings):

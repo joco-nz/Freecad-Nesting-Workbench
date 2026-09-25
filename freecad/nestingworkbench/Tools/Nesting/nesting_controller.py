@@ -124,7 +124,9 @@ class NestingController:
         
         algo_kwargs = self._prepare_algo_kwargs(ui_params)
         verbose = self.ui.verbose_logging_checkbox.isChecked()
+        performance_logging = self.ui.performance_logging_checkbox.isChecked()
         algo_kwargs['verbose'] = verbose
+        algo_kwargs['performance_logging'] = performance_logging
         
         rot_steps = ui_params.get('rotation_steps', 1)
         ann_steps = algo_kwargs.get('anneal_steps', 25) if ui_params.get('algorithm') == 'Physics' else 0
@@ -136,6 +138,7 @@ class NestingController:
         
         prefs = FreeCAD.ParamGet(PREFS_PATH)
         prefs.SetBool("VerboseLogging", verbose)
+        prefs.SetBool("PerformanceLogging", performance_logging)
         
         
         def progress_cb(current, total, message=None):
@@ -751,6 +754,7 @@ class NestingController:
             'population_size': self.ui.minkowski_population_size_input.value(),
             'compactness_weight': self.ui.minkowski_compactness_input.value(),
             'verbose': self.ui.verbose_logging_checkbox.isChecked(),
+            'performance_logging': self.ui.performance_logging_checkbox.isChecked(),
             'nesting_direction': self.ui.minkowski_direction_dial.value(),
             'algorithm': self.ui.algorithm_dropdown.currentText(),
             'use_random_direction': (self.ui.physics_random_checkbox.isChecked() if self.ui.algorithm_dropdown.currentText() == 'Physics' else self.ui.minkowski_random_checkbox.isChecked()),
@@ -894,4 +898,3 @@ class NestingController:
             algo_kwargs['log_callback'] = self.ui.log_message
             
         return algo_kwargs
-

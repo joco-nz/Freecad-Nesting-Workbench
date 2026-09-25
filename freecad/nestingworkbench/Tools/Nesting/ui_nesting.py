@@ -24,6 +24,7 @@ _DEFAULTS = {
     "add_labels": False,
     "simulate_nesting": False,
     "verbose_logging": False,
+    "performance_logging": False,
     "rotation_angles": MINKOWSKI_ROTATION_PRESETS,
 }
 
@@ -314,6 +315,9 @@ class NestingPanel(QtWidgets.QWidget):
         self.simulate_nesting_checkbox = QtWidgets.QCheckBox("Simulate Nesting (slower)"); self.simulate_nesting_checkbox.setChecked(_DEFAULTS["simulate_nesting"])
         self.verbose_logging_checkbox = QtWidgets.QCheckBox("Verbose Logging"); self.verbose_logging_checkbox.setChecked(_DEFAULTS["verbose_logging"])
         self.verbose_logging_checkbox.setToolTip("Enables detailed logging of the nesting process in the FreeCAD console.")
+        self.performance_logging_checkbox = QtWidgets.QCheckBox("Performance Logging")
+        self.performance_logging_checkbox.setChecked(_DEFAULTS["performance_logging"])
+        self.performance_logging_checkbox.setToolTip("Enables performance and timing diagnostics in the FreeCAD console.")
         self.sound_checkbox = QtWidgets.QCheckBox("Play sound on completion"); self.sound_checkbox.setChecked(True)
         
         self.nest_button = QtWidgets.QPushButton("Run Nesting")
@@ -362,7 +366,11 @@ class NestingPanel(QtWidgets.QWidget):
         
 
         form_layout.addRow(self.simulate_nesting_checkbox)
-        form_layout.addRow(self.verbose_logging_checkbox)
+        logging_layout = QtWidgets.QHBoxLayout()
+        logging_layout.addWidget(self.verbose_logging_checkbox)
+        logging_layout.addWidget(self.performance_logging_checkbox)
+        logging_layout.addStretch()
+        form_layout.addRow(logging_layout)
         form_layout.addRow(self.show_bounds_checkbox) # Keep this on its own line
         form_layout.addRow(self.sound_checkbox)
         
@@ -531,6 +539,7 @@ class NestingPanel(QtWidgets.QWidget):
         self.simplification_input.setValue(prefs.GetFloat(PROP_SIMPLIFICATION, 1.0))
         self.minkowski_compactness_input.setValue(prefs.GetFloat("GACompactnessWeight", 0.0))
         self.verbose_logging_checkbox.setChecked(prefs.GetBool("VerboseLogging", False))
+        self.performance_logging_checkbox.setChecked(prefs.GetBool("PerformanceLogging", False))
         self.physics_improvement_threshold_input.setValue(prefs.GetFloat("PhysicsStabilityTolerance", 0.01))
         
         self.physics_anneal_curve_type.setCurrentText(prefs.GetString("PhysicsAnnealCurveType", "Logarithmic"))

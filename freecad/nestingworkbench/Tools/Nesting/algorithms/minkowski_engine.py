@@ -12,7 +12,7 @@ from shapely.affinity import translate, rotate
 from . import minkowski_utils
 from ....datatypes.shape import Shape
 
-def compute_and_cache_nfp(shape_A, angle_A, part_to_place, angle_B, cache_key, log=None, step_size=5.0):
+def compute_and_cache_nfp(shape_A, angle_A, part_to_place, angle_B, cache_key, log=None, step_size=5.0, performance_logging=False):
     """Computes the NFP for one (A, B, relative-angle) pair and stores it in
     Shape.nfp_cache under cache_key. Pure Shapely — safe on any thread.
     Returns the cache entry."""
@@ -40,13 +40,14 @@ def compute_and_cache_nfp(shape_A, angle_A, part_to_place, angle_B, cache_key, l
             is_owner = False
 
     if not is_owner:
-        if log:
+        if log and performance_logging:
             log(f"[PERF] NFP in-flight JOIN key={cache_key[:3]}")
         return future.result()
 
     try:
         nfp_data = _compute_nfp_uncached(
-            shape_A, angle_A, part_to_place, angle_B, cache_key, log, step_size
+            shape_A, angle_A, part_to_place, angle_B, cache_key, log, step_size,
+            performance_logging
         )
         with Shape.nfp_cache_lock:
             Shape.nfp_cache[cache_key] = nfp_data
@@ -60,7 +61,7 @@ def compute_and_cache_nfp(shape_A, angle_A, part_to_place, angle_B, cache_key, l
             Shape.nfp_inflight.pop(cache_key, None)
 
 
-def _compute_nfp_uncached(shape_A, angle_A, part_to_place, angle_B, cache_key, log, step_size):
+def _compute_nfp_uncached(shape_A, angle_A, part_to_place, angle_B, cache_key, log, step_size, performance_logging=False):
     """Compute one NFP without consulting or updating the shared cache."""
     t_total = time.perf_counter()
     timings = {}
@@ -103,11 +104,12 @@ def _compute_nfp_uncached(shape_A, angle_A, part_to_place, angle_B, cache_key, l
         if master_nfp is None or (
             master_nfp.is_empty or not master_nfp.is_valid or master_nfp.area <= 0
         ):
-            log(
-                f"[PERF] Fast convex-pair path rejected final NFP for {cache_key[:3]}; "
-                "recomputing with per-pair checks",
-                level="warning",
-            )
+            if performance_logging:
+                log(
+                    f"[PERF] Fast convex-pair path rejected final NFP for {cache_key[:3]}; "
+                    "recomputing with per-pair checks",
+                    level="warning",
+                )
             minkowski_timings = {}
             nfp_exterior = minkowski_utils.minkowski_sum(
                 poly_A_centered, angle_A, False, poly_B_centered, angle_B, True, log,
@@ -136,7 +138,8 @@ def _compute_nfp_uncached(shape_A, angle_A, part_to_place, angle_B, cache_key, l
         log(f"Error calculating NFP for {cache_key}: {e}", level="error")
         nfp_data = {'error': str(e)}
     timings["total_ms"] = (time.perf_counter() - t_total) * 1000
-    log(
+    if performance_logging:
+        log(
         "[PERF] NFP phases key={} total={total_ms:.1f}ms "
         "prepare={prepare_ms:.1f} decompose={decompose_ms:.1f} "
         "transform={transform_ms:.1f} convex_sum={convex_sum_ms:.1f} "
@@ -212,7 +215,7 @@ def _compute_nfp_uncached(shape_A, angle_A, part_to_place, angle_B, cache_key, l
                 "merged_pieces_a": timings.get("merged_pieces_a", 0),
                 "merged_pieces_b": timings.get("merged_pieces_b", 0),
             },
-        )
+            )
     )
     return nfp_data
 
@@ -221,13 +224,14 @@ class MinkowskiEngine:
     Handles geometric operations for Minkowski nesting, such as NFP generation,
     candidate point finding, and placement validation.
     """
-    def __init__(self, bin_width, bin_height, step_size, discretize_edges=True, log_callback=None, verbose=False, search_direction=(0, -1), rng=None):
+    def __init__(self, bin_width, bin_height, step_size, discretize_edges=True, log_callback=None, verbose=False, performance_logging=False, search_direction=(0, -1), rng=None):
         self.bin_width = bin_width
         self.bin_height = bin_height
         self.step_size = step_size
         self.discretize_edges = discretize_edges
         self.log_callback = log_callback
         self.verbose = verbose
+        self.performance_logging = performance_logging
         
         self.search_direction = search_direction
         self.rng = rng
@@ -299,7 +303,7 @@ class MinkowskiEngine:
                     p.shape, 0.0, part_to_place, relative_angle, nfp_cache_key
                 )
                 dt_miss = (time.perf_counter() - t_miss) * 1000
-                if self.verbose:
+                if self.performance_logging:
                     self.log(f"[PERF] NFP cache MISS key={nfp_cache_key[:3]} angle={relative_angle:.1f} -> {dt_miss:.1f}ms")
                 with self._perf_lock:
                     self._perf_stats['nfp_compute_ms'] += dt_miss
@@ -351,7 +355,7 @@ class MinkowskiEngine:
             points = all_pts[unique_idx]
         else:
             points = np.empty((0, 2), dtype=np.float32)
-        if self.verbose and (n_misses > 0 or dt_total > 10.0):
+        if self.performance_logging and (n_misses > 0 or dt_total > 10.0):
             self.log(f"[PERF] get_global_nfp_for angle={angle:.1f} "
                      f"hits={n_hits} misses={n_misses} "
                      f"total={dt_total:.1f}ms candidates={len(points)}")
@@ -526,7 +530,7 @@ class MinkowskiEngine:
         with self._perf_lock:
             self._perf_stats['cache_hits'] += n_hits
             self._perf_stats['cache_misses'] += n_misses
-        if self.verbose:
+        if self.performance_logging:
             dt = (time.perf_counter() - t0_total) * 1000
             self.log(f"[PERF] incremental_candidates angle={angle:.1f} "
                      f"new_parts={m - n_prev} hits={n_hits} misses={n_misses} "
@@ -557,7 +561,9 @@ class MinkowskiEngine:
         return best_idx, metric
 
     def _calculate_and_cache_nfp(self, shape_A, angle_A, part_to_place, angle_B, cache_key):
-        return compute_and_cache_nfp(shape_A, angle_A, part_to_place, angle_B, cache_key, self.log, self.step_size)
+        return compute_and_cache_nfp(
+            shape_A, angle_A, part_to_place, angle_B, cache_key, self.log,
+            self.step_size, self.performance_logging)
 
     def get_perf_stats(self):
         with self._perf_lock:

@@ -104,6 +104,7 @@ class GACoordinator:
         immigrant_ratio = 0.15
         early_stop_threshold = 5
         verbose = algo_kwargs.get('verbose', False)
+        performance_logging = algo_kwargs.get('performance_logging', False)
         cancel_callback = algo_kwargs.get('cancel_callback', lambda: False)
         
         seed = algo_kwargs.get('random_seed')
@@ -275,7 +276,7 @@ class GACoordinator:
 
                 generation_elapsed = time.perf_counter() - generation_start
                 self._ga_perf['generation_s'] += generation_elapsed
-                if verbose:
+                if performance_logging:
                     FreeCAD.Console.PrintMessage(
                         f"[GA PERF] generation={gen + 1} total={generation_elapsed:.2f}s "
                         f"layouts={len(layouts)} nesting={gen_time:.2f}s "
@@ -324,7 +325,7 @@ class GACoordinator:
                         ui_params.get('compactness_weight', 0.0))
                     best_efficiency = best_layout.efficiency
 
-            if self._ga_perf:
+            if performance_logging:
                 FreeCAD.Console.PrintMessage(
                     "[GA PERF TOTAL] "
                     f"generations={self._ga_perf['generation_s']:.2f}s "
