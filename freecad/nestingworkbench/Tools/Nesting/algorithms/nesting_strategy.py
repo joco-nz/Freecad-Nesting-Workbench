@@ -12,28 +12,6 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import numpy as np
 from shapely.affinity import rotate, translate
 from shapely.geometry import Polygon
-try:
-    # Shapely >= 2.0. The DE-9IM pattern gate below is a pure optimisation, so
-    # an older Shapely must degrade to the plain area test, never fail.
-    from shapely import relate_pattern as _relate_pattern
-except ImportError:  # pragma: no cover - depends on the installed Shapely
-    _relate_pattern = None
-
-# DE-9IM pattern that matches exactly when the two interiors are disjoint.
-# Interiors disjoint implies the intersection is at most a set of lines and
-# points, so its area is exactly 0.0 and `area > tolerance` is necessarily
-# False -- so a match can only ever short-circuit to `overlaps = False`,
-# which is what the area test would have concluded anyway.
-#
-# Only the first cell (interior n interior) is constrained. The matrix is
-# ordered [I*I, I*B, I*E, B*I, B*B, B*E, E*I, E*B, E*E], so a pattern that
-# also pins the boundary cells -- e.g. "FF*FF****" -- additionally demands the
-# boundaries be disjoint, i.e. FULLY disjoint rather than merely touching.
-# Such a pattern never matches a touching pair, so it silently turns the gate
-# into a no-op that still costs a relate call. Constrain the interior cell
-# alone. Verified in test_intersects_equiv.py, which asserts a match never
-# coexists with a real overlap.
-_ZERO_AREA_PATTERN = "FF*******"
 
 import FreeCAD
 from ....datatypes.sheet import Sheet
@@ -176,15 +154,6 @@ class PlacementOptimizer:
             # Their sum must equal exact_collision_checks.
             'collision_intersects_true': 0,
             'collision_intersects_false': 0,
-            # Subset of collision_intersects_true whose overlay area came out
-            # within tolerance (grazing contact). The remainder are genuine
-            # overlaps.
-            'collision_grazing_pairs': 0,
-            # Subset of collision_grazing_pairs that the DE-9IM gate settled
-            # without running the overlay at all. The difference is the
-            # sliver population: overlapping interiors but sub-tolerance area,
-            # which the gate provably cannot skip.
-            'collision_zero_area_gated': 0,
             'candidate_geometry_unique': 0,
             'candidate_geometry_repeats': 0,
             'max_concurrent_rotations': 0,
@@ -291,8 +260,6 @@ class PlacementOptimizer:
                                 'exact_collision_checks',
                                 'collision_intersects_true',
                                 'collision_intersects_false',
-                                'collision_grazing_pairs',
-                                'collision_zero_area_gated',
                             ):
                                 self._perf_stats[key] += res.get(f'_{key}', 0)
                             self._perf_stats['candidate_geometry_cache_entries'] = max(
@@ -544,8 +511,6 @@ class PlacementOptimizer:
             probe['exact_collision_checks'] = 0
             probe['collision_intersects_true'] = 0
             probe['collision_intersects_false'] = 0
-            probe['collision_grazing_pairs'] = 0
-            probe['collision_zero_area_gated'] = 0
         if not valid.any():
             return valid
 
@@ -708,32 +673,10 @@ class PlacementOptimizer:
                     # area <= tol holds for both. See make-faster.md.
                     existing = existing_polygons[e_pos]
                     if existing.intersects(candidate):
+                        overlaps = candidate.intersection(
+                            existing).area > area_tolerance
                         if probe is not None:
                             probe['collision_intersects_true'] += 1
-                        # Zero-area gate. The measured pair mix on the
-                        # 122-part fixture is 67.9% disjoint, 28.9% grazing
-                        # (interiors touching, overlay area within tolerance)
-                        # and only 3.1% real overlaps, so most of the overlay
-                        # work below is spent proving a zero area. This gate
-                        # pays off whenever relate_pattern costs less than
-                        # grazing / intersects_true of that overlay -- 90.2%
-                        # as measured, a wide margin.
-                        if (_relate_pattern is not None
-                                and not _relate_pattern(
-                                    existing, candidate, _ZERO_AREA_PATTERN)):
-                            overlaps = candidate.intersection(
-                                existing).area > area_tolerance
-                        else:
-                            overlaps = False
-                            if probe is not None:
-                                probe['collision_zero_area_gated'] += 1
-                        if probe is not None and not overlaps:
-                            # Subset of intersects_true concluded non-colliding
-                            # without a real overlap. Exact, because the loop
-                            # breaks at the first real collision, so every
-                            # True pair inspected with overlaps False is a
-                            # true grazing sample and none is double counted.
-                            probe['collision_grazing_pairs'] += 1
                     else:
                         overlaps = False
                         if probe is not None:
