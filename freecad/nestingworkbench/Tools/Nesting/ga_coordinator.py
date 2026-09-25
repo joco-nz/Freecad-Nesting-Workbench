@@ -42,6 +42,7 @@ _LAYOUT_PERF_COUNTERS = (
     'lm_layouts_deleted',
     'lm_parts_created',
     'lm_masters_processed',
+    'lm_masters_pooled',   # headless master served from the run-scoped pool
     'lm_master_group_objects_created',
     'lm_group_objects_created',
     'lm_master_containers_created',
@@ -117,6 +118,10 @@ class GACoordinator:
             f"(group={lm['lm_group_s']:.2f}s "
             f"prepare={lm['lm_prepare_parts_s']:.2f}s "
             f"masters={lm['lm_master_prepare_s']:.2f}s "
+            # Headless only. Should be masters_processed - pooled, i.e. one
+            # real build per master type per run, not one per layout. A
+            # non-zero pooled count in simulate mode would be a bug.
+            f"masters_pooled={lm['lm_masters_pooled']} "
             f"instances={lm['lm_part_instances_s']:.2f}s "
             f"ordering={lm['lm_ordering_s']:.2f}s) "
             f"delete={lm['lm_delete_s']:.2f}s "

@@ -124,6 +124,23 @@ class LayoutManager:
         # (Shapely only). The GA uses this so that only the winning layout
         # pays for document object creation.
         self.create_doc_objects = create_doc_objects
+        # cache_key -> (master_shape_obj, temp_shape_wrapper), run-scoped.
+        #
+        # Master FreeCAD objects depend only on the master source shape and the
+        # geometry settings, never on the layout being built, so every layout
+        # in a GA run wants the identical set. Building them per layout means
+        # 57 masters for a 19-layout run where 3 suffice, and the per-master
+        # Shape.copy() on a part this complex is the whole cost: the fixture
+        # measures lm_master_prepare_s at 9.79s, 98% of layout management.
+        #
+        # Headless only. A simulate-mode layout is drawn while it nests, so it
+        # genuinely needs its own master objects parented under its own group
+        # -- sharing them there would let one layout's teardown delete objects
+        # another layout is still drawing. Headless layouts are never drawn and
+        # are torn down by delete_layout, so they must NOT own the masters:
+        # see the shared group below.
+        self._master_pool = {}
+        self._shared_master_group = None
 
     def _perf_add(self, key, seconds):
         stats = self._perf_stats
@@ -134,7 +151,26 @@ class LayoutManager:
         stats = self._perf_stats
         if stats is not None:
             stats[key] = stats.get(key, 0) + count
-    
+
+    def _get_shared_master_group(self):
+        """Document-level group owning the pooled masters, headless only.
+
+        Deliberately NOT a child of any layout group. delete_layout recursively
+        deletes a layout group and everything under it, so masters parented
+        there would be destroyed by the teardown of whichever layout happened
+        to be discarded first, leaving every later layout with dangling
+        references. A layout-level group is still created per layout in
+        simulate mode, where ownership is unambiguous.
+        """
+        if self.create_doc_objects:
+            return None
+        if self._shared_master_group is None:
+            self._shared_master_group = self.doc.addObject(
+                "App::DocumentObjectGroup", "MasterShapes")
+            self._shared_master_group.Label = "MasterShapes"
+            self._perf_inc('lm_master_group_objects_created')
+        return self._shared_master_group
+
     def create_layout(self, name, master_shapes_map, quantities, ui_params, 
                       chromosome_ordering=None) -> Layout:
         """
@@ -168,7 +204,9 @@ class LayoutManager:
         # Create shape preparer for this layout
         preparer = ShapePreparer(self.doc, self.processed_shape_cache,
                                  perf_stats=self._perf_stats,
-                                 create_doc_objects=self.create_doc_objects)
+                                 create_doc_objects=self.create_doc_objects,
+                                 master_pool=self._master_pool,
+                                 shared_master_group=self._get_shared_master_group())
         
         # Prepare parts (creates masters and instances)
         prepare_start = time.perf_counter()

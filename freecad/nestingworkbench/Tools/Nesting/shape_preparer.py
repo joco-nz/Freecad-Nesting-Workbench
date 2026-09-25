@@ -19,7 +19,8 @@ class ShapePreparer:
     - Creates the temporary Shape instances used by the algorithm.
     """
     def __init__(self, doc, processed_shape_cache, perf_stats=None,
-                 create_doc_objects=True):
+                 create_doc_objects=True, master_pool=None,
+                 shared_master_group=None):
         self.doc = doc
         self.processed_shape_cache = processed_shape_cache
         # Optional run-scoped measurement sink (Performance Logging only).
@@ -35,6 +36,16 @@ class ShapePreparer:
         # master label -> master Part::Feature, captured during
         # prepare_parts so a headless layout can be materialized later.
         self._last_master_objects = {}
+        # cache_key -> (master_shape_obj, temp_shape_wrapper), shared across
+        # every layout of a run. Master objects depend only on the source shape
+        # and the geometry settings, so they are identical for all layouts and
+        # are built once instead of per layout. Populated only when
+        # create_doc_objects is False; a simulate-mode layout draws its masters
+        # as it nests and must own them outright. See LayoutManager.
+        self.master_pool = master_pool if master_pool is not None else {}
+        # Document-level group for pooled masters, or None in simulate mode
+        # (where the per-layout MasterShapes group is used instead).
+        self.shared_master_group = shared_master_group
 
     def _perf_add(self, key, seconds):
         stats = self._perf_stats
@@ -66,11 +77,21 @@ class ShapePreparer:
         verbose = ui_global_settings.get('verbose', False)
 
         self._last_master_objects = {}
-        master_shapes_group = self._get_or_create_master_group(layout_obj)
+        # Headless: masters are pooled in a document-level group shared by all
+        # layouts, so no per-layout group is created. Simulate: masters belong
+        # to this layout and go under its own group.
+        if self.shared_master_group is not None:
+            master_shapes_group = self.shared_master_group
+        else:
+            master_shapes_group = self._get_or_create_master_group(layout_obj)
 
         master_shape_obj_map = {} # Maps original FreeCAD object ID to the new master ShapeObject
         master_geometry_cache = {} # Maps original FreeCAD object ID to the processed Shape wrapper
         masters_to_place = []
+        # Containers this call is responsible for positioning. Pooled masters
+        # are excluded, so _arrange_masters only ever moves objects this layout
+        # created.
+        newly_built = []
 
         master_start = time.perf_counter()
         for label, master_obj in master_shapes_map.items():
@@ -87,6 +108,25 @@ class ShapePreparer:
                 cache_key = (master_obj.Name, spacing, deflection, simplification, up_direction)
                 is_reloading = master_obj.Label.startswith("master_shape_")
                 
+                # Pooled master hit: the objects already exist and do not
+                # depend on this layout, so reuse them wholesale and skip the
+                # whole create path below. This is the branch that turns 57
+                # master builds per run into 3.
+                pooled = self.master_pool.get(cache_key)
+                if pooled is not None:
+                    master_shape_obj, temp_shape_wrapper = pooled
+                    # source_freecad_object is rebound to this layout's source
+                    # object (same object every time, but keep the invariant
+                    # explicit rather than relying on that).
+                    temp_shape_wrapper.source_freecad_object = master_obj
+                    self._perf_inc('lm_masters_pooled')
+                    master_shape_obj_map[id(master_obj)] = master_shape_obj
+                    master_geometry_cache[id(master_obj)] = temp_shape_wrapper
+                    if master_shape_obj.InList:
+                        masters_to_place.append(
+                            (master_shape_obj.InList[0], temp_shape_wrapper))
+                    continue
+
                 temp_shape_wrapper = None
                 
                 # Check Cache
@@ -106,16 +146,31 @@ class ShapePreparer:
                 if master_shape_obj and temp_shape_wrapper:
                     master_shape_obj_map[id(master_obj)] = master_shape_obj
                     master_geometry_cache[id(master_obj)] = temp_shape_wrapper
+                    # Hand the wrapper to the next layout that needs this
+                    # master, so it can skip the build entirely. Only
+                    # populate the pool when a pool was supplied: in simulate
+                    # mode each layout must own its masters.
+                    if self.master_pool is not None:
+                        self.master_pool.setdefault(
+                            cache_key, (master_shape_obj, temp_shape_wrapper))
                     
                     # Need container for sorting/placing
                     if master_shape_obj.InList:
                         masters_to_place.append((master_shape_obj.InList[0], temp_shape_wrapper))
+                        newly_built.append(master_shape_obj.InList[0])
 
             except Exception as e:
                 FreeCAD.Console.PrintError(f"Could not create boundary for '{master_obj.Label}', it will be skipped. Error: {e}\n{traceback.format_exc()}\n")
                 continue
         
-        self._arrange_masters(masters_to_place, spacing)
+        # Arrange only the masters this call actually built. Pooled masters were
+        # positioned when first built and arranging them again would fight the
+        # shared ownership (several layouts each claiming to place the same
+        # container), which is a needless write rather than a saving, but it is
+        # also wrong to let a no-op layout perturb a container another live
+        # layout still points at.
+        if newly_built:
+            self._arrange_masters(masters_to_place, spacing)
         self._perf_add('lm_master_prepare_s', time.perf_counter() - master_start)
         self._perf_inc('lm_masters_processed', len(master_shapes_map))
 
