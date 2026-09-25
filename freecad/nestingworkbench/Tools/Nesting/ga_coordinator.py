@@ -264,8 +264,16 @@ class GACoordinator:
         # all take the dict by reference and no-op when it is None.
         self._layout_perf = _new_layout_perf_stats() if performance_logging else None
 
+        # GA layouts only need Shapely geometry while the search runs. The
+        # nester deep-copies parts in non-simulate mode (and Shape.__deepcopy__
+        # drops fc_object), so the per-layout FreeCAD part objects are pure
+        # overhead: they are only ever consumed at commit, for the winner.
+        # Simulate mode draws every layout as it nests, so it must keep them.
+        self._headless_layouts = not is_simulating
+
         self.layout_manager = LayoutManager(self.doc, self.shape_preparer.processed_shape_cache,
-                                            rng=self.rng, perf_stats=self._layout_perf)
+                                            rng=self.rng, perf_stats=self._layout_perf,
+                                            create_doc_objects=not self._headless_layouts)
         
         self._set_status(f"Creating {population_size} layouts...")
         if self.draw_callback:
@@ -413,12 +421,14 @@ class GACoordinator:
                 # converges quickly. If no elite child (improved ordering/rotation layout) is found
                 # after 5 generations, the population has converged to a local optimum, and continuing
                 # to run more generations would waste CPU/GPU resources without realistic chance of improvement.
-                if generations_without_improvement >= early_stop_threshold:
-                    FreeCAD.Console.PrintMessage(f"Early stopping: no improvement for {early_stop_threshold} generations\n")
-                    break
-                
+                # Decided before building the next generation (a converged run
+                # must not pay to breed a population it will discard), but acted
+                # on after this generation is accounted for and reported below, so
+                # the final generation is not dropped from generation_s.
+                early_stop = generations_without_improvement >= early_stop_threshold
+
                 # STEP 2 & 3: Build next generation
-                if gen < generations - 1:
+                if gen < generations - 1 and not early_stop:
                     layout_management_start = time.perf_counter()
                     actual_elite = min(elite_count, len(layouts))
                     elites = layouts[:actual_elite]
@@ -465,23 +475,37 @@ class GACoordinator:
                         f"cache_misses={self._ga_perf['candidate_geometry_cache_misses'] - generation_perf_start['candidate_geometry_cache_misses']}"
                         + (self._format_layout_generation(layout_perf_start) if self._layout_perf else "")
                         + "\n")
+
+                if early_stop:
+                    FreeCAD.Console.PrintMessage(
+                        f"Early stopping: no improvement for "
+                        f"{early_stop_threshold} generations\n")
+                    break
+
+            # Final cleanup: discard every layout except the winner.
+            #
+            # Deliberately done once after the loop rather than in the last
+            # generation: the cancel, interrupt and early-stop exits all leave
+            # a full population behind, and leaving those layouts in the
+            # document leaks their FreeCAD objects into the commit path.
+            # delete_layout is re-entry safe, so layouts already discarded by
+            # _build_next_generation are skipped here.
+            survivors = [l for l in layouts if l is not best_layout]
+            cleanup_start = time.perf_counter()
+            if survivors:
+                if self.draw_callback:
+                    self.draw_callback({
+                        'cleanup_layouts': True,
+                        'layouts': survivors,
+                        'best_layout': best_layout,
+                        'verbose': verbose,
+                    })
                 else:
-                    # Final cleanup
-                    cleanup_start = time.perf_counter()
-                    if self.draw_callback:
-                         self.draw_callback({
-                             'cleanup_layouts': True,
-                             'layouts': layouts,
-                             'best_layout': best_layout,
-                             'verbose': verbose
-                         })
-                    else:
-                        for layout in layouts:
-                            if layout != best_layout:
-                                self.layout_manager.delete_layout(layout, verbose=verbose)
-                    layouts = [best_layout]
-                    self._record_layout_time(
-                        'lm_cleanup_s', time.perf_counter() - cleanup_start)
+                    for layout in survivors:
+                        self.layout_manager.delete_layout(layout, verbose=verbose)
+            self._record_layout_time(
+                'lm_cleanup_s', time.perf_counter() - cleanup_start)
+            layouts = [best_layout] if best_layout is not None else []
 
             # Fill phase: generations nested regular parts only — fill the
             # winning layout exactly once (spawns still marshal to the main
@@ -878,6 +902,20 @@ class GACoordinator:
             best_layout.layout_group.ViewObject.Visibility = True
         
         if not getattr(self, 'is_simulating', False):
+            # A headless layout has no FreeCAD part objects yet, and
+            # Sheet.draw re-parents shape.fc_object into the final nested_*
+            # containers. Build them for the winner first — this is the only
+            # layout that ever needs them.
+            if getattr(self, '_headless_layouts', False):
+                materialize_start = time.perf_counter()
+                created = self.layout_manager.materialize_layout_objects(
+                    best_layout, ui_params)
+                self._record_layout_time('lm_materialize_s',
+                                         time.perf_counter() - materialize_start)
+                if self._layout_perf is not None:
+                    FreeCAD.Console.PrintMessage(
+                        f"[GA] Materialized {created} part objects for the "
+                        f"winning layout\n")
             for sheet in best_layout.sheets:
                 sheet.draw(self.doc, ui_params, best_layout.layout_group,
                            parts_to_place_group=best_layout.parts_group)

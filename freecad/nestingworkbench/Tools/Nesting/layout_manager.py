@@ -16,9 +16,10 @@ import copy
 import random
 import math
 import time
+import traceback
 from .shape_preparer import ShapePreparer
 from ...datatypes.shape import Shape
-from ...freecad_helpers import recursive_delete
+from ...freecad_helpers import recursive_delete, create_part_feature
 
 try:
     from shapely.geometry import Polygon
@@ -83,11 +84,16 @@ class Layout:
         genes: List of (part_id, angle) tuples representing the ordering and rotation
                of parts. Can be used to recreate the exact same layout.
     """
-    def __init__(self, layout_group, parts_group, parts, master_shapes_group=None):
+    def __init__(self, layout_group, parts_group, parts, master_shapes_group=None,
+                 master_objects=None):
         self.layout_group = layout_group  # The Layout_xxx group object
         self.parts_group = parts_group    # The PartsToPlace group
         self.parts = parts                # List of Shape objects for nesting
         self.master_shapes_group = master_shapes_group
+        # master label -> master Part::Feature. Lets a headless layout (one
+        # built without FreeCAD part objects) be materialized later; see
+        # LayoutManager.materialize_layout_objects.
+        self.master_objects = master_objects or {}
         self.sheets = []                  # Filled after nesting
         self.fitness = float('inf')
         self.efficiency = 0.0
@@ -104,7 +110,8 @@ class LayoutManager:
     Acts as a factory for Layout objects used in nesting.
     """
     
-    def __init__(self, doc, processed_shape_cache=None, rng=None, perf_stats=None):
+    def __init__(self, doc, processed_shape_cache=None, rng=None, perf_stats=None,
+                 create_doc_objects=True):
         self.doc = doc
         self.processed_shape_cache = processed_shape_cache or {}
         self._layout_counter = 0
@@ -113,6 +120,10 @@ class LayoutManager:
         # hook below is a no-op, so production runs pay nothing for this
         # instrumentation. Only the Performance Logging path passes a dict.
         self._perf_stats = perf_stats
+        # When False, layouts are built without FreeCAD part/boundary objects
+        # (Shapely only). The GA uses this so that only the winning layout
+        # pays for document object creation.
+        self.create_doc_objects = create_doc_objects
 
     def _perf_add(self, key, seconds):
         stats = self._perf_stats
@@ -156,7 +167,8 @@ class LayoutManager:
 
         # Create shape preparer for this layout
         preparer = ShapePreparer(self.doc, self.processed_shape_cache,
-                                 perf_stats=self._perf_stats)
+                                 perf_stats=self._perf_stats,
+                                 create_doc_objects=self.create_doc_objects)
         
         # Prepare parts (creates masters and instances)
         prepare_start = time.perf_counter()
@@ -183,7 +195,8 @@ class LayoutManager:
         self._layout_counter += 1
         self._perf_inc('lm_layouts_created')
         
-        layout = Layout(layout_group, parts_group, parts, master_shapes_group)
+        layout = Layout(layout_group, parts_group, parts, master_shapes_group,
+                        master_objects=dict(preparer._last_master_objects))
         if chromosome_ordering and parts:
             # Genotype drives nesting: only genes for parts that actually exist,
             # and never for fill parts (they are placed greedily after the genome)
@@ -194,6 +207,76 @@ class LayoutManager:
         self._perf_add('lm_create_s', time.perf_counter() - create_start)
         return layout
     
+    def materialize_layout_objects(self, layout, ui_params):
+        """
+        Creates the FreeCAD part/boundary objects for a headless layout.
+
+        Headless layouts (LayoutManager created with
+        ``create_doc_objects=False``) nest from Shapely geometry alone, so
+        their parts carry ``fc_object = None``. The winning layout must be
+        turned back into real document objects before ``Sheet.draw``, which
+        re-parents them out of ``parts_group`` into the final ``nested_*``
+        containers.
+
+        Master FreeCAD objects are still created per layout, so the geometry
+        source is already available and nothing is recomputed here.
+
+        Must be called on the main thread. Idempotent: any shape that already
+        has an ``fc_object`` is skipped, so calling it twice is harmless.
+        Parts spawned mid-nest (fill top-ups) are not in ``layout.parts``, so
+        the placed parts on each sheet are walked as well.
+
+        Returns:
+            int: number of parts materialized (0 if already materialized or
+            this manager builds document objects itself).
+        """
+        if self.create_doc_objects or not layout or not layout.parts_group:
+            return 0
+
+        parts_group = layout.parts_group
+        master_objects = getattr(layout, 'master_objects', None) or {}
+
+        candidates = list(layout.parts)
+        for sheet in (layout.sheets or []):
+            for placed in sheet.parts:
+                shape = getattr(placed, 'shape', None)
+                if shape is not None:
+                    candidates.append(shape)
+
+        created = 0
+        for shape in candidates:
+            if getattr(shape, 'fc_object', None) is not None:
+                continue
+            master = master_objects.get(getattr(shape, 'master_label', None))
+            if master is None:
+                continue
+            try:
+                part_copy = create_part_feature(
+                    self.doc, f"part_{shape.id}", master.Shape.copy(),
+                    group=parts_group, visible=False
+                )
+                self._perf_inc('lm_part_features_created')
+                part_copy.Placement = master.Placement
+
+                if hasattr(master, "BoundaryObject") and master.BoundaryObject:
+                    boundary_copy = create_part_feature(
+                        self.doc, f"boundary_{shape.id}",
+                        master.BoundaryObject.Shape.copy(),
+                        group=parts_group, visible=False
+                    )
+                    self._perf_inc('lm_part_boundary_features_created')
+                    part_copy.addProperty("App::PropertyLink", "BoundaryObject",
+                                          "Nesting", "Boundary object")
+                    part_copy.BoundaryObject = boundary_copy
+
+                shape.fc_object = part_copy
+                created += 1
+            except Exception:
+                FreeCAD.Console.PrintWarning(
+                    f"[LayoutManager] Could not materialize part "
+                    f"'{getattr(shape, 'id', '?')}': {traceback.format_exc()}\n")
+        return created
+
     def _apply_ordering(self, parts, chromosome_ordering):
         """
         Reorders and rotates parts according to a chromosome.

@@ -18,11 +18,23 @@ class ShapePreparer:
     - Manages the 'MasterShapes' group.
     - Creates the temporary Shape instances used by the algorithm.
     """
-    def __init__(self, doc, processed_shape_cache, perf_stats=None):
+    def __init__(self, doc, processed_shape_cache, perf_stats=None,
+                 create_doc_objects=True):
         self.doc = doc
         self.processed_shape_cache = processed_shape_cache
         # Optional run-scoped measurement sink (Performance Logging only).
         self._perf_stats = perf_stats
+        # When False, parts are Shapely-only: no Part::Feature is created for
+        # them and shape.fc_object stays None. GA layouts use this because the
+        # nester only ever reads shape.polygon — it deep-copies parts in
+        # non-simulate mode, and Shape.__deepcopy__ drops fc_object anyway,
+        # so the per-layout FreeCAD objects are pure overhead. The winning
+        # layout is materialized once at commit; see
+        # LayoutManager.materialize_layout_objects.
+        self.create_doc_objects = create_doc_objects
+        # master label -> master Part::Feature, captured during
+        # prepare_parts so a headless layout can be materialized later.
+        self._last_master_objects = {}
 
     def _perf_add(self, key, seconds):
         stats = self._perf_stats
@@ -53,6 +65,7 @@ class ShapePreparer:
         simplification = ui_global_settings.get('simplification', 0.1)
         verbose = ui_global_settings.get('verbose', False)
 
+        self._last_master_objects = {}
         master_shapes_group = self._get_or_create_master_group(layout_obj)
 
         master_shape_obj_map = {} # Maps original FreeCAD object ID to the new master ShapeObject
@@ -454,26 +467,29 @@ class ShapePreparer:
                 shape_instance.fill_sheet = fill_sheet
                 shape_instance.up_direction = up_direction
 
-                part_copy = create_part_feature(
-                    self.doc, f"part_{shape_instance.id}", master_shape_obj.Shape.copy(), group=parts_to_place_group, visible=False
-                )
-                self._perf_inc('lm_part_features_created')
-                part_copy.Placement = master_shape_obj.Placement
-
-                # Debug: Check what geometry we're getting
-                if verbose and up_direction != "Z+" and up_direction is not None:
-                    FreeCAD.Console.PrintMessage(f"     Part copy {shape_instance.id}: BoundBox={part_copy.Shape.BoundBox}\n")
-
-                # Copy boundary if exists
-                if hasattr(master_shape_obj, "BoundaryObject") and master_shape_obj.BoundaryObject:
-                    boundary_copy = create_part_feature(
-                        self.doc, f"boundary_{shape_instance.id}", master_shape_obj.BoundaryObject.Shape.copy(), group=parts_to_place_group, visible=False
+                if self.create_doc_objects:
+                    part_copy = create_part_feature(
+                        self.doc, f"part_{shape_instance.id}", master_shape_obj.Shape.copy(), group=parts_to_place_group, visible=False
                     )
-                    self._perf_inc('lm_part_boundary_features_created')
-                    part_copy.addProperty("App::PropertyLink", "BoundaryObject", "Nesting", "Boundary object")
-                    part_copy.BoundaryObject = boundary_copy
+                    self._perf_inc('lm_part_features_created')
+                    part_copy.Placement = master_shape_obj.Placement
 
-                shape_instance.fc_object = part_copy
+                    # Debug: Check what geometry we're getting
+                    if verbose and up_direction != "Z+" and up_direction is not None:
+                        FreeCAD.Console.PrintMessage(f"     Part copy {shape_instance.id}: BoundBox={part_copy.Shape.BoundBox}\n")
+
+                    # Copy boundary if exists
+                    if hasattr(master_shape_obj, "BoundaryObject") and master_shape_obj.BoundaryObject:
+                        boundary_copy = create_part_feature(
+                            self.doc, f"boundary_{shape_instance.id}", master_shape_obj.BoundaryObject.Shape.copy(), group=parts_to_place_group, visible=False
+                        )
+                        self._perf_inc('lm_part_boundary_features_created')
+                        part_copy.addProperty("App::PropertyLink", "BoundaryObject", "Nesting", "Boundary object")
+                        part_copy.BoundaryObject = boundary_copy
+
+                    shape_instance.fc_object = part_copy
+                # Headless: fc_object stays None. materialize_layout_objects()
+                # builds the real objects for the winning layout at commit.
 
                 # Do NOT manipulate Placement here.
                 # The Sheet.draw method is the sole authority on where this part ends up.
@@ -504,6 +520,10 @@ class ShapePreparer:
             master_wrapper = master_geometry_cache.get(id(original_obj))
             
             if not master_shape_obj or not master_wrapper: continue
+
+            # Recorded under the same normalized label the parts carry, so a
+            # headless layout can be materialized from master_label later.
+            self._last_master_objects[lookup_label] = master_shape_obj
 
             # Fill-sheet parts don't know in advance how many copies will fit,
             # so instance creation lives in a closure; fill parts carry a
