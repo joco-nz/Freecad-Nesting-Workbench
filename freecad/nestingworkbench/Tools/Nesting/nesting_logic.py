@@ -148,6 +148,7 @@ def nest(parts, width, height, rotation_steps=1, simulate=False, algorithm='Mink
     """
 
     sort = kwargs.pop('sort', True)
+    perf_stats_callback = kwargs.pop('perf_stats_callback', None)
     parts_to_process = parts if simulate else copy.deepcopy(parts)
 
     steps = 0
@@ -190,6 +191,8 @@ def nest(parts, width, height, rotation_steps=1, simulate=False, algorithm='Mink
     start_time = time.monotonic()
     result = nester.nest(parts_to_process, sort=sort)
     elapsed = time.monotonic() - start_time
+    if perf_stats_callback and hasattr(nester, 'get_perf_stats'):
+        perf_stats_callback(nester.get_perf_stats())
     
     if simulate:
         # These access FreeCAD doc objects and ViewObject — must run on main thread

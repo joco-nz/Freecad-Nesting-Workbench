@@ -3,6 +3,8 @@
 import math
 import os
 import random
+import time
+import threading
 import copy
 from datetime import datetime
 from collections import defaultdict
@@ -30,6 +32,26 @@ class PlacementOptimizer:
         self.trial_callback = trial_callback  # Called for each trial placement in simulation mode
         self.rng = rng or random  # Seeded random.Random for reproducible runs, or the global module
         self.verbose = False
+        self._perf_lock = threading.Lock()
+        self._perf_stats = {
+            'rotation_evaluations': 0,
+            'successful_rotations': 0,
+            'candidate_points': 0,
+            'valid_candidate_points': 0,
+            'nfp_ms': 0.0,
+            'candidate_validity_ms': 0.0,
+            'score_ms': 0.0,
+            'bounds_survivors': 0,
+            'sheet_candidates': 0,
+            'sheet_rejections': 0,
+            'collision_candidates': 0,
+            'collision_rejections': 0,
+            'bbox_rejections': 0,
+            'polygon_checks': 0,
+            'candidate_geometry_ms': 0.0,
+            'sheet_difference_ms': 0.0,
+            'collision_intersection_ms': 0.0,
+        }
 
     def log(self, message):
         if self.log_callback:
@@ -84,6 +106,31 @@ class PlacementOptimizer:
                     if res:
                         total_nfp_ms += res.get('_t_nfp_ms', 0)
                         total_score_ms += res.get('_t_score_ms', 0)
+                        with self._perf_lock:
+                            self._perf_stats['rotation_evaluations'] += 1
+                            self._perf_stats['successful_rotations'] += int(
+                                res.get('x') is not None)
+                            self._perf_stats['candidate_points'] += res.get(
+                                '_candidate_points', 0)
+                            self._perf_stats['valid_candidate_points'] += res.get(
+                                '_valid_candidate_points', 0)
+                            self._perf_stats['nfp_ms'] += res.get('_t_nfp_ms', 0)
+                            self._perf_stats['candidate_validity_ms'] += res.get(
+                                '_t_validity_ms', 0)
+                            self._perf_stats['score_ms'] += res.get('_t_score_ms', 0)
+                            for key in (
+                                'bounds_survivors', 'sheet_candidates',
+                                'sheet_rejections', 'collision_candidates',
+                                'collision_rejections', 'bbox_rejections',
+                                'polygon_checks',
+                            ):
+                                self._perf_stats[key] += res.get(f'_{key}', 0)
+                            self._perf_stats['candidate_geometry_ms'] += res.get(
+                                '_candidate_geometry_ms', 0)
+                            self._perf_stats['sheet_difference_ms'] += res.get(
+                                '_sheet_difference_ms', 0)
+                            self._perf_stats['collision_intersection_ms'] += res.get(
+                                '_collision_intersection_ms', 0)
                         if res['metric'] < best_result['metric']:
                             best_result = res
                             # Call trial callback from main thread for each better result found
@@ -163,12 +210,17 @@ class PlacementOptimizer:
         t_nfp = _time.perf_counter()
 
         best = {'metric': float('inf')}
+        t_validity = t_nfp
+        valid_mask = None
+        validity_probe = {}
         if pts_arr is not None and len(pts_arr):
             valid_mask = self._exact_candidate_mask(
                 rotated_poly,
                 pts_arr,
                 sheet,
+                probe=validity_probe,
             )
+            t_validity = _time.perf_counter()
             best_idx, metric = MinkowskiEngine.score_gravity(pts_arr, valid_mask, direction, rng=self.rng)
             if best_idx is not None:
                 best = {'x': float(pts_arr[best_idx, 0]), 'y': float(pts_arr[best_idx, 1]),
@@ -181,14 +233,23 @@ class PlacementOptimizer:
         t_end = _time.perf_counter()
         if self.verbose:
             self.log(f"    [{thread_id}] angle={angle:.0f}: NFP={((t_nfp-t0)*1000):.1f}ms, "
-                     f"score={((t_end-t_nfp)*1000):.1f}ms, total={((t_end-t0)*1000):.1f}ms")
+                     f"validity={((t_validity-t_nfp)*1000):.1f}ms, "
+                     f"score={((t_end-t_validity)*1000):.1f}ms, "
+                     f"total={((t_end-t0)*1000):.1f}ms")
 
         best['_t_nfp_ms'] = (t_nfp - t0) * 1000
-        best['_t_score_ms'] = (t_end - t_nfp) * 1000
+        best['_t_validity_ms'] = (t_validity - t_nfp) * 1000
+        best['_t_score_ms'] = (t_end - t_validity) * 1000
+        best['_candidate_points'] = len(pts_arr) if pts_arr is not None else 0
+        best['_valid_candidate_points'] = int(valid_mask.sum()) if valid_mask is not None else 0
+        for key, value in validity_probe.items():
+            best[f'_{key}'] = value
         return best
 
     @staticmethod
-    def _exact_candidate_mask(rotated_poly, points, sheet, area_tolerance=1e-7):
+    def _exact_candidate_mask(
+        rotated_poly, points, sheet, area_tolerance=1e-7, probe=None
+    ):
         """Validate NFP candidates against the actual transformed polygons.
 
         NFP boundaries are a candidate generator, not the final collision
@@ -207,6 +268,8 @@ class PlacementOptimizer:
             & (points[:, 1] + rminy >= -area_tolerance)
             & (points[:, 1] + rmaxy <= sheet.height + area_tolerance)
         )
+        if probe is not None:
+            probe['bounds_survivors'] = int(valid.sum())
         if not valid.any():
             return valid
 
@@ -221,18 +284,66 @@ class PlacementOptimizer:
         bin_polygon = Polygon(
             [(0, 0), (sheet.width, 0), (sheet.width, sheet.height), (0, sheet.height)]
         )
+        existing_bounds = [polygon.bounds for polygon in existing_polygons]
+        if probe is not None:
+            probe['sheet_candidates'] = int(valid.sum())
         for index in np.flatnonzero(valid):
+            geometry_start = time.perf_counter()
             candidate = translate(
                 rotated_poly,
                 xoff=float(points[index, 0] - rotated_centroid.x),
                 yoff=float(points[index, 1] - rotated_centroid.y),
             )
+            if probe is not None:
+                probe['candidate_geometry_ms'] = probe.get(
+                    'candidate_geometry_ms', 0.0) + (
+                    time.perf_counter() - geometry_start) * 1000
+            difference_start = time.perf_counter()
             if candidate.difference(bin_polygon).area > area_tolerance:
                 valid[index] = False
+                if probe is not None:
+                    probe['sheet_rejections'] = probe.get('sheet_rejections', 0) + 1
+                    probe['sheet_difference_ms'] = probe.get(
+                        'sheet_difference_ms', 0.0) + (
+                        time.perf_counter() - difference_start) * 1000
                 continue
-            if any(candidate.intersection(existing).area > area_tolerance
-                   for existing in existing_polygons):
+            if probe is not None:
+                probe['sheet_difference_ms'] = probe.get(
+                    'sheet_difference_ms', 0.0) + (
+                    time.perf_counter() - difference_start) * 1000
+                probe['collision_candidates'] = probe.get(
+                    'collision_candidates', 0) + 1
+            collision = False
+            candidate_min_x, candidate_min_y, candidate_max_x, candidate_max_y = (
+                candidate.bounds)
+            for existing, (
+                existing_min_x, existing_min_y, existing_max_x, existing_max_y
+            ) in zip(existing_polygons, existing_bounds):
+                if (
+                    candidate_max_x <= existing_min_x
+                    or candidate_min_x >= existing_max_x
+                    or candidate_max_y <= existing_min_y
+                    or candidate_min_y >= existing_max_y
+                ):
+                    if probe is not None:
+                        probe['bbox_rejections'] = probe.get(
+                            'bbox_rejections', 0) + 1
+                    continue
+                probe_checks_start = time.perf_counter()
+                overlaps = candidate.intersection(existing).area > area_tolerance
+                if probe is not None:
+                    probe['polygon_checks'] = probe.get('polygon_checks', 0) + 1
+                    probe['collision_intersection_ms'] = probe.get(
+                        'collision_intersection_ms', 0.0) + (
+                        time.perf_counter() - probe_checks_start) * 1000
+                if overlaps:
+                    collision = True
+                    break
+            if collision:
                 valid[index] = False
+                if probe is not None:
+                    probe['collision_rejections'] = probe.get(
+                        'collision_rejections', 0) + 1
 
         return valid
 
@@ -269,6 +380,16 @@ class Nester:
         self.parts_to_place = []
         self.sheets = []
         self.update_callback = None # Can be set externally
+
+    def get_perf_stats(self):
+        """Return aggregated candidate-evaluation and NFP timings."""
+        with self.optimizer._perf_lock:
+            stats = dict(self.optimizer._perf_stats)
+        stats.update({
+            f'nfp_{key}': value
+            for key, value in self.engine.get_perf_stats().items()
+        })
+        return stats
 
 
     def log(self, message, level="message"):

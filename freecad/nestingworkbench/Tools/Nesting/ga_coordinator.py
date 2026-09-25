@@ -7,6 +7,7 @@ import FreeCAD
 import FreeCADGui
 import math
 import random
+import time
 from ...datatypes.shape import Shape
 from .layout_manager import LayoutManager
 from .algorithms import genetic_utils
@@ -34,6 +35,28 @@ class GACoordinator:
         self.worker = worker
         self.layout_manager = None
         self._pending_layouts = None
+        self._ga_perf = None
+
+    def _record_nest_perf(self, stats, elapsed):
+        if self._ga_perf is None:
+            return
+        self._ga_perf['layout_evaluations'] += 1
+        self._ga_perf['nesting_s'] += elapsed
+        self._ga_perf['nfp_compute_s'] += stats.get('nfp_nfp_compute_ms', 0.0) / 1000
+        self._ga_perf['candidate_validity_s'] += stats.get('candidate_validity_ms', 0.0) / 1000
+        self._ga_perf['candidate_score_s'] += stats.get('score_ms', 0.0) / 1000
+        self._ga_perf['candidate_geometry_s'] += stats.get('candidate_geometry_ms', 0.0) / 1000
+        self._ga_perf['sheet_difference_s'] += stats.get('sheet_difference_ms', 0.0) / 1000
+        self._ga_perf['collision_intersection_s'] += stats.get(
+            'collision_intersection_ms', 0.0) / 1000
+        for key in ('rotation_evaluations', 'successful_rotations',
+                    'candidate_points', 'valid_candidate_points',
+                    'bounds_survivors', 'sheet_candidates', 'sheet_rejections',
+                    'collision_candidates', 'collision_rejections',
+                    'bbox_rejections', 'polygon_checks'):
+            self._ga_perf[key] += stats.get(key, 0)
+        self._ga_perf['nfp_cache_hits'] += stats.get('nfp_cache_hits', 0)
+        self._ga_perf['nfp_cache_misses'] += stats.get('nfp_cache_misses', 0)
 
     def _set_status(self, msg):
         if self.worker:
@@ -128,9 +151,38 @@ class GACoordinator:
         best_efficiency = 0
         generations_without_improvement = 0
         total_nesting_time = 0
+        self._ga_perf = {
+            'generation_s': 0.0,
+            'layout_evaluations': 0,
+            'nesting_s': 0.0,
+            'nfp_compute_s': 0.0,
+            'candidate_validity_s': 0.0,
+            'candidate_score_s': 0.0,
+            'candidate_geometry_s': 0.0,
+            'sheet_difference_s': 0.0,
+            'collision_intersection_s': 0.0,
+            'bounds_survivors': 0,
+            'sheet_candidates': 0,
+            'sheet_rejections': 0,
+            'collision_candidates': 0,
+            'collision_rejections': 0,
+            'bbox_rejections': 0,
+            'polygon_checks': 0,
+            'candidate_points': 0,
+            'valid_candidate_points': 0,
+            'rotation_evaluations': 0,
+            'successful_rotations': 0,
+            'nfp_cache_hits': 0,
+            'nfp_cache_misses': 0,
+            'layout_management_s': 0.0,
+            'visualization_s': 0.0,
+            'offspring_layouts': 0,
+            'immigrant_layouts': 0,
+        }
         
         try:
             for gen in range(generations):
+                generation_start = time.perf_counter()
                 if cancel_callback():
                     FreeCAD.Console.PrintMessage("Nesting cancelled by user.\n")
                     break
@@ -138,10 +190,12 @@ class GACoordinator:
                 if verbose:
                     FreeCAD.Console.PrintMessage(f"\n=== Generation {gen+1}/{generations} ===\n")
                 self._set_status(f"Generation {gen+1}/{generations}...")
+                gui_start = time.perf_counter()
                 if self.draw_callback:
                     self.draw_callback({'updateGui_only': True})
                 else:
                     FreeCADGui.updateGui()
+                self._ga_perf['visualization_s'] += time.perf_counter() - gui_start
                 
                 gen_time, interrupted = self._run_generation(
                     layouts, gen, generations, ui_params, rotation_steps, 
@@ -177,6 +231,7 @@ class GACoordinator:
                 
                 # STEP 2 & 3: Build next generation
                 if gen < generations - 1:
+                    layout_management_start = time.perf_counter()
                     actual_elite = min(elite_count, len(layouts))
                     elites = layouts[:actual_elite]
                     
@@ -201,6 +256,8 @@ class GACoordinator:
                             gen, layouts, elites, master_map, quantities, ui_params, 
                             rotation_steps, mutation_rate, immigrant_ratio, verbose
                         )
+                    self._ga_perf['layout_management_s'] += (
+                        time.perf_counter() - layout_management_start)
                 else:
                     # Final cleanup
                     if self.draw_callback:
@@ -215,6 +272,15 @@ class GACoordinator:
                             if layout != best_layout:
                                 self.layout_manager.delete_layout(layout, verbose=verbose)
                     layouts = [best_layout]
+
+                generation_elapsed = time.perf_counter() - generation_start
+                self._ga_perf['generation_s'] += generation_elapsed
+                if verbose:
+                    FreeCAD.Console.PrintMessage(
+                        f"[GA PERF] generation={gen + 1} total={generation_elapsed:.2f}s "
+                        f"layouts={len(layouts)} nesting={gen_time:.2f}s "
+                        f"cumulative_nesting={self._ga_perf['nesting_s']:.2f}s "
+                        f"layout_management={self._ga_perf['layout_management_s']:.2f}s\n")
             
             # Fill phase: generations nested regular parts only — fill the
             # winning layout exactly once (spawns still marshal to the main
@@ -257,6 +323,34 @@ class GACoordinator:
                         best_layout, ui_params['sheet_width'], ui_params['sheet_height'],
                         ui_params.get('compactness_weight', 0.0))
                     best_efficiency = best_layout.efficiency
+
+            if self._ga_perf:
+                FreeCAD.Console.PrintMessage(
+                    "[GA PERF TOTAL] "
+                    f"generations={self._ga_perf['generation_s']:.2f}s "
+                    f"layouts={self._ga_perf['layout_evaluations']} "
+                    f"nesting={self._ga_perf['nesting_s']:.2f}s "
+                    f"nfp_compute={self._ga_perf['nfp_compute_s']:.2f}s "
+                    f"validity={self._ga_perf['candidate_validity_s']:.2f}s "
+                    f"score={self._ga_perf['candidate_score_s']:.2f}s "
+                    f"candidate_geometry={self._ga_perf['candidate_geometry_s']:.2f}s "
+                    f"sheet_difference={self._ga_perf['sheet_difference_s']:.2f}s "
+                    f"collision_intersection={self._ga_perf['collision_intersection_s']:.2f}s "
+                    f"layout_management={self._ga_perf['layout_management_s']:.2f}s "
+                    f"offspring={self._ga_perf['offspring_layouts']} "
+                    f"immigrants={self._ga_perf['immigrant_layouts']} "
+                    f"rotations={self._ga_perf['rotation_evaluations']} "
+                    f"candidates={self._ga_perf['candidate_points']} "
+                    f"valid_candidates={self._ga_perf['valid_candidate_points']} "
+                    f"bounds_survivors={self._ga_perf['bounds_survivors']} "
+                    f"sheet_candidates={self._ga_perf['sheet_candidates']} "
+                    f"sheet_rejections={self._ga_perf['sheet_rejections']} "
+                    f"collision_candidates={self._ga_perf['collision_candidates']} "
+                    f"collision_rejections={self._ga_perf['collision_rejections']} "
+                    f"bbox_rejections={self._ga_perf['bbox_rejections']} "
+                    f"polygon_checks={self._ga_perf['polygon_checks']} "
+                    f"nfp_hits={self._ga_perf['nfp_cache_hits']} "
+                    f"nfp_misses={self._ga_perf['nfp_cache_misses']}\n")
             
             # STEP 4: Finalize result — dispatch to main thread (ViewObject + recompute)
             job = self._dispatch_finalize(best_layout, best_efficiency, total_nesting_time, target_layout, ui_params)
@@ -330,6 +424,8 @@ class GACoordinator:
             current_kwargs = algo_kwargs.copy()
             current_kwargs['rng'] = self.rng  # Seeded fallback for search_direction=None
             current_kwargs['spawn_more_callback'] = self.request_spawn
+            nest_perf = [None]
+            current_kwargs['perf_stats_callback'] = lambda stats: nest_perf.__setitem__(0, stats)
             if layout.direction is not None:
                 current_kwargs['search_direction'] = layout.direction
             if self.draw_callback:
@@ -356,6 +452,8 @@ class GACoordinator:
                 rotation_steps, is_simulating, algorithm=ui_params.get('algorithm', 'Minkowski'),
                 viz_manager=viz_manager, **current_kwargs
             )
+            if nest_perf[0] is not None:
+                self._record_nest_perf(nest_perf[0], elapsed)
 
             if not is_simulating:
                  original_parts_map = {p.id: p for p in layout.parts}
@@ -437,6 +535,9 @@ class GACoordinator:
         population_size = len(layouts)
         n_immigrants = max(1, int((population_size - 1) * immigrant_ratio))
         n_offspring = max(0, (population_size - 1) - n_immigrants)
+        if self._ga_perf is not None:
+            self._ga_perf['offspring_layouts'] += n_offspring
+            self._ga_perf['immigrant_layouts'] += n_immigrants
 
         for i in range(n_offspring):
             k = min(3, len(ranked_pool))
