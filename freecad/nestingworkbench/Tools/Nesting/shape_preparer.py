@@ -39,13 +39,18 @@ class ShapePreparer:
         # cache_key -> (master_shape_obj, temp_shape_wrapper), shared across
         # every layout of a run. Master objects depend only on the source shape
         # and the geometry settings, so they are identical for all layouts and
-        # are built once instead of per layout. Populated only when
-        # create_doc_objects is False; a simulate-mode layout draws its masters
-        # as it nests and must own them outright. See LayoutManager.
+        # are built once instead of per layout. See LayoutManager.
         self.master_pool = master_pool if master_pool is not None else {}
         # Document-level group for pooled masters, or None in simulate mode
         # (where the per-layout MasterShapes group is used instead).
         self.shared_master_group = shared_master_group
+        # Pooling is gated on create_doc_objects, NOT on master_pool being
+        # non-empty. LayoutManager always supplies a pool dict, so gating on
+        # the dict alone let simulate mode read it: layouts 2..N then reused
+        # layout 1's masters instead of owning their own, which is exactly
+        # what simulate mode must not do -- it draws as it nests, so tearing
+        # one down must not remove objects another is still using.
+        self.pool_masters = not create_doc_objects
 
     def _perf_add(self, key, seconds):
         stats = self._perf_stats
@@ -112,7 +117,8 @@ class ShapePreparer:
                 # depend on this layout, so reuse them wholesale and skip the
                 # whole create path below. This is the branch that turns 57
                 # master builds per run into 3.
-                pooled = self.master_pool.get(cache_key)
+                pooled = self.master_pool.get(cache_key) \
+                    if self.pool_masters else None
                 if pooled is not None:
                     master_shape_obj, temp_shape_wrapper = pooled
                     # source_freecad_object is rebound to this layout's source
@@ -147,10 +153,9 @@ class ShapePreparer:
                     master_shape_obj_map[id(master_obj)] = master_shape_obj
                     master_geometry_cache[id(master_obj)] = temp_shape_wrapper
                     # Hand the wrapper to the next layout that needs this
-                    # master, so it can skip the build entirely. Only
-                    # populate the pool when a pool was supplied: in simulate
-                    # mode each layout must own its masters.
-                    if self.master_pool is not None:
+                    # master, so it can skip the build entirely. Headless
+                    # only: in simulate mode each layout must own its masters.
+                    if self.pool_masters:
                         self.master_pool.setdefault(
                             cache_key, (master_shape_obj, temp_shape_wrapper))
                     
