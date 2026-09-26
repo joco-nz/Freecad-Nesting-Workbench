@@ -30,11 +30,24 @@ def _safe_ratio(numerator, denominator):
 def _subthreshold_pct(perf):
     """Share of hole vertices sitting in rings too small to hold any part.
 
-    This is the number that decides whether filling sub-threshold holes is worth
-    attempting at all. A small value means both the speed prize and the quality
-    risk are rounding errors, and the whole line of work closes. The test
-    mirrors the NFP engine's own hole filter, so "sub-threshold" here means
-    exactly "the NFP builds no legal-position island for this ring".
+    Necessary but NOT sufficient to justify filling sub-threshold holes. The
+    test mirrors the NFP engine's own hole filter, so "sub-threshold" here means
+    exactly "the NFP builds no legal-position island for this ring" -- i.e. these
+    rings are dead weight for candidate generation. A high value therefore says
+    the *NFP* wastes effort on them; it says nothing about the *collision mask*,
+    which is where a fill would actually save time.
+
+    The size of the collision-side prize is capped by two other numbers, both
+    printed on the same line and both much smaller than this one:
+
+    - hole_pct -- hole vertices as a share of the whole mask. A fill can only
+      remove vertices the overlay predicates have to walk.
+    - hole_sensitive_pairs / collision_intersects_true -- the share of overlays
+      whose verdict depends on a hole at all. The GEOS intersection envelope is
+      a subset of the candidate bbox, so this is a strict upper bound. On the
+      122-part fixture it is ~25%.
+
+    Against those, mask_hole_exploiting_placements is the yield a fill destroys.
     """
     sub = perf.get('mask_subthreshold_hole_vertices', 0)
     holes = perf.get('mask_hole_vertices', 0)
@@ -243,6 +256,13 @@ class GACoordinator:
             self._ga_perf['max_concurrent_rotations'],
             stats.get('max_concurrent_rotations', 0),
         )
+        # A per-run constant, not an accumulator: every find_best_placement call
+        # resolves the same limit, so max() is the honest reduction and also
+        # makes a mid-run env change visible instead of averaged away.
+        self._ga_perf['rotation_workers'] = max(
+            self._ga_perf.get('rotation_workers', 0),
+            stats.get('rotation_workers', 0),
+        )
         self._ga_perf['candidate_geometry_cache_entries'] = max(
             self._ga_perf['candidate_geometry_cache_entries'],
             stats.get('candidate_geometry_cache_entries', 0),
@@ -415,6 +435,7 @@ class GACoordinator:
             'candidate_geometry_unique': 0,
             'candidate_geometry_repeats': 0,
             'max_concurrent_rotations': 0,
+            'rotation_workers': 0,
             'candidate_points': 0,
             'valid_candidate_points': 0,
             'rotation_evaluations': 0,
@@ -661,6 +682,10 @@ class GACoordinator:
                     f"placement_wall={self._ga_perf['placement_wall_s']:.2f}s "
                     f"rotation_wall={self._ga_perf['rotation_wall_s']:.2f}s "
                     f"max_concurrent_rotations={self._ga_perf['max_concurrent_rotations']} "
+                    # Thread-pool width actually used, so an NESTING_ROTATION_WORKERS
+                    # A/B is attributable from the log alone. Pair it with
+                    # rotation_wall / nesting wall to get realised parallelism.
+                    f"rotation_workers={self._ga_perf['rotation_workers']} "
                     f"candidate_geometries={self._ga_perf['candidate_geometries_built']} "
                     f"geometry_key_observations={self._ga_perf['candidate_geometry_observations']} "
                     f"geometry_unique={self._ga_perf['candidate_geometry_unique']} "
@@ -697,9 +722,21 @@ class GACoordinator:
                     f"/{self._ga_perf['mask_batch_max']} "
                     f"hole_rings={self._ga_perf['mask_hole_rings']} "
                     f"hole_vertices={self._ga_perf['mask_hole_vertices']} "
+                    # Raw exterior count, not just its ratio. hole_pct alone cannot
+                    # be trusted: the exterior is accumulated once per existing
+                    # polygon per mask call, so its magnitude is governed by
+                    # bbox_checks, and on the 122-part fixture bbox_checks is
+                    # 20.3M -- which forces the ratio down to ~3% no matter what
+                    # hole_vertices says. Printing both raw totals makes the
+                    # denominator auditable instead of merely asserted.
+                    f"exterior_vertices={self._ga_perf['mask_exterior_vertices']} "
                     f"hole_pct={_hole_vertex_pct(self._ga_perf):.1f}% "
+                    # Denominator is existing-part rings PLUS candidate rings:
+                    # both are classified against the same threshold, so counting
+                    # only the existing-part side lets the numerator exceed the
+                    # denominator (500844 vs 496827 on the fixture).
                     f"subthreshold_rings={self._ga_perf['mask_subthreshold_hole_rings']}"
-                    f"/{self._ga_perf['mask_hole_rings']} "
+                    f"/{self._ga_perf['mask_hole_rings'] + self._ga_perf['mask_candidate_rings']} "
                     f"subthreshold_pct={_subthreshold_pct(self._ga_perf):.1f}% "
                     f"hole_sensitive_pairs={self._ga_perf['mask_hole_sensitive_pairs']} "
                     f"hole_exploiting_placements={self._ga_perf['mask_hole_exploiting_placements']} "

@@ -26,6 +26,31 @@ def _candidate_geometry_key(prefix, x, y):
     return (prefix, float(x), float(y))
 
 
+def _rotation_worker_limit():
+    """Resolve the rotation thread-pool size, or None for the stdlib default.
+
+    ``ThreadPoolExecutor()`` with no argument defaults to
+    ``min(32, os.cpu_count() + 4)``, which is 8 on the 4-CPU development box --
+    twice the core count. The candidate-geometry work is GEOS-bound and releases
+    the GIL, so oversubscription is not automatically harmful, but it is also not
+    automatically helpful: it trades throughput for cache pressure and
+    contention on the shared NFP cache. The effective width is therefore
+    measurable rather than assumed.
+
+    ``NESTING_ROTATION_WORKERS`` overrides it. This exists so the 4-vs-8
+    comparison can be run without editing code; unset means "stdlib default",
+    which is the production behaviour and is what the fixture baseline used.
+    """
+    raw = os.environ.get('NESTING_ROTATION_WORKERS', '').strip()
+    if not raw:
+        return None
+    try:
+        value = int(raw)
+    except ValueError:
+        return None
+    return value if value > 0 else None
+
+
 # Measurement-only. Ring area is needed to classify an interior ring as able or
 # unable to hold a nestable part, and a LinearRing exposes no area of its own.
 #
@@ -290,6 +315,7 @@ class PlacementOptimizer:
             'candidate_geometry_unique': 0,
             'candidate_geometry_repeats': 0,
             'max_concurrent_rotations': 0,
+            'rotation_workers': 0,
         }
 
     def log(self, message):
@@ -334,7 +360,17 @@ class PlacementOptimizer:
         total_nfp_ms = 0.0
         total_validity_ms = 0.0
         total_score_ms = 0.0
-        with ThreadPoolExecutor() as executor:
+        # Recorded so the report line is self-describing: a run measured with
+        # the env override must say so, otherwise the 4-vs-8 comparison is
+        # unattributable. max_workers=None means the stdlib default.
+        worker_limit = _rotation_worker_limit()
+        with self._perf_lock:
+            self._perf_stats['rotation_workers'] = (
+                worker_limit
+                if worker_limit is not None
+                else min(32, (os.cpu_count() or 1) + 4)
+            )
+        with ThreadPoolExecutor(max_workers=worker_limit) as executor:
             futures = {
                 executor.submit(
                     self._evaluate_rotation_tracked,
