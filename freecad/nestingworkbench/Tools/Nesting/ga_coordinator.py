@@ -11,6 +11,7 @@ import time
 from ...datatypes.shape import Shape
 from .layout_manager import LayoutManager
 from .algorithms import genetic_utils
+from .algorithms import minkowski_utils
 
 
 def _safe_ratio(numerator, denominator):
@@ -54,6 +55,21 @@ def _subthreshold_pct(perf):
     if not holes:
         return 0.0
     return 100.0 * sub / holes
+
+
+def _dead_ring_summary():
+    """One-line dead-ring pruning summary, or 'off'.
+
+    Empty whenever the optimisation is disabled, so the default production
+    report is unchanged and a reader can tell at a glance whether the A/B was
+    actually armed -- a knob that silently does nothing is worse than no knob.
+    """
+    stats = minkowski_utils.get_dead_ring_stats()
+    if not stats:
+        return "off"
+    return "polys=%d rings=%d dropped=%d parts=%d" % (
+        stats['polygons_pruned'], stats['rings_seen'],
+        stats['rings_dropped'], stats['parts_after'])
 
 
 def _hole_vertex_pct(perf):
@@ -686,6 +702,11 @@ class GACoordinator:
                     # A/B is attributable from the log alone. Pair it with
                     # rotation_wall / nesting wall to get realised parallelism.
                     f"rotation_workers={self._ga_perf['rotation_workers']} "
+                    # Dead-ring pruning. Read straight from the module because the
+                    # part set it needs is run-global state, not something that
+                    # travels the per-generation stats dict. Empty when the
+                    # optimisation is off, which is the default.
+                    f"dead_rings={_dead_ring_summary()} "
                     f"candidate_geometries={self._ga_perf['candidate_geometries_built']} "
                     f"geometry_key_observations={self._ga_perf['candidate_geometry_observations']} "
                     f"geometry_unique={self._ga_perf['candidate_geometry_unique']} "

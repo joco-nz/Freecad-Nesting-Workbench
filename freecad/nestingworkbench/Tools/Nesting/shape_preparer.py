@@ -7,6 +7,7 @@ import Draft
 import time
 import traceback
 from .algorithms import shape_processor
+from .algorithms import minkowski_utils
 from ...datatypes.shape_object import create_shape_object
 from ...datatypes.shape import Shape
 from ...freecad_helpers import get_up_direction_rotation, create_part_feature
@@ -193,6 +194,11 @@ class ShapePreparer:
         self._perf_add('lm_master_prepare_s', time.perf_counter() - master_start)
         self._perf_inc('lm_masters_processed', len(master_shapes_map))
 
+        # Whether an interior ring is dead depends on the SMALLEST part in the
+        # whole set, which is not known until every master has been prepared --
+        # hence publishing here, after the master loop.
+        self._publish_dead_ring_profiles(master_geometry_cache)
+
         instances_start = time.perf_counter()
         parts_to_nest = self._create_nesting_instances(
             master_shapes_map, 
@@ -203,8 +209,45 @@ class ShapePreparer:
             parts_group
         )
         self._perf_add('lm_part_instances_s', time.perf_counter() - instances_start)
-        
+
         return parts_to_nest
+
+    def _publish_dead_ring_profiles(self, master_geometry_cache):
+        """Hand the part set's extents to the NFP decomposition.
+
+        Deliberately NOT undone at the end of this method. The decomposition
+        runs during find_best_placement, long after prepare_parts has returned,
+        so clearing here would disable the optimisation for the entire actual
+        nesting run. Shape.clear_caches() is NOT the place either: it is called
+        between GA generations, and the part set is run configuration rather
+        than a cache, so clearing it there would switch the optimisation off
+        partway through a run. This method's opening clear is the only owner.
+        """
+        # Unconditional: a run that has pruning switched off must not inherit a
+        # previous run's part set.
+        minkowski_utils.clear_dead_ring_profiles()
+        if not minkowski_utils.dead_ring_pruning_requested():
+            return
+        if not master_geometry_cache:
+            return
+        profiles = []
+        seen = set()
+        for wrapper in master_geometry_cache.values():
+            poly = getattr(wrapper, 'original_polygon', None)
+            if poly is None or poly.is_empty:
+                continue
+            minx, miny, maxx, maxy = poly.bounds
+            key = (round(maxx - minx, 9), round(maxy - miny, 9), round(poly.area, 9))
+            if key in seen:
+                continue
+            seen.add(key)
+            profiles.append(key)
+        if not profiles:
+            return
+        minkowski_utils.set_dead_ring_profiles(profiles)
+        FreeCAD.Console.PrintMessage(
+            "  -> Dead-ring pruning active for %d distinct part profile(s)\n"
+            % len(profiles))
 
     def _get_or_create_master_group(self, layout_obj):
         master_shapes_group = None

@@ -6,6 +6,7 @@ and differences (including containment/erosion for IFP) to determine valid
 placement zones for nesting operations.
 """
 import math
+import os
 import time
 import threading
 from concurrent.futures import Future
@@ -20,6 +21,158 @@ from ....datatypes.shape import Shape
 _decomposition_lock = threading.Lock()
 
 
+# ---------------------------------------------------------------------------
+# Dead-ring pruning.
+#
+# A polygon's interior rings are not free. The convex decomposition has to
+# cover the material AROUND every ring, so each ring costs convex pieces, and
+# the NFP then pays one pairwise Minkowski sum per piece pair. On the 122-part
+# fixture a ring that no nestable part can ever occupy is responsible for the
+# difference between 192 pieces and 98 on the Spacer, and between 27 and 1 on
+# Bottle Top.
+#
+# A ring is DEAD when no part in the set is strictly narrower than it on both
+# axes and smaller in area -- the same strict test the NFP engine already
+# applies when deciding whether to build an inner-fit island for a ring
+# (see minkowski_engine._compute_nfp_uncached). If no part can fit inside a
+# ring, that ring cannot be the reason a placement is legal, so decomposing
+# around it is wasted work.
+#
+# Two properties make this safe rather than merely plausible:
+#
+# 1. FRAME. The prune happens on the polygon handed to the decomposition, not
+#    on the shape. minkowski_sum separately computes `c1 = master_poly1.centroid`
+#    from the ORIGINAL polygon, and get_global_nfp_for anchors the result on
+#    `p.shape.centroid` -- the unfilled collision mask. So the NFP stays in
+#    exactly the frame production uses. Replacing original_polygon wholesale
+#    instead would move the centroid and silently relocate every candidate.
+#
+# 2. NO COLLISION-MASK CHANGE. The collision mask never passes through here,
+#    so it keeps every ring and remains the exact verifier. This optimisation
+#    only ever removes NFP over-cover; it can never let an overlap through.
+#
+# It also repairs a real defect. Replacing a clipped piece with its
+# `convex_hull` (in _decompose_uncached) over-covers rings, but the unconstrained
+# Delaunay can also lose coverage outright. Measured on the fixture, the
+# unpruned NFP area for Bottle Top x Bottle Top is 15094.8 at 0/45/180/225 deg
+# yet collapses to 10947.6 at 90 deg and 11977.6 at 135 deg. A Minkowski sum of
+# two rigid bodies has area invariant under relative rotation, so 15094.8 is
+# correct at every angle and the smaller figures are lost coverage -- the exact
+# failure the code comment in _decompose_uncached says must never happen. With
+# the rings pruned, the area is 15094.8 at all eight angles.
+#
+# Opt-in via NESTING_FILL_DEAD_HOLES so the fixture can be run as a control.
+# ---------------------------------------------------------------------------
+
+_dead_ring_profiles = None
+_dead_ring_stats = {
+    'polygons_pruned': 0,
+    'rings_seen': 0,
+    'rings_dropped': 0,
+    'parts_after': 0,
+}
+
+
+def dead_ring_pruning_requested():
+    """True when NESTING_FILL_DEAD_HOLES asks for the optimisation.
+
+    Default off. The measurement in the comment above was taken against the
+    real engine, but the packing outcome still has to be confirmed on the
+    fixture, and a control run is the only honest way to do that.
+    """
+    raw = os.environ.get('NESTING_FILL_DEAD_HOLES', '').strip().lower()
+    return raw in ('1', 'true', 'yes', 'on')
+
+
+def set_dead_ring_profiles(profiles):
+    """Publish the (width, height, area) of every part type, or None to disable.
+
+    Must be called after ALL parts are prepared: whether a ring is dead depends
+    on the smallest part in the whole set, which is not known until then. Each
+    call starts a fresh counting session, because prepare_parts runs once per
+    layout and the counters describe one layout's work.
+    """
+    global _dead_ring_profiles
+    _dead_ring_profiles = tuple(profiles) if profiles else None
+    for key in _dead_ring_stats:
+        _dead_ring_stats[key] = 0
+
+
+def clear_dead_ring_profiles():
+    """Disable pruning and reset counters. Always call this when done."""
+    global _dead_ring_profiles
+    _dead_ring_profiles = None
+    for key in _dead_ring_stats:
+        _dead_ring_stats[key] = 0
+
+
+def get_dead_ring_stats():
+    """Snapshot of the counters. Empty when pruning was never enabled."""
+    if _dead_ring_profiles is None:
+        return {}
+    return dict(_dead_ring_stats)
+
+
+def _ring_is_live(ring):
+    """True when some part in the set could fit inside this ring.
+
+    Mirrors the NFP engine's own filter exactly: strictly narrower on BOTH axes
+    and strictly smaller in area. See minkowski_engine._compute_nfp_uncached.
+
+    Matching that filter -- including its strictness -- is what makes pruning
+    safe. A ring only ever becomes usable through an inner-fit island, and the
+    engine builds one only under `mw < w and mh < h and ma < area`. A ring
+    failing that test therefore has no island, so its area is pure forbidden
+    over-cover and the decomposition can skip straight over it.
+
+    The boundary case is a part that EXACTLY fills a ring. It is classified
+    dead here, which is the aggressive reading, and deliberately so: the engine
+    would refuse to build an island for it anyway, so no reachable position is
+    lost. Using `<=` instead would be more conservative and prune strictly less,
+    at no gain in reachable positions.
+    """
+    minx, miny, maxx, maxy = ring.bounds
+    width = maxx - minx
+    height = maxy - miny
+    area = Polygon(ring.coords).area
+    for mw, mh, ma in _dead_ring_profiles:
+        if mw < width and mh < height and ma < area:
+            return True
+    return False
+
+
+def _prune_dead_rings(polygon):
+    """Return `polygon` with every provably-dead interior ring removed.
+
+    Returns the input unchanged when there is nothing to prune, when no part set
+    has been published, or when pruning is disabled -- so it is a safe no-op for
+    any caller in any state, rather than assuming the registry is armed.
+    """
+    global _dead_ring_stats
+    if not _dead_ring_profiles:
+        return polygon
+    if polygon is None or polygon.is_empty:
+        return polygon
+    if polygon.geom_type != 'Polygon' or not polygon.interiors:
+        return polygon
+
+    live = [ring for ring in polygon.interiors if _ring_is_live(ring)]
+    dropped = len(polygon.interiors) - len(live)
+    if not dropped:
+        return polygon
+
+    pruned = Polygon(polygon.exterior.coords, live)
+    if pruned.is_empty or not pruned.is_valid:
+        # Never trade correctness for the speed-up: an unusable prune is
+        # discarded and the caller decomposes the original.
+        return polygon
+
+    _dead_ring_stats['polygons_pruned'] += 1
+    _dead_ring_stats['rings_seen'] += len(polygon.interiors)
+    _dead_ring_stats['rings_dropped'] += dropped
+    return pruned
+
+
 def decompose_if_needed(polygon, logger):
     """Decomposes a non-convex polygon into convex parts (triangles)."""
     if not polygon or polygon.is_empty:
@@ -28,7 +181,14 @@ def decompose_if_needed(polygon, logger):
     # Ensure valid geometry
     if not polygon.is_valid:
         polygon = polygon.buffer(0)
-    
+
+    # Drop interior rings that no nestable part can occupy, BEFORE the cache
+    # key is taken, so the pruned polygon gets its own cache entry and the
+    # unpruned one is never polluted. The polygon the caller centres on is
+    # untouched -- only what gets triangulated changes. _prune_dead_rings is a
+    # no-op when the part set has not been published.
+    polygon = _prune_dead_rings(polygon)
+
     # Use WKT for cache key
     cache_key = polygon.wkt
     with _decomposition_lock:
@@ -48,6 +208,8 @@ def decompose_if_needed(polygon, logger):
 
     try:
         parts = _decompose_uncached(polygon, logger, cache_key)
+        if _dead_ring_profiles:
+            _dead_ring_stats['parts_after'] += len(parts)
         future.set_result(parts)
         return parts
     except BaseException as exc:

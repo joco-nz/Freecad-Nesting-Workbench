@@ -57,6 +57,12 @@ class Shape:
         with cls.convex_pair_probe_lock:
             cls.convex_pair_probe_keys.clear()
             cls.convex_pair_probe_requests = 0
+        # NOTE: dead-ring pruning is deliberately NOT reset here. It is run
+        # configuration (the part set), not a cache, and the NFP path calls
+        # clear_caches() between generations -- clearing the part set there
+        # would silently switch the optimisation off partway through a run.
+        # ShapePreparer publishes a fresh part set at the start of every
+        # prepare_parts, which is the correct owner.
 
     @classmethod
     def clear_nfp_cache(cls):
