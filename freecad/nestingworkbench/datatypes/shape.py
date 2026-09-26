@@ -111,6 +111,16 @@ class Shape:
             if k in ['source_freecad_object', 'fc_object']:
                 continue
 
+            # Measurement-only memo attached by PlacementOptimizer._part_profile
+            # when Performance Logging is on. It holds derived geometry for the
+            # polygon this shape currently holds, so it is pure cache: copying
+            # it would deep-copy Shapely geometries into every part of every
+            # layout for nothing, and the identity check in _part_profile would
+            # discard the copy anyway. Absent when logging is off, in which case
+            # this branch simply never runs.
+            if k == '_nfp_hole_profile':
+                continue
+
             if isinstance(v, FreeCAD.Vector):
                 setattr(result, k, FreeCAD.Vector(v))
             elif isinstance(v, FreeCAD.Placement):

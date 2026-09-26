@@ -26,6 +26,109 @@ def _candidate_geometry_key(prefix, x, y):
     return (prefix, float(x), float(y))
 
 
+# Measurement-only. Ring area is needed to classify an interior ring as able or
+# unable to hold a nestable part, and a LinearRing exposes no area of its own.
+#
+# This is deliberately NOT a WeakKeyDictionary keyed on the geometry. Shapely
+# geometries have no __dict__, and such a dict would re-hash the whole WKB on
+# every lookup -- 47.6 us for a 600-vertex polygon here, ~9 s across a fixture
+# run -- while missing anyway, because list(poly.interiors) returns fresh
+# wrapper objects on each call. Shapely also compares geometries by VALUE, so a
+# value-keyed cache would merge distinct-but-identical placements.
+#
+# Callers reach this through _part_profile, which memoises on the owning Shape
+# and so keeps each ring's area computed once per placement rather than once
+# per candidate-mask call.
+def _ring_area(ring):
+    """Area of an interior LinearRing, as a Polygon."""
+    return Polygon(ring).area
+
+
+def _holes_touched(candidate, holes, hole_bbox, cx0, cy0, cx1, cy1):
+    """True if `candidate` reaches into `holes`, cheaply.
+
+    The caller's already-computed candidate extents reject almost every pair
+    before GEOS is involved: rings sit strictly inside their part, and most
+    candidates are nowhere near a hole. Without this the accepted-candidate
+    touch test dominates the instrumentation.
+    """
+    if holes is None:
+        return False
+    if hole_bbox is None:
+        return False
+    if cx1 < hole_bbox[0] or cx0 > hole_bbox[2]:
+        return False
+    if cy1 < hole_bbox[1] or cy0 > hole_bbox[3]:
+        return False
+    return candidate.intersects(holes)
+
+
+def _part_profile(owner, poly):
+    """Everything the hole measurement needs about one placed part, memoised.
+
+    Returns (width, height, area, rings, hole_geometry, hole_bbox) where `rings`
+    is a list of (area, vertex_count, bounds) per interior ring.
+
+    Caching is keyed on `owner` -- the Shape, an ordinary Python object that
+    accepts attributes. Two alternatives were measured and rejected:
+
+    - Shapely geometries have no __dict__, so attributes cannot be attached to
+      the geometry itself.
+    - A WeakKeyDictionary keyed on the geometry re-hashes the whole WKB on
+      every lookup: 47.6 us for a 600-vertex polygon on this machine, ~9 s over
+      a fixture run at 60 parts x 3099 calls. It would miss regardless, because
+      `list(poly.interiors)` hands back fresh wrapper objects each call. Shapely
+      also hashes and compares geometries by VALUE, so such a dict would merge
+      distinct-but-identical placements.
+
+    The `is` test on the polygon is what makes this safe. `set_rotation` and
+    `move` rebind `shape.polygon`, so a rebound polygon fails the identity check
+    and is recomputed rather than returning another placement's numbers.
+
+    `owner` is None for the candidate under test, which is a fresh rotation each
+    call and not worth caching.
+    """
+    if owner is not None:
+        cached = getattr(owner, '_nfp_hole_profile', None)
+        if cached is not None and cached[0] is poly:
+            return cached[1]
+    min_x, min_y, max_x, max_y = poly.bounds
+    ring_objs = list(poly.interiors)
+    rings = []
+    for ring in ring_objs:
+        rmin_x, rmin_y, rmax_x, rmax_y = ring.bounds
+        rings.append((
+            _ring_area(ring),
+            len(ring.coords),
+            (rmin_x, rmin_y, rmax_x, rmax_y),
+        ))
+    if ring_objs:
+        hole_geom = _rings_geometry(ring_objs)
+        hole_bbox = (
+            min(r.bounds[0] for r in ring_objs),
+            min(r.bounds[1] for r in ring_objs),
+            max(r.bounds[2] for r in ring_objs),
+            max(r.bounds[3] for r in ring_objs),
+        )
+    else:
+        hole_geom = hole_bbox = None
+    profile = (max_x - min_x, max_y - min_y, poly.area, rings,
+               hole_geom, hole_bbox)
+    if owner is not None:
+        owner._nfp_hole_profile = (poly, profile)
+    return profile
+
+
+def _rings_geometry(rings):
+    """One geometry covering all of a part's interior rings.
+
+    A single ring becomes a Polygon; several become a GeometryCollection, which
+    keeps `intersects` exact without paying for a union on every call.
+    """
+    polys = [Polygon(r) for r in rings]
+    return polys[0] if len(polys) == 1 else GeometryCollection(polys)
+
+
 class CandidateGeometryKeyTracker:
     """Track candidate geometry keys across one or more optimizers.
 
@@ -179,6 +282,8 @@ class PlacementOptimizer:
             'mask_hole_sensitive_pairs': 0,
             'mask_hole_exploiting_placements': 0,
             'mask_candidate_rings': 0,
+            'mask_subthreshold_hole_rings': 0,
+            'mask_subthreshold_hole_vertices': 0,
             'mask_calls': 0,
             'mask_batch_candidates': 0,
             'mask_batch_max': 0,
@@ -294,6 +399,8 @@ class PlacementOptimizer:
                                 'mask_hole_sensitive_pairs',
                                 'mask_hole_exploiting_placements',
                                 'mask_candidate_rings',
+                                'mask_subthreshold_hole_rings',
+                                'mask_subthreshold_hole_vertices',
                                 'mask_calls', 'mask_batch_candidates',
                             ):
                                 self._perf_stats[key] += res.get(f'_{key}', 0)
@@ -558,17 +665,20 @@ class PlacementOptimizer:
             probe['mask_hole_sensitive_pairs'] = 0
             probe['mask_hole_exploiting_placements'] = 0
             probe['mask_candidate_rings'] = 0
+            probe['mask_subthreshold_hole_rings'] = 0
+            probe['mask_subthreshold_hole_vertices'] = 0
             probe['mask_calls'] = 0
             probe['mask_batch_candidates'] = 0
             probe['mask_batch_max'] = 0
         if not valid.any():
             return valid
 
-        existing_polygons = [
-            placed.shape.polygon
+        existing_shapes = [
+            placed.shape
             for placed in sheet.parts
             if placed.shape and placed.shape.polygon
         ]
+        existing_polygons = [shape.polygon for shape in existing_shapes]
         if not existing_polygons:
             if probe is not None:
                 probe['sheet_candidates'] = int(valid.sum())
@@ -580,43 +690,67 @@ class PlacementOptimizer:
         # ordering; it exists to size the hole population before deciding
         # whether any hole-related change is worth making.
         #
-        # `hole_geoms[i]` is existing part i's interior rings as a geometry, or
-        # None. `all_holes` is every existing ring in one collection, used to
-        # classify accepted placements. It is deliberately NOT unioned: a union
-        # would cost real time on every call, and `intersects` against a
-        # GeometryCollection answers the same question.
+        # `hole_geoms[i]` is existing part i's interior rings as one geometry,
+        # or None; `hole_bounds[i]` is the union bbox of those rings. Both are
+        # indexed per existing part, never merged into one run-wide collection:
+        # a merged GeometryCollection of ~163 rings made `intersects` on the
+        # accepted-candidate path cost ~45 s over a fixture run, which was the
+        # bulk of this instrumentation's own overhead. Rings lie strictly inside
+        # their part, so a candidate that misses a part's bbox cannot reach its
+        # holes -- testing per part is exact, not an approximation.
         hole_geoms = None
-        all_holes = None
+        hole_bounds = None
         if probe is not None:
-            hole_geoms = []
-            hole_polys = []
-            for poly in existing_polygons:
-                rings = list(poly.interiors)
-                if rings:
-                    probe['mask_hole_rings'] += len(rings)
-                    for ring in rings:
-                        probe['mask_hole_vertices'] += len(ring.coords)
-                    hole_polys.extend(Polygon(r) for r in rings)
-                    if len(rings) == 1:
-                        hole_geoms.append(hole_polys[-1])
-                    else:
-                        hole_geoms.append(GeometryCollection(
-                            hole_polys[-len(rings):]))
-                else:
-                    hole_geoms.append(None)
-                probe['mask_exterior_vertices'] += len(poly.exterior.coords)
+            # Parts that could be nested into a hole. The test mirrors the NFP
+            # engine's own filter in _compute_nfp_uncached -- strictly narrower
+            # bbox on both axes AND smaller area -- so "sub-threshold" here
+            # means exactly "the NFP will not build a legal-position island for
+            # this ring".
+            #
+            # The three per-axis minima prune the scan: a ring no larger than
+            # the smallest part in any one dimension cannot pass the strict
+            # test, so most rings are classified without the inner `any()`.
+            profiles = [
+                _part_profile(shape, poly)
+                for shape, poly in zip(existing_shapes, existing_polygons)
+            ]
+            cand_profile = _part_profile(None, rotated_poly)
+            metrics = [(p[0], p[1], p[2]) for p in profiles]
+            metrics.append((cand_profile[0], cand_profile[1], cand_profile[2]))
+            min_w = min(m[0] for m in metrics)
+            min_h = min(m[1] for m in metrics)
+            min_a = min(m[2] for m in metrics)
 
-            if hole_polys:
-                all_holes = (hole_polys[0] if len(hole_polys) == 1
-                             else GeometryCollection(hole_polys))
+            hole_geoms = []
+            hole_bounds = []
+            for poly, (_pw, _ph, _pa, rings, geom, bbox) in zip(
+                    existing_polygons, profiles):
+                probe['mask_hole_rings'] += len(rings)
+                for r_area, r_verts, (r0x, r0y, r1x, r1y) in rings:
+                    probe['mask_hole_vertices'] += r_verts
+                    rw, rh = r1x - r0x, r1y - r0y
+                    if (rw <= min_w or rh <= min_h or r_area <= min_a
+                            or not any(mw < rw and mh < rh and ma < r_area
+                                       for mw, mh, ma in metrics)):
+                        probe['mask_subthreshold_hole_rings'] += 1
+                        probe['mask_subthreshold_hole_vertices'] += r_verts
+                hole_geoms.append(geom)
+                hole_bounds.append(bbox)
+                probe['mask_exterior_vertices'] += len(poly.exterior.coords)
 
             # The candidate's own rings matter for `existing.intersects(...)`
             # cost, and for a candidate that is itself re-tested as an existing
             # part in a later call of the same run.
-            cand_rings = list(rotated_poly.interiors)
+            _cw, _ch, _ca, cand_rings, _cg, _cb = cand_profile
             probe['mask_candidate_rings'] += len(cand_rings)
-            probe['mask_hole_vertices'] += sum(
-                len(r.coords) for r in cand_rings)
+            for r_area, r_verts, (r0x, r0y, r1x, r1y) in cand_rings:
+                probe['mask_hole_vertices'] += r_verts
+                rw, rh = r1x - r0x, r1y - r0y
+                if (rw <= min_w or rh <= min_h or r_area <= min_a
+                        or not any(mw < rw and mh < rh and ma < r_area
+                                   for mw, mh, ma in metrics)):
+                    probe['mask_subthreshold_hole_rings'] += 1
+                    probe['mask_subthreshold_hole_vertices'] += r_verts
             probe['mask_exterior_vertices'] += len(rotated_poly.exterior.coords)
 
         bin_polygon = Polygon(
@@ -701,6 +835,9 @@ class PlacementOptimizer:
         for row in exact_rows:
             index = idx[row]
             candidate = None
+            # Set when a pair is seen whose outcome depends on an existing
+            # part's interior ring rather than its solid body.
+            row_hole_touched = False
             if candidate_geometry_cache is not None and geometry_key_prefix is not None:
                 cache_key = _candidate_geometry_key(
                     geometry_key_prefix, points[index, 0], points[index, 1]
@@ -790,15 +927,29 @@ class PlacementOptimizer:
                             # Measurement-only: the pair's verdict depends on
                             # this part's interior rings rather than its solid
                             # body, so filling holes could flip it.
-                            if hole_geoms is not None:
-                                holes = hole_geoms[e_pos]
-                                if holes is not None and candidate.intersects(
-                                        holes):
-                                    probe['mask_hole_sensitive_pairs'] += 1
+                            if (hole_geoms is not None
+                                    and _holes_touched(
+                                        candidate, hole_geoms[e_pos],
+                                        hole_bounds[e_pos],
+                                        c_minx[row], c_miny[row],
+                                        c_maxx[row], c_maxy[row])):
+                                probe['mask_hole_sensitive_pairs'] += 1
+                                row_hole_touched = True
                     else:
                         overlaps = False
                         if probe is not None:
                             probe['collision_intersects_false'] += 1
+                            # A candidate lying wholly inside a hole also lands
+                            # here, and it is the most hole-dependent placement
+                            # of all -- so the touch test must run on this
+                            # branch too, not only on the intersects-True one.
+                            if (hole_geoms is not None
+                                    and _holes_touched(
+                                        candidate, hole_geoms[e_pos],
+                                        hole_bounds[e_pos],
+                                        c_minx[row], c_miny[row],
+                                        c_maxx[row], c_maxy[row])):
+                                row_hole_touched = True
                     collision_intersection_ms += (
                         time.perf_counter() - checks_start) * 1000
                     polygon_checks += 1
@@ -814,21 +965,14 @@ class PlacementOptimizer:
             if collision:
                 valid[index] = False
                 collision_rejections += 1
-            elif probe is not None and all_holes is not None:
+            elif row_hole_touched and probe is not None:
                 # Measurement-only, and the cost side of any hole-filling
                 # proposal. This placement is legal only because it occupies
                 # empty space: a hole in an existing part, or the free space
                 # beside one. Filling holes would forbid the hole case
                 # outright, so this counter is the sheet yield that filling
                 # would destroy.
-                #
-                # It has to be tested here, on the accepted candidate, rather
-                # than inside the intersects branch: a candidate lying wholly
-                # inside a hole returns intersects=False and never reaches
-                # that branch, yet it is the most hole-dependent placement of
-                # all.
-                if candidate.intersects(all_holes):
-                    probe['mask_hole_exploiting_placements'] += 1
+                probe['mask_hole_exploiting_placements'] += 1
 
         if probe is not None:
             probe['candidate_geometry_ms'] = probe.get(

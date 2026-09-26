@@ -27,6 +27,22 @@ def _safe_ratio(numerator, denominator):
         return 0.0
 
 
+def _subthreshold_pct(perf):
+    """Share of hole vertices sitting in rings too small to hold any part.
+
+    This is the number that decides whether filling sub-threshold holes is worth
+    attempting at all. A small value means both the speed prize and the quality
+    risk are rounding errors, and the whole line of work closes. The test
+    mirrors the NFP engine's own hole filter, so "sub-threshold" here means
+    exactly "the NFP builds no legal-position island for this ring".
+    """
+    sub = perf.get('mask_subthreshold_hole_vertices', 0)
+    holes = perf.get('mask_hole_vertices', 0)
+    if not holes:
+        return 0.0
+    return 100.0 * sub / holes
+
+
 def _hole_vertex_pct(perf):
     """Share of collision-mask vertices that live in interior rings.
 
@@ -214,6 +230,8 @@ class GACoordinator:
                     'mask_hole_rings', 'mask_hole_vertices',
                     'mask_exterior_vertices', 'mask_hole_sensitive_pairs',
                     'mask_hole_exploiting_placements', 'mask_candidate_rings',
+                    'mask_subthreshold_hole_rings',
+                    'mask_subthreshold_hole_vertices',
                     'mask_calls', 'mask_batch_candidates',
                     'candidate_geometry_unique', 'candidate_geometry_repeats'):
             self._ga_perf[key] += stats.get(key, 0)
@@ -389,6 +407,8 @@ class GACoordinator:
             'mask_hole_sensitive_pairs': 0,
             'mask_hole_exploiting_placements': 0,
             'mask_candidate_rings': 0,
+            'mask_subthreshold_hole_rings': 0,
+            'mask_subthreshold_hole_vertices': 0,
             'mask_calls': 0,
             'mask_batch_candidates': 0,
             'mask_batch_max': 0,
@@ -439,6 +459,8 @@ class GACoordinator:
                         'mask_hole_rings', 'mask_hole_vertices',
                         'mask_exterior_vertices', 'mask_hole_sensitive_pairs',
                         'mask_hole_exploiting_placements', 'mask_candidate_rings',
+                        'mask_subthreshold_hole_rings',
+                        'mask_subthreshold_hole_vertices',
                         'mask_calls', 'mask_batch_candidates', 'mask_batch_max',
                         'candidate_geometry_unique', 'candidate_geometry_repeats',
                     )
@@ -676,6 +698,9 @@ class GACoordinator:
                     f"hole_rings={self._ga_perf['mask_hole_rings']} "
                     f"hole_vertices={self._ga_perf['mask_hole_vertices']} "
                     f"hole_pct={_hole_vertex_pct(self._ga_perf):.1f}% "
+                    f"subthreshold_rings={self._ga_perf['mask_subthreshold_hole_rings']}"
+                    f"/{self._ga_perf['mask_hole_rings']} "
+                    f"subthreshold_pct={_subthreshold_pct(self._ga_perf):.1f}% "
                     f"hole_sensitive_pairs={self._ga_perf['mask_hole_sensitive_pairs']} "
                     f"hole_exploiting_placements={self._ga_perf['mask_hole_exploiting_placements']} "
                     f"layout_management={self._ga_perf['layout_management_s']:.2f}s "
