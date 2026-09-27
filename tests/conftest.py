@@ -1,22 +1,28 @@
 """Shared pytest configuration for the Nesting Workbench test suite.
 
-Several workbench modules import FreeCAD and Part at module scope. Those
-modules are not importable under a plain `pytest` interpreter, which is what
-made it tempting to test only hand-written Shapely approximations instead of
-the real code.
+Several workbench modules import FreeCAD and Part at module scope, so they are
+not importable under a plain `pytest` interpreter. That is what made it
+tempting to test hand-written Shapely approximations instead of the real code.
 
 This conftest installs minimal stand-ins for the FreeCAD modules *only when
-they are genuinely absent*, so the suite runs in two environments:
+they are genuinely absent*, so `python3 -m pytest` can import workbench code
+and exercise the pure-Python layers for real.
 
-  - plain CPython (`python3 -m pytest`)  -> stubs are installed
-  - FreeCAD's own interpreter
-    (`freecadcmd script.py`)             -> the real modules are used
+Scope of this tier
+------------------
+It covers the layers that need no FreeCAD API: the view-object guards, and the
+whole of minkowski_utils (NFP, decomposition, inner-fit polygons), which is
+Shapely-only.
 
-The stubs are deliberately inert: attribute access returns None. That is
-enough to satisfy module-level `import FreeCAD` / `import Part` and to let
-pure-Python logic (geometry helpers, view guards, NFP maths) be exercised for
-real. It is NOT enough to drive document or GUI code — that is what the
-FreeCAD-based end-to-end harness is for.
+It does NOT cover document or geometry extraction. `freecadcmd` ships its own
+interpreter without pytest, so the document-level checks (real profiles,
+corpus packing, `[GA PERF]` counters) live in a separate plain-script harness
+run under `freecadcmd`, not here.
+
+The stubs are deliberately inert: attribute access returns None. That is enough
+to satisfy module-level `import FreeCAD` / `import Part`; any actual use of a
+FreeCAD API then fails loudly with an AttributeError on None rather than
+silently returning a plausible-looking wrong answer.
 """
 import sys
 import types

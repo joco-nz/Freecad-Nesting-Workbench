@@ -1,11 +1,17 @@
-"""Tests for shape_processor coordinate alignment fix.
+"""Documents the centroid-vs-bounding-box property the workbench relies on.
 
-These tests ensure that for asymmetric shapes (triangles, L-shapes, etc.),
-the source_centroid is calculated from the Shapely polygon centroid rather
-than the bounding box center. This is critical for correct part placement
-in the nesting algorithm.
+Scope note: these assert properties of Shapely itself, not of workbench code.
+They are here because `shape_processor.get_2d_profile_from_obj` derives a
+part's `source_centroid` from the Shapely polygon centroid, and every
+asymmetric part is a case where using the bounding-box centre instead would
+place the part wrongly. Keeping the property pinned makes the reason for that
+choice explicit.
 
-Regression tests for: correct centroid calculation in nesting workbench.
+Testing the workbench's own profile extraction needs a real FreeCAD (it
+tessellates via `Part`), so it belongs to the freecadcmd end-to-end harness,
+not to this tier. For the same reason nothing here exercises the
+NFP/minkowski code -- that is covered against the real functions in
+tests/test_minkowski_utils/.
 """
 import pytest
 from shapely.geometry import Polygon
