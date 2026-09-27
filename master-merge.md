@@ -1,291 +1,404 @@
-# Master Merge Plan — Pulling value from main@eac1e30 into Faster-NFP-Calc-Investigate
+# Master Merge Plan — pulling value from main@eac1e30 into Faster-NFP-Workbench
 
-**Goal:** Selectively integrate provably-beneficial, non-overlapping, and correctness-fixing capabilities from the upstream `main` (commit `eac1e30`, "Release 9-26") into this working branch, in a way that can be verified after each block and reverted if needed.
+**Branch:** `integrate-main-2026.9`, branched from `cc57e25` ("optimisation lab notebook").
+**Upstream:** `main` = `eac1e30` "Release 9-26" (2026.9.0), 53 files, +5081/−1767.
+**Merge base:** `5439c2f`.
 
-**Branch:** `Faster-NFP-Calc-Investigate` (tip `cc57e25`, 14 unpushed commits). Common ancestor with `main`: `5439c2f`.
+**Reconciled** against what was actually built. Status markers throughout:
+`DONE` · `DECIDED` (settled by measurement) · `PENDING` · `STRUCK` (was wrong).
 
-**How this plan works:** Each numbered block is a self-contained hunk that can be applied independently with `git cherry-pick -n` or manual copy. After each block, a verification step (Tier 1→3, see §7) must pass before the next block is applied. Every block carries a `Ported-from:` trailer so a future full merge can locate the exact upstream origin. No block depends on a later one — any block can be dropped with `git revert <sha>`.
+---
+
+## Status
+
+| block | what | state |
+|---|---|---|
+| 0.1 | characterisation harness | **DONE** — then superseded, see below |
+| 0.2 | recorded baseline | **DONE** — committed, with a known weakness (§7) |
+| — | `ViewObject` guards (unplanned, found by the harness) | **DONE** |
+| — | real characterisation tests replacing the approximations | **DONE** |
+| — | Tier 2/3 freecadcmd harness + committed baseline | **DONE** |
+| 4.1 | `MasterShapes` orphaning on commit | **DONE** |
+| 4.2 | pooled master group leaked on abandoned runs | **DONE** |
+| 5.3 | benchmarks: rotation width, lazy-vs-eager, convex sum | **DONE** |
+| — | GA-loop integration test (found a real leak in 4.2) | **DONE** |
+| — | GUI-session viability probe | **DONE** — worker path is testable |
+| 1.1–1.4, 2.1–2.3, 3.1, 3.2 | the author's blocks | **PENDING** |
+| 3.1, 3.2, 3.3 | merge-vs-keep decisions | **DECIDED** by 5.3 |
+| 3.4 → now 3.1 | `type_label` cache keys | **PENDING** |
+
+Nine commits on the branch. All suites green.
+
+### Two corrections to the original plan
+
+- **§4.2 as originally written was not a live defect.** It described the
+  `trial_callback` 4-vs-5 arity mismatch. Verified: our `nesting_logic` builds a
+  4-arg lambda and our `nesting_strategy` calls it with 4 args at both sites
+  (`nesting_strategy.py:455`, `:619`). The two agree. The mismatch only
+  materialises if our `nesting_logic` is mixed with **main's**
+  `nesting_strategy`, which this integration deliberately does not do.
+  **STRUCK.** The block numbered 4.2 is now a different, real defect (§4.2 below).
+- **§6 claimed our linear convex merge was "algorithmically better".** Measured
+  in 5.3: at n = 3 — which is what `decompose_if_needed` actually yields, Delaunay
+  triangles — **main's numpy is 1.33× faster**. The claim was wrong for this
+  workload. Corrected below, with the reason we still keep ours.
+
+---
 
 ## 0. Pre-conditions & enablement
 
-### 0.1 Install a characterisation harness
-**Source:** `inmternal-overlap-issue` branch (13 test files, including `test_nfp_cpp_python_equivalence.py`, `test_inner_nfp.py`, `test_outer_nfp_holes.py`, `test_nfp_concave.py`, `test_centroid_alignment.py`, performance tests, conftest fixtures).
+### 0.1 Characterisation harness — **DONE, then superseded**
 
-**Action:** Harvest the test suite from that branch, adapt any absolute paths to this repo's layout, and make them runnable on the current code. Commit these as `0.2-tests`.
+As planned, 13 tests were harvested from `inmternal-overlap-issue`. Those turned
+out to be worthless as a gate: they exercised Shapely *approximations written
+inside the test files* (`piece.buffer(-0.01)` standing in for a Minkowski
+difference) behind `if result is not None:` guards, so they would have passed
+whether or not the workbench's NFP code was correct.
 
-**Why:** You cannot safely land ~15 geometry behavioural changes without a baseline. The other branch provides exactly the right test corpus (NFP correctness, IFP, concavity, centroid alignment, performance baselines). Without this, every later block's "does it improve speed/correctness?" is unanswerable.
+Replaced with 54 tests that call the real functions and pin measured output
+(`tests/test_minkowski_utils/`). The lesson is recorded because it generalises:
+**a characterisation test that cannot fail is worse than none, because it is
+counted as coverage.**
 
-**Commit after:** Tier 1–2 tests pass against the baseline (step 7.2).
+### 0.2 Recorded baseline — **DONE**
 
-### 0.2 Record the baseline
-**Files:** none (numbers live in a `bench/` directory or a wiki; out of scope for the merge plan).
+Committed at `tests/freecad_harness/baseline/synthetic_v1.json`: 1 sheet,
+18 placed, 0 unplaced, density 0.563184, 51 perf counters.
 
-**Action:** Run the corpus (`n70-intercooler-spacer-bottle-nesting.FCStd` or equivalent) with a fixed seed, capture:
-- `[GA PERF]` counters
-- `[LAYOUT PERF]` counters
-- Dead-ring stats (`polygons_pruned`, `rings_seen`, `rings_dropped`, `parts_from_misses`)
-- Pack result: sheets, parts/placed, density, `hole_pct`
-- Any `is_valid == False` or `is_empty == True` polygon findings.
-
-**Why:** Every later block's "neutral-or-better" gate in §7 compares against these numbers.
-
-**Commit after:** Baseline file is generated and its path is noted in `0.2-tests`.
-
----
-
-## 1. Correctness & crash fixes (author's bugs you're behind on)
-
-These are the author's *own* fixes from `eac1e30` that address bugs still live on this branch. They have zero overlap with your perf work, and they are strictly improvements.
-
-### 1.1 `_MainThreadRelay` FIFO + `_draining` re-entry guard
-**File(s):** `freecad/nestingworkbench/Tools/Nesting/nesting_logic.py` (lines 12–34).
-
-**From main:** The relay now has an explicit `deque` + `_draining` flag; `updateGui()` re-entering the drain continues the queue instead of nesting one callable inside another, which previously caused a stack overflow and FreeCAD death on a warm re-nest.
-
-**Verification:**
-- Tier 1: Run the NFP correctness tests (0.2) — no invalid polygons, no crashes.
-- Tier 2: Same corpus, re-nest twice without a full document reset — no `TypeError`, no one-part-per-sheet.
-- Tier 3: Diff perf dump against 0.3 baseline — neutral or better.
-
-**Why now:** This is a genuine crash fix; it does not touch any of your performance machinery. It is also a prerequisite for any later block that touches `trial_callback` or the GA loop, because the old code will silently segfault/crash under the same conditions main just fixed.
-
-### 1.2 `_retire_worker()` — destroy running QThread from main thread
-**File(s):** `freecad/nestingworkbench/Tools/Nesting/nesting_controller.py` (new method near `_on_nesting_finished`/`_on_nesting_error`).
-
-**From main:** `worker.wait()`, then `worker.coordinator = None; coordinator.worker = None; coordinator.draw_callback = None`. Docstring: *"Destroying a QThread from a foreign thread (or while still running) is a hard crash, which is why a second run in the same panel could take FreeCAD down."*
-
-**Verification:**
-- Tier 1: Run the harness, run nesting, close panel, re-run nesting (same session) — no crash.
-- Tier 2: Same as Tier 1, but also toggle simulate nesting on/off — still no crash.
-- Tier 3: Same perf comparison as 1.1.
-
-**Why now:** You lack this entirely. Your `_on_nesting_finished` just sets `self._worker = None`. A second nesting in the same session will raise or crash FreeCAD. Main's fix is minimal and well-scoped.
-
-### 1.3 `compute_and_cache_nfp` None-master guard + per-hole failure isolation
-**File(s):** `freecad/nestingworkbench/Tools/Nesting/algorithms/minkowski_engine.py` (lines 77–87, 135–142).
-
-**From main:**
-- Guard: `if shape_A.original_polygon is None or part_to_place.original_polygon is None: log and return {} without caching`, so a transient failure cannot disable a pair for the whole session.
-- Per-hole: `try/except` around `calculate_inner_fit_polygon` + one-shot warning (`_warn_hole_fit_failed`), so one bad hole cannot poison the whole pair's NFP.
-
-**Verification:**
-- Tier 1: Correctness tests from 0.2 all pass.
-- Tier 2: Simulate a missing `original_polygon` (patch `shape.py` to set it `None` temporarily, run a nesting, restore) — the pair is retried next rotation, not cached as empty.
-- Tier 3: Perf diff neutral.
-
-**Why now:** The author's notebook and commit text both flag this: *"Do NOT cache this. Shape.nfp_cache persists across runs by design, so a cached failure would disable this pair for the whole session."* Your code has no guard, so a single bad part permanently cripples that part-type's NFP cache.
-
-### 1.4 Fix re-nest crash on a saved layout (#19) — original_polygon set on reload
-**File(s):** `freecad/nestingworkbench/Tools/Nesting/shape_preparer.py` (`_create_temp_from_reloading`, lines 344–355) + `freecad/nestingworkbench/Tools/Nesting/nesting_controller.py` (`_load_shapes_from_layout`, `_load_params_from_layout`).
-
-**From main:** On the reload path, set `original_polygon`, `spacing`, `deflection`, `simplification` on the reloaded wrapper (your code sets only `.polygon`). Also mirror the source master's rotation instead of `Placement(..., Rotation)`, and make `temp_bound` visible.
-
-**Verification:**
-- Tier 1: Correctness tests pass.
-- Tier 2: Reload a saved layout, re-nest — no `TypeError`, no one-part-per-sheet, master outline matches.
-- Tier 3: Perf diff neutral (this is a bugfix, not a perf change).
-
-**Why now:** You are missing this fix. Your `_create_temp_from_reloading` leaves `original_polygon = None`, which is exactly what the author's comment identifies as the #19 cause: *"Leaving this at None makes compute_and_cache_nfp raise on `mA.centroid` and cache an error for every pair key."*
+Weakness, from 5.3: it stores a **single run**, and `make-faster.md` records
+24s→31s→37s drift across sessions on untouchable work — a **20% noise floor**.
+A future comparison could read pure drift as a regression. Should be re-recorded
+as min-of-N. 5.3's own sweep avoids this by interleaving widths in one session
+and reporting the minimum; the committed baseline does not.
 
 ---
 
-## 2. Geometric correctness upgrades (your branch should take these even though they change geometry)
+## 1. Correctness & crash fixes (the author's bugs we're behind on) — **PENDING**
 
-These improve the math of the IFP and polygon handling. They do change geometry, but in the right direction (less permissive IFP for non-convex holes, fewer false-positive overlaps). Re-baseline after block 2.2.
+Small and well-understood, but each is a fork of a bugfix he will likely also
+fix upstream. See §9 for the "send a PR instead" question.
 
-### 2.1 IFP hole-edge sweeps `e ⊕ −P` subtraction
-**File(s):** `freecad/nestingworkbench/Tools/Nesting/algorithms/minkowski_utils.py` — new function `_merge_convex_parts` is **not** taken (see block 3.1). The IFP rewrite in `calculate_inner_fit_polygon`.
+| block | change | file |
+|---|---|---|
+| **1.1** | `_MainThreadRelay` FIFO + `_draining` re-entry guard (stack-overflow crash on warm re-nest) | `nesting_logic.py` |
+| **1.2** | `_retire_worker()` — destroying a running `QThread` from a foreign thread takes FreeCAD down | `nesting_controller.py` |
+| **1.3** | `compute_and_cache_nfp` None-master guard (do not cache a failure) + per-hole failure isolation | `minkowski_engine.py` |
+| **1.4** | `#19`: set `original_polygon`/`spacing`/`deflection`/`simplification` on the reload path | `shape_preparer.py`, `nesting_controller.py` |
 
-**From main:** After computing per-piece vertex erosions, also compute *hole-edge sweeps* `e ⊕ −P` (the convex hull of every hole edge + the negated piece) and subtract `union_all(sweeps)` from the result. Main's comment: *"Vertex erosion is exact only for a convex hole: also exclude every position where a hole edge touches or crosses this piece."* Your IFP is per-piece erosion only, which for a non-convex hole is over-permissive — a candidate centroid can be accepted whose part actually crosses the hole boundary.
-
-**What I verified:** Your engine already handles the `MultiPolygon` return from `calculate_inner_fit_polygon` (it iterates `ifp.geoms`), so the geometry plumbing accepts main's new return type cleanly.
-
-**Verification:**
-- Tier 1: Correctness tests pass.
-- Tier 2: Same corpus, verify that no candidate is accepted that crosses a hole boundary (visual check or add a test). The IFP should be *smaller* (more restrictive) for non-convex holes.
-- Tier 3: Perf diff may be slightly worse (more ops per IFP) — gate is *neutral or better*; if worse, document the correctness win.
-
-**Why now:** Your IFP is a known correctness gap. Main's fix is the right direction. Do NOT take `_merge_convex_parts` (block 3.1) — your notebook measured it as a ~1.9× regression.
-
-### 2.2 `discretize_wires_to_polygon` dedup + `make_valid`; `_require_area`/`EdgeOnProfileError`; `inv_rotation = rotation.inverted()`
-**File(s):** `freecad/nestingworkbench/Tools/Nesting/algorithms/shape_processor.py`.
-
-**From main:** Rewrote the wire→polygon path with:
-- `RING_DEDUP_TOLERANCE = 1e-6` + `shapely.remove_repeated_points` on the closing point.
-- `make_valid` on the assembled polygon, largest‑polygon selection if split.
-- `_require_area` + `EdgeOnProfileError` raised when `poly.is_empty or poly.area < 1e-6`, with a clear message *"it is flat and viewed edge-on. Choose the up direction along its normal."*
-- `inv_rotation = rotation.inverted()` replaces a 7‑branch `if up_direction == …` chain.
-
-**What I verified:** Your `shape_preparer.py` calls `discretize_wires_to_polygon` with the saved boundary wires exactly as main does (same call signature, no re‑simplification). Your code already guards against `None` returns. Your engine already guards `MultiPolygon` IFP returns. So the plumbing is compatible.
-
-**CRITICAL:** This rewrite changes the actual polygon objects (vertex counts, winding, validity). It **re-bases all recorded performance numbers**. After this block, re-run the baseline (0.3) and accept the new numbers before proceeding to any perf gate.
-
-**Verification:**
-- Tier 1: Correctness tests from 0.2 pass (no invalid polygons, IFP containment).
-- Tier 2: Same corpus; re-baseline pack result (sheets, parts, density). The polygon set is different but topologically valid.
-- Tier 3: Perf diff against *new* baseline. Do not compare to 0.3's numbers.
-
-**Why now:** This is a strict improvement over OURS' wire handling (dedup eliminates zero‑length edges that cause GEOS "non-noded intersection"/"side location conflict" in the exact mask; `make_valid` fixes winding). It is also a prerequisite for any later block that touches `shape_preparer` or `shape_processor` geometry.
-
-### 2.3 Fill `as_fill` — required Quantity as normal parts, then fill copies
-**File(s):** `freecad/nestingworkbench/Tools/Nesting/shape_preparer.py` — `_spawn_factory` and the fill loop in `prepare_parts`.
-
-**From main:** Their `make_instance(as_fill=...)` creates the full `Quantity` as `as_fill=False` instances first, then adds `as_fill=True` instances for the sheet fill. Their comment: *"The quantity is a requirement even when Fill is on… (Marking the required copies as fill parts queued them behind every other part and dropped the ones that no longer fit, so 20 requested circles nested as 12.)"* Your code marks every instance `fill_sheet`; their split prevents that.
-
-**Verification:**
-- Tier 1: Correctness tests pass.
-- Tier 2: Corpus: verify that a part requested with `quantity=20` and `fill_sheet=True` places all 20 (or as many as fit *before* the fill pass), not silently 12.
-- Tier 3: Perf diff against new baseline (this is a correctness/behaviour fix; may change sheet count).
-
-**Why now:** You are on the buggy side. Main's split is the fix.
-
-### 2.4 `_handle_new_master` tuple branch up-direction
-**Correction:** Already verified your code uses `'Z+'`, not `part_params[0]`. No action needed. (Drop this from the plan.)
+1.1 and 1.2 are now **test-first viable** — see §8. 1.4 is the one with a live
+bug on our branch: `_create_temp_from_reloading` sets only `.polygon`, leaving
+`original_polygon` None, which is exactly what poisons every NFP pair key.
 
 ---
 
-## 3. Decisions that must be consciously chosen (not auto-merged)
+## 2. Geometric correctness upgrades — **PENDING**
 
-These are where main and this branch have genuinely opposite choices. The plan makes them explicit blocks so you can decide per your own data.
+These change geometry, in the right direction. Re-baseline after 2.2.
 
-### 3.1 `_merge_convex_parts` (Hertel–Mehlhorn greedy convex merging) — **DO NOT TAKE**
-**File(s):** `freecad/nestingworkbench/Tools/Nesting/algorithms/minkowski_utils.py`.
+### 2.1 IFP hole-edge sweeps `e ⊕ −P`
 
-**The choice:** Main's `_merge_convex_parts` greedily merges convex pieces whose union is still convex (Hertel–Mehlhorn). Your notebook measured: Spacer 192 → 68 pieces, wall time **23.97s → 44.58s** (`make-faster.md:371-377`). The greedy merge *increased* wall time because repeated union + convex-hull checks cost ~39–41 seconds of decomposition. `make-faster.md:2116` says *do not revisit*.
+**Measured in 5.3** (this branch vs main's algorithm, same helpers, same corpus):
 
-**Your alternative:** Dead-ring pruning (`_prune_dead_rings`) gets 192 → 98 pieces and is faster. Your convex-sum phase (`_minkowski_sum_convex_linear`) is O(n+m) pure-Python edge merge + batched `from_ragged_array` build, with per-pair validity/emptiness/area gates and a reference fallback — all of which main drops.
+| case | ours | main | |
+|---|---|---|---|
+| convex hole / sq | 36.0 | 36.0 | identical |
+| convex hole / tri | 16.0 | 16.0 | identical |
+| convex hole / sq@45 | 26.7452 | 26.7452 | identical |
+| **non-convex L / tri** | **8.0** | **4.0** | main tighter |
+| **non-convex L / sq@45** | **12.7452** | **11.7452** | main tighter |
 
-**Decision:** Explicitly **do not take** this. Leave the dead-ring block as-is. If anyone later wants to re-experiment with convex merging, it can be a separate PR against a re‑based branch, not part of this series.
+So the port is provably safe for convex holes (the sweeps remove nothing there),
+and for non-convex holes the IFP gets **smaller** — the correctness fix working.
+A factor-of-two difference on the triangle case is a real hole-wall overlap being
+admitted, not rounding.
 
-### 3.2 Lazy vs eager NFP precompute
-**The choice:** Main eagerly fills `Shape.nfp_cache` with every NFP the run can request, before generation 1 starts, via `_precompute_all_nfps(enumerate_nfp_jobs(parts))` on a 2-thread pool. You made NFPs lazy on demand inside `find_best_placement`.
+**GATE CHANGE:** the IFP shrinking means fewer in-hole placements are offered, so
+this block's Tier 2 gate must read **"same or fewer parts placed"**. Run it with
+`NEST_BENCH_ALLOW_FEWER_PLACED=1`. The flag exists for exactly this case.
 
-**Why it matters:** Main's eager precompute **drains your in-flight NFP dedup and transformed-piece caches** before the run even starts. Their `enumerate_nfp_jobs` dedupes by *instance* label while the engine keys by *type* label — a latent mismatch that only works while those coincide.
+`tests/test_minkowski_utils/test_ifp_convexity.py` already encodes the gate: every
+convex-case area must be unchanged afterwards, and no non-convex area may grow.
 
-**Decision:** This series **does not** port main's `_precompute_all_nfps` or the parallel worker path (blocks 4.1–4.2 deliberately skip it). If you want to measure eager vs lazy, add a dedicated benchmark block (see §7, Phase 5) after the geometry blocks are stable, using the characterisation harness from 0.2.
+### 2.2 `discretize_wires_to_polygon` dedup + `make_valid`; `EdgeOnProfileError`; `inv_rotation`
 
-### 3.3 Rotation parallelism: ThreadPoolExecutor vs serial
-**The choice:** You keep a per-placement `ThreadPoolExecutor` + `NESTING_ROTATION_WORKERS` knob; main deleted it, claiming *"serial evaluation is 2.4–3.3x faster"* (their benchmark). Your own `make-faster.md:2114` lists *"test four rotation workers versus eight"* as still outstanding.
+Strict improvement: dedup removes the near-zero-length edges that cause GEOS
+"non-noded intersection" / "side location conflict" in the exact mask, and
+`make_valid` fixes winding. Our `shape_preparer` calls it identically to main,
+so the plumbing is compatible.
 
-**Decision:** Do not adopt main's serial loop in this series. If you want to test the claim, add a dedicated block after the geometry stabilises (see §7, Phase 5) that runs the 4-vs-8 experiment on the same corpus, with both paths instrumented. Keep your executor functional for now.
+**This re-bases every recorded number.** Re-record the baseline afterwards and
+judge all later blocks against the new one.
 
-### 3.4 `type_label` in cache keys vs instance labels
-**The choice:** Main keys NFP/candidate caches by part *type* (`Shape.type_label`, a new property) rather than instance label. You key by instance label.
+### 2.3 Fill `as_fill` — required `Quantity` as normal parts, then fill copies
 
-**Decision:** Port `Shape.type_label` + the three key-site switches (`_nfp_cache_key`, `candidate_cache_key`) as block 3.1 (below). This is strictly more NFP-sharing (covers parts with no `source_freecad_object`) and costs nothing on your side — the only edit is replacing two inline key constructions. Do NOT switch the dead-ring probe keys (`convex_pair_probe_keys`) — those are keyed on `master_poly1.wkb + angles + piece indices`, not labels, and are immune to this change.
+We are on the buggy side: we mark every instance `fill_sheet`, so required copies
+get queued behind fill parts and dropped ("20 requested circles nested as 12").
 
----
+### 2.4 `_handle_new_master` tuple up-direction — **STRUCK**
 
-## 4. Latent defects in this branch that the merge exposes
-
-These are bugs your branch has that main's commit path brings into sharper relief. They are not "main's fault" but they make a naïve merge uncomfortable.
-
-### 4.1 Document-level `MasterShapes` group orphaning on commit/re-nest
-**File(s):** Your `_get_shared_master_group()` creates a document-level group `"MasterShapes"` not under any layout. `nesting_job.commit()` (identical on both sides) finds masters via `next(c for c in self.temp_layout.Group if c.Label.startswith("MasterShapes"))`. Since yours is not a child of the layout group, on commit the old master row is neither replaced nor deleted, and the new masters are orphaned outside any layout.
-
-**Why it matters:** Main's `hide_all_master_shapes(doc)` only enumerates `Layout*` groups, so your pooled doc-level group is never hidden → the doubled, misaligned master outline main fixed in this release.
-
-**Fix (own branch, not main's):** Either (a) make the shared group a child of the current layout group when `create_doc_objects=True`, or (b) on commit, explicitly delete the old master row and re-parent the new ones. This is a your-branch fix, not a main-port.
-
-### 4.2 `trial_callback` arity 4 vs 5
-**File(s):** `nesting_logic.py` lambda (`4` args) vs `nesting_strategy.PlacementOptimizer` call (`5` args including `sheet`).
-
-**Why it matters:** Mixing your `nesting_logic` with main's `nesting_strategy` raises `TypeError` inside the per-rotation `except` → placements silently stop happening. No crash, no obvious log.
-
-**Fix:** Either adopt main's 5-arg `trial_callback` (and update `find_best_placement` accordingly) **or** keep your 4-arg and keep main's `nesting_strategy` out. This series adopts main's `nesting_logic` wholesale (including the relay FIFO and 5-arg callback) in block 5.1.
-
-### 4.3 Your `_handle_new_master` tuple branch uses quantity as up-direction
-Already verified your code uses `'Z+'`. No issue.
+Not a bug. Our code already uses `'Z+'` (`shape_preparer.py:426`). An agent
+report claimed otherwise; verified twice, including by reverting the fix and
+re-running.
 
 ---
 
-## 5. Landing order — one commit per block
+## 3. Decisions — **DECIDED by 5.3** except 3.1-as-port
 
-Recommended order (nothing depends on a later block; any block is droppable):
+Full data in `tests/freecad_harness/RESULTS-5.3.md`.
 
-1. **0.1** — Harvest test suite from `inmternal-overlap-issue`, adapt, commit as `0.2-tests`.
-2. **0.2** — Record baseline numbers (corpus + seed + perf dump); commit as `0.3-baseline`.
-3. **1.1** — `_MainThreadRelay` FIFO + `_draining` guard (`nesting_logic.py`).
-4. **1.2** — `_retire_worker()` (`nesting_controller.py`).
-5. **1.3** — `compute_and_cache_nfp` None-master guard + per-hole failure isolation (`minkowski_engine.py`).
-6. **2.1** — IFP `e ⊕ −P` hole-edge sweeps (`minkowski_utils.py`).
-7. **2.2** — `discretize_wires_to_polygon` dedup+`make_valid`; `_require_area`/`EdgeOnProfileError`; `inv_rotation` (`shape_processor.py`). **Re-baseline numbers after this.**
-8. **2.3** — Fill `as_fill` split (`shape_preparer.py`).
-9. **3.1** — Port `Shape.type_label` + three key-site switches (`shape.py` + `minkowski_engine.py` + `nesting_strategy.py`). **Do NOT** take `_merge_convex_parts` or the numpy `minkowski_sum_convex`.
-10. **3.2** — `is_known_infeasible` + `count_skipped_rotations` + `rotations_skipped` stat, wired into **your** `find_best_placement`, preserving your `_cand_cache` early-return and your `ThreadPoolExecutor`.
-11. **4.1** — Fix doc-level `MasterShapes` group orphaning (your branch).
-12. **4.2** — Adopt main's 5-arg `trial_callback` + `_MainThreadRelay` rewrite (blocks 1.1 + 5.1 already landed, so this is just the callback arity change in `nesting_logic.py`).
-13. **5.1** — Port main's `nesting_logic.py` wholesale (relay + 5-arg trial_callback + `_find_master_container_for_part` → `getattr(part, 'master_container', None)`). This is the "take main's nesting_logic" block — everything else in it (the `_MainThreadRelay`, `nest()`, `fill_existing_sheets()`, `_hide_sim_outlines`, `_teardown_sim`) is main-only, your version is superseded.
-14. **5.2** — Port main's `ga_coordinator.py` structures that are compatible after 3.1–3.2: `enumerate_nfp_jobs` as a *counter only*, `ga_snapshot.SnapshotShape` (for the parallel path, if you later decide to add it), `ga_worker.py` init/ping/nest (if you add the parallel path). **Do not** port `_precompute_all_nfps`, the ProcessPoolExecutor path, or the parallel generation loop — those contradict your lazy-NFP spine.
+### 3.1 `_merge_convex_parts` (greedy convex merging) — **DO NOT TAKE**
 
-**After block 5.2:** You have a functional integration. Run the full Tier 1–3 suite. If all green, you can either (a) push this as a PR/merge candidate, or (b) continue with the optional blocks below.
+`make-faster.md:371` had already rejected it at 23.97s → 44.58s. 5.3 confirmed and
+*explained* it: the merge works (48 pieces at mean 3.0 vertices → 18 at mean 4.7,
+2.7× fewer pairs) but the union and convex-hull checks inside it cost more than
+the pair reduction saves. Unaffected by which convex sum is used.
 
-**Optional post-5.2 (not required for the plan, but the door is open):**
-- 5.3 — Add a dedicated benchmark block (Phase 5) that compares your lazy NFP + dead-ring pruning against main's eager precompute + serial rotation, on the same corpus, to finally settle the "which is faster" question.
-- 5.4 — If you want main's GA presets, compactness default `1.0`, and the `simulate_nesting`/`add_labels` default flips, those are product decisions; they go in a separate series because they invalidate baselines.
+### 3.2 Lazy vs eager NFP — **KEEP LAZY**
+
+main's `_precompute_all_nfps` builds 24 NFPs where a nest asks for 16, at **2.56×**
+the time. It also cannot use dead-ring pruning — it commits to the whole grid
+before any placement happens. Framed explicitly as favourable to lazy; the
+direction is the finding, not the factor.
+
+### 3.3 Rotation parallelism — **KEEP THE POOL**
+
+main's *"serial evaluation is 2.4–3.3× faster"* is **not reproduced**. n70 corpus,
+interleaved one session: 18.140s (w1) → 12.014 (w2) → 10.574 (w4) → 10.068 (w8),
+i.e. **1.80× faster at width 8**. Packing result identical at every width.
+
+Two caveats: this box has 4 CPUs and the curve saturates; and the branch's own
+notes warn the work is GEOS-bound with brief GIL release, so oversubscription
+should hurt more on a many-core machine. Revalidate before treating 4–8 as the
+default.
+
+**Consequence now open:** rotation evaluation draws from one shared
+`random.Random` across threads, which makes 28 of 51 perf counters
+non-reproducible. Small fix, and it blocks honest throughput measurement now
+that we know the pool is worth 1.8×. See §9.
+
+### 3.4 `type_label` cache keys — **PENDING** (an author's change)
+
+main keys NFP/candidate caches by part *type*; we key by instance. Strictly more
+sharing, and we have no `type_label` at all. Cost on our side is replacing two
+inline key constructions with their `_nfp_cache_key` / `candidate_cache_key`
+helpers. Prerequisite for main's rotation-skip (`is_known_infeasible`).
+
+Do **not** convert the dead-ring `convex_pair_probe_keys` — keyed on
+`master_poly1.wkb` + angles + piece indices, not labels, and immune to this.
+
+---
+
+## 4. Latent defects in this branch — **DONE**
+
+### 4.1 `MasterShapes` orphaning on commit — **DONE** (`7ffd3c8`)
+
+Our headless mode parents pooled masters in a document-level group, so
+`delete_layout` cannot reach them. `commit()` only ever looked for a
+`MasterShapes` child of the temp layout, so on commit it did nothing:
+
+| | pre-fix | post-fix |
+|---|---|---|
+| target `MasterShapes` | `['master_STALE']` | `['master_A','master_B']` |
+| unreachable from target | **6 objects** | 0 |
+
+Fixed in four places: a shared-group fallback in `create_layout` (the `Layout`
+had no handle on its own masters), a `shared_master_group` property, an explicit
+`from_ga_result` parameter plus a restructured `_promote_masters` in
+`nesting_job`, and the pass-through in `ga_coordinator._finalize`.
+
+The stale row must be deleted **before** adopting the shared masters, or the
+newly-adopted group is itself found and deleted. That ordering bug was hit on the
+first attempt.
+
+`tests/freecad_harness/test_master_promotion.py`, 16 checks over headless and
+simulate, verified to fail without the fix.
+
+### 4.2 The pooled group leaked on abandoned runs — **DONE** (`3598cc4`)
+
+A cancelled or failed run left the group populated and **visible**, with 6 master
+objects orphaned, because nothing else could reach it. Added
+`dispose_shared_master_group()` and a `_job_committed` gate in `run()`'s
+`finally`.
+
+The gate is deliberately *not* unconditional: the success path returns a job the
+controller commits later, and in worker mode `_dispatch_finalize` may not have
+run yet.
+
+### 4.3 The `_job_committed` gate itself was wrong — **DONE** (`317c2dc`)
+
+Found by the GA-loop test, in my own 4.2 work. `_dispatch_finalize` runs
+unconditionally — the `if best_layout is not None and not cancel_callback()` guard
+wraps only the *fill phase* — and `_finalize` returns `None` when there is no
+best layout. So the flag was set even when no job came back, a cancelled run
+claimed masters nothing would promote, and 9 objects leaked. Now keyed on
+`if job is not None`. The test fails again when the fix is reverted.
+
+Also noted, not fixed: on cancel `_dispatch_finalize` is still called with a
+`None` best layout. Harmless synchronously; in worker mode it marshals a
+pointless payload and blocks on `_draw_event.wait()`.
+
+### 4.4 `trial_callback` arity — **STRUCK**. Not a live defect; see the
+corrections at the top.
+
+---
+
+## 5. What was built, in order
+
+| # | commit | what |
+|---|---|---|
+| 1 | `5429c78` | harvested test harness (later superseded) |
+| 2 | `c2d61ba` | `ViewObject` guards — unblocked headless nesting entirely |
+| 3 | `88abaea` | real characterisation tests; removed the approximations |
+| 4 | `fd8c3c2` | Tier 2/3 freecadcmd harness + committed baseline |
+| 5 | `7ffd3c8` | 4.1 master promotion on commit |
+| 6 | `3598cc4` | 4.2 dispose the pooled group on abandoned runs |
+| 7 | `1c964fe` | 5.3 benchmarks: three either/or decisions settled |
+| 8 | `317c2dc` | GA-loop integration test; fixed the 4.3 gate |
+| 9 | `1d552ad` | GUI-session viability probe |
+
+### Unplanned work these enabled
+
+Three blocks were not in the original plan and none were optional:
+
+- **`ViewObject` guards** — `hasattr(obj, "ViewObject")` is not a sufficient
+  test; under freecadcmd the attribute exists but is `None`. A headless run raised
+  on every master container and **silently produced zero parts**.
+  `shape_object.py`/`label_object.py` were worse: `obj.ViewObject.Proxy = 0`
+  completely unguarded, a hard crash rather than a degradation.
+- **GA-loop integration test** — nothing constructed `GACoordinator` or
+  `NestingController` at all. Also found `FreeCADGui.updateGui()` called
+  unconditionally in `run()` (importable under freecadcmd, but with no such
+  attribute), which killed the loop on its first redraw. Fixed via
+  `freecad_helpers.refresh_gui()`. main has the same unguarded pattern.
+- **GUI-session viability probe** — see §8.
 
 ---
 
 ## 6. What this plan deliberately does NOT include
 
-| Category | Reason |
+| category | reason |
 |---|---|
-| UI restructure, i18n, About dialog, ManualNester Qt rework, Silhouette/Exporter DXF fixes | Orthogonal, zero overlap with your perf work, zero speed value here. These belong in a real merge or an upstream PR later. |
-| `_precompute_all_nfps`, `ga_snapshot.py`, `ga_worker.py`, ProcessPoolExecutor path | Contradicts your lazy-NFP spine; needs `member_idx`; unusable until 2.1 lands and the parallel path is a deliberate opt-in. |
-| `_merge_convex_parts` (greedy convex merge) | Your notebook measured 23.97s → 44.58s regression; explicitly **not** taken. |
-| Main's numpy `minkowski_sum_convex` | Asymptotically different; your O(n+m) edge merge is algorithmically better; wall-clock is genuinely unproven. Benchmark separately (see 5.3). |
-| Deleting your rotation `ThreadPoolExecutor` + `NESTING_ROTATION_WORKERS` | Your own notes list the 4-vs-8 experiment as outstanding; run it separately if you want to contest main's 2.4–3.3× claim. |
-| GA presets, compactness default `1.0`, `simulate_nesting`/`add_labels` default flips | Product decisions; invalidate baselines; keep out of this series. |
-| Any file outside `freecad/nestingworkbench/Tools/Nesting/` or `freecad/nestingworkbench/datatypes/` | Outside scope. |
+| UI restructure, i18n, About dialog, ManualNester Qt rework, Silhouette/Exporter DXF fixes | Orthogonal, zero overlap, zero speed value. Belong in a real merge or an upstream PR later. |
+| `_precompute_all_nfps`, `ga_snapshot.py`, `ga_worker.py`, ProcessPoolExecutor path | Contradicts the lazy-NFP spine; 5.3 measured eager at 2.56× the cost. Needs `member_idx`; unusable until 1.4 lands. |
+| `_merge_convex_parts` | 23.97s → 44.58s, mechanism now understood. |
+| Main's numpy `minkowski_sum_convex` | **5.3 measured it 1.33× faster at n = 3** — the case the workload always hits. Still not taking it, but for measured reasons: ~9% of nest time, and it would delete the reference implementation and the `[GA PERF]` `convex_*` instrumentation. Revisit if decomposition stops producing triangles. |
+| Deleting the rotation `ThreadPoolExecutor` | 5.3 measured the pool at 1.80× on 4 CPUs. Keep. |
+| GA presets, compactness default `1.0`, `simulate_nesting`/`add_labels` flips | Product decisions; invalidate baselines; separate series. |
+| Any file outside `Tools/Nesting/` and `datatypes/` | Out of scope. |
 
 ---
 
-## 7. Per-block verification protocol
+## 7. Verification, as it actually works
 
-After each block is applied, run these three tiers. Only if **all three pass** does the next block get applied.
+Three tiers, three mechanisms. Run everything with `tests/freecad_harness/run.sh`,
+which reports 0 pass / 1 gate failed / 2 usage error and fails if any suite does.
 
-### Tier 1 — Pure geometry, no FreeCAD (unit tests from the harness in 0.1)
-- Run every test file from the harvested suite.
-- Assert: no `is_valid == False`, no `is_empty == True` polygons, IFP containment holds, convex-piece counts within expected ranges.
-- Pass requirement: **100% pass** (0 failures).
+| tier | what | how |
+|---|---|---|
+| 1 | pure geometry, no FreeCAD | `python3 -m pytest tests/` — **70 tests**. `conftest.py` installs inert FreeCAD stubs only when genuinely absent. |
+| 2 | master lifecycle | `test_master_promotion.py` — **26 checks** |
+| 2 | GA loop + commit | `test_ga_loop.py` — **21 checks** |
+| 3 | corpus packing + perf | `nest_benchmark.py` vs the committed baseline |
 
-### Tier 2 — Geometry invariants, with FreeCAD (fixed corpus + fixed seed)
-- Run the same corpus (`n70-intercooler-spacer-bottle-nesting.FCStd` or equivalent) with the exact same seed.
-- Capture:
-  - Pack result: number of sheets, total placed parts, pack density, `hole_pct`.
-  - Any `TypeError`, `ValueError`, or crash during nesting.
-  - Whether the result is identical or *better* (more parts placed, fewer sheets) than the pre-block baseline.
-- Pass requirement: **no crashes**; pack result is **neutral or better** (same or more parts, same or fewer sheets).
+Plus two opt-in suites: `probe_gui_session.py` (12 checks, needs the `freecad`
+binary) and the 5.3 benchmarks.
 
-### Tier 3 — Perf diff against the latest baseline
-- Diff the full `[GA PERF]` + `[LAYOUT PERF]` dump against the baseline recorded in 0.3.
-- Pass requirement: **neutral or better** (no counter increases, no new warnings). If a block intentionally changes a counter (e.g. 2.3 Fill changes sheet count), the doc must note the expected delta and the other counters must be neutral or better.
+**Gates.** `sheets`, `unplaced`, `placed`, `density` must not regress.
+`NEST_BENCH_ALLOW_FEWER_PLACED=1` relaxes the last two — for **2.1 only**.
 
-**Gate decision:** Only proceed to the next block if Tier 1–3 all pass. If any tier fails, revert the block (`git revert <sha>`), document the failure reason, and either (a) skip that capability, or (b) iterate a smaller sub-block until green.
+**Never gated:** wall-clock and the eleven `*_ms` counters. A timing regression
+is a judgement call, not a threshold. Work counts *are* reproducible at rotation
+width 1 and are printed with a percentage when they change.
 
-**Commit message template (after each block):**
-```
-Ported-from: main@eac1e30 (<function/file>)
-Capability: <one-line description>
-Before: <brief before-numbers or "see baseline">
-After: <brief after-numbers or "see new baseline">
-Independently revertable: yes
-Tier: 1=pass 2=pass 3=neutral-or-better
-```
+Two standing traps:
+
+- **`[PERF]` counters are sums of per-worker times, not wall clock**
+  (`make-faster.md`, "Timing interpretation"). Only explicit nesting/generation
+  totals are wall time.
+- **20% noise floor across sessions.** Compare with interleaved A/B in one
+  session and the minimum, never two runs on different days.
+
+### Environment findings worth keeping
+
+- `freecadcmd` **eats command-line flags**: `--pass a b c` arrives intact,
+  `--pass --alpha --beta` never runs the script. Hence env-var configuration.
+- `FreeCAD.Console` swallows plain `print` once a document exists. Hence `emit()`
+  in every harness script.
+- `freecadcmd` runs a script with `__name__` set to the module basename and does
+  not reliably propagate its exit code. Hence the `__name__ in (...)` guards and
+  the `.last_status*` files.
+- `FreeCAD.GuiUp` is an **int**, not a bool. `if FreeCAD.GuiUp:` is right;
+  `is True` is a false negative.
+- FreeCAD **de-duplicates Labels as well as Names**, so a re-nest gets
+  `MasterShapes001`. Lookups must match by prefix. main hit this too and fixed it
+  the same way. Pre-existing in our `create_layout` exact-match, harmless because
+  nothing outside `layout_manager` reads the attribute and `commit` matches by
+  prefix. Left alone deliberately, to keep 4.1 to one concern.
+- Orphan detection must use **reachability from the target layout**;
+  `getParentGroup()` reports `None` for children of an `App::Part`, which
+  produced three false positives on the first attempt.
 
 ---
 
-## 8. Next step
+## 8. Worker-path viability — **RESOLVED, and better than expected**
 
-1. Create a new integration branch off current HEAD:
-   ```bash
-   git checkout -b integrate-main-2026.9 cc57e25
-   ```
-2. Apply 0.1 (harvest test suite from `inmternal-overlap-issue`), adapt paths, commit as `0.2-tests`.
-3. Run Tier 1; fix any failures.
-4. Proceed block by block per the order in §5, running Tiers 1–3 after each.
+1.1 and 1.2 were blocked on whether a QThread and the Qt event loop are testable.
+`freecadcmd` has no GUI, so signals posted across threads are never delivered.
+Xvfb is installed, so a virtual display was the obvious route.
 
-**Do not skip 0.1.** The characterisation harness is your safety net. Without it, you are merging blind.
+**No Xvfb is needed.** FreeCAD 26.3's `freecad` binary starts with a live GUI on
+no display at all. Verified, 12 checks:
+
+| property | result |
+|---|---|
+| `FreeCAD.GuiUp` | 1 |
+| `FreeCADGui.updateGui` | present |
+| QApplication / main thread | exists, and this *is* `app.thread()` |
+| QThread | genuinely runs off the main thread |
+| queued signal across threads | delivers — the `_MainThreadRelay` mechanism |
+| `ViewObject` | live; `Visibility = False` takes effect |
+| `NestingWorker` + `GACoordinator` | runs on a thread, marshals a draw payload |
+
+Consequences: **1.1 and 1.2 can be landed test-first**, and the visual half of
+4.2 becomes assertable.
+
+**The trap:** signals need the event loop pumped *after* the worker finishes, not
+only while it runs. A test that waits on `isRunning()` then asserts without
+draining gets a false negative. The first draft of the probe made exactly that
+mistake.
+
+**Still needed** before 1.1/1.2 are landed under test: a faithful reproduction of
+`NestingController._handle_draw_request` (~50 lines), or drive the controller
+itself. `create_population` must actually populate
+`coordinator._pending_layouts`, or `_run_generation` receives `None`. Tractable.
 
 ---
-*This plan was generated from a comparative analysis of the working branch vs. main@eac1e30, with load-bearing claims verified against the on-disk git state. Blocks marked "DO NOT TAKE" are explicitly excluded; all others are individually revertable.*
+
+## 9. Outstanding work that is NOT the author's
+
+Ordered by how much it blocks.
+
+1. **Faithful `_handle_draw_request` reproduction.** Gates 1.1 and 1.2. §8.
+2. **Shared-rng across rotation threads.** One `random.Random` consumed by
+   concurrent rotation evaluation makes 28 of 51 counters non-reproducible.
+   Now matters because 5.3 showed the pool is worth 1.8× and we cannot measure
+   it cleanly. Small; per-worker seeded rng, as main's coordinator already does
+   per GA member.
+3. **Re-record the baseline as min-of-N.** §0.2. Currently a single run against
+   a documented 20% noise floor.
+4. **Candidate-geometry-cache disabled control, seed `649084969`**
+   (`make-faster.md:52-58`). Required before the cache can go default-on, and
+   the cache has zero test coverage despite being the one opt-in feature with a
+   measured win (87.44s → 10.22s, 75.2% hit rate).
+5. **`collision_intersection`** — 350.87s aggregate, the largest remaining cost.
+   The notebook's own rule applies: a counting counter and a measurement on the
+   fixture *before* any code.
+6. **`.gitignore` regression, still uncommitted.** The working-tree file deletes
+  the ignores for `minkowski_cpp/bin/`, `build/`, `*.so`, `opencode.json` and the
+  n70 fixture. Restore it.
+7. **23 unpushed commits, no PR** (14 pre-existing plus the 9 here). And the
+   unanswered question: send the author a PR carrying §1 and §2 so the fixes
+   land once and this branch carries only perf work?
+8. **`nfp-cpp` (15) and `inmternal-overlap-issue` (18)** both fork from `5439c2f`
+   and contain neither our work nor each other's. `nfp-cpp` is a Clipper2 C++
+   NFP engine — a third competing answer to a problem now solved twice.
