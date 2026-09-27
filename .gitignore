@@ -54,3 +54,6 @@ freecad/nestingworkbench/Tools/Nesting/algorithms/minkowski_cpp/test_nfp_verbose
 .opencode/plans/
 
 tests/Test_Files/n70-intercooler-spacer-bottle-nesting.FCStd
+
+# nest benchmark harness scratch status
+tests/freecad_harness/.last_status
