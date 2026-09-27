@@ -17,7 +17,11 @@ These tests pin the two helpers that make such access safe.
 """
 import pytest
 
-from freecad.nestingworkbench.freecad_helpers import get_view_object, set_visibility
+from freecad.nestingworkbench.freecad_helpers import (
+    get_view_object,
+    set_visibility,
+    refresh_gui,
+)
 
 
 class _FakeView:
@@ -93,3 +97,40 @@ class TestSetVisibility:
         # safe, including the headless shapes that used to raise.
         for obj in (_ObjWithView(), _ObjWithoutView(), _ObjNoAttr(), None):
             set_visibility(obj, True)
+
+
+class TestRefreshGui:
+    """`FreeCADGui` imports under freecadcmd but exposes no `updateGui`.
+
+    The same reasoning as get_view_object: a name being importable says nothing
+    about the attribute existing. GACoordinator.run() called
+    `FreeCADGui.updateGui()` unconditionally, so the GA loop died on its first
+    redraw under test with:
+
+        AttributeError: module 'FreeCADGui' has no attribute 'updateGui'
+
+    These tests run under plain CPython, where FreeCADGui is the inert stub from
+    tests/conftest.py and genuinely has no updateGui -- which is exactly the
+    failing case.
+    """
+
+    def test_is_a_noop_without_a_gui(self):
+        assert refresh_gui() is False
+
+    def test_never_raises(self):
+        # Must be safe to call from any code path, including a deep one.
+        assert refresh_gui() in (True, False)
+
+    def test_reports_false_rather_than_raising_when_freecadegui_is_absent(self):
+        import sys
+
+        saved = sys.modules.get("FreeCADGui")
+        try:
+            # Simulate a launcher where FreeCADGui is not importable at all.
+            sys.modules["FreeCADGui"] = None
+            assert refresh_gui() is False
+        finally:
+            if saved is not None:
+                sys.modules["FreeCADGui"] = saved
+            else:
+                sys.modules.pop("FreeCADGui", None)

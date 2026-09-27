@@ -9,7 +9,7 @@ import math
 import random
 import time
 from ...datatypes.shape import Shape
-from ...freecad_helpers import set_visibility
+from ...freecad_helpers import set_visibility, refresh_gui
 from .layout_manager import LayoutManager
 from .algorithms import genetic_utils
 from .algorithms import minkowski_utils
@@ -387,7 +387,7 @@ class GACoordinator:
         if self.draw_callback:
             self.draw_callback({'updateGui_only': True})
         else:
-            FreeCADGui.updateGui()
+            refresh_gui()
         
         if self.draw_callback:
             # Marshal to main thread
@@ -524,7 +524,7 @@ class GACoordinator:
                 if self.draw_callback:
                     self.draw_callback({'updateGui_only': True})
                 else:
-                    FreeCADGui.updateGui()
+                    refresh_gui()
                 self._ga_perf['visualization_s'] += time.perf_counter() - gui_start
                 
                 gen_time, interrupted = self._run_generation(
@@ -807,7 +807,17 @@ class GACoordinator:
             # A job now owns the masters: NestingJob._promote_masters moves them
             # out of the shared group into the target layout when the
             # controller commits. Stops the finally block disposing them first.
-            self._job_committed = True
+            #
+            # Keyed on the job, not on reaching this line. _dispatch_finalize
+            # runs unconditionally -- the `if best_layout is not None and not
+            # cancel_callback()` guard above wraps only the fill phase -- and
+            # _finalize returns None when there is no best layout, as on a
+            # cancelled or empty run. Setting the flag unconditionally let such
+            # a run claim ownership of masters nothing will ever promote, so
+            # the finally block skipped disposal and the shared group leaked.
+            # Found by tests/freecad_harness/test_ga_loop.py.
+            if job is not None:
+                self._job_committed = True
             return job
 
         except Exception as e:
@@ -1007,7 +1017,7 @@ class GACoordinator:
                     
                     if len(layouts) > 1 and layout.layout_group:
                         set_visibility(layout.layout_group, False)
-                    FreeCADGui.updateGui()
+                    refresh_gui()
             
         return total_time, False
 

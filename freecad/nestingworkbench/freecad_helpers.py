@@ -52,6 +52,30 @@ def set_visibility(obj, visible):
     view_object.Visibility = visible
     return True
 
+def refresh_gui():
+    """Processes pending Qt events, tolerating a GUI-less FreeCAD.
+
+    `FreeCADGui` imports fine under freecadcmd but exposes no `updateGui`, so
+    an unguarded call raises AttributeError partway through a nest. That is
+    what stopped the GA loop running under test at all: GACoordinator.run()
+    died on its first redraw.
+
+    The equivalent of get_view_object's reasoning -- a name being importable
+    says nothing about the attribute existing. This is a no-op with no GUI.
+
+    Returns:
+        bool — whether a GUI was present and the event queue pumped.
+    """
+    try:
+        import FreeCADGui
+
+        if FreeCADGui is None or not hasattr(FreeCADGui, "updateGui"):
+            return False
+        FreeCADGui.updateGui()
+        return True
+    except Exception:
+        return False
+
 def get_up_direction_rotation(up_direction):
     """
     Returns a FreeCAD.Rotation that transforms the given up_direction to Z+.

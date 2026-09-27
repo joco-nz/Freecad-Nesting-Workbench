@@ -29,13 +29,15 @@ export NEST_BENCH_BASELINE
 
 BENCH_STATUS="$HARNESS_DIR/.last_status"
 TEST_STATUS="$HARNESS_DIR/.last_status_test"
-rm -f "$BENCH_STATUS" "$TEST_STATUS"
+GA_STATUS="$HARNESS_DIR/.last_status_ga"
+rm -f "$BENCH_STATUS" "$TEST_STATUS" "$GA_STATUS"
 
 cd "$REPO_ROOT"
 "$FREECADCMD" "$HARNESS_DIR/nest_benchmark.py" || true
 "$FREECADCMD" "$HARNESS_DIR/test_master_promotion.py" || true
+"$FREECADCMD" "$HARNESS_DIR/test_ga_loop.py" || true
 
-for f in "$BENCH_STATUS" "$TEST_STATUS"; do
+for f in "$BENCH_STATUS" "$TEST_STATUS" "$GA_STATUS"; do
     if [ ! -f "$f" ]; then
         echo "harness did not write $f -- it probably did not run" >&2
         exit 3
@@ -56,6 +58,12 @@ esac
 # and fail if either did.
 if [ "$TESTS" -ne 0 ]; then
     echo "master-promotion regression test FAILED (status $TESTS)" >&2
+    [ "$STATUS" -eq 0 ] && STATUS=1
+fi
+
+GA=$(cat "$GA_STATUS")
+if [ "$GA" -ne 0 ]; then
+    echo "GA-loop integration test FAILED (status $GA)" >&2
     [ "$STATUS" -eq 0 ] && STATUS=1
 fi
 

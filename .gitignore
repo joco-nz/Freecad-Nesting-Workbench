@@ -59,3 +59,4 @@ tests/Test_Files/n70-intercooler-spacer-bottle-nesting.FCStd
 tests/freecad_harness/.last_status
 tests/freecad_harness/.last_status_test
 tests/freecad_harness/.last_status_bench
+tests/freecad_harness/.last_status_ga
