@@ -66,3 +66,9 @@ def ensure_freecad_importable():
 # Installed at collection time so test modules can import workbench code at
 # module scope, matching how the workbench itself imports them.
 STUBBED_MODULES = ensure_freecad_importable()
+
+# tests/freecad_harness/ holds scripts that run under `freecadcmd`, not pytest.
+# One of them is named test_*.py and would be collected here, where importing it
+# executes a real nesting run and then calls sys.exit() -- pytest aborts with
+# "INTERNALERROR> SystemExit". They are driven by tests/freecad_harness/run.sh.
+collect_ignore = ["freecad_harness"]

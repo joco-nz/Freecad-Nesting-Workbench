@@ -1109,7 +1109,13 @@ class GACoordinator:
         best_layout.layout_group.Label = "Layout_temp"
         job = NestingJob.from_ga_result(
             doc=self.doc, target_layout=target_layout, params=ui_params, preparer=self.shape_preparer,
-            layout_group=best_layout.layout_group, parts_group=best_layout.parts_group, sheets=best_layout.sheets
+            layout_group=best_layout.layout_group, parts_group=best_layout.parts_group, sheets=best_layout.sheets,
+            # Headless layouts keep their masters in a document-level group, so
+            # the job cannot find them from the layout alone. Without this the
+            # masters were orphaned outside every layout and the previous run's
+            # master row was never replaced.
+            shared_master_group=(self.layout_manager.shared_master_group
+                                 if self.layout_manager else None),
         )
         
         unplaced_count = len(getattr(best_layout, 'unplaced', []) or [])

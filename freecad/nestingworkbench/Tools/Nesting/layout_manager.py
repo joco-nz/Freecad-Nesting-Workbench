@@ -171,6 +171,16 @@ class LayoutManager:
             self._perf_inc('lm_master_group_objects_created')
         return self._shared_master_group
 
+    @property
+    def shared_master_group(self):
+        """The document-level master group, or None in simulate mode.
+
+        Read-only, and does NOT create the group -- the caller may just be
+        inspecting. NestingJob needs this to find the masters when the winning
+        layout has no MasterShapes child of its own.
+        """
+        return self._shared_master_group
+
     def create_layout(self, name, master_shapes_map, quantities, ui_params, 
                       chromosome_ordering=None) -> Layout:
         """
@@ -216,12 +226,18 @@ class LayoutManager:
         self._perf_add('lm_prepare_parts_s', time.perf_counter() - prepare_start)
         self._perf_inc('lm_parts_created', len(parts))
 
-        # Get master shapes group
+        # Get master shapes group. Headless layouts keep their masters in the
+        # document-level shared group (see _get_shared_master_group), so that
+        # loop never matches and the Layout was left with master_shapes_group
+        # set to None for the whole run -- which is what left NestingJob.commit
+        # unable to find the masters to promote.
         master_shapes_group = None
         for child in layout_group.Group:
             if child.Label == "MasterShapes":
                 master_shapes_group = child
                 break
+        if master_shapes_group is None:
+            master_shapes_group = self._shared_master_group
         
         # Apply chromosome ordering if provided
         order_start = time.perf_counter()
