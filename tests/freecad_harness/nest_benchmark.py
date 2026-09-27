@@ -385,13 +385,75 @@ def run_nest(doc, parts, quantities, cfg):
 # --------------------------------------------------------------------------
 # Reporting
 # --------------------------------------------------------------------------
+def validate_perf(perf):
+    """Self-checks on the instrumentation, run on every harness invocation.
+
+    Guards the guard. The phase accumulator was added after a NameError inside
+    `_compute_nfp_uncached` was swallowed by that function's broad `except`:
+    every NFP became `{'error': ...}`, every rotation was skipped, and the run
+    quietly produced 18 single-part sheets instead of 1. Nothing crashed and the
+    summary line looked plausible.
+
+    These invariants turn that class of silent degradation into a hard failure:
+
+      * the phase keys must be present at all, or the accumulator is broken;
+      * `total_ms` must cover the phases it is the sum of, catching a
+        mis-ordered or partially-written accumulator;
+      * `work_convex_pairs` must be non-zero on any run that did real work;
+      * `nfp_errors` must be zero. Any NFP error is a swallowed exception.
+
+    Returns a list of failure strings, empty when the run is sound.
+    """
+    failures = []
+
+    phase_total = perf.get("nfp_phase_total_ms")
+    if phase_total is None:
+        failures.append("no nfp_phase_total_ms: the phase accumulator is not "
+                        "reporting, so phase attribution is unavailable")
+        return failures
+
+    for required in ("nfp_phase_convex_sum_ms", "nfp_phase_union_ms",
+                     "nfp_work_convex_pairs", "nfp_nfp_errors"):
+        if required not in perf:
+            failures.append(f"missing perf key {required}")
+
+    # total_ms is the whole NFP, so it must not be less than the sum of two
+    # phases that sit inside it.
+    inner = perf.get("nfp_phase_convex_sum_ms", 0.0) + perf.get("nfp_phase_union_ms", 0.0)
+    if phase_total + 1e-9 < inner:
+        failures.append(
+            f"phase_total_ms {phase_total:.3f} < convex_sum+union {inner:.3f}: "
+            f"the accumulator is not summing a partition")
+
+    pairs = perf.get("nfp_work_convex_pairs", 0)
+    if pairs <= 0:
+        failures.append(f"nfp_work_convex_pairs is {pairs}: no convex sums ran, "
+                        f"so this is not a comparable run")
+
+    errors = perf.get("nfp_nfp_errors", 0)
+    if errors:
+        failures.append(
+            f"{errors} NFP(s) errored. Each is an exception swallowed by "
+            f"_compute_nfp_uncached's broad except, and each one silently "
+            f"removes a placement region. This run is not comparable.")
+
+    worst_total = perf.get("nfp_phase_total_ms_worst", 0.0)
+    if worst_total > phase_total + 1e-9:
+        failures.append("worst single NFP exceeds the total: accumulator is "
+                        "double counting")
+
+    return failures
+
+
 def _is_timing(key):
     """True for wall-clock counters, never comparable run to run.
 
-    Every volatile key ends in `_ms`; the rest are work counts, reproducible
-    at rotation-worker width 1.
+    Matches both `*_ms` and `*_ms_worst` (the phase accumulator's worst-single-
+    NFP figures). Getting this wrong is not cosmetic: a `_ms_worst` key was
+    classified as a work count and reported as a "reproducible count that
+    changed", which is exactly the noise it is not.
     """
-    return key.endswith("_ms")
+    return key.endswith("_ms") or "_ms_" in key
 
 
 def build_record(cfg, corpus_desc, result, perf, dead_ring, wall):
@@ -502,6 +564,15 @@ def main():
     result, perf, dead_ring, wall = run_nest(doc, parts, quantities, cfg)
     record = build_record(cfg, corpus_desc, result, perf, dead_ring, wall)
     print_record(record)
+
+    problems = validate_perf(perf)
+    if problems:
+        emit("")
+        emit("ERROR: the run's own instrumentation is not self-consistent, so "
+             "this is not a comparable run:")
+        for problem in problems:
+            emit(f"  - {problem}")
+        return 3
 
     if not dead_ring:
         # A run with the optimisation silently off is not a usable reference.

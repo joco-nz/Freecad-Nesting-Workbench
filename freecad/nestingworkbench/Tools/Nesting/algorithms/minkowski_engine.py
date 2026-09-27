@@ -12,7 +12,7 @@ from shapely.affinity import translate, rotate
 from . import minkowski_utils
 from ....datatypes.shape import Shape
 
-def compute_and_cache_nfp(shape_A, angle_A, part_to_place, angle_B, cache_key, log=None, step_size=5.0, performance_logging=False):
+def compute_and_cache_nfp(shape_A, angle_A, part_to_place, angle_B, cache_key, log=None, step_size=5.0, performance_logging=False, out_timings=None):
     """Computes the NFP for one (A, B, relative-angle) pair and stores it in
     Shape.nfp_cache under cache_key. Pure Shapely — safe on any thread.
     Returns the cache entry."""
@@ -47,7 +47,7 @@ def compute_and_cache_nfp(shape_A, angle_A, part_to_place, angle_B, cache_key, l
     try:
         nfp_data = _compute_nfp_uncached(
             shape_A, angle_A, part_to_place, angle_B, cache_key, log, step_size,
-            performance_logging
+            performance_logging, out_timings
         )
         with Shape.nfp_cache_lock:
             Shape.nfp_cache[cache_key] = nfp_data
@@ -61,7 +61,7 @@ def compute_and_cache_nfp(shape_A, angle_A, part_to_place, angle_B, cache_key, l
             Shape.nfp_inflight.pop(cache_key, None)
 
 
-def _compute_nfp_uncached(shape_A, angle_A, part_to_place, angle_B, cache_key, log, step_size, performance_logging=False):
+def _compute_nfp_uncached(shape_A, angle_A, part_to_place, angle_B, cache_key, log, step_size, performance_logging=False, out_timings=None):
     """Compute one NFP without consulting or updating the shared cache."""
     t_total = time.perf_counter()
     timings = {}
@@ -138,6 +138,11 @@ def _compute_nfp_uncached(shape_A, angle_A, part_to_place, angle_B, cache_key, l
         log(f"Error calculating NFP for {cache_key}: {e}", level="error")
         nfp_data = {'error': str(e)}
     timings["total_ms"] = (time.perf_counter() - t_total) * 1000
+    # Hand the phase breakdown to the caller so the engine can accumulate it.
+    # Placed before the logging block, and on every path that computed including
+    # the error path, so a failed NFP still reports where it died.
+    if out_timings is not None:
+        out_timings.update(timings)
     if performance_logging:
         log(
         "[PERF] NFP phases key={} total={total_ms:.1f}ms "
@@ -238,7 +243,7 @@ class MinkowskiEngine:
         self._log_lock = Lock()
 
         self.bin_polygon = Polygon([(0, 0), (self.bin_width, 0), (self.bin_width, self.bin_height), (0, self.bin_height)])
-        self._perf_stats = {'cache_hits': 0, 'cache_misses': 0, 'nfp_compute_ms': 0.0}
+        self._perf_stats = {'cache_hits': 0, 'cache_misses': 0, 'nfp_compute_ms': 0.0, 'nfp_errors': 0}
         self._perf_lock = Lock()
         self._cand_cache_lock = Lock()
 
@@ -561,9 +566,63 @@ class MinkowskiEngine:
         return best_idx, metric
 
     def _calculate_and_cache_nfp(self, shape_A, angle_A, part_to_place, angle_B, cache_key):
-        return compute_and_cache_nfp(
+        # out_timings collects this call's ~25 phase timings and work counts.
+        # They were previously formatted into a [PERF] log line and discarded,
+        # so nothing outside that log could see where NFP time actually went --
+        # answering "which phase dominates?" needed a hand-written probe. The
+        # dict is filled in place rather than returned so the call signature and
+        # the cached payload are both untouched: a timings key stored in
+        # Shape.nfp_cache would be retained per entry and would be stale on a
+        # hit. Filling on the compute path only is also correct for the
+        # in-flight case -- a thread that joins an in-flight computation does
+        # not compute, so it has no timings to contribute.
+        timings = {}
+        nfp_data = compute_and_cache_nfp(
             shape_A, angle_A, part_to_place, angle_B, cache_key, self.log,
-            self.step_size, self.performance_logging)
+            self.step_size, self.performance_logging, out_timings=timings)
+        if timings:
+            with self._perf_lock:
+                self._accumulate_phase_timings(timings)
+        if isinstance(nfp_data, dict) and nfp_data.get('error'):
+            # A failed NFP is turned into {'error': ...} by a broad `except` and
+            # then skipped, so the run continues with one fewer usable placement
+            # region and no crash. That is a silent degradation: it once cost a
+            # whole run its packing (18 sheets instead of 1) because a
+            # NameError in this function was swallowed. Counted here so the
+            # harness can gate on it rather than trusting the summary line.
+            with self._perf_lock:
+                self._perf_stats['nfp_errors'] = self._perf_stats.get('nfp_errors', 0) + 1
+        return nfp_data
+
+    def _accumulate_phase_timings(self, timings):
+        """Folds one call's phase timings and work counts into _perf_stats.
+
+        Sums numeric values and keeps the extremes that are only meaningful as
+        extremes, so a run-level view can answer both "where did the time go"
+        and "what was the worst single NFP".
+
+        Keys are namespaced `phase_` for timings and `work_` for counts, so they
+        cannot collide with the three existing counters (cache_hits,
+        cache_misses, nfp_compute_ms) and so Nester.get_perf_stats()'s `nfp_`
+        prefixing keeps them visibly separate from candidate-stage timings.
+        """
+        for key, value in timings.items():
+            if not isinstance(value, (int, float)) or isinstance(value, bool):
+                continue
+            if key.endswith("_ms"):
+                target = f"phase_{key[:-3]}_ms"
+                self._perf_stats[target] = self._perf_stats.get(target, 0.0) + value
+                worst = f"phase_{key[:-3]}_ms_worst"
+                if value > self._perf_stats.get(worst, 0.0):
+                    self._perf_stats[worst] = value
+            else:
+                target = f"work_{key}"
+                if isinstance(value, int) and not isinstance(value, bool):
+                    self._perf_stats[target] = self._perf_stats.get(target, 0) + value
+                    if key in ("parts_a", "parts_b", "convex_pairs"):
+                        high = f"work_{key}_max"
+                        if value > self._perf_stats.get(high, 0):
+                            self._perf_stats[high] = value
 
     def get_perf_stats(self):
         with self._perf_lock:
@@ -571,7 +630,7 @@ class MinkowskiEngine:
 
     def reset_perf_stats(self):
         with self._perf_lock:
-            self._perf_stats = {'cache_hits': 0, 'cache_misses': 0, 'nfp_compute_ms': 0.0}
+            self._perf_stats = {'cache_hits': 0, 'cache_misses': 0, 'nfp_compute_ms': 0.0, 'nfp_errors': 0}
 
     @staticmethod
     def _discretize_ring_np(ring, step_size):
