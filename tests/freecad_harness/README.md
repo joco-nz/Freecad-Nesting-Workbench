@@ -167,6 +167,59 @@ Current committed baseline: `rings_seen 28, rings_dropped 28, polygons_pruned
 empirical confirmation of the documented invariant that pruning only ever
 shrinks the NFP and so cannot cost a placement.
 
+## GUI sessions and the worker path
+
+`freecadcmd` has no GUI, so `FreeCAD.GuiUp` is False, `ViewObject` is None, and
+a signal posted across threads is never delivered. That made the workbench's
+worker/thread path untestable, which blocked two planned integration blocks:
+**1.1** (`_MainThreadRelay` FIFO guard) and **1.2** (`_retire_worker`, the
+second-run crash).
+
+**No Xvfb is needed.** FreeCAD 26.3's `freecad` binary starts with a live GUI on
+no display at all. Verified by `probe_gui_session.py` (run it with `freecad`,
+*not* `freecadcmd`):
+
+```sh
+$FREECAD tests/freecad_harness/probe_gui_session.py
+```
+
+| property | result |
+|---|---|
+| `FreeCAD.GuiUp` | 1 (an int — test truthiness, not `is True`) |
+| `FreeCADGui.updateGui` | present |
+| QApplication / main thread | exists, and this *is* `app.thread()` |
+| QThread | genuinely runs off the main thread |
+| queued signal across threads | delivers — the `_MainThreadRelay` mechanism |
+| `ViewObject` | live; `Visibility = False` takes effect |
+| `NestingWorker` + `GACoordinator` | runs on a thread, marshals a draw payload |
+
+Consequences:
+
+- **1.1 and 1.2 can be landed test-first.** Both the relay mechanism and the
+  QThread lifecycle are exercisable.
+- **The visual half of 4.2 becomes assertable** — master outlines, labels,
+  visibility — which the 4.2 notes had to leave unverified.
+- `FreeCAD.GuiUp` is an `int`, so `if FreeCAD.GuiUp:` (what the workbench does)
+  is correct and `is True` is a false negative.
+
+### The trap in any worker-mode test
+
+Signals need the event loop pumped **after** the worker finishes, not only while
+it runs. A test that waits on `isRunning()` and then asserts without draining
+the queue gets a false negative. `probe_gui_session.py` provides `pump()` and
+`drain()` for this; the first draft of the probe made exactly that mistake and
+looked like the signal never arrived.
+
+### Still needed for a worker-mode GA test
+
+The probe's draw handler only counts payloads. `create_population` is supposed
+to run `LayoutManager.create_ga_population` and stash the result in
+`coordinator._pending_layouts`; without that, `_run_generation` receives `None`
+and raises — which the probe asserts happens, rather than hanging. A real
+worker-mode test therefore needs a faithful reproduction of
+`NestingController._handle_draw_request` (about 50 lines), or should drive the
+controller itself. Tractable, and the natural next piece of work.
+
 ## Baseline
 
 `baseline/synthetic_v1.json` — schema 1, synthetic corpus, seed 20260925,
