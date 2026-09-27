@@ -324,6 +324,37 @@ Migrating it is a follow-up, not a blocker.
 Re-record with `NEST_BENCH_OUT=...` after an intentional change. Keep the
 schema version in step with the reader; the harness refuses a mismatch.
 
+## The n70 corpus
+
+`tests/Test_Files/n70-intercooler-spacer-bottle-nesting.FCStd` is a real job:
+3 part types — **Spacer** (510×438 mm, the one that dominates), **Bottle Top**,
+**Bottle Bottom** — inside `PartDesign::Body` objects with Sketches, Pads and
+Origins. `discover_doc_parts` correctly finds the 3 Bodies and skips the 30
+scaffolding objects.
+
+It is **gitignored** (added in 3507c79, "Ignore updated"), so it is the one
+workload here that cannot back a committed baseline — see the note at the end.
+
+Reproduces the workload in `make-faster.md`:
+
+```sh
+NEST_BENCH_CORPUS=tests/Test_Files/n70-intercooler-spacer-bottle-nesting.FCStd \
+NEST_BENCH_QUANTITIES='Spacer=2,Bottle Top=60,Bottle Bottom=60' \
+NEST_BENCH_SHEET=1200x600 NEST_BENCH_ROTATION_STEPS=8 \
+NEST_BENCH_REPS=3 $FREECADCMD tests/freecad_harness/nest_benchmark.py
+```
+
+Measured here: **122 placed, 2 sheets, 41.8% density, 72.5 s** per nest
+(min of 3, spread 1.9%). The notebook's GA run of the same part set reported 122
+placed, 2 sheets, 40.4% — so this is the same workload.
+
+`NEST_BENCH_QUANTITIES` exists because the workload is not uniform. The FCStd
+path used to hardcode quantity 1, which meant `NEST_BENCH_QUANTITY=2` and `=5`
+produced byte-identical runs and any n70 measurement was silently measuring one
+of each part. Found by measuring, not by reading. A malformed entry raises
+rather than being skipped, because a dropped quantity gives a clean-looking run
+of the wrong workload.
+
 ## Reps, and what a baseline is allowed to claim
 
 A baseline recorded from one sample is a claim about a machine state that does
@@ -379,3 +410,20 @@ baseline**: `tests/Test_Files/n70-*.FCStd` is gitignored, so no one else could
 reproduce it. Heavy-corpus measurement therefore stays an ad-hoc activity in the
 style of `bench_rotation_workers.py` — interleaved within one session, minimum
 of N, never compared against a stored number.
+
+### Which is the real noise floor?
+
+Measured on the n70 workload, 3 back-to-back reps in one process: wall spread
+**1.9%**, and all 63 work counts **exact**. Not 20%.
+
+Both numbers can be right, because they answer different questions. In-process
+reps sample a quiet box with a cold cache each time; the 24s → 31s → 37s
+sequence was across conditions. So in-process reps *understate* the variation
+you will see between a quiet box and a loaded one — which is exactly the
+variation that matters when deciding whether a number moved. The honest reading:
+
+- for **gating**, in-process reps at width 1 are sufficient and the discrete
+  fields are exact on both corpora;
+- for **claiming a speedup**, the measurement has to be interleaved with the
+  thing it is compared against, in one session, minimum of N. Never a stored
+  number.

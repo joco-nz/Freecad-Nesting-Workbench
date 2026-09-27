@@ -138,6 +138,61 @@ class TestCollapse:
         assert counts == ["n"]
 
 
+class TestQuantitySpec:
+    """The FCStd corpus path used to hardcode quantity 1.
+
+    `NEST_BENCH_QUANTITY=2` and `=5` produced byte-identical runs, so an
+    n70 measurement at any scale was silently measuring one of each. The parser
+    raises on a malformed entry for the same reason: a dropped quantity produces
+    a clean-looking run of the wrong workload.
+    """
+
+    @staticmethod
+    def _parse(spec):
+        """Imports nest_benchmark by path and parses with its real parser.
+
+        Loaded by path rather than imported, because under freecadcmd a script
+        runs with __name__ set to its own basename and the module's
+        `if __name__ in ("__main__", "nest_benchmark")` guard would not fire
+        under pytest -- so this is the real code path, not a copy of it.
+        """
+        import importlib.util
+
+        path = os.path.join(os.path.dirname(__file__), "freecad_harness",
+                            "nest_benchmark.py")
+        module_spec = importlib.util.spec_from_file_location("nest_benchmark_mod", path)
+        module = importlib.util.module_from_spec(module_spec)
+        module_spec.loader.exec_module(module)
+        return module._parse_quantities(spec)
+
+    def test_labels_containing_spaces(self):
+        """The n70 corpus is 'Bottle Top' and 'Bottle Bottom'."""
+        assert self._parse("Bottle Top=60,Bottle Bottom=60") == {
+            "Bottle Top": 60, "Bottle Bottom": 60}
+
+    def test_splits_on_the_last_equals(self):
+        assert self._parse("a=b=3") == {"a=b": 3}
+
+    def test_whitespace_tolerated(self):
+        assert self._parse(" Spacer = 2 , Bottle Top = 60 ") == {
+            "Spacer": 2, "Bottle Top": 60}
+
+    def test_empty_spec_is_empty(self):
+        assert self._parse("") == {}
+        assert self._parse("  ,  ") == {}
+
+    @pytest.mark.parametrize("spec", [
+        "Spacer",        # no '='
+        "Spacer=0",      # zero
+        "Spacer=-1",     # negative
+        "Spacer=x",      # not a number
+        "=3",            # empty label
+    ])
+    def test_malformed_raises(self, spec):
+        with pytest.raises(ValueError):
+            self._parse(spec)
+
+
 class TestNoiseBlock:
     def test_reports_spread_and_exactness(self):
         block = hc.noise_block(5, 1, [], ["a_ms", "b_ms"], [1.0, 1.2])

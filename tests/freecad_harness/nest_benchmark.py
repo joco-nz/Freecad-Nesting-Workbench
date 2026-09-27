@@ -114,6 +114,36 @@ def emit(message=""):
 # command-line flags for itself.
 #
 # The payoff is that the common cases need no arguments at all.
+def _parse_quantities(spec):
+    """Parses "Spacer=2,Bottle Top=60" into {"Spacer": 2, "Bottle Top": 60}.
+
+    Labels in this corpus contain spaces, so the separator is the comma and the
+    split is on the *last* '='. A malformed entry raises rather than being
+    skipped: a silently dropped quantity produces a run that looks fine and
+    measures the wrong workload, which is the exact failure this parser exists
+    to make impossible.
+    """
+    out = {}
+    for chunk in spec.split(","):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        if "=" not in chunk:
+            raise ValueError(
+                f"NEST_BENCH_QUANTITIES entry {chunk!r} is not Label=count")
+        label, _, count = chunk.rpartition("=")
+        label, count = label.strip(), count.strip()
+        if not count.isdigit() or int(count) < 1:
+            raise ValueError(
+                f"NEST_BENCH_QUANTITIES entry {chunk!r} has a non-positive or "
+                f"non-integer count")
+        if not label:
+            raise ValueError(
+                f"NEST_BENCH_QUANTITIES entry {chunk!r} has an empty label")
+        out[label] = int(count)
+    return out
+
+
 class Config:
     def __init__(self, environ=None):
         env = os.environ if environ is None else environ
@@ -132,6 +162,11 @@ class Config:
         self.rotation_steps = int(env.get("NEST_BENCH_ROTATION_STEPS", "4"))
         self.rotation_workers = int(env.get("NEST_BENCH_ROTATION_WORKERS", "1"))
         self.quantity = int(env.get("NEST_BENCH_QUANTITY", "3"))
+        # Per-label overrides, "Spacer=2,Bottle Top=60". Real workloads are not
+        # uniform, and the n70 corpus is the worked example: 2 of the big Spacer,
+        # 60 of each bottle part.
+        self.per_label_quantities = _parse_quantities(
+            env.get("NEST_BENCH_QUANTITIES", ""))
         self.draw = bool(env.get("NEST_BENCH_DRAW", ""))
         # Reps run in one process, interleaved with nothing else, each with
         # cold caches. Timings become a minimum over them; counts and results
@@ -593,8 +628,22 @@ def main():
                 return 2
             source = FreeCAD.openDocument(cfg.corpus)
             parts = discover_doc_parts(source)
-            quantities = {p.Label: 1 for p in parts}
+            # Previously hardcoded to 1, which silently ignored
+            # NEST_BENCH_QUANTITY: quantity 2 and quantity 5 produced byte-identical
+            # runs. Real workloads are not uniform either -- the notebook's n70
+            # configuration is 2 Spacer, 60 Bottle Top, 60 Bottle Bottom -- so
+            # NEST_BENCH_QUANTITIES takes per-label overrides and quantity is the
+            # fallback for anything not named.
+            quantities = {p.Label: cfg.per_label_quantities.get(p.Label, cfg.quantity)
+                          for p in parts}
+            missing = [label for label in cfg.per_label_quantities
+                       if label not in quantities]
+            if missing:
+                emit(f"ERROR: NEST_BENCH_QUANTITIES names labels not in the "
+                     f"corpus: {missing}. Available: {sorted(quantities)}")
+                return 2
             corpus_desc = {"kind": "fcstd", "path": cfg.corpus,
+                           "quantities": dict(quantities),
                            "labels": sorted(quantities)}
         if not parts:
             emit("ERROR: corpus produced no parts")
