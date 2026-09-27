@@ -265,6 +265,24 @@ class PlacementOptimizer:
             'candidate_geometry_ms': 0.0,
             'sheet_difference_ms': 0.0,
             'collision_intersection_ms': 0.0,
+            # The collision stage's decomposition. These are not decoration:
+            # the absorption loop below does `self._perf_stats[key] += ...`, so
+            # a key listed there but absent here raises KeyError inside the
+            # per-rotation future loop. `quiet=True` -- which every benchmark and
+            # every GA layout sets -- routes self.log to nothing, so the
+            # exception is swallowed with no output at all: every rotation
+            # evaluation dies, no candidates are produced, and the run reports
+            # zero placed parts and zero NFP computations while looking
+            # otherwise healthy. Every key in that allowlist must appear here.
+            'collision_intersects_ms': 0.0,
+            'collision_overlay_ms': 0.0,
+            'collision_hole_probe_ms': 0.0,
+            'collision_intersects_calls': 0,
+            'collision_overlay_calls': 0,
+            'collision_hole_probe_calls': 0,
+            'collision_overlay_area_zero': 0,
+            'collision_overlay_area_below_tol': 0,
+            'collision_overlay_area_total': 0.0,
             # Measurement-only candidate-path counters.
             'placement_wall_ms': 0.0,
             'rotation_wall_ms': 0.0,
@@ -416,6 +434,16 @@ class PlacementOptimizer:
                                 '_sheet_difference_ms', 0)
                             self._perf_stats['collision_intersection_ms'] += res.get(
                                 '_collision_intersection_ms', 0)
+                            # The collision stage's decomposition. The probe
+                            # keys arrive here underscore-prefixed -- that is the
+                            # convention every other absorbed key uses, and
+                            # reading them unprefixed yields a silent 0 rather
+                            # than an error, because .get() defaults.
+                            for _key in ('collision_intersects_ms',
+                                          'collision_overlay_ms',
+                                          'collision_hole_probe_ms'):
+                                self._perf_stats[_key] = self._perf_stats.get(
+                                    _key, 0.0) + res.get(f'_{_key}', 0.0)
                             self._perf_stats['rotation_wall_ms'] += res.get(
                                 '_t_wall_ms', 0)
                             self._perf_stats['candidate_evaluation_wall_ms'] += res.get(
@@ -438,6 +466,12 @@ class PlacementOptimizer:
                                 'mask_subthreshold_hole_rings',
                                 'mask_subthreshold_hole_vertices',
                                 'mask_calls', 'mask_batch_candidates',
+                                'collision_intersects_calls',
+                                'collision_overlay_calls',
+                                'collision_hole_probe_calls',
+                                'collision_overlay_area_zero',
+                                'collision_overlay_area_below_tol',
+                                'collision_overlay_area_total',
                             ):
                                 self._perf_stats[key] += res.get(f'_{key}', 0)
                             self._perf_stats['mask_batch_max'] = max(
@@ -861,6 +895,29 @@ class PlacementOptimizer:
         cache_ms = 0.0
         sheet_difference_ms = 0.0
         collision_intersection_ms = 0.0
+        # Sub-costs of the collision stage, because "18 seconds in collision" is
+        # not actionable and `collision_intersection_ms` does not decompose on
+        # its own. Three separable pieces:
+        #   intersects_ms  the GEOS boolean predicate, run on every pair
+        #   overlay_ms     candidate.intersection(existing).area, run only when
+        #                  intersects says True
+        #   hole_probe_ms  the interior-ring measurement probe
+        #
+        # The last one is why the split matters. `_holes_touched` is documented
+        # as measurement-only and is correctly gated on `probe is not None`, so
+        # it never runs in production -- but it sits *inside* the
+        # collision_intersection_ms window, so a logged run overstates the real
+        # cost by exactly its own overhead. Splitting it out is what makes
+        # `collision_intersection_ms` usable as a production figure.
+        intersects_ms = 0.0
+        overlay_ms = 0.0
+        hole_probe_ms = 0.0
+        intersects_calls = 0
+        overlay_calls = 0
+        hole_probe_calls = 0
+        overlay_area_zero = 0
+        overlay_area_below_tol = 0
+        overlay_area_total = 0.0
         sheet_rejections = 0
         collision_rejections = 0
         bbox_rejections = 0
@@ -950,9 +1007,33 @@ class PlacementOptimizer:
                     # error: it conflated "disjoint" with "touching", since
                     # area <= tol holds for both. See make-faster.md.
                     existing = existing_polygons[e_pos]
-                    if existing.intersects(candidate):
-                        overlaps = candidate.intersection(
-                            existing).area > area_tolerance
+                    t_intersects = time.perf_counter()
+                    hit = existing.intersects(candidate)
+                    intersects_ms += (time.perf_counter() - t_intersects) * 1000
+                    intersects_calls += 1
+                    if hit:
+                        t_overlay = time.perf_counter()
+                        overlap_area = candidate.intersection(
+                            existing).area
+                        overlaps = overlap_area > area_tolerance
+                        overlay_ms += (time.perf_counter() - t_overlay) * 1000
+                        overlay_calls += 1
+                        # How the rejected pairs are rejected. The overlay is
+                        # 65.7% of the collision stage and `overlaps or contains`
+                        # measures 6-10x cheaper for the same verdict
+                        # (probe_collision_overlay.py), so the obvious
+                        # optimisation is to drop it. Whether that is *exactly*
+                        # equivalent turns on this split: a pair whose
+                        # intersection is exactly zero is a boundary touch and
+                        # both forms reject it, but a pair with a sliver of
+                        # area below the tolerance is accepted today and would
+                        # be rejected by the predicate form. If the second group
+                        # is empty, the swap is free.
+                        if overlap_area <= 0.0:
+                            overlay_area_zero += 1
+                        else:
+                            overlay_area_below_tol += 1
+                        overlay_area_total += overlap_area
                         if probe is not None:
                             probe['collision_intersects_true'] += 1
                             if not overlaps:
@@ -963,6 +1044,7 @@ class PlacementOptimizer:
                             # Measurement-only: the pair's verdict depends on
                             # this part's interior rings rather than its solid
                             # body, so filling holes could flip it.
+                            t_hole = time.perf_counter()
                             if (hole_geoms is not None
                                     and _holes_touched(
                                         candidate, hole_geoms[e_pos],
@@ -971,6 +1053,8 @@ class PlacementOptimizer:
                                         c_maxx[row], c_maxy[row])):
                                 probe['mask_hole_sensitive_pairs'] += 1
                                 row_hole_touched = True
+                            hole_probe_ms += (time.perf_counter() - t_hole) * 1000
+                            hole_probe_calls += 1
                     else:
                         overlaps = False
                         if probe is not None:
@@ -979,6 +1063,7 @@ class PlacementOptimizer:
                             # here, and it is the most hole-dependent placement
                             # of all -- so the touch test must run on this
                             # branch too, not only on the intersects-True one.
+                            t_hole = time.perf_counter()
                             if (hole_geoms is not None
                                     and _holes_touched(
                                         candidate, hole_geoms[e_pos],
@@ -986,6 +1071,8 @@ class PlacementOptimizer:
                                         c_minx[row], c_miny[row],
                                         c_maxx[row], c_maxy[row])):
                                 row_hole_touched = True
+                            hole_probe_ms += (time.perf_counter() - t_hole) * 1000
+                            hole_probe_calls += 1
                     collision_intersection_ms += (
                         time.perf_counter() - checks_start) * 1000
                     polygon_checks += 1
@@ -1025,6 +1112,26 @@ class PlacementOptimizer:
                 'sheet_difference_ms', 0.0) + sheet_difference_ms
             probe['collision_intersection_ms'] = probe.get(
                 'collision_intersection_ms', 0.0) + collision_intersection_ms
+            # The collision stage's own decomposition. Reported alongside the
+            # total so the total can be checked against the parts, and so the
+            # measurement-only probe's cost is visible rather than inflating
+            # the number it is supposed to be explaining.
+            for key, value in (
+                    ('collision_intersects_ms', intersects_ms),
+                    ('collision_overlay_ms', overlay_ms),
+                    ('collision_hole_probe_ms', hole_probe_ms)):
+                probe[key] = probe.get(key, 0.0) + value
+            for key, value in (
+                    ('collision_intersects_calls', intersects_calls),
+                    ('collision_overlay_calls', overlay_calls),
+                    ('collision_hole_probe_calls', hole_probe_calls)):
+                probe[key] = probe.get(key, 0) + value
+            probe['collision_overlay_area_zero'] = probe.get(
+                'collision_overlay_area_zero', 0) + overlay_area_zero
+            probe['collision_overlay_area_below_tol'] = probe.get(
+                'collision_overlay_area_below_tol', 0) + overlay_area_below_tol
+            probe['collision_overlay_area_total'] = probe.get(
+                'collision_overlay_area_total', 0.0) + overlay_area_total
             probe['sheet_rejections'] = probe.get('sheet_rejections', 0) + sheet_rejections
             probe['collision_rejections'] = probe.get('collision_rejections', 0) + collision_rejections
             # Skipped candidates (no overlap, inside sheet) were screened

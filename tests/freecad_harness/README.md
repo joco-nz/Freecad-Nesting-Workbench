@@ -491,6 +491,42 @@ path, and the gate would stay green while measuring something nobody runs.
 `test_candidate_geometry_cache.py` guards that, by source inspection of all
 three call sites as well as behaviourally.
 
+### Where the remaining time goes
+
+Two write-ups, both measurement-first per `make-faster.md`'s own rule — and one
+of them ends in a win that was measured and then **disproved**, which is the more
+useful outcome.
+
+- [RESULTS-union.md](RESULTS-union.md) — the union is 71% of NFP time, 8 calls of
+  54 756 inputs hold 98.4% of the work, and 99.98% of the input geometry does
+  not survive into the answer. Not removable at the union: 6 duplicates in
+  54 756, and the containment filter is O(n²). The lever is the decomposition
+  upstream — 234 convex pieces for 36 rectangular holes.
+- [RESULTS-collision.md](RESULTS-collision.md) — the collision stage decomposed
+  into overlay 65.7% / `intersects` 23.7% / measurement probe 8.8%. The overlay
+  rejects 144 981 of 144 981. Replacing it with `overlaps or contains` is 6–10×
+  cheaper and would be worth ~17% of wall clock — and is wrong, because 98.8% of
+  those rejections are positive areas below tolerance summing to 0 mm², which the
+  predicate would reject as real overlaps.
+
+`probe_union_cost.py`, `probe_union_determinism.py` and
+`probe_collision_overlay.py` produce those; `probe_decomposition.py` reports
+convex piece counts through the real `ShapePreparer` pipeline.
+
+Two instrumentation traps found along the way, both worth knowing about:
+
+- **A "measurement-only" probe inside a production timer.** `_holes_touched` is
+  correctly gated on `probe is not None` and never runs in production, but it sat
+  inside the `collision_intersection_ms` window — so every logged run overstated
+  collision cost by 8.8%. Now timed separately.
+- **A new counter in the absorption allowlist but not in the schema.** The
+  absorption does `self._perf_stats[key] += ...`, so a key listed there but not
+  in the initialiser raises `KeyError` inside the per-rotation future loop. With
+  `quiet=True` the exception is swallowed with no output, every rotation
+  evaluation dies, and the run reports **zero placed parts** while looking
+  healthy. `tests/test_perf_counter_plumbing/` now checks the two lists agree,
+  structurally.
+
 ## Reps, and what a baseline is allowed to claim
 
 A baseline recorded from one sample is a claim about a machine state that does
