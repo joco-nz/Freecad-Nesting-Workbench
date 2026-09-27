@@ -563,6 +563,50 @@ def validate_perf(perf):
         failures.append("worst single NFP exceeds the total: accumulator is "
                         "double counting")
 
+    failures.extend(_validate_union(perf))
+
+    return failures
+
+
+def _validate_union(perf):
+    """Invariants the union counters must satisfy, per RESULTS-union.md.
+
+    Cheap because they are exact counts, not timings: if `union_inputs` and
+    `convex_pairs` ever disagree, either a pair result is being dropped before
+    the union or the counters have drifted apart, and both would quietly
+    invalidate the pair-count arithmetic that the whole union analysis rests on.
+    """
+    failures = []
+    inputs = perf.get("nfp_work_union_inputs")
+    pairs = perf.get("nfp_work_convex_pairs")
+    if inputs is None or pairs is None:
+        return [f"missing union counters (union_inputs={inputs}, "
+                f"convex_pairs={pairs})"]
+
+    if inputs != pairs:
+        failures.append(
+            f"union_inputs {inputs} != convex_pairs {pairs}: every convex pair "
+            f"should reach unary_union exactly once. A mismatch means pair "
+            f"results are being dropped or duplicated before the union, which "
+            f"would invalidate the pair arithmetic.")
+
+    calls = perf.get("nfp_work_union_calls", 0)
+    outputs = perf.get("nfp_work_union_outputs", 0)
+    if calls and outputs != calls:
+        failures.append(
+            f"union_outputs {outputs} != union_calls {calls}: each union should "
+            f"return exactly one polygon (the NFP). More than one means a union "
+            f"produced a MultiPolygon, which is a correctness question, not a "
+            f"performance one.")
+
+    # The max must be a real size, not a sum. If these are equal the accumulator
+    # is summing something it should be maximising.
+    max_inputs = perf.get("nfp_work_union_inputs_max", 0)
+    if max_inputs > inputs:
+        failures.append(
+            f"union_inputs_max {max_inputs} exceeds the total {inputs}: a "
+            f"per-call maximum cannot be larger than the sum it came from")
+
     return failures
 
 

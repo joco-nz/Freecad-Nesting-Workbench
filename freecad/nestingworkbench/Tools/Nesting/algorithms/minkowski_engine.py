@@ -224,6 +224,15 @@ def _compute_nfp_uncached(shape_A, angle_A, part_to_place, angle_B, cache_key, l
     )
     return nfp_data
 
+# Count keys whose per-call value is a size rather than a running total, so the
+# run-level view needs both a sum and a maximum. Without this, "the biggest
+# single union took 36,864 inputs" is unrepresentable: summed over 8 rotations
+# it reads as 294,912, which is not a size of anything.
+_COUNT_MAX_KEYS = frozenset({
+    "parts_a", "parts_b", "convex_pairs", "union_inputs",
+})
+
+
 class MinkowskiEngine:
     """
     Handles geometric operations for Minkowski nesting, such as NFP generation,
@@ -619,7 +628,11 @@ class MinkowskiEngine:
                 target = f"work_{key}"
                 if isinstance(value, int) and not isinstance(value, bool):
                     self._perf_stats[target] = self._perf_stats.get(target, 0) + value
-                    if key in ("parts_a", "parts_b", "convex_pairs"):
+                    if key in _COUNT_MAX_KEYS:
+                        # Summed, "how big was the largest single one" has no
+                        # answer at all. A 36,864-input union summed over 8
+                        # rotations reads as 294,912, which is not a size of
+                        # anything.
                         high = f"work_{key}_max"
                         if value > self._perf_stats.get(high, 0):
                             self._perf_stats[high] = value

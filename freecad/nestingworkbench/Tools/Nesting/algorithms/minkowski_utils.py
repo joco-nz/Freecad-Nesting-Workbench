@@ -867,4 +867,37 @@ def minkowski_sum(master_poly1, angle1, reflect1, master_poly2, angle2, reflect2
     result = unary_union(minkowski_parts)
     if timings is not None:
         timings["union_ms"] = (time.perf_counter() - t_union) * 1000
+        # What the union was actually handed.
+        #
+        # `union_ms` alone cannot be acted on: it says 22.5 seconds went here
+        # and not whether that is one enormous call or a million small ones,
+        # which have completely different fixes. These counters separate those
+        # cases, and the bucket histogram separates "cost scales with input
+        # count" from "a few pathological calls dominate".
+        #
+        # The result is expected to be a single polygon -- the NFP. Anything
+        # else means a union call returned a MultiPolygon, which would be a
+        # correctness question, so it is counted rather than assumed.
+        inputs = len(minkowski_parts)
+        timings["union_calls"] = timings.get("union_calls", 0) + 1
+        timings["union_inputs"] = timings.get("union_inputs", 0) + inputs
+        outputs = getattr(result, "geoms", None)
+        timings["union_outputs"] = timings.get("union_outputs", 0) + (
+            len(outputs) if outputs is not None else (0 if result.is_empty else 1))
+        exterior = getattr(result, "exterior", None)
+        vertices = 0
+        if exterior is not None:
+            vertices += len(exterior.coords)
+            for interior in getattr(result, "interiors", ()) or ():
+                vertices += len(interior.coords)
+        elif outputs:
+            for part in outputs:
+                vertices += len(part.exterior.coords)
+        timings["union_result_vertices"] = (
+            timings.get("union_result_vertices", 0) + vertices)
+        # Power-of-two buckets, so the shape of the distribution survives the
+        # sum without a histogram object that cannot cross a process boundary.
+        bucket = inputs.bit_length() if inputs else 0
+        timings[f"union_input_pow2_{bucket}"] = (
+            timings.get(f"union_input_pow2_{bucket}", 0) + 1)
     return result
