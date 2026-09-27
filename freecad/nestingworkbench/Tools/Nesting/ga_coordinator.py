@@ -166,6 +166,10 @@ class GACoordinator:
         self._candidate_geometry_key_tracker = None
         self._candidate_geometry_cache = None
         self._layout_perf = None
+        # Set once run() hands a NestingJob back. While it is False the run
+        # owns the document-level master group outright, which is what lets the
+        # finally block in run() dispose it without racing a pending commit.
+        self._job_committed = False
 
     def _record_layout_time(self, key, seconds):
         """Adds to a layout-management sub-phase timer (Performance Logging only)."""
@@ -329,6 +333,7 @@ class GACoordinator:
         Returns:
             NestingJob — ready to commit or cancel
         """
+        self._job_committed = False
         # Keep the Shapely-dependent strategy import lazy so importing the
         # panel still works when the optional nesting dependency is missing.
         from .algorithms.nesting_strategy import (
@@ -799,6 +804,10 @@ class GACoordinator:
                     "[GA PERF FINALIZE] "
                     f"finalize_dispatch={self._layout_perf['lm_finalize_s']:.2f}s "
                     f"doc_recompute={self._layout_perf['lm_doc_recompute_s']:.2f}s\n")
+            # A job now owns the masters: NestingJob._promote_masters moves them
+            # out of the shared group into the target layout when the
+            # controller commits. Stops the finally block disposing them first.
+            self._job_committed = True
             return job
 
         except Exception as e:
@@ -817,6 +826,25 @@ class GACoordinator:
                 self._candidate_geometry_key_tracker.clear()
             self._candidate_geometry_cache = None
             self._candidate_geometry_key_tracker = None
+            # Headless runs keep their masters in a document-level group, and
+            # delete_layout cannot reach it: it is not under any layout. A run
+            # that ends without a job -- the cancel `break`, or the exception
+            # handler above -- has nothing that will ever promote those masters,
+            # so they are left visible and orphaned in the document. Measured
+            # before this: 6 objects (master_*, master_shape_*, bound_*), none
+            # under a Layout* group, group still Visibility True.
+            #
+            # Gated on `_job_committed` rather than disposed unconditionally.
+            # The success path hands a NestingJob back to the controller, which
+            # commits it later on the main thread, and in worker mode
+            # _dispatch_finalize may not even have run yet -- disposing there
+            # would delete the masters out from under the pending commit.
+            if not self._job_committed and self.layout_manager is not None:
+                disposed = self.layout_manager.dispose_shared_master_group()
+                if disposed:
+                    FreeCAD.Console.PrintMessage(
+                        f"[GA] Disposed {disposed} orphaned master shape(s) "
+                        f"from the abandoned run\n")
 
     def _dispatch_finalize(self, best_layout, best_efficiency, total_time, target_layout, ui_params):
         """Runs _finalize() and doc.recompute() on the main thread if using a worker."""

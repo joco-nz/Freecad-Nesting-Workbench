@@ -242,9 +242,89 @@ def run_case(create_doc_objects):
           doc.getObject(temp_layout_name) is None)
 
 
+def run_leak_case():
+    """A cancelled run must not leave the shared master group behind.
+
+    The shared group is parented at document level, so `delete_layout` cannot
+    reach it -- it is not under any layout. Deleting every layout of a run,
+    which is what the cancel and early-stop paths do, therefore left the group
+    in the document still populated and visible. Measured before this fix:
+
+        group still exists, Visibility True
+        6 objects not under any Layout* group
+        (master_A/B, master_shape_A/B, bound_A_1/B_1)
+
+    `dispose_shared_master_group` is what the coordinator's `finally` calls
+    when no NestingJob will commit the masters. It is deliberately NOT called
+    on the success path, where the job promotes them instead.
+    """
+    import FreeCAD
+    import Part
+
+    from freecad.nestingworkbench.Tools.Nesting.layout_manager import LayoutManager
+
+    emit("")
+    emit("--- abandoned (cancelled) run ---")
+
+    doc = FreeCAD.newDocument("leak")
+    sources = {}
+    for name, (length, width) in (("A", (60, 40)), ("B", (30, 30))):
+        obj = doc.addObject("Part::Feature", name)
+        obj.Shape = Part.makeBox(length, width, 10)
+        sources[name] = obj
+    doc.recompute()
+
+    manager = LayoutManager(doc, {}, create_doc_objects=False)
+    first = manager.create_layout("Layout_GA_1_1", sources, _QUANTITIES, _UI)
+    second = manager.create_layout("Layout_GA_1_2", sources, _QUANTITIES, _UI)
+
+    shared = manager.shared_master_group
+    check("[cancel] a shared group was created", shared is not None)
+    check("[cancel] it holds the masters",
+          shared is not None and len(shared.Group) == 2)
+    shared_name = shared.Name if shared is not None else None
+
+    # The cancel path deletes every layout in the population.
+    manager.delete_layout(first, verbose=False)
+    manager.delete_layout(second, verbose=False)
+
+    # This is the leak itself: a populated group that no layout teardown can
+    # reach. Asserted so the test records why dispose is needed at all.
+    check("[cancel] delete_layout cannot reach the shared group",
+          doc.getObject(shared_name) is not None and len(shared.Group) == 2)
+
+    disposed = manager.dispose_shared_master_group()
+    check("[cancel] dispose reports the masters it removed", disposed == 2,
+          f"got {disposed}")
+    check("[cancel] the group is gone from the document",
+          doc.getObject(shared_name) is None)
+    check("[cancel] the manager no longer caches a deleted group",
+          manager.shared_master_group is None)
+
+    leaked = sorted(
+        o.Label for o in doc.Objects
+        if o.Label.startswith(("master_", "temp_master_", "master_shape_", "bound_"))
+    )
+    check("[cancel] no master objects left orphaned", not leaked, f"left {leaked}")
+
+    check("[cancel] dispose is idempotent",
+          manager.dispose_shared_master_group() == 0)
+    check("[cancel] dispose with no group is a no-op",
+          LayoutManager(doc, {}, create_doc_objects=True)
+          .dispose_shared_master_group() == 0)
+
+    # A later run must still be able to create a group.
+    again = LayoutManager(doc, {}, create_doc_objects=False)
+    again.create_layout("Layout_GA_2_1", sources, _QUANTITIES, _UI)
+    check("[cancel] a later run can still create a shared group",
+          again.shared_master_group is not None
+          and len(again.shared_master_group.Group) == 2)
+
+
 def main():
     for create_doc_objects in (False, True):
         run_case(create_doc_objects)
+    run_leak_case()
     emit("")
     emit(f"{_CHECKS[0] - len(_FAILURES)}/{_CHECKS[0]} checks passed")
     if _FAILURES:
