@@ -119,6 +119,118 @@ class TestCacheSemantics:
             assert cache.get(key) is poly
 
 
+class TestDefaultOn:
+    """The cache is default-on, and five places have to agree about that.
+
+    The constant lives in `freecad.nestingworkbench.constants` and is read by the
+    UI checkbox, the preference read-back, the controller's two fallbacks, the
+    coordinator's gate and the benchmark harness. Those are six consumers of one
+    fact, and the failure mode is quiet: the workbench ships default-on while a
+    committed baseline still describes the off path, and the gate stays green
+    while measuring something nobody runs.
+    """
+
+    def test_constant_is_true(self):
+        from freecad.nestingworkbench import constants
+
+        assert constants.CANDIDATE_GEOMETRY_CACHE_DEFAULT is True
+
+    def test_reachable_by_star_import(self):
+        """ui_nesting and nesting_controller use `from ...constants import *`."""
+        namespace = {}
+        exec("from freecad.nestingworkbench.constants import *", namespace)
+        assert namespace["CANDIDATE_GEOMETRY_CACHE_DEFAULT"] is True
+
+    def test_ui_default_reads_the_constant(self):
+        """The checkbox must not hardcode its own default."""
+        from freecad.nestingworkbench import constants
+
+        source = _read(
+            "freecad/nestingworkbench/Tools/Nesting/ui_nesting.py")
+        assert '"candidate_geometry_cache": CANDIDATE_GEOMETRY_CACHE_DEFAULT' in source
+        assert '"candidate_geometry_cache": False' not in source
+        # and the preference read-back, which is what a returning user actually
+        # gets rather than the _DEFAULTS entry
+        assert ('prefs.GetBool("CandidateGeometryCache",\n'
+                '                               CANDIDATE_GEOMETRY_CACHE_DEFAULT)'
+                in source)
+        assert 'prefs.GetBool("CandidateGeometryCache", False)' not in source
+        assert constants.CANDIDATE_GEOMETRY_CACHE_DEFAULT is True
+
+    def test_no_stray_hardcoded_fallbacks(self):
+        """Greps the three call sites for a literal False next to the flag.
+
+        A source-level check rather than a behavioural one because the call
+        sites are `dict.get(key, False)` fallbacks inside a large function --
+        importing the module to observe them would need a full FreeCAD session
+        and would still not prove the *other* five agree.
+        """
+        offenders = []
+        for relative in (
+            "freecad/nestingworkbench/Tools/Nesting/ui_nesting.py",
+            "freecad/nestingworkbench/Tools/Nesting/nesting_controller.py",
+            "freecad/nestingworkbench/Tools/Nesting/ga_coordinator.py",
+        ):
+            for number, line in enumerate(_read(relative).splitlines(), 1):
+                stripped = line.strip()
+                if "candidate_geometry_cache" not in stripped:
+                    continue
+                if "False" in stripped and "CANDIDATE_GEOMETRY_CACHE_DEFAULT" not in stripped:
+                    offenders.append(f"{relative}:{number}: {stripped}")
+        assert not offenders, "hardcoded cache default remains:\n" + "\n".join(offenders)
+
+    def test_harness_follows_the_product_default(self):
+        """Unset must mean "whatever the workbench does", not a harness default.
+
+        The harness measures the product. Pinning its own default is how the two
+        drift apart silently.
+        """
+        from freecad.nestingworkbench import constants
+
+        assert _config({}).candidate_geometry_cache is \
+            constants.CANDIDATE_GEOMETRY_CACHE_DEFAULT
+        assert _config({"NEST_BENCH_CANDIDATE_GEOMETRY_CACHE": ""}).candidate_geometry_cache is \
+            constants.CANDIDATE_GEOMETRY_CACHE_DEFAULT
+        assert _config({"NEST_BENCH_CANDIDATE_GEOMETRY_CACHE": "default"}
+                       ).candidate_geometry_cache is \
+            constants.CANDIDATE_GEOMETRY_CACHE_DEFAULT
+
+    @pytest.mark.parametrize("spec", ["0", "no", "false", "off"])
+    def test_harness_control_arm_is_explicitly_off(self, spec):
+        """The A/B driver needs a way to turn it off, which is how 9.4 was
+        measured, so the override must not be lost when the default flips."""
+        assert _config({"NEST_BENCH_CANDIDATE_GEOMETRY_CACHE": spec}
+                       ).candidate_geometry_cache is False
+
+    @pytest.mark.parametrize("spec", ["1", "yes", "true", "on"])
+    def test_harness_explicit_on(self, spec):
+        assert _config({"NEST_BENCH_CANDIDATE_GEOMETRY_CACHE": spec}
+                       ).candidate_geometry_cache is True
+
+
+def _read(relative):
+    import os
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    path = os.path.join(root, os.path.pardir, relative)
+    with open(os.path.normpath(path)) as handle:
+        return handle.read()
+
+
+def _config(environ):
+    """The harness Config, loaded by path so its __name__ guard cannot fire."""
+    import importlib.util
+    import os
+
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        os.path.pardir, "freecad_harness", "nest_benchmark.py")
+    spec = importlib.util.spec_from_file_location(
+        "nb_for_cache_default", os.path.normpath(path))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.Config(environ)
+
+
 class TestKeyPrefix:
     def test_same_everything_gives_the_same_prefix(self):
         """The reuse the 92.2% hit rate depends on."""

@@ -367,7 +367,8 @@ It matches n70 closely enough to be worth trusting:
 
 | | heavy | n70 |
 |---|---:|---:|
-| wall (min of N) | 69.1 s | 73.6 s |
+| wall (min of N, cache off) | 69.1 s | 73.6 s |
+| wall (min of N, cache on) | 58.9 s | 62.7 s |
 | `nfp_work_convex_pairs` | 445 616 | 516 144 |
 | `nfp_work_parts_a` / `_b` | 9 440 / 1 984 | 6 096 / 2 064 |
 | `convex_result_points` | 2.63 M | 3.23 M |
@@ -457,8 +458,38 @@ Memory is measured in a **separate process per arm**, not in-process:
 `ru_maxrss` is a process high-water mark and never falls, so a reading taken
 after the other arm has run is contaminated by it.
 
-`NEST_BENCH_CANDIDATE_GEOMETRY_CACHE` is off by default, so the committed
-baseline is unaffected.
+### Default on
+
+The cache is now **on by default** in the workbench. `CANDIDATE_GEOMETRY_CACHE_DEFAULT`
+in `freecad/nestingworkbench/constants.py` is the single source of truth, read by
+the UI checkbox, the preference read-back, the controller's two fallbacks, the
+coordinator's gate and both harnesses. Five hardcoded booleans would be five
+chances to disagree about what the workbench actually does.
+
+It lives in `constants.py` rather than beside `CandidateGeometryCache` because
+`ui_nesting` needs it at module scope and must not import `nesting_strategy` —
+that pulls in Shapely, and the panel has to keep importing when the optional
+nesting dependency is missing.
+
+**Existing installs keep the old behaviour.** The preference is written on save,
+so anyone who has already run this workbench has `CandidateGeometryCache=False`
+stored. Deliberate — a saved setting is the user's choice — but it means the new
+default reaches new users and anyone who resets preferences, not everyone.
+
+`NEST_BENCH_CANDIDATE_GEOMETRY_CACHE` is tri-state so the harness measures the
+product rather than a parallel opinion of it:
+
+| value | meaning |
+|---|---|
+| unset (or `default`) | follow `CANDIDATE_GEOMETRY_CACHE_DEFAULT` |
+| `0` / `off` / `false` | explicitly off — the A/B control arm |
+| `1` / `on` / `true` | explicitly on |
+
+A harness that pinned its own default would let the two drift: the workbench
+could ship default-on while every committed baseline still described the off
+path, and the gate would stay green while measuring something nobody runs.
+`test_candidate_geometry_cache.py` guards that, by source inspection of all
+three call sites as well as behaviourally.
 
 ## Reps, and what a baseline is allowed to claim
 

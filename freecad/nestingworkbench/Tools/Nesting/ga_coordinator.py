@@ -9,6 +9,7 @@ import math
 import random
 import time
 from ...datatypes.shape import Shape
+from ...constants import CANDIDATE_GEOMETRY_CACHE_DEFAULT
 from ...freecad_helpers import set_visibility, refresh_gui
 from .layout_manager import LayoutManager
 from .algorithms import genetic_utils
@@ -534,7 +535,8 @@ class GACoordinator:
         )
         self._candidate_geometry_cache = (
             CandidateGeometryCache()
-            if algo_kwargs.get('candidate_geometry_cache', False) else None
+            if algo_kwargs.get('candidate_geometry_cache',
+                              CANDIDATE_GEOMETRY_CACHE_DEFAULT) else None
         )
         if performance_logging:
             FreeCAD.Console.PrintMessage(

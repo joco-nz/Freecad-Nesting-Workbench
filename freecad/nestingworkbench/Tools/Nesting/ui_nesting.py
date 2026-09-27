@@ -26,7 +26,7 @@ _DEFAULTS = {
     "simulate_nesting": False,
     "verbose_logging": False,
     "performance_logging": False,
-    "candidate_geometry_cache": False,
+    "candidate_geometry_cache": CANDIDATE_GEOMETRY_CACHE_DEFAULT,
     "rotation_angles": MINKOWSKI_ROTATION_PRESETS,
 }
 
@@ -550,7 +550,8 @@ class NestingPanel(QtWidgets.QWidget):
         self.verbose_logging_checkbox.setChecked(prefs.GetBool("VerboseLogging", False))
         self.performance_logging_checkbox.setChecked(prefs.GetBool("PerformanceLogging", False))
         self.candidate_geometry_cache_checkbox.setChecked(
-            prefs.GetBool("CandidateGeometryCache", False)
+            prefs.GetBool("CandidateGeometryCache",
+                               CANDIDATE_GEOMETRY_CACHE_DEFAULT)
         )
         self.physics_improvement_threshold_input.setValue(prefs.GetFloat("PhysicsStabilityTolerance", 0.01))
         

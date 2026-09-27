@@ -188,12 +188,24 @@ class Config:
         self.per_label_quantities = _parse_quantities(
             env.get("NEST_BENCH_QUANTITIES", ""))
         self.draw = bool(env.get("NEST_BENCH_DRAW", ""))
-        # The one opt-in feature with a measured win and no test coverage:
-        # make-faster.md records 87.44s -> 10.22s at a 75.2% hit rate, and
-        # master-merge.md 9.4 needs a disabled-control measurement before it can
-        # go default-on. Off here so the committed baseline is unaffected.
-        self.candidate_geometry_cache = bool(
-            env.get("NEST_BENCH_CANDIDATE_GEOMETRY_CACHE", ""))
+        # Tri-state, and unset means "whatever the workbench does". The harness
+        # exists to measure the product, so pinning its own default would let
+        # the two drift: the workbench could ship default-on while every
+        # committed baseline still described the off path, and the gate would
+        # stay green while measuring something nobody runs.
+        #
+        #   unset  -> follow CANDIDATE_GEOMETRY_CACHE_DEFAULT
+        #   0      -> explicitly off, for the A/B control arm
+        #   1      -> explicitly on
+        spec = env.get("NEST_BENCH_CANDIDATE_GEOMETRY_CACHE", "").strip()
+        if spec in ("", "default"):
+            from freecad.nestingworkbench.constants import (
+                CANDIDATE_GEOMETRY_CACHE_DEFAULT,
+            )
+
+            self.candidate_geometry_cache = CANDIDATE_GEOMETRY_CACHE_DEFAULT
+        else:
+            self.candidate_geometry_cache = spec not in ("0", "no", "false", "off")
         # Reps run in one process, interleaved with nothing else, each with
         # cold caches. Timings become a minimum over them; counts and results
         # must be identical, and a difference is a hard failure rather than

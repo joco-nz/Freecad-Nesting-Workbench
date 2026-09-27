@@ -789,7 +789,8 @@ class NestingController:
         prefs.SetFloat("GACompactnessWeight", float(settings['compactness_weight']))
         prefs.SetBool(
             "CandidateGeometryCache",
-            bool(settings.get('candidate_geometry_cache', False)),
+            bool(settings.get('candidate_geometry_cache',
+                               CANDIDATE_GEOMETRY_CACHE_DEFAULT)),
         )
         
         mink_steps = int(360 / self.ui.rotation_angles[self.ui.minkowski_rotation_steps_slider.value()])
@@ -900,7 +901,7 @@ class NestingController:
             algo_kwargs['generations'] = self.ui.minkowski_generations_input.value()
             algo_kwargs['clear_nfp_cache'] = self.ui.clear_cache_checkbox.isChecked()
             algo_kwargs['candidate_geometry_cache'] = ui_params.get(
-                'candidate_geometry_cache', False
+                'candidate_geometry_cache', CANDIDATE_GEOMETRY_CACHE_DEFAULT
             )
 
         algo_kwargs['spacing'] = ui_params['spacing']

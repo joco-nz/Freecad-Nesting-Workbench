@@ -57,6 +57,22 @@ STATUS_FILE = os.path.join(_HERE, ".last_status_bench_ga")
 SCHEMA_VERSION = 1
 
 
+def _cache_setting():
+    """Tri-state, unset means follow the workbench default. See nest_benchmark.
+
+    bench_ga drives the coordinator directly rather than through
+    nesting_logic.nest, so it has to state the flag itself -- and stating it is
+    the point, because a value it does not record is a value the baseline compare
+    cannot check for drift.
+    """
+    from freecad.nestingworkbench.constants import CANDIDATE_GEOMETRY_CACHE_DEFAULT
+
+    spec = os.environ.get("NEST_BENCH_CANDIDATE_GEOMETRY_CACHE", "").strip()
+    if spec in ("", "default"):
+        return CANDIDATE_GEOMETRY_CACHE_DEFAULT
+    return spec not in ("0", "no", "false", "off")
+
+
 def cfg():
     return {
         "population": int(os.environ.get("NEST_BENCH_GA_POPULATION", "2")),
@@ -71,6 +87,9 @@ def cfg():
         "simplification": float(os.environ.get("NEST_BENCH_SIMPLIFICATION", "0.1")),
         "rotation_steps": int(os.environ.get("NEST_BENCH_ROTATION_STEPS", "4")),
         "rotation_workers": int(os.environ.get("NEST_BENCH_ROTATION_WORKERS", "1")),
+        # Recorded rather than inherited, so a baseline cannot silently
+        # change meaning when the product default moves.
+        "candidate_geometry_cache": _cache_setting(),
     }
 
 
@@ -121,6 +140,7 @@ def one_run(c):
         "spacing": c["spacing"], "search_direction": (0, -1),
         "random_seed": c["seed"],
         "cancel_callback": lambda: False,
+        "candidate_geometry_cache": c["candidate_geometry_cache"],
         # performance_logging is what populates _ga_perf, so it must stay on.
         # The per-NFP [PERF] lines it also produces go through log_callback, so
         # a sink keeps the counters without burying the report: a single GA run
@@ -255,6 +275,7 @@ def report(c, runs):
     hc.emit(f"  corpus       {c['corpus']}")
     hc.emit(f"  rot workers  {c['rotation_workers']}  (pinned: counts are exact only "
             f"at width 1)")
+    hc.emit(f"  cand cache   {'on' if c['candidate_geometry_cache'] else 'off'}")
     walls = [r["wall"] for r in runs]
     best = runs[0]["result"]
     hc.emit("")
@@ -441,7 +462,7 @@ def main():
             hc.emit(f"ERROR: baseline schema {baseline.get('schema')} != {SCHEMA_VERSION}")
             return 2
         for key in ("population", "generations", "sheet", "seed", "quantity",
-                    "rotation_workers"):
+                    "rotation_workers", "candidate_geometry_cache"):
             if baseline["config"].get(key) != c[key]:
                 hc.emit(f"ERROR: baseline {key}={baseline['config'].get(key)} "
                         f"but this run used {c[key]}")
