@@ -14,6 +14,24 @@ from .layout_manager import LayoutManager
 from .algorithms import genetic_utils
 from .algorithms import minkowski_utils
 
+# NFP phase timers, mapped from the engine's accumulated keys to the GA-level
+# names they are stored under. Sums, not the `*_worst` single-NFP figures.
+_NFP_PHASE_S_TO_ENGINE_MS = {
+    'nfp_total_s': 'nfp_phase_total_ms',
+    'nfp_prepare_s': 'nfp_phase_prepare_ms',
+    'nfp_decompose_s': 'nfp_phase_decompose_ms',
+    'nfp_transform_s': 'nfp_phase_transform_ms',
+    'nfp_convex_sum_s': 'nfp_phase_convex_sum_ms',
+    'nfp_convex_prepare_s': 'nfp_phase_convex_prepare_ms',
+    'nfp_convex_merge_s': 'nfp_phase_convex_merge_ms',
+    'nfp_convex_polygon_create_s': 'nfp_phase_convex_polygon_create_ms',
+    'nfp_convex_pair_loop_s': 'nfp_phase_convex_pair_loop_ms',
+    'nfp_union_s': 'nfp_phase_union_ms',
+    'nfp_holes_ifp_s': 'nfp_phase_holes_ifp_ms',
+    'nfp_assemble_s': 'nfp_phase_assemble_ms',
+    'nfp_discretize_s': 'nfp_phase_discretize_ms',
+}
+
 
 def _safe_ratio(numerator, denominator):
     """Guarded division for report lines.
@@ -255,6 +273,22 @@ class GACoordinator:
         self._ga_perf['rotation_wall_s'] += stats.get('rotation_wall_ms', 0.0) / 1000
         self._ga_perf['candidate_evaluation_wall_s'] += stats.get(
             'candidate_evaluation_wall_ms', 0.0) / 1000
+        # NFP phase breakdown, now that the engine accumulates it. nfp_compute_s
+        # above is the whole NFP; these say where inside it the time goes, at the
+        # GA level where the aggregation is actually useful. Aggregates only --
+        # the per-phase `*_worst` figures are single-NFP noise and are left in
+        # the per-layout stats.
+        for ga_key, engine_key in _NFP_PHASE_S_TO_ENGINE_MS.items():
+            self._ga_perf[ga_key] += stats.get(engine_key, 0.0) / 1000
+        # Convex-pair work count, the machine-independent measure of NFP work.
+        # convex_sum_ms is wall clock and noisy; this is not.
+        self._ga_perf['nfp_convex_pairs'] += stats.get('nfp_work_convex_pairs', 0)
+        self._ga_perf['nfp_pieces_a'] += stats.get('nfp_work_parts_a', 0)
+        self._ga_perf['nfp_pieces_b'] += stats.get('nfp_work_parts_b', 0)
+        # Swallowed NFP failures. Each is an exception caught by
+        # _compute_nfp_uncached's broad except that then silently removes a
+        # placement region, so a run with any of these is not comparable.
+        self._ga_perf['nfp_errors'] += stats.get('nfp_nfp_errors', 0)
         for key in ('rotation_evaluations', 'successful_rotations',
                     'candidate_points', 'valid_candidate_points',
                     'bounds_survivors', 'sheet_candidates', 'sheet_rejections',
@@ -468,6 +502,23 @@ class GACoordinator:
             'successful_rotations': 0,
             'nfp_cache_hits': 0,
             'nfp_cache_misses': 0,
+            'nfp_total_s': 0.0,
+            'nfp_prepare_s': 0.0,
+            'nfp_decompose_s': 0.0,
+            'nfp_transform_s': 0.0,
+            'nfp_convex_sum_s': 0.0,
+            'nfp_convex_prepare_s': 0.0,
+            'nfp_convex_merge_s': 0.0,
+            'nfp_convex_polygon_create_s': 0.0,
+            'nfp_convex_pair_loop_s': 0.0,
+            'nfp_union_s': 0.0,
+            'nfp_holes_ifp_s': 0.0,
+            'nfp_assemble_s': 0.0,
+            'nfp_discretize_s': 0.0,
+            'nfp_convex_pairs': 0,
+            'nfp_pieces_a': 0,
+            'nfp_pieces_b': 0,
+            'nfp_errors': 0,
             'layout_management_s': 0.0,
             'visualization_s': 0.0,
             'offspring_layouts': 0,

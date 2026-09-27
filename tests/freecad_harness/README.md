@@ -220,6 +220,75 @@ worker-mode test therefore needs a faithful reproduction of
 `NestingController._handle_draw_request` (about 50 lines), or should drive the
 controller itself. Tractable, and the natural next piece of work.
 
+## Phase attribution and the GA level
+
+Two levels of counters, both now exposed rather than log-only.
+
+### NFP phase breakdown (`nest_benchmark.py`)
+
+`minkowski_sum` produced ~25 phase timings and work counts that were formatted
+into a `[PERF]` line and **discarded** — so answering "which phase dominates?"
+needed a hand-written probe. `MinkowskiEngine` now accumulates them into
+`_perf_stats`, so they reach `Nester.get_perf_stats()` and the harness.
+Collected keys went 51 → 110 (36 phase, 22 work). A run now reports, as a
+query:
+
+```
+nfp_phase_union_ms 154.0   nfp_phase_convex_sum_ms 85.2
+nfp_phase_convex_pair_loop_ms 42.5   nfp_phase_convex_prepare_ms 37.4
+nfp_phase_transform_ms 33.0   nfp_phase_decompose_ms 30.4   nfp_phase_total_ms 366.4
+nfp_work_convex_pairs 818    nfp_work_parts_a 48
+```
+
+`nfp_errors` is counted too. A failed NFP becomes `{'error': ...}` and is
+skipped, which **silently removes a placement region** — a `NameError` once did
+exactly that and cost a run its packing (18 single-part sheets instead of 1)
+with nothing crashing. Both harnesses refuse a run with any.
+
+### GA level (`bench_ga.py`)
+
+`nest_benchmark.py` calls `nesting_logic.nest()` directly, so it never sees
+`_ga_perf` (57 counters) or `_layout_perf` (17 phase timers) — the only dataset
+describing the GA *loop* rather than a single nest. Drives the coordinator
+synchronously (`draw_callback=None`, `worker=None`), which is the path
+single-threaded execution takes.
+
+```sh
+$FREECAD tests/freecad_harness/bench_ga.py
+NEST_BENCH_GA_BASELINE=tests/freecad_harness/baseline/ga_pop2_gen2.json \
+    $FREECAD tests/freecad_harness/bench_ga.py
+```
+
+Exposes the NFP phase sums at GA level (`nfp_union_s`, `nfp_convex_sum_s`, …),
+the convex-pair work count, the interior-ring population metrics
+(`mask_hole_rings`, `mask_subthreshold_hole_rings`, `mask_hole_sensitive_pairs`,
+`mask_hole_exploiting_placements` — the `hole_pct` / `subthreshold_pct`
+denominators), the loop counters, and the full layout-management breakdown
+(`lm_layouts_created`, `lm_layouts_deleted`, `doc_objects_deleted`,
+`lm_master_prepare_s`, …).
+
+Two things to know:
+
+- **Rotation width is pinned to 1** and recorded in the baseline. Above 1, one
+  shared `random.Random` is consumed by concurrent threads, so tie-breaks — and
+  therefore every work count — move between runs. At width 1 all counts are
+  stable; raise it to measure throughput, not to compare.
+- `performance_logging` must stay on to populate `_ga_perf`, but its per-NFP
+  `[PERF]` lines go through `log_callback`, which is pointed at a sink. A single
+  GA run otherwise emits thousands of them.
+
+### Shared helpers
+
+`harness_common.py` holds the corpus builder, document part discovery, `emit()`,
+and the timing-key classifier. It is deliberately **not** named like a script:
+under `freecadcmd` a script runs with `__name__` set to its own basename, so
+every harness uses `if __name__ in ("__main__", "<own name>")` — and importing
+one harness from another re-executes it. That is not hypothetical; an early
+debug script ran the whole suite on import.
+
+`nest_benchmark.py` and `bench_rotation_workers.py` still carry their own
+copies of the corpus builder. Migrating them is a follow-up, not a blocker.
+
 ## Baseline
 
 `baseline/synthetic_v1.json` — schema 1, synthetic corpus, seed 20260925,
