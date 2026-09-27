@@ -321,8 +321,84 @@ Migrating it is a follow-up, not a blocker.
 2 sheets, 12 placed, efficiency 0.447987, `nfp_convex_pairs` 3332,
 `nfp_errors` 0.
 
+`baseline/heavy_v1.json` — tier 2, heavy corpus, 1200×600, 8 rotation steps,
+3 reps: 1 sheet, 122 placed, density 0.660024, 69.1 s, all 63 counts exact.
+
+### Config drift is a usage error, not a regression
+
+A baseline only means something against the run that recorded it, so the harness
+compares the workload-defining config fields and refuses with exit 2 if they
+differ:
+
+```
+ERROR: baseline sheet='1200x600' but this run used '900x600'. That is a
+different workload, not a regression.
+```
+
+Without that, changing a sheet size reports as `GATE FAILED: sheets, density` —
+and the obvious response to a failing gate is to change the code. Exit 1 means
+"the nest broke"; exit 2 means "you are not running the same thing". Checked:
+corpus kind, sheet, quantity, per-label quantities, rotation steps, spacing,
+deflection, simplification, seed, rotation width, and the candidate-geometry
+cache flag.
+
 Re-record with `NEST_BENCH_OUT=...` after an intentional change. Keep the
 schema version in step with the reader; the harness refuses a mismatch.
+
+## Three tiers
+
+| tier | runner | corpus | cost | what it catches |
+|---|---|---|---|---|
+| 1 | `run.sh` | synthetic, 450×350, 18 parts | ~10 s | packing regressions, instrumentation drift |
+| 2 | `run_heavy.sh` | heavy synthetic, 1200×600, 122 parts | ~3.5 min | throughput and algorithmic regressions |
+| 3 | ad hoc | n70 (gitignored) | ~25 min | geometry-specific behaviour |
+
+`run.sh` is the fast contract and runs on every commit. `run_heavy.sh` costs
+minutes, so it is separate and opt-in. Both are committed baselines.
+
+### Tier 2: the heavy synthetic corpus
+
+`NEST_BENCH_CORPUS=heavy` builds one plate drilled with 36 large holes plus four
+small part types. It exists to reproduce the *intensity* of a real job without
+its geometry, because n70 is a customer part in a gitignored file that nobody
+else can reproduce and CI cannot run.
+
+It matches n70 closely enough to be worth trusting:
+
+| | heavy | n70 |
+|---|---:|---:|
+| wall (min of N) | 69.1 s | 73.6 s |
+| `nfp_work_convex_pairs` | 445 616 | 516 144 |
+| `nfp_work_parts_a` / `_b` | 9 440 / 1 984 | 6 096 / 2 064 |
+| `convex_result_points` | 2.63 M | 3.23 M |
+| `candidate_geometries_built` | 172 256 | 153 228 |
+| `exact_collision_checks` | 184 197 | 188 317 |
+| `collision_intersection` | 18.4 s | 21.4 s |
+| `candidate_geometry` | 11.8 s | 10.9 s |
+| `union` share of NFP | **71.3%** | **70.7%** |
+| `convex_sum` share of NFP | 22.0% | 25.1% |
+
+The phase profile matching to within a couple of points is the part that matters:
+a corpus that merely took a similar number of seconds could be spending them
+somewhere else entirely.
+
+**The dial is hole size, not hole count.** A first attempt used a 14×14 grid of
+r=7 mm holes and produced **1** convex piece, against n70's 253 — 100× less
+work. `decompose_if_needed` prunes interior rings that no nestable part can
+occupy, and nothing 40–90 mm across fits a 14 mm hole, so all 196 rings were
+dropped and the plate decomposed to a plain rectangle. Large, occupiable holes
+are what make the part expensive. Verified with `probe_decomposition.py`, which
+reports real piece counts through the actual `ShapePreparer` pipeline.
+
+The dial has a cliff on the far side, which is worth knowing:
+
+```
+6x5 -> 198 pieces    6x6 -> 234    7x6 -> 270    7x7 -> 312
+8x7 ->   1 piece  (collapsed: 8mm webs stop triangulating)
+```
+
+6×6 lands within 8% of the Spacer's 253. "More holes" is not monotonically
+heavier.
 
 ## The n70 corpus
 
@@ -330,10 +406,20 @@ schema version in step with the reader; the harness refuses a mismatch.
 3 part types — **Spacer** (510×438 mm, the one that dominates), **Bottle Top**,
 **Bottle Bottom** — inside `PartDesign::Body` objects with Sketches, Pads and
 Origins. `discover_doc_parts` correctly finds the 3 Bodies and skips the 30
-scaffolding objects.
+scaffolding objects. The Spacer's 13 bottle-sized holes are what make it
+expensive: 253 convex pieces, so a Spacer-against-Spacer NFP is 192×192 = 36 864
+convex pairs. `probe_decomposition.py` reports those counts.
 
 It is **gitignored** (added in 3507c79, "Ignore updated"), so it is the one
-workload here that cannot back a committed baseline — see the note at the end.
+workload here that cannot back a committed baseline. `run_heavy.sh` covers the
+same intensity with the heavy synthetic corpus; n70 stays as tier 3, run locally
+against a baseline stored outside the repository:
+
+```sh
+HEAVY_CORPUS=tests/Test_Files/n70-intercooler-spacer-bottle-nesting.FCStd \
+NEST_BENCH_QUANTITIES='Spacer=2,Bottle Top=60,Bottle Bottom=60' \
+NEST_BENCH_BASELINE=~/n70_local.json tests/freecad_harness/run_heavy.sh
+```
 
 Reproduces the workload in `make-faster.md`:
 

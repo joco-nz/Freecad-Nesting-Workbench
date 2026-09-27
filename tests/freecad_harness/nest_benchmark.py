@@ -241,6 +241,7 @@ class Config:
             "quantity": self.quantity,
             "draw": self.draw,
             "candidate_geometry_cache": self.candidate_geometry_cache,
+            "per_label_quantities": self.per_label_quantities,
             "reps": self.reps,
         }
 
@@ -676,6 +677,12 @@ def main():
             parts, quantities = build_synthetic_corpus(doc, cfg.seed, cfg.quantity)
             corpus_desc = {"kind": "synthetic", "seed": cfg.seed,
                            "labels": sorted(quantities)}
+        elif cfg.corpus == "heavy":
+            parts, quantities = hc.build_heavy_corpus(
+                doc, cfg.seed, cfg.quantity, cfg.per_label_quantities)
+            corpus_desc = {"kind": "heavy", "seed": cfg.seed,
+                           "labels": sorted(quantities),
+                           "quantities": dict(quantities)}
         else:
             if not os.path.exists(cfg.corpus):
                 emit(f"ERROR: corpus not found: {cfg.corpus}")
@@ -791,6 +798,26 @@ def main():
                  f"width ({baseline['config'].get('rotation_workers')} vs "
                  f"{cfg.rotation_workers}); its work counts are not comparable")
             return 2
+        if baseline.get("config", {}).get("candidate_geometry_cache") != \
+                cfg.candidate_geometry_cache:
+            emit("ERROR: baseline was recorded with the candidate-geometry cache "
+                 f"{'on' if cfg.candidate_geometry_cache else 'off'} and this run "
+                 f"has it {'on' if cfg.candidate_geometry_cache else 'off'}")
+            return 2
+        # The remaining workload-defining fields. Without these a changed sheet
+        # or rotation count is reported as a GATE FAILED regression, which is
+        # both wrong -- nothing regressed, the workload is simply different --
+        # and dangerous, because the obvious "fix" for a failing gate is to
+        # change the code.
+        for key in ("sheet", "quantity", "per_label_quantities",
+                    "rotation_steps", "spacing", "deflection", "simplification",
+                    "seed"):
+            was = baseline.get("config", {}).get(key)
+            now = cfg.as_dict().get(key)
+            if was != now:
+                emit(f"ERROR: baseline {key}={was!r} but this run used {now!r}. "
+                     f"That is a different workload, not a regression.")
+                return 2
         return 0 if compare(record, baseline, cfg.allow_fewer_placed) else 1
 
     return 0

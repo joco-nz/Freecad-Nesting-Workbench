@@ -94,6 +94,98 @@ def build_synthetic_corpus(doc, seed, quantity):
     return parts, {p.Label: quantity for p in parts}
 
 
+def build_heavy_corpus(doc, seed, quantity, per_label_quantities=None):
+    """A synthetic corpus with n70's *intensity* and none of its geometry.
+
+    Why it exists
+    -------------
+    The n70 corpus is the only realistic workload here and it is gitignored --
+    a real customer part ("intercooler spacer bottle"), in a public repository
+    that currently tracks no .FCStd at all. So its measurements are real but
+    unreproducible for anyone else, and CI cannot run them.
+
+    This reproduces the *shape* of that workload. What makes n70 expensive is
+    one part that decomposes into a very large number of convex pieces, so that
+    every NFP against it is a large pairwise Minkowski sum. Measured on n70:
+
+        nfp_work_convex_pairs        516,144     <- the driver
+        parts_a / parts_b            6,096 / 2,064
+        NFP union phase              22.5 s of 31.8 s
+        candidate_geometry           10.8 s
+
+    The real Spacer decomposes to 229 convex pieces, which is where those
+    numbers come from. A plate drilled with a grid of holes decomposes into one
+    convex piece per hole plus the surrounding web, so hole count is a direct
+    and tunable dial on the same quantity. Sized here to land in the same order
+    of magnitude on both pairs and wall clock.
+
+    What it does NOT reproduce: the real part's feature topology. It will catch
+    algorithmic regressions and throughput changes. It will not catch anything
+    specific to that geometry. Those stay with n70, run locally.
+    """
+    import FreeCAD
+    import Part
+
+    rng = random.Random(seed)
+    parts = []
+
+    def add(name, shape):
+        obj = doc.addObject("Part::Feature", name)
+        obj.Shape = shape
+        parts.append(obj)
+        return obj
+
+    # The heavy part: a plate with a grid of LARGE holes.
+    #
+    # The hole *size* is the dial, not the hole count, and getting that backwards
+    # is the whole story of the first attempt. A 14x14 grid of r=7 holes gave 1
+    # convex piece, against n70's 253, because decompose_if_needed prunes
+    # interior rings no nestable part can occupy -- and no 40-90mm part fits a
+    # 14mm hole, so all 196 rings were dropped and the plate decomposed to a
+    # plain rectangle. n70's Spacer has 13 holes that survive because they are
+    # bottle-sized. So the holes here have to be large enough for the small
+    # parts to actually occupy, or the pruning deletes the entire cost.
+    #
+    # Verified with probe_decomposition.py rather than assumed. Sweeping the
+    # grid gives a clean dial until it does not:
+    #
+    #     6x5 -> 198 pieces     7x6 -> 270     7x7 -> 312
+    #     6x6 -> 234 pieces                       8x7 -> 1  (collapsed)
+    #
+    # n70's Spacer is 253, so 6x6 lands within 8% of it. The 8x7 collapse is
+    # worth recording: at 8mm webs the plate stops triangulating and returns a
+    # single piece, so there is a cliff on the far side of the useful range and
+    # "more holes" is not monotonically heavier.
+    HOLE_COLS, HOLE_ROWS = 6, 6             # 36 large holes -> 234 convex pieces
+    PLATE_W, PLATE_H, PLATE_T = 500.0, 440.0, 10.0
+    HOLE_W, HOLE_H = 70.0, 62.0
+    plate = Part.makeBox(PLATE_W, PLATE_H, PLATE_T)
+    pitch_x = PLATE_W / HOLE_COLS
+    pitch_y = PLATE_H / HOLE_ROWS
+    for col in range(HOLE_COLS):
+        for row in range(HOLE_ROWS):
+            x = col * pitch_x + (pitch_x - HOLE_W) / 2
+            y = row * pitch_y + (pitch_y - HOLE_H) / 2
+            plate = plate.cut(Part.makeBox(
+                HOLE_W, HOLE_H, PLATE_T + 2, FreeCAD.Vector(x, y, -1.0)))
+    add("HeavyPlate", plate)
+
+    # Small parts alongside it, so the nest is not one part type repeated. Sized
+    # to fit the 70x62 holes, which is what keeps those rings alive.
+    for i in range(3):
+        add(f"Small{i}", Part.makeBox(rng.randrange(40, 60),
+                                      rng.randrange(30, 45), 10))
+    add("SmallL", Part.makeBox(58, 54, 10).cut(
+        Part.makeBox(34, 30, 10, FreeCAD.Vector(14, 12, 0))))
+
+    # Per-label overrides honoured here too. This was the same trap as the FCStd
+    # path: a builder that takes only a uniform `quantity` silently ignores
+    # NEST_BENCH_QUANTITIES, and the run measures 3 of each part instead of the
+    # requested 2-and-30-and-30 while looking entirely healthy.
+    return parts, {p.Label: (per_label_quantities or {}).get(p.Label, quantity)
+                   for p in parts}
+
+
 def discover_doc_parts(doc):
     """Top-level candidate part objects in an opened document.
 
