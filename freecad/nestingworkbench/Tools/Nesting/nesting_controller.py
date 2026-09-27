@@ -11,6 +11,7 @@ from PySide import QtWidgets
 from PySide.QtCore import QThread, Signal
 from ...datatypes.shape import Shape
 from .shape_preparer import ShapePreparer
+from .algorithms import minkowski_utils
 from .layout_manager import LayoutManager, Layout
 from .ga_coordinator import GACoordinator
 from ...freecad_helpers import recursive_delete
@@ -109,6 +110,9 @@ class NestingController:
 
         self._prepare_source_parts()
         Shape.clear_caches()
+        # Once per run, not once per layout: the decomposition work the
+        # dead-ring counters describe only happens while the NFP cache is cold.
+        minkowski_utils.reset_dead_ring_stats()
 
         target_layout = self._ensure_target_layout()
         if not target_layout:

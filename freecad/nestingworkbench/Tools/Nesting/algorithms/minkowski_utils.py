@@ -65,12 +65,46 @@ _decomposition_lock = threading.Lock()
 # ---------------------------------------------------------------------------
 
 _dead_ring_profiles = None
+# Run-level totals describing what the pruning actually saved. Read by
+# ga_coordinator._dead_ring_summary at the end of a run.
+#   polygons_pruned   - polygons that had at least one ring removed
+#   rings_seen        - interior rings in THOSE polygons (not all rings seen;
+#                       a polygon with no dead ring contributes nothing)
+#   rings_dropped     - interior rings removed, i.e. rings proven unoccupiable
+#   parts_from_misses - convex pieces produced by cache-MISSING decompositions.
+#                       Not "pieces per polygon": a cache hit returns early and
+#                       is never counted, so this is a lower bound and must not
+#                       be divided by polygons_pruned.
 _dead_ring_stats = {
     'polygons_pruned': 0,
     'rings_seen': 0,
     'rings_dropped': 0,
-    'parts_after': 0,
+    'parts_from_misses': 0,
 }
+# Guards every read-modify-write of _dead_ring_stats.
+#
+# This MUST be held. `_prune_dead_rings` runs inside the NFP path, which the
+# rotation futures execute concurrently (rotation_workers=8 on this box), and
+# `d[k] += v` is a read followed by a store -- not atomic. The increments were
+# silently lossy, and the first run that showed it reported rings_dropped=1048
+# against rings_seen=1042. That pair is impossible: dropped is a subset of seen
+# (both are bumped in the same block, and only when dropped is truthy), so
+# dropped <= seen is an invariant. Observing a violation is a positive proof the
+# counters are racing, not a rounding wobble.
+#
+# The counters were broken before the lock was added too; it was invisible while
+# they were being zeroed once per layout and so always read 0. Holding the lock
+# costs nothing measurable: it is taken at most once per NFP decomposition
+# miss, and the surrounding work is milliseconds of shapely.
+_dead_ring_stats_lock = threading.Lock()
+
+
+def _bump_dead_ring_stats(**deltas):
+    """Add to the run totals under the lock. Unknown keys are ignored."""
+    with _dead_ring_stats_lock:
+        for key, amount in deltas.items():
+            if key in _dead_ring_stats:
+                _dead_ring_stats[key] += amount
 
 
 def dead_ring_pruning_requested():
@@ -88,29 +122,49 @@ def set_dead_ring_profiles(profiles):
     """Publish the (width, height, area) of every part type, or None to disable.
 
     Must be called after ALL parts are prepared: whether a ring is dead depends
-    on the smallest part in the whole set, which is not known until then. Each
-    call starts a fresh counting session, because prepare_parts runs once per
-    layout and the counters describe one layout's work.
+    on the smallest part in the whole set, which is not known until then.
+
+    Deliberately does NOT touch the counters. This runs once per layout, and
+    the decomposition work it counts only happens while the NFP cache is cold
+    -- in practice generation 1, after which every request is a cache hit and
+    decompose_if_needed is never reached. Resetting here therefore wiped a
+    generation's work before it could ever be reported, which is how the first
+    treatment run printed `polys=0 rings=0 dropped=0 parts=0` while the NFP was
+    plainly 4x faster. reset_dead_ring_stats() is the run-level owner.
     """
     global _dead_ring_profiles
     _dead_ring_profiles = tuple(profiles) if profiles else None
-    for key in _dead_ring_stats:
-        _dead_ring_stats[key] = 0
 
 
 def clear_dead_ring_profiles():
-    """Disable pruning and reset counters. Always call this when done."""
+    """Disable pruning. Counters are left alone; see set_dead_ring_profiles."""
     global _dead_ring_profiles
     _dead_ring_profiles = None
-    for key in _dead_ring_stats:
-        _dead_ring_stats[key] = 0
+
+
+def reset_dead_ring_stats():
+    """Zero the counters. Called once per run, not once per layout.
+
+    Under the same lock as the increments: this runs from the controller thread
+    while no worker is active in practice, but an unsynchronised reset can
+    interleave with an increment and silently discard it.
+    """
+    with _dead_ring_stats_lock:
+        for key in _dead_ring_stats:
+            _dead_ring_stats[key] = 0
 
 
 def get_dead_ring_stats():
-    """Snapshot of the counters. Empty when pruning was never enabled."""
+    """Snapshot of the counters. Empty when pruning was never enabled.
+
+    Copied under the lock so the four fields come from one instant; a torn
+    snapshot could report dropped > seen and look like a race that had already
+    been fixed.
+    """
     if _dead_ring_profiles is None:
         return {}
-    return dict(_dead_ring_stats)
+    with _dead_ring_stats_lock:
+        return dict(_dead_ring_stats)
 
 
 def _ring_is_live(ring):
@@ -148,7 +202,6 @@ def _prune_dead_rings(polygon):
     has been published, or when pruning is disabled -- so it is a safe no-op for
     any caller in any state, rather than assuming the registry is armed.
     """
-    global _dead_ring_stats
     if not _dead_ring_profiles:
         return polygon
     if polygon is None or polygon.is_empty:
@@ -167,9 +220,13 @@ def _prune_dead_rings(polygon):
         # discarded and the caller decomposes the original.
         return polygon
 
-    _dead_ring_stats['polygons_pruned'] += 1
-    _dead_ring_stats['rings_seen'] += len(polygon.interiors)
-    _dead_ring_stats['rings_dropped'] += dropped
+    # rings_seen is bumped in the same call as rings_dropped and is a superset
+    # of it, so the two must never be updated in separate critical sections.
+    _bump_dead_ring_stats(
+        polygons_pruned=1,
+        rings_seen=len(polygon.interiors),
+        rings_dropped=dropped,
+    )
     return pruned
 
 
@@ -209,7 +266,7 @@ def decompose_if_needed(polygon, logger):
     try:
         parts = _decompose_uncached(polygon, logger, cache_key)
         if _dead_ring_profiles:
-            _dead_ring_stats['parts_after'] += len(parts)
+            _bump_dead_ring_stats(parts_from_misses=len(parts))
         future.set_result(parts)
         return parts
     except BaseException as exc:

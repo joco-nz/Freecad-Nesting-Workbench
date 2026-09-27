@@ -58,11 +58,17 @@ class Shape:
             cls.convex_pair_probe_keys.clear()
             cls.convex_pair_probe_requests = 0
         # NOTE: dead-ring pruning is deliberately NOT reset here. It is run
-        # configuration (the part set), not a cache, and the NFP path calls
-        # clear_caches() between generations -- clearing the part set there
-        # would silently switch the optimisation off partway through a run.
-        # ShapePreparer publishes a fresh part set at the start of every
-        # prepare_parts, which is the correct owner.
+        # configuration (the part set), not a cache. Its actual owner is
+        # ShapePreparer._publish_dead_ring_profiles, which publishes a fresh
+        # part set at the start of every prepare_parts -- the decomposition
+        # runs during find_best_placement, long after prepare_parts returns, so
+        # clearing the part set anywhere in here would switch the optimisation
+        # off for the entire actual nesting run.
+        #
+        # (An earlier version of this comment claimed clear_caches() is called
+        # between GA generations. It is not: execute_nesting is the only caller
+        # and it runs once, before the GA starts. The decision is still right;
+        # the reason it was originally given for was wrong.)
 
     @classmethod
     def clear_nfp_cache(cls):

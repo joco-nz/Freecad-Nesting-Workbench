@@ -218,10 +218,21 @@ class ShapePreparer:
         Deliberately NOT undone at the end of this method. The decomposition
         runs during find_best_placement, long after prepare_parts has returned,
         so clearing here would disable the optimisation for the entire actual
-        nesting run. Shape.clear_caches() is NOT the place either: it is called
-        between GA generations, and the part set is run configuration rather
-        than a cache, so clearing it there would switch the optimisation off
-        partway through a run. This method's opening clear is the only owner.
+        nesting run.
+
+        Shape.clear_caches() is not an alternative owner, but not for the
+        reason once recorded here: it is not called between GA generations at
+        all -- NestingController.execute_nesting is its only caller and it runs
+        once, before the GA starts, so clearing there would merely be undone by
+        the very next prepare_parts. This method's opening clear is what actually
+        prevents a run with pruning switched off from inheriting a previous
+        run's part set.
+
+        This method also deliberately does NOT reset the counters. It runs once
+        per layout while the counting only happens during generation 1 (the NFP
+        cache is warm from generation 2 on, so decompose_if_needed is never
+        reached). reset_dead_ring_stats, called once per run from
+        execute_nesting, is the owner.
         """
         # Unconditional: a run that has pruning switched off must not inherit a
         # previous run's part set.

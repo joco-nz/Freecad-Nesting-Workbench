@@ -63,13 +63,17 @@ def _dead_ring_summary():
     Empty whenever the optimisation is disabled, so the default production
     report is unchanged and a reader can tell at a glance whether the A/B was
     actually armed -- a knob that silently does nothing is worse than no knob.
+    That is the whole reason this exists, so it must never read all-zero while
+    the optimisation is demonstrably on. The counters are run totals owned by
+    reset_dead_ring_stats, which is called once per run in
+    NestingController.execute_nesting.
     """
     stats = minkowski_utils.get_dead_ring_stats()
     if not stats:
         return "off"
-    return "polys=%d rings=%d dropped=%d parts=%d" % (
+    return "polys=%d rings=%d dropped=%d missed_pieces=%d" % (
         stats['polygons_pruned'], stats['rings_seen'],
-        stats['rings_dropped'], stats['parts_after'])
+        stats['rings_dropped'], stats['parts_from_misses'])
 
 
 def _hole_vertex_pct(perf):
