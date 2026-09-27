@@ -61,7 +61,8 @@ _decomposition_lock = threading.Lock()
 # failure the code comment in _decompose_uncached says must never happen. With
 # the rings pruned, the area is 15094.8 at all eight angles.
 #
-# Opt-in via NESTING_FILL_DEAD_HOLES so the fixture can be run as a control.
+# Enabled by default. NESTING_FILL_DEAD_HOLES=0 restores the old behaviour and
+# is the only way to reproduce the control numbers.
 # ---------------------------------------------------------------------------
 
 _dead_ring_profiles = None
@@ -110,12 +111,18 @@ def _bump_dead_ring_stats(**deltas):
 def dead_ring_pruning_requested():
     """True when NESTING_FILL_DEAD_HOLES asks for the optimisation.
 
-    Default off. The measurement in the comment above was taken against the
-    real engine, but the packing outcome still has to be confirmed on the
-    fixture, and a control run is the only honest way to do that.
+    DEFAULT ON. Flipped after four fixture runs of the 122-part Spacer/Bottle
+    set all landed on 40.4% efficiency, 2 sheets, 122 parts placed -- the
+    control included -- with both structural invariants exact. Pruning only
+    ever SHRINKS the NFP, so the reachable position set can only grow; it
+    cannot cost a placement. The collision mask is untouched and remains the
+    exact verifier.
+
+    Set NESTING_FILL_DEAD_HOLES=0 (or off/false/no) to get the old behaviour.
+    That is the only way to reproduce the control numbers above.
     """
     raw = os.environ.get('NESTING_FILL_DEAD_HOLES', '').strip().lower()
-    return raw in ('1', 'true', 'yes', 'on')
+    return raw not in ('0', 'false', 'no', 'off')
 
 
 def set_dead_ring_profiles(profiles):
