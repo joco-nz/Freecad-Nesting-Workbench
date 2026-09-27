@@ -355,6 +355,25 @@ of each part. Found by measuring, not by reading. A malformed entry raises
 rather than being skipped, because a dropped quantity gives a clean-looking run
 of the wrong workload.
 
+## The candidate-geometry cache
+
+`NEST_BENCH_CANDIDATE_GEOMETRY_CACHE=1` enables the one opt-in feature with a
+measured win and no test coverage. `bench_candidate_cache.py` A/B's it
+interleaved and answers three questions in order of importance: is it
+layout-neutral, what does it save, what does it cost in memory.
+
+On the n70 workload: **layout-identical across 6 runs**, `candidate_geometry`
+10 757 ms → 886 ms, total wall 72.688 s → 62.715 s (0.863×) against a 1.3%
+control spread, 92.2% hit rate, **+0 MiB** peak RSS. Full write-up in
+[RESULTS-9.4.md](RESULTS-9.4.md).
+
+Memory is measured in a **separate process per arm**, not in-process:
+`ru_maxrss` is a process high-water mark and never falls, so a reading taken
+after the other arm has run is contaminated by it.
+
+`NEST_BENCH_CANDIDATE_GEOMETRY_CACHE` is off by default, so the committed
+baseline is unaffected.
+
 ## Reps, and what a baseline is allowed to claim
 
 A baseline recorded from one sample is a claim about a machine state that does

@@ -114,6 +114,26 @@ def emit(message=""):
 # command-line flags for itself.
 #
 # The payoff is that the common cases need no arguments at all.
+def _peak_rss_bytes():
+    """Peak resident set size of this process, or None where unavailable.
+
+    `ru_maxrss` is kilobytes on Linux and bytes on macOS, which is a real trap
+    when reading a memory number off a Mac and believing it.
+
+    This is a high-water mark for the whole process, not a per-run figure, so it
+    is only meaningful as a *difference* against a reading taken just before the
+    run -- and only when the process is not otherwise growing. That is enough to
+    answer "does an unbounded cache cost a lot of memory", which is the question
+    being asked of it.
+    """
+    try:
+        import resource
+    except ImportError:
+        return None
+    raw = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    return raw * 1024 if sys.platform.startswith("linux") else raw
+
+
 def _parse_quantities(spec):
     """Parses "Spacer=2,Bottle Top=60" into {"Spacer": 2, "Bottle Top": 60}.
 
@@ -168,6 +188,12 @@ class Config:
         self.per_label_quantities = _parse_quantities(
             env.get("NEST_BENCH_QUANTITIES", ""))
         self.draw = bool(env.get("NEST_BENCH_DRAW", ""))
+        # The one opt-in feature with a measured win and no test coverage:
+        # make-faster.md records 87.44s -> 10.22s at a 75.2% hit rate, and
+        # master-merge.md 9.4 needs a disabled-control measurement before it can
+        # go default-on. Off here so the committed baseline is unaffected.
+        self.candidate_geometry_cache = bool(
+            env.get("NEST_BENCH_CANDIDATE_GEOMETRY_CACHE", ""))
         # Reps run in one process, interleaved with nothing else, each with
         # cold caches. Timings become a minimum over them; counts and results
         # must be identical, and a difference is a hard failure rather than
@@ -180,20 +206,26 @@ class Config:
         Read at call time by nesting_strategy._rotation_worker_limit(), so
         setting it before the nest is enough.
 
-        Why the default is 1: with the pool enabled the work counters are not
-        reproducible. Rotation evaluation draws from one shared
+        Why the default is 1: above width 1 some work counters stop being exact.
+        Rotation evaluation breaks metric ties by drawing from one shared
         `random.Random`, and concurrent threads consume it in scheduling order,
-        so tie-breaks vary run to run. Measured over three identical runs,
-        28 of 51 perf counters differed (bbox_checks 51639/49894/47487,
-        collision_intersects_true 1856/2387/2431, nfp_cache_misses 92/94/99).
-        At width 1 only the eleven `*_ms` timing counters still move and all
-        40 count counters are stable.
+        so the draw order is not fixed.
 
-        The nesting *result* is identical either way on the built-in corpus --
-        1 sheet, 18 placed, density 0.563184 every time -- so this is a
-        measurement-fidelity problem rather than a correctness one. It does
+        An earlier version of this docstring said 28 of 51 counters differed
+        run to run. That was measured before the caches were cleared between
+        reps, and it does not reproduce: 4 reps at width 1, 2, 4 and 8 on the
+        built-in corpus show 59 of 63 counts exact at every width, with
+        nfp_cache_hits/misses, candidate_points and exact_collision_checks
+        moving and nfp_work_convex_pairs, rotation_evaluations and
+        successful_rotations not. The pinning stands, but for the narrower
+        reason that width 1 is the only setting where *every* count is exact --
+        not because a quarter of them are unreliable.
+
+        The nesting *result* is identical either way on both corpora, so this is
+        a measurement-fidelity problem rather than a correctness one. It does
         mean a baseline recorded with the pool on cannot be compared against a
-        run with it off, which is why the width is recorded in the JSON.
+        run with it off, which is why the width is recorded in the JSON and in
+        the `noise` block.
         """
         os.environ["NESTING_ROTATION_WORKERS"] = str(max(1, self.rotation_workers))
 
@@ -208,6 +240,7 @@ class Config:
             "rotation_workers": self.rotation_workers,
             "quantity": self.quantity,
             "draw": self.draw,
+            "candidate_geometry_cache": self.candidate_geometry_cache,
             "reps": self.reps,
         }
 
@@ -399,6 +432,21 @@ def run_nest(doc, parts, quantities, cfg):
 
     width, height = (float(v) for v in cfg.sheet.lower().split("x"))
     perf = {}
+
+    # A fresh cache per run, never reused: CandidateGeometryCache is an
+    # unbounded per-run dict of translated polygons, so sharing one across reps
+    # would make rep 2..N measure a warm cache -- the same trap the class-level
+    # NFP cache set. Constructed here rather than in main() so that holds for
+    # every caller, including the A/B driver.
+    geometry_cache = None
+    if cfg.candidate_geometry_cache:
+        from freecad.nestingworkbench.Tools.Nesting.algorithms.nesting_strategy import (
+            CandidateGeometryCache,
+        )
+
+        geometry_cache = CandidateGeometryCache()
+
+    rss_before = _peak_rss_bytes()
     started = time.perf_counter()
     sheets, unplaced, _sim_steps, _elapsed = nesting_logic.nest(
         shapes,
@@ -409,8 +457,10 @@ def run_nest(doc, parts, quantities, cfg):
         rng=_random.Random(cfg.seed),
         quiet=True,
         perf_stats_callback=perf.update,
+        candidate_geometry_cache=geometry_cache,
     )
     wall = time.perf_counter() - started
+    peak_rss = max(_peak_rss_bytes() - rss_before, 0)
 
     placed_total = 0
     used_area = 0.0
@@ -437,7 +487,7 @@ def run_nest(doc, parts, quantities, cfg):
         "prepared_shapes": len(shapes),
         "placed_by_label": dict(sorted(by_label.items())),
     }
-    return result, perf, minkowski_utils.get_dead_ring_stats(), wall
+    return result, perf, minkowski_utils.get_dead_ring_stats(), wall, peak_rss
 
 
 # --------------------------------------------------------------------------
@@ -514,7 +564,7 @@ def _is_timing(key):
     return key.endswith("_ms") or "_ms_" in key
 
 
-def build_record(cfg, corpus_desc, result, perf, dead_ring, wall):
+def build_record(cfg, corpus_desc, result, perf, dead_ring, wall, peak_rss=None):
     return {
         "schema": SCHEMA_VERSION,
         "corpus": corpus_desc,
@@ -523,6 +573,7 @@ def build_record(cfg, corpus_desc, result, perf, dead_ring, wall):
         "perf": {k: perf[k] for k in sorted(perf)},
         "dead_ring": dead_ring,
         "wall_seconds": round(wall, 4),
+        "peak_rss_bytes": peak_rss,
     }
 
 
@@ -543,6 +594,9 @@ def print_record(record):
          f"({len(counts)} reproducible counts, {len(timings)} timings)")
     if record["dead_ring"]:
         emit(f"  dead rings        {record['dead_ring']}")
+    if record.get("peak_rss_bytes"):
+        emit(f"  peak rss          {record['peak_rss_bytes'] / (1024 * 1024):.0f} MiB "
+             f"(delta over the run, high-water mark)")
     noise = record.get("noise")
     if noise:
         emit(f"  reps              {noise['reps']} in one process, "
@@ -648,9 +702,10 @@ def main():
         if not parts:
             emit("ERROR: corpus produced no parts")
             return 2
-        result, perf, dead_ring, wall = run_nest(doc, parts, quantities, cfg)
+        result, perf, dead_ring, wall, peak_rss = run_nest(
+            doc, parts, quantities, cfg)
         reps.append({"result": result, "perf": perf,
-                     "dead_ring": dead_ring, "wall": wall})
+                     "dead_ring": dead_ring, "wall": wall, "peak_rss": peak_rss})
 
     result_fields = list(reps[0]["result"].keys())
     perf_list = [r["perf"] for r in reps]
@@ -687,7 +742,12 @@ def main():
 
     result = reps[0]["result"]
     dead_ring = reps[0]["dead_ring"]
-    record = build_record(cfg, corpus_desc, result, perf, dead_ring, min(walls))
+    # ru_maxrss is a process high-water mark, so the honest figure across reps is
+    # the largest, not the smallest or the first.
+    rss_values = [r["peak_rss"] for r in reps if r["peak_rss"] is not None]
+    peak_rss = max(rss_values) if rss_values else None
+    record = build_record(cfg, corpus_desc, result, perf, dead_ring, min(walls),
+                          peak_rss)
     record["noise"] = hc.noise_block(cfg.reps, cfg.rotation_workers,
                                      unstable_counts, unstable_timings, walls)
     print_record(record)
