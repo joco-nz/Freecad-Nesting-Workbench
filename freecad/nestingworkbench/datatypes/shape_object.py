@@ -7,6 +7,8 @@ This module defines a custom FreeCAD scripted object for representing a nested s
 
 import FreeCAD
 
+from ..freecad_helpers import get_view_object, set_visibility
+
 class ShapeObject:
     """A scripted object representing a single nested shape."""
 
@@ -18,19 +20,22 @@ class ShapeObject:
         obj.addProperty("App::PropertyBool", "ShowLabel", "Display", "Toggle visibility of the label").ShowLabel = True
         obj.addProperty("App::PropertyLink", "BoundaryObject", "Nesting", "Link to the boundary wire object")
         obj.addProperty("App::PropertyLink", "LabelObject", "Nesting", "Link to the label text object")
-        obj.ViewObject.Proxy = 0 # Use the default view provider
+        # Use the default view provider. Unguarded this raised AttributeError
+        # under a GUI-less FreeCAD, where ViewObject exists but is None.
+        obj_view = get_view_object(obj)
+        if obj_view is not None:
+            obj_view.Proxy = 0
 
     def onChanged(self, fp, prop):
         """Called when a property changes."""
         if prop == "ShowShape":
-            if hasattr(fp, "ViewObject"):
-                fp.ViewObject.Visibility = fp.ShowShape
+            set_visibility(fp, fp.ShowShape)
         elif prop == "ShowBounds":
-            if hasattr(fp, "BoundaryObject") and fp.BoundaryObject and hasattr(fp.BoundaryObject, "ViewObject"):
-                fp.BoundaryObject.ViewObject.Visibility = fp.ShowBounds
+            if getattr(fp, "BoundaryObject", None):
+                set_visibility(fp.BoundaryObject, fp.ShowBounds)
         elif prop == "ShowLabel":
-            if hasattr(fp, "LabelObject") and fp.LabelObject and hasattr(fp.LabelObject, "ViewObject"):
-                fp.LabelObject.ViewObject.Visibility = fp.ShowLabel
+            if getattr(fp, "LabelObject", None):
+                set_visibility(fp.LabelObject, fp.ShowLabel)
 
     def execute(self, fp):
         """Called on recompute. Does nothing for now as shape is set externally."""

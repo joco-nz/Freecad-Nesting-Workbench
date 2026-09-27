@@ -12,7 +12,20 @@ Supports two methods:
 import FreeCAD
 import Part
 from ..Nesting.algorithms.shape_processor import get_2d_profile_from_obj
-from ...freecad_helpers import get_nested_containers
+from ...freecad_helpers import get_nested_containers, get_view_object
+
+def _style_silhouette(silhouette_obj):
+    """Applies the standard light-blue silhouette appearance.
+
+    A no-op without a GUI: under freecadcmd the ViewObject exists but is None,
+    so the attribute writes below would raise AttributeError.
+    """
+    view = get_view_object(silhouette_obj)
+    if view is None:
+        return
+    view.ShapeColor = (0.2, 0.6, 1.0)  # Light blue
+    view.Transparency = 50
+    view.LineWidth = 2.0
 
 def create_cross_section(obj, cut_height=None):
     """
@@ -289,10 +302,7 @@ def create_silhouettes_for_layout(doc, layout_group, cut_height=None, method="cr
                 silhouette_obj.Placement = FreeCAD.Placement()
                 
                 # Style the silhouette
-                if hasattr(silhouette_obj, "ViewObject"):
-                    silhouette_obj.ViewObject.ShapeColor = (0.2, 0.6, 1.0)  # Light blue
-                    silhouette_obj.ViewObject.Transparency = 50
-                    silhouette_obj.ViewObject.LineWidth = 2.0
+                _style_silhouette(silhouette_obj)
                 
                 # Add to the container (alongside the part)
                 container.addObject(silhouette_obj)
@@ -372,10 +382,7 @@ def create_silhouette_for_container(doc, container, cut_height=None, method="cro
     silhouette_obj.Placement = FreeCAD.Placement()
     
     # Style the silhouette
-    if hasattr(silhouette_obj, "ViewObject"):
-        silhouette_obj.ViewObject.ShapeColor = (0.2, 0.6, 1.0)  # Light blue
-        silhouette_obj.ViewObject.Transparency = 50
-        silhouette_obj.ViewObject.LineWidth = 2.0
+    _style_silhouette(silhouette_obj)
     
     # Add to the container
     container.addObject(silhouette_obj)
@@ -420,10 +427,7 @@ def create_silhouette_for_part(doc, part_obj, parent_container=None, cut_height=
     silhouette_obj.Placement = FreeCAD.Placement()
     
     # Style the silhouette
-    if hasattr(silhouette_obj, "ViewObject"):
-        silhouette_obj.ViewObject.ShapeColor = (0.2, 0.6, 1.0)  # Light blue
-        silhouette_obj.ViewObject.Transparency = 50
-        silhouette_obj.ViewObject.LineWidth = 2.0
+    _style_silhouette(silhouette_obj)
     
     # Add to container if provided
     if parent_container and hasattr(parent_container, "addObject"):

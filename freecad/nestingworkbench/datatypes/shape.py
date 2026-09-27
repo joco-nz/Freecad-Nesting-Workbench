@@ -10,7 +10,11 @@ import Part
 import copy
 import FreeCAD
 import threading
-from ..freecad_helpers import get_up_direction_rotation, calculate_container_centroid
+from ..freecad_helpers import (
+    get_up_direction_rotation,
+    calculate_container_centroid,
+    get_view_object,
+)
 
 try:
     from shapely.affinity import translate, rotate
@@ -183,7 +187,9 @@ class Shape:
         new_shape = Part.makeCompound(wires)
         bound_obj.Shape = new_shape
         if group: group.addObject(bound_obj)
-        if FreeCAD.GuiUp: bound_obj.ViewObject.LineColor = (1.0, 0.0, 0.0)
+        bound_view = get_view_object(bound_obj)
+        if bound_view is not None:
+            bound_view.LineColor = (1.0, 0.0, 0.0)
         return bound_obj
 
     def get_final_placement(self, sheet_origin=None):

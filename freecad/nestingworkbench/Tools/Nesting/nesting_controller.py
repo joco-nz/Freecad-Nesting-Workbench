@@ -14,7 +14,7 @@ from .shape_preparer import ShapePreparer
 from .algorithms import minkowski_utils
 from .layout_manager import LayoutManager, Layout
 from .ga_coordinator import GACoordinator
-from ...freecad_helpers import recursive_delete
+from ...freecad_helpers import recursive_delete, set_visibility
 from ...constants import *
 from .nesting_job import NestingJob
 from ... import DEFAULT_FONT
@@ -120,8 +120,7 @@ class NestingController:
              return # Standard error handled in helper
              
         is_simulating = self.ui.simulate_nesting_checkbox.isChecked()
-        if hasattr(target_layout, "ViewObject"):
-            target_layout.ViewObject.Visibility = False
+        set_visibility(target_layout, False)
 
         ui_params = self._collect_ui_params()
         ui_params, quantities, master_map, rotation_params = self._collect_job_parameters(ui_params)
@@ -170,8 +169,7 @@ class NestingController:
             seen.add(id(obj))
             saved.append((obj, FreeCAD.Placement(obj.Placement)))
             obj.Placement = FreeCAD.Placement()
-            if hasattr(obj, "ViewObject"):
-                obj.ViewObject.Visibility = False
+            set_visibility(obj, False)
         self._saved_source_placements = saved
         if saved:
             self.doc.recompute()
@@ -547,8 +545,8 @@ class NestingController:
                               verbose=payload.get('verbose', False))
                 if payload.get('hide_layout'):
                     lg = payload['layout_group']
-                    if lg and hasattr(lg, "ViewObject"):
-                        lg.ViewObject.Visibility = False
+                    if lg:
+                        set_visibility(lg, False)
                 FreeCADGui.updateGui()
             elif payload.get('ga_finalize'):
                 # _finalize() and doc.recompute() must run on main thread (ViewObject + recompute)
@@ -605,15 +603,15 @@ class NestingController:
             
             self.ui.current_layout = final_layout
             
-            if final_layout and hasattr(final_layout, "ViewObject"):
-                final_layout.ViewObject.Visibility = True
-                
+            if final_layout:
+                set_visibility(final_layout, True)
+
             if final_layout and hasattr(final_layout, "Group"):
                 for child in final_layout.Group:
-                    if child.Label.startswith("MasterShapes") and hasattr(child, "ViewObject"):
-                        child.ViewObject.Visibility = False
-                    elif child.Label.startswith("Sheet_") and hasattr(child, "ViewObject"):
-                        child.ViewObject.Visibility = True
+                    if child.Label.startswith("MasterShapes"):
+                        set_visibility(child, False)
+                    elif child.Label.startswith("Sheet_"):
+                        set_visibility(child, True)
             
             self.current_job = None
             FreeCAD.Console.PrintMessage("Job Finalized & Committed.\n")
@@ -661,15 +659,14 @@ class NestingController:
                             self.ui.current_layout = None
                         FreeCAD.Console.PrintMessage("Removed empty target layout.\n")
                     else:
-                        if hasattr(target, "ViewObject"):
-                            target.ViewObject.Visibility = True
-                        
+                        set_visibility(target, True)
+
                         if hasattr(target, "Group"):
                             for child in target.Group:
-                                if child.Label.startswith("Sheet_") and hasattr(child, "ViewObject"):
-                                    child.ViewObject.Visibility = True
-                                if child.Label.startswith("MasterShapes") and hasattr(child, "ViewObject"):
-                                    child.ViewObject.Visibility = False
+                                if child.Label.startswith("Sheet_"):
+                                    set_visibility(child, True)
+                                if child.Label.startswith("MasterShapes"):
+                                    set_visibility(child, False)
                 except Exception as e:
                     FreeCAD.Console.PrintWarning(f"[NestingController] Cancel cleanup failed for child: {e}\n")
             
@@ -699,13 +696,11 @@ class NestingController:
             
             if obj.Label.startswith("boundary_"):
                 found_count += 1
-                if hasattr(obj, "ViewObject"):
-                    obj.ViewObject.Visibility = is_visible
-                    
+                set_visibility(obj, is_visible)
+
             if hasattr(obj, "BoundaryObject") and obj.BoundaryObject:
                 found_count += 1
-                if hasattr(obj.BoundaryObject, "ViewObject"):
-                    obj.BoundaryObject.ViewObject.Visibility = is_visible
+                set_visibility(obj.BoundaryObject, is_visible)
                 
             if hasattr(obj, "Group"):
                 for child in obj.Group:

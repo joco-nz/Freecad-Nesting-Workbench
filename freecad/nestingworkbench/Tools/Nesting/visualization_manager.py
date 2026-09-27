@@ -3,6 +3,8 @@ import FreeCAD
 import FreeCADGui
 import Part
 
+from ...freecad_helpers import get_view_object
+
 class VisualizationManager:
     """
     Manages global visualization state for nesting operations,
@@ -27,10 +29,11 @@ class VisualizationManager:
         # Get or create the trial visualization object
         if self._trial_viz_obj is None or self._trial_viz_obj.Name not in [o.Name for o in doc.Objects]:
             self._trial_viz_obj = doc.addObject("Part::Feature", "TrialBounds")
-            if hasattr(self._trial_viz_obj, "ViewObject"):
-                self._trial_viz_obj.ViewObject.LineColor = (0.0, 0.5, 1.0)  # Blue
-                self._trial_viz_obj.ViewObject.LineWidth = 1.5
-                self._trial_viz_obj.ViewObject.Transparency = 50
+            trial_view = get_view_object(self._trial_viz_obj)
+            if trial_view is not None:
+                trial_view.LineColor = (0.0, 0.5, 1.0)  # Blue
+                trial_view.LineWidth = 1.5
+                trial_view.Transparency = 50
         
         try:
             if isinstance(bounds, Part.Shape):
@@ -103,13 +106,14 @@ class VisualizationManager:
             for child in master_container.Group:
                 if hasattr(child, "BoundaryObject") and child.BoundaryObject:
                     boundary = child.BoundaryObject
-                    if hasattr(boundary, "ViewObject"):
+                    boundary_view = get_view_object(boundary)
+                    if boundary_view is not None:
                         if highlight:
-                            boundary.ViewObject.Visibility = True
-                            boundary.ViewObject.LineColor = (0.0, 0.8, 0.0)  # Green
-                            boundary.ViewObject.LineWidth = 3.0
+                            boundary_view.Visibility = True
+                            boundary_view.LineColor = (0.0, 0.8, 0.0)  # Green
+                            boundary_view.LineWidth = 3.0
                         else:
                             # Don't hide — placed parts must stay visible.
                             # Just remove the highlight glow (restore normal appearance).
-                            boundary.ViewObject.LineColor = (0.0, 0.7, 0.0)
-                            boundary.ViewObject.LineWidth = 2.0
+                            boundary_view.LineColor = (0.0, 0.7, 0.0)
+                            boundary_view.LineWidth = 2.0

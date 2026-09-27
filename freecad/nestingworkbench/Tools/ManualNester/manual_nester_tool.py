@@ -14,6 +14,7 @@ from .ui_manual_nester import ManualNesterToolUI
 from .physics_engine import PhysicsEngine
 from .collision_resolver import CollisionResolver
 from .input_manager import InputManager
+from ...freecad_helpers import get_view_object, set_visibility
 
 def _compute_physics_frame(
     working_cache,
@@ -268,9 +269,10 @@ class ManualNesterToolObserver:
             return
 
         self.master_group = self._get_or_create_master_group()
-        if self.master_group and hasattr(self.master_group, "ViewObject"):
-            self.original_visibilities[self.master_group] = self.master_group.ViewObject.Visibility
-            self.master_group.ViewObject.Visibility = True
+        master_view = get_view_object(self.master_group)
+        if master_view is not None:
+            self.original_visibilities[self.master_group] = master_view.Visibility
+            master_view.Visibility = True
 
         # Track objects in the layout
         self._track_layout_objects()
@@ -340,9 +342,10 @@ class ManualNesterToolObserver:
             if sheet_group.isDerivedFrom("App::DocumentObjectGroup") and sheet_group.Label.startswith("Sheet_"):
                 # Ensure sheet boundary is visible
                 sheet_boundary = next((obj for obj in sheet_group.Group if obj.Label.startswith("Sheet_Boundary_")), None)
-                if sheet_boundary and hasattr(sheet_boundary, "ViewObject"):
-                    self.original_visibilities[sheet_boundary] = sheet_boundary.ViewObject.Visibility
-                    sheet_boundary.ViewObject.Visibility = True
+                boundary_view = get_view_object(sheet_boundary)
+                if boundary_view is not None:
+                    self.original_visibilities[sheet_boundary] = boundary_view.Visibility
+                    boundary_view.Visibility = True
 
                 for sub_group in sheet_group.Group:
                     if sub_group.isDerivedFrom("App::DocumentObjectGroup") and sub_group.Label.startswith("Shapes_"):
@@ -361,22 +364,23 @@ class ManualNesterToolObserver:
                                 self._track_single_object(obj, sheet_group)
 
                 # Make existing sheet boundary unselectable
-                if sheet_boundary and hasattr(sheet_boundary, "ViewObject"):
-                    if hasattr(sheet_boundary.ViewObject, "Selectable"):
-                        self.original_visibilities[sheet_boundary.Name + "_selectable"] = sheet_boundary.ViewObject.Selectable
-                        sheet_boundary.ViewObject.Selectable = False
+                selectable_view = get_view_object(sheet_boundary)
+                if selectable_view is not None and hasattr(selectable_view, "Selectable"):
+                    self.original_visibilities[sheet_boundary.Name + "_selectable"] = selectable_view.Selectable
+                    selectable_view.Selectable = False
 
     def _track_single_object(self, obj, sheet_group=None):
         self.original_placements[obj] = obj.Placement.copy()
         if sheet_group:
             self.obj_to_sheet[obj] = sheet_group
 
-        if hasattr(obj, "ViewObject"):
-            self.original_visibilities[obj] = obj.ViewObject.Visibility
+        obj_view = get_view_object(obj)
+        if obj_view is not None:
+            self.original_visibilities[obj] = obj_view.Visibility
 
             # Make sure parts ARE selectable
-            if hasattr(obj.ViewObject, "Selectable"):
-                obj.ViewObject.Selectable = True
+            if hasattr(obj_view, "Selectable"):
+                obj_view.Selectable = True
 
     # Input action handlers (registered with InputManager)
 
@@ -968,7 +972,10 @@ class ManualNesterToolObserver:
         if key in self._coin_disp_nodes:
             return
         try:
-            root = obj.ViewObject.RootNode
+            obj_view = get_view_object(obj)
+            if obj_view is None:
+                return
+            root = obj_view.RootNode
             trans = coin.SoTranslation()
             trans.translation.setValue(0, 0, 0)
             root.insertChild(trans, 0)
@@ -998,7 +1005,9 @@ class ManualNesterToolObserver:
         """Remove all injected SoTranslation nodes and reset their objects' visual offset."""
         for key, (trans, obj) in list(self._coin_disp_nodes.items()):
             try:
-                obj.ViewObject.RootNode.removeChild(trans)
+                obj_view = get_view_object(obj)
+                if obj_view is not None:
+                    obj_view.RootNode.removeChild(trans)
             except Exception:
                 pass  # Coin3D RootNode or trans node already removed or torn down
         self._coin_disp_nodes.clear()
@@ -1020,22 +1029,23 @@ class ManualNesterToolObserver:
 
     def _set_part_highlight(self, obj, invalid):
         """Color the dragged part red to signal an impossible placement, restore otherwise."""
-        if not obj or not hasattr(obj, 'ViewObject') or not obj.ViewObject:
+        obj_view = get_view_object(obj)
+        if obj_view is None:
             return
         if invalid:
             if self._dragged_original_color is None:
                 try:
-                    self._dragged_original_color = obj.ViewObject.ShapeColor
+                    self._dragged_original_color = obj_view.ShapeColor
                 except Exception:
                     pass  # ViewObject deleted or ShapeColor unavailable
             try:
-                obj.ViewObject.ShapeColor = (1.0, 0.0, 0.0)
+                obj_view.ShapeColor = (1.0, 0.0, 0.0)
             except Exception:
                 pass  # ViewObject deleted during drag
         else:
             if self._dragged_original_color is not None:
                 try:
-                    obj.ViewObject.ShapeColor = self._dragged_original_color
+                    obj_view.ShapeColor = self._dragged_original_color
                 except Exception:
                     pass  # ViewObject deleted during drag
                 self._dragged_original_color = None
@@ -1358,9 +1368,9 @@ class ManualNesterToolObserver:
                 try:
                     if sheet_group.Label.startswith("Sheet_"):
                         boundary = next((obj for obj in sheet_group.Group if obj.Label.startswith("Sheet_Boundary_")), None)
-                        if boundary and hasattr(boundary, "ViewObject"):
-                            if hasattr(boundary.ViewObject, "Selectable"):
-                                boundary.ViewObject.Selectable = True
+                        boundary_view = get_view_object(boundary)
+                        if boundary_view is not None and hasattr(boundary_view, "Selectable"):
+                            boundary_view.Selectable = True
                 except Exception:
                     pass  # Sheet group or boundary object deleted during cleanup
 
@@ -1369,8 +1379,7 @@ class ManualNesterToolObserver:
         for obj, is_visible in self.original_visibilities.items():
             try:
                 if not isinstance(obj, str) and hasattr(obj, "Name") and obj.Name:
-                    if hasattr(obj, "ViewObject") and obj.ViewObject:
-                        obj.ViewObject.Visibility = is_visible
+                    set_visibility(obj, is_visible)
             except Exception:
                 pass  # Object was already deleted at C++ level
         self.original_visibilities = {}
@@ -1470,10 +1479,11 @@ class ManualNesterToolObserver:
         shapes_group.Label = f"Shapes_{index}"
         sheet_group.addObject(shapes_group)
 
-        if hasattr(boundary, "ViewObject"):
-            boundary.ViewObject.Transparency = 75
-            if hasattr(boundary.ViewObject, "Selectable"):
-                boundary.ViewObject.Selectable = False # Make sheet unselectable natively
+        boundary_view = get_view_object(boundary)
+        if boundary_view is not None:
+            boundary_view.Transparency = 75
+            if hasattr(boundary_view, "Selectable"):
+                boundary_view.Selectable = False # Make sheet unselectable natively
 
         self.new_objects.append(sheet_group)
         self.new_objects.append(boundary)
@@ -1591,7 +1601,7 @@ class ManualNesterToolObserver:
             if not hasattr(nested_part, "BoundaryObject"):
                 nested_part.addProperty("App::PropertyLink", "BoundaryObject", "Nesting", "Boundary object")
             nested_part.BoundaryObject = bound_copy
-            if hasattr(bound_copy, "ViewObject"): bound_copy.ViewObject.Visibility = False
+            set_visibility(bound_copy, False)
 
         # Track for revert
         self.new_objects.append(container)

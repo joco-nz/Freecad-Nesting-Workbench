@@ -12,6 +12,7 @@ import FreeCADGui
 import os
 from ...constants import *
 from ... import FONTS_DIR, DEFAULT_FONT
+from ...freecad_helpers import set_visibility
 
 _MINKOWSKI_DIR_MAX = 359
 
@@ -58,8 +59,7 @@ class NestingPanel(QtWidgets.QWidget):
             
         # Also ensure visibility is restored if controller didn't fully run
         for obj in self.hidden_originals:
-             if hasattr(obj, "ViewObject"):
-                 obj.ViewObject.Visibility = True
+             set_visibility(obj, True)
                  
         return True
 

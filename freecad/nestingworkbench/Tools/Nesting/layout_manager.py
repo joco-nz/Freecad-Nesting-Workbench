@@ -19,7 +19,7 @@ import time
 import traceback
 from .shape_preparer import ShapePreparer
 from ...datatypes.shape import Shape
-from ...freecad_helpers import recursive_delete, create_part_feature
+from ...freecad_helpers import recursive_delete, create_part_feature, set_visibility
 
 try:
     from shapely.geometry import Polygon
@@ -192,8 +192,7 @@ class LayoutManager:
         group_start = time.perf_counter()
         layout_group = self.doc.addObject("App::DocumentObjectGroup", name)
         layout_group.Label = name
-        if hasattr(layout_group, "ViewObject"):
-            layout_group.ViewObject.Visibility = True
+        set_visibility(layout_group, True)
         
         # Create parts bin
         parts_group = self.doc.addObject("App::DocumentObjectGroup", "PartsToPlace")

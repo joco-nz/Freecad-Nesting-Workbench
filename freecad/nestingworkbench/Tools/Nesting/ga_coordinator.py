@@ -9,6 +9,7 @@ import math
 import random
 import time
 from ...datatypes.shape import Shape
+from ...freecad_helpers import set_visibility
 from .layout_manager import LayoutManager
 from .algorithms import genetic_utils
 from .algorithms import minkowski_utils
@@ -976,8 +977,8 @@ class GACoordinator:
                         sheet.draw(self.doc, ui_params, layout.layout_group, 
                                    parts_to_place_group=layout.parts_group, verbose=verbose)
                     
-                    if len(layouts) > 1 and layout.layout_group and hasattr(layout.layout_group, "ViewObject"):
-                        layout.layout_group.ViewObject.Visibility = False
+                    if len(layouts) > 1 and layout.layout_group:
+                        set_visibility(layout.layout_group, False)
                     FreeCADGui.updateGui()
             
         return total_time, False
@@ -1078,8 +1079,8 @@ class GACoordinator:
         from .nesting_job import NestingJob
         if not best_layout: return None
             
-        if best_layout.layout_group and hasattr(best_layout.layout_group, "ViewObject"):
-            best_layout.layout_group.ViewObject.Visibility = True
+        if best_layout.layout_group:
+            set_visibility(best_layout.layout_group, True)
         
         if not getattr(self, 'is_simulating', False):
             # A headless layout has no FreeCAD part objects yet, and
@@ -1102,8 +1103,8 @@ class GACoordinator:
 
         if best_layout.layout_group and hasattr(best_layout.layout_group, "Group"):
             for child in best_layout.layout_group.Group:
-                if child.Label.startswith("MasterShapes") and hasattr(child, "ViewObject"):
-                    child.ViewObject.Visibility = False
+                if child.Label.startswith("MasterShapes"):
+                    set_visibility(child, False)
         
         best_layout.layout_group.Label = "Layout_temp"
         job = NestingJob.from_ga_result(
