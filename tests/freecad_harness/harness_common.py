@@ -136,8 +136,86 @@ def ring(cx, cy, r, n, phase=0.0):
 def is_timing_key(key):
     """True for wall-clock counters, which are never comparable run to run.
 
-    Matches `*_ms` and `*_ms_worst` (the phase accumulator's worst-single-NFP
-    figures). Misclassifying those is not cosmetic: a `_ms_worst` key reported as
-    a "reproducible work count" is exactly the noise the split exists to exclude.
+    Matches `*_ms`, `*_ms_worst` (the phase accumulator's worst-single-NFP
+    figures) and `*_s` / `*_seconds`. Misclassifying any of those is not
+    cosmetic: a timing reported as a "reproducible work count that changed" is
+    exactly the noise the split exists to exclude, and it trains the reader to
+    ignore the report.
     """
-    return key.endswith("_ms") or "_ms_" in key or key.endswith("_s")
+    return (key.endswith("_ms")
+            or "_ms_" in key
+            or key.endswith("_s")
+            or key.endswith("_seconds"))
+
+
+def classify_stability(perfs, results):
+    """Splits sampled fields into those that held and those that moved.
+
+    Two tiers, and the distinction is the whole point:
+
+      * work counts and result fields are exact at rotation width 1, so a change
+        between reps means something is wrong, not that the box was busy
+      * timings are never exact; a minimum over reps is the only defensible
+        estimator, and the spread is worth recording so the baseline says how
+        noisy it is instead of asserting one sample
+
+    `perfs` is a list of per-rep perf dicts, `results` a list of per-rep result
+    dicts. Returns (unstable_counts, unstable_timings, unstable_results).
+    """
+    unstable_counts, unstable_timings = [], []
+    for key in perfs[0]:
+        values = [p.get(key) for p in perfs]
+        if len(set(values)) == 1:
+            continue
+        (unstable_timings if is_timing_key(key) else unstable_counts).append(key)
+
+    def fingerprint(value):
+        # placed_by_label is a dict, which is unhashable; compare structurally.
+        return repr(value) if isinstance(value, (dict, list)) else value
+
+    unstable_results = [
+        k for k in results[0]
+        if len({fingerprint(r.get(k)) for r in results}) > 1
+    ]
+    return unstable_counts, unstable_timings, unstable_results
+
+
+def collapse(perfs):
+    """Folds per-rep perf dicts into one: minimum for timings, one value for counts.
+
+    Deliberately never averages a work count. A mean of a count is not a count,
+    and averaging a count that *should* be deterministic is exactly how a real
+    regression gets smoothed into a plausible-looking number.
+    """
+    out = {}
+    for key in perfs[0]:
+        values = [p.get(key) for p in perfs]
+        out[key] = min(values) if is_timing_key(key) else values[0]
+    return out
+
+
+def noise_block(reps, rotation_workers, unstable_counts, unstable_timings, walls):
+    """The self-describing part of a baseline: what is exact, and what is not.
+
+    A reader of a baseline otherwise sees a hundred counters with no indication
+    that some are exact and the rest are noise, and cannot tell which is safe to
+    gate on.
+    """
+    spread = (max(walls) - min(walls)) / min(walls) if min(walls) else 0.0
+    return {
+        "reps": reps,
+        "rotation_workers": rotation_workers,
+        "wall_seconds_spread_pct": round(100.0 * spread, 2),
+        "work_counts_exact": not unstable_counts,
+        "work_counts_unstable": sorted(unstable_counts),
+        "timings_vary": len(unstable_timings),
+        "note": (
+            "Work counts and result fields are exact at rotation width 1 and "
+            "safe to gate. Above width 1 the tie-break draw in score_gravity "
+            "runs in worker threads against one shared random.Random, so some "
+            "counts move; measured on the synthetic corpus, cache hits/misses, "
+            "candidate_points and exact_collision_checks move while "
+            "nfp_work_convex_pairs and the packing result do not. Timings are a "
+            "minimum over `reps` runs in one process and are not comparable "
+            "against a stored number."),
+    }

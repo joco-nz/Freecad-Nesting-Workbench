@@ -30,7 +30,8 @@ export NEST_BENCH_BASELINE
 BENCH_STATUS="$HARNESS_DIR/.last_status"
 TEST_STATUS="$HARNESS_DIR/.last_status_test"
 GA_STATUS="$HARNESS_DIR/.last_status_ga"
-rm -f "$BENCH_STATUS" "$TEST_STATUS" "$GA_STATUS"
+PYTEST_STATUS="$HARNESS_DIR/.last_status_pytest"
+rm -f "$BENCH_STATUS" "$TEST_STATUS" "$GA_STATUS" "$PYTEST_STATUS"
 
 cd "$REPO_ROOT"
 "$FREECADCMD" "$HARNESS_DIR/nest_benchmark.py" || true
@@ -46,6 +47,23 @@ done
 
 STATUS=$(cat "$BENCH_STATUS")
 TESTS=$(cat "$TEST_STATUS")
+
+# The harness's own statistics -- the code that decides whether a run is
+# comparable -- live in harness_common.py and are pure Python, so they belong in
+# the fast suite rather than only behind a freecadcmd run. Runs the whole tests/
+# tree so one command is the whole contract.
+PYTHON=${PYTHON:-python3}
+if "$PYTHON" -c 'import pytest' 2>/dev/null; then
+    if "$PYTHON" -m pytest -q tests/ >/dev/null 2>&1; then
+        echo 0 > "$PYTEST_STATUS"
+    else
+        echo 1 > "$PYTEST_STATUS"
+        "$PYTHON" -m pytest -q tests/ || true
+    fi
+else
+    echo 0 > "$PYTEST_STATUS"
+    echo "note: pytest not available, skipped the pure-Python suite" >&2
+fi
 
 case "$STATUS" in
     0) echo "harness: PASS" ;;
@@ -64,6 +82,12 @@ fi
 GA=$(cat "$GA_STATUS")
 if [ "$GA" -ne 0 ]; then
     echo "GA-loop integration test FAILED (status $GA)" >&2
+    [ "$STATUS" -eq 0 ] && STATUS=1
+fi
+
+PYTEST_RC=$(cat "$PYTEST_STATUS")
+if [ "$PYTEST_RC" -ne 0 ]; then
+    echo "pytest suite FAILED (status $PYTEST_RC)" >&2
     [ "$STATUS" -eq 0 ] && STATUS=1
 fi
 

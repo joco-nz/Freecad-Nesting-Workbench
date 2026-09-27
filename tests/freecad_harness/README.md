@@ -269,10 +269,17 @@ denominators), the loop counters, and the full layout-management breakdown
 
 Two things to know:
 
-- **Rotation width is pinned to 1** and recorded in the baseline. Above 1, one
-  shared `random.Random` is consumed by concurrent threads, so tie-breaks — and
-  therefore every work count — move between runs. At width 1 all counts are
-  stable; raise it to measure throughput, not to compare.
+- **Rotation width is pinned to 1** and recorded in the baseline. The tie-break
+  draw in `score_gravity` happens inside worker threads against one shared
+  `random.Random`, so above width 1 the consumption order is scheduling
+  dependent. Measured on this corpus rather than assumed: on the *GA* config
+  every counter is identical at widths 1/2/4/8, but on the *nest* config
+  `nfp_cache_hits`, `nfp_cache_misses`, `candidate_points` and
+  `exact_collision_checks` all move with width, while `nfp_work_convex_pairs`
+  and the packing result do not. So width > 1 is measurable but not
+  outcome-affecting — and width 1 is the only setting where the counts are
+  exact enough to gate. The `noise` block reports this per run, so the pin
+  self-enforces rather than relying on a comment.
 - `performance_logging` must stay on to populate `_ga_perf`, but its per-NFP
   `[PERF]` lines go through `log_callback`, which is pointed at a sink. A single
   GA run otherwise emits thousands of them.
@@ -280,19 +287,25 @@ Two things to know:
 ### Shared helpers
 
 `harness_common.py` holds the corpus builder, document part discovery, `emit()`,
-and the timing-key classifier. It is deliberately **not** named like a script:
+the timing-key classifier, and the rep statistics (`classify_stability`,
+`collapse`, `noise_block`). It is deliberately **not** named like a script:
 under `freecadcmd` a script runs with `__name__` set to its own basename, so
 every harness uses `if __name__ in ("__main__", "<own name>")` — and importing
 one harness from another re-executes it. That is not hypothetical; an early
 debug script ran the whole suite on import.
 
-`nest_benchmark.py` and `bench_rotation_workers.py` still carry their own
-copies of the corpus builder. Migrating them is a follow-up, not a blocker.
+The rep statistics are covered by `tests/test_harness_stats.py`, which runs in
+plain CPython — `harness_common` installs inert stand-ins for the FreeCAD
+modules precisely so the logic deciding *whether a run is comparable* sits in
+the fast suite rather than only in an expensive freecadcmd run.
+
+`bench_rotation_workers.py` still carries its own copy of the corpus builder.
+Migrating it is a follow-up, not a blocker.
 
 ## Baseline
 
 `baseline/synthetic_v1.json` — schema 1, synthetic corpus, seed 20260925,
-450×350, rotation workers 1:
+450×350, rotation workers 1, 5 reps:
 
 | | |
 |---|---|
@@ -301,8 +314,68 @@ copies of the corpus builder. Migrating them is a follow-up, not a blocker.
 | unplaced | 0 |
 | density | 0.563184 |
 | used area | 88701.4668 mm² |
-| wall | ~2.2 s |
-| perf counters | 51 (40 reproducible counts, 11 timings) |
+| wall (min of 5) | ~1.10 s, spread ~7% |
+| perf counters | 110 (63 exact counts, 47 timings) |
+
+`baseline/ga_pop2_gen2.json` — GA, population 2, generations 2, 300×220, 3 reps:
+2 sheets, 12 placed, efficiency 0.447987, `nfp_convex_pairs` 3332,
+`nfp_errors` 0.
 
 Re-record with `NEST_BENCH_OUT=...` after an intentional change. Keep the
 schema version in step with the reader; the harness refuses a mismatch.
+
+## Reps, and what a baseline is allowed to claim
+
+A baseline recorded from one sample is a claim about a machine state that does
+not repeat. Both benchmarks now run **N reps in one process** (`NEST_BENCH_REPS`,
+default 5 for nest, 3 for GA), each with cold caches, and every baseline carries
+a `noise` block saying what is exact and what is not:
+
+```json
+"noise": {
+  "reps": 5, "rotation_workers": 1,
+  "wall_seconds_spread_pct": 11.4,
+  "work_counts_exact": true, "work_counts_unstable": [],
+  "timings_vary": 37
+}
+```
+
+Two tiers, and the distinction is the point:
+
+| | estimator | gate on it? |
+|---|---|---|
+| result fields (`sheets`, `placed`, `unplaced`, `density`) | must be **identical** across reps, else exit 3 | yes |
+| work counts (63 of 110) | must be **identical** at width 1, else exit 3 | yes, as a diff review |
+| timings (47 of 110) | **minimum** of N | no |
+| `wall_seconds` | **minimum** of N | no |
+
+A work count that moves between reps is a bug, not noise, and it is a hard
+failure. Averaging it would be worse than useless: the mean of a count is not a
+count, and averaging a count that should be deterministic is exactly how a real
+regression gets smoothed into a plausible-looking number. `hc.collapse` never
+does it, and `tests/test_harness_stats.py` asserts it does not.
+
+**Reps must be cold.** `Shape.nfp_cache` is class-level, so without an explicit
+clear the first rep computes every NFP and the rest are pure cache hits. That
+moved 24 counters and made every rep after the first a different measurement. It
+was found by the count-stability gate, not by inspection, which is the argument
+for having the gate.
+
+### On the 20% noise floor
+
+`make-faster.md` recorded per-generation drift of 24s → 31s → 37s across three
+consecutive runs on the n70 corpus, and concluded the noise floor is ~20%. Two
+caveats, because that number is heavier than it looks next to what is committed:
+
+- The committed baseline is the **synthetic** corpus, where wall spread measures
+  ~6–11% over five in-process reps. The 20% figure came from the much longer n70
+  runs, not from this corpus.
+- Five reps on a quiet box is a thin basis for a noise floor anyway. A
+  defensible figure is a deliberate exercise — three consecutive runs under
+  comparable load, recorded, not inferred — not something to fold into a test.
+
+The heavy corpus is where drift actually bites, and it **cannot have a committed
+baseline**: `tests/Test_Files/n70-*.FCStd` is gitignored, so no one else could
+reproduce it. Heavy-corpus measurement therefore stays an ad-hoc activity in the
+style of `bench_rotation_workers.py` — interleaved within one session, minimum
+of N, never compared against a stored number.

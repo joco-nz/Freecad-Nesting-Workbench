@@ -65,8 +65,11 @@ import traceback
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _REPO = os.path.abspath(os.path.join(_HERE, "..", ".."))
-if _REPO not in sys.path:
-    sys.path.insert(0, _REPO)
+for _p in (_REPO, _HERE):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
+import harness_common as hc  # noqa: E402  (needs the sys.path above)
 
 SCHEMA_VERSION = 1
 DEFAULT_SEED = 20260925
@@ -130,6 +133,11 @@ class Config:
         self.rotation_workers = int(env.get("NEST_BENCH_ROTATION_WORKERS", "1"))
         self.quantity = int(env.get("NEST_BENCH_QUANTITY", "3"))
         self.draw = bool(env.get("NEST_BENCH_DRAW", ""))
+        # Reps run in one process, interleaved with nothing else, each with
+        # cold caches. Timings become a minimum over them; counts and results
+        # must be identical, and a difference is a hard failure rather than
+        # something to average away.
+        self.reps = max(1, int(env.get("NEST_BENCH_REPS", "5")))
 
     def apply_rotation_worker_limit(self):
         """Pins the rotation thread-pool width for this process.
@@ -165,6 +173,7 @@ class Config:
             "rotation_workers": self.rotation_workers,
             "quantity": self.quantity,
             "draw": self.draw,
+            "reps": self.reps,
         }
 
 
@@ -290,6 +299,20 @@ def run_nest(doc, parts, quantities, cfg):
     from freecad.nestingworkbench.Tools.Nesting import nesting_logic
     from freecad.nestingworkbench.Tools.Nesting.algorithms import minkowski_utils
     from freecad.nestingworkbench.Tools.Nesting.shape_preparer import ShapePreparer
+    from freecad.nestingworkbench.datatypes.shape import Shape
+
+    # Every rep must be a cold run. These caches are class-level, so within one
+    # process rep 1 computed every NFP and reps 2..N were pure cache hits --
+    # which moved 24 work counts and made every rep after the first a different
+    # measurement. It was found by the count-stability gate below, not by
+    # inspection, and it is the reason the gate exists.
+    #
+    # clear_nfp_cache() is called explicitly because Shape.clear_caches()
+    # deliberately leaves the NFP cache alone ("expensive and benefits from
+    # persistence"). That default is right for the workbench and wrong for a
+    # benchmark, which must measure a cold cache every time.
+    Shape.clear_nfp_cache()
+    Shape.clear_caches()
 
     layout_group = doc.addObject("App::DocumentObjectGroup", "Layout_bench")
     parts_group = doc.addObject("App::DocumentObjectGroup", "PartsToPlace")
@@ -485,6 +508,14 @@ def print_record(record):
          f"({len(counts)} reproducible counts, {len(timings)} timings)")
     if record["dead_ring"]:
         emit(f"  dead rings        {record['dead_ring']}")
+    noise = record.get("noise")
+    if noise:
+        emit(f"  reps              {noise['reps']} in one process, "
+             f"rot width {noise['rotation_workers']}")
+        emit(f"  wall spread       {noise['wall_seconds_spread_pct']:.1f}%")
+        emit(f"  work counts       "
+             f"{'exact' if noise['work_counts_exact'] else 'NOT EXACT: ' + str(noise['work_counts_unstable'])}")
+        emit(f"  timings varying   {noise['timings_vary']} of the `*_ms` keys")
 
 
 def compare(current, baseline, allow_fewer_placed):
@@ -538,31 +569,78 @@ def compare(current, baseline, allow_fewer_placed):
     return True
 
 
-# --------------------------------------------------------------------------
 def main():
     import FreeCAD
 
     cfg = Config()
     cfg.apply_rotation_worker_limit()
 
-    doc = FreeCAD.newDocument("bench")
-    if cfg.corpus == "synthetic":
-        parts, quantities = build_synthetic_corpus(doc, cfg.seed, cfg.quantity)
-        corpus_desc = {"kind": "synthetic", "seed": cfg.seed, "labels": sorted(quantities)}
-    else:
-        if not os.path.exists(cfg.corpus):
-            emit(f"ERROR: corpus not found: {cfg.corpus}")
+    # Reps run in one process, interleaved with nothing else in between, and
+    # each clears the class-level caches so every rep is a cold run. That is the
+    # point: a baseline recorded from one sample is a claim about a machine
+    # state that does not repeat.
+    reps = []
+    corpus_desc = None
+    for _rep in range(cfg.reps):
+        doc = FreeCAD.newDocument("bench")
+        if cfg.corpus == "synthetic":
+            parts, quantities = build_synthetic_corpus(doc, cfg.seed, cfg.quantity)
+            corpus_desc = {"kind": "synthetic", "seed": cfg.seed,
+                           "labels": sorted(quantities)}
+        else:
+            if not os.path.exists(cfg.corpus):
+                emit(f"ERROR: corpus not found: {cfg.corpus}")
+                return 2
+            source = FreeCAD.openDocument(cfg.corpus)
+            parts = discover_doc_parts(source)
+            quantities = {p.Label: 1 for p in parts}
+            corpus_desc = {"kind": "fcstd", "path": cfg.corpus,
+                           "labels": sorted(quantities)}
+        if not parts:
+            emit("ERROR: corpus produced no parts")
             return 2
-        source = FreeCAD.openDocument(cfg.corpus)
-        parts = discover_doc_parts(source)
-        quantities = {p.Label: 1 for p in parts}
-        corpus_desc = {"kind": "fcstd", "path": cfg.corpus, "labels": sorted(quantities)}
-    if not parts:
-        emit("ERROR: corpus produced no parts")
-        return 2
+        result, perf, dead_ring, wall = run_nest(doc, parts, quantities, cfg)
+        reps.append({"result": result, "perf": perf,
+                     "dead_ring": dead_ring, "wall": wall})
 
-    result, perf, dead_ring, wall = run_nest(doc, parts, quantities, cfg)
-    record = build_record(cfg, corpus_desc, result, perf, dead_ring, wall)
+    result_fields = list(reps[0]["result"].keys())
+    perf_list = [r["perf"] for r in reps]
+    results = [r["result"] for r in reps]
+    unstable_counts, unstable_timings, unstable_results = hc.classify_stability(
+        perf_list, results)
+
+    # A result field that moves is a packing change, which the gate reports
+    # anyway. Counts that move at width 1 mean the run is not comparable.
+    if unstable_results:
+        emit("")
+        emit("ERROR: the packing result differed between reps: "
+             f"{unstable_results}. Not a comparable run.")
+        return 3
+
+    walls = [r["wall"] for r in reps]
+    if unstable_counts and cfg.rotation_workers == 1:
+        emit("")
+        emit("ERROR: these work counts are not reproducible at rotation width 1, "
+             f"so this run is not comparable: {unstable_counts}")
+        emit("  A count that should be exact has drifted. Do not average it --")
+        emit("  find out why.")
+        return 3
+    if unstable_counts:
+        emit("")
+        emit(f"NOTE: {len(unstable_counts)} work counts moved because rotation "
+             f"width is {cfg.rotation_workers}, where one shared random.Random is "
+             f"consumed by concurrent threads and tie-breaks are not stable.")
+        emit("  Recording the first value; treat these as indicative only.")
+
+    # Timings: minimum of N is the only defensible estimator. Counts are never
+    # averaged -- see hc.collapse.
+    perf = hc.collapse(perf_list)
+
+    result = reps[0]["result"]
+    dead_ring = reps[0]["dead_ring"]
+    record = build_record(cfg, corpus_desc, result, perf, dead_ring, min(walls))
+    record["noise"] = hc.noise_block(cfg.reps, cfg.rotation_workers,
+                                     unstable_counts, unstable_timings, walls)
     print_record(record)
 
     problems = validate_perf(perf)

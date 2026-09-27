@@ -253,8 +253,8 @@ def report(c, runs):
     hc.emit(f"  reps         {c['reps']}")
     hc.emit(f"  sheet        {c['sheet']}")
     hc.emit(f"  corpus       {c['corpus']}")
-    hc.emit(f"  rot workers  {c['rotation_workers']}  (pinned: work counts are only")
-    hc.emit( "               reproducible at width 1 -- shared rng across threads)")
+    hc.emit(f"  rot workers  {c['rotation_workers']}  (pinned: counts are exact only "
+            f"at width 1)")
     walls = [r["wall"] for r in runs]
     best = runs[0]["result"]
     hc.emit("")
@@ -262,6 +262,8 @@ def report(c, runs):
     for key in ("sheets", "placed", "unplaced", "efficiency", "density"):
         hc.emit(f"  {key:16s} {best[key]}")
     hc.emit(f"  {'wall min':16s} {min(walls):.3f}s   median {statistics.median(walls):.3f}s")
+    spread = (max(walls) - min(walls)) / min(walls) * 100 if min(walls) else 0.0
+    hc.emit(f"  {'wall spread':16s} {spread:.1f}%   over {c['reps']} reps in one process")
 
     ga, layout = summarise(c, runs)
 
@@ -350,10 +352,19 @@ def compare(record, baseline, allow_fewer):
 
 def main():
     c = cfg()
-    # Pinned so the work counts are reproducible. Rotation evaluation draws from
-    # one shared random.Random, and concurrent threads consume it in scheduling
-    # order, so above width 1 the tie-breaks -- and therefore the counts -- move
-    # between runs. See master-merge.md section 9.2.
+    # Pinned so the work counts are gate-able. The tie-break draw in
+    # score_gravity happens inside worker threads against one shared
+    # random.Random, so the order the threads consume it in is scheduling
+    # dependent above width 1.
+    #
+    # What that actually costs is narrower than first assumed, and measured here
+    # rather than inferred. On this config every counter is identical at widths
+    # 1/2/4/8. The nest harness does move some: at width 8 versus 1,
+    # nfp_cache_hits/misses, candidate_points and exact_collision_checks all
+    # differ, while nfp_work_convex_pairs and the packing result do not. So
+    # width > 1 is measurable but not outcome-affecting; width 1 is simply the
+    # only setting where the counts are exact. The noise block below reports
+    # this per run, so the pin is self-enforcing rather than a comment.
     os.environ["NESTING_ROTATION_WORKERS"] = str(max(1, c["rotation_workers"]))
     runs = []
     for rep in range(c["reps"]):
@@ -373,17 +384,46 @@ def main():
             hc.emit(f"  - {problem}")
         return 3
 
-    # Sum across reps so the record reflects the run as measured, and note that
-    # counts are per-rep where stable.
+    # Count stability, the same check the nest harness does. A work count that
+    # moves at width 1 is not noise, it is a bug, and this file previously stored
+    # the *mean* of such a count -- which is not a count, and which averages a
+    # real regression into a plausible-looking number. Found while fixing the
+    # nest harness, where the same class of drift turned out to be an uncleared
+    # NFP cache making reps 2..N pure hits.
+    unstable_counts, unstable_timings, unstable_results = hc.classify_stability(
+        [r["ga_perf"] for r in runs], [r["result"] for r in runs])
+
+    if unstable_results:
+        hc.emit("")
+        hc.emit("ERROR: the GA result differed between reps: "
+                f"{unstable_results}. Not a comparable run.")
+        return 3
+    if unstable_counts and c["rotation_workers"] == 1:
+        hc.emit("")
+        hc.emit("ERROR: these GA work counts are not reproducible at rotation "
+                f"width 1, so this run is not comparable: {unstable_counts}")
+        hc.emit("  A count that should be exact has drifted. Do not average it --")
+        hc.emit("  find out why.")
+        return 3
+    if unstable_counts:
+        hc.emit("")
+        hc.emit(f"NOTE: {len(unstable_counts)} GA work counts moved at rotation "
+                f"width {c['rotation_workers']}. Above width 1 the tie-break draw in "
+                f"score_gravity runs in worker threads against one shared "
+                f"random.Random, so the consumption order is scheduling dependent.")
+        hc.emit("  Recording the first value; treat these as indicative only.")
+
+    walls = [r["wall"] for r in runs]
     record = {
         "schema": SCHEMA_VERSION,
         "corpus": runs[0]["corpus"],
         "config": c,
         "result": runs[0]["result"],
-        "ga_perf": {k: (v[0] if len(set(v)) == 1 else sum(v) / len(v))
-                    for k, v in ga.items()},
-        "layout_perf": {k: min(v) for k, v in layout.items()},
-        "wall_seconds": round(min(r["wall"] for r in runs), 4),
+        "ga_perf": hc.collapse([r["ga_perf"] for r in runs]),
+        "layout_perf": hc.collapse([r["layout_perf"] for r in runs]),
+        "wall_seconds": round(min(walls), 4),
+        "noise": hc.noise_block(c["reps"], c["rotation_workers"],
+                                unstable_counts, unstable_timings, walls),
     }
 
     out = os.environ.get("NEST_BENCH_GA_OUT")
