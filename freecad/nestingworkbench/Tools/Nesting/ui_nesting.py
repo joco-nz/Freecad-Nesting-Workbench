@@ -12,6 +12,7 @@ import FreeCADGui
 import os
 from ...constants import *
 from ... import FONTS_DIR, DEFAULT_FONT
+from ...freecad_helpers import set_visibility
 
 _MINKOWSKI_DIR_MAX = 359
 
@@ -25,7 +26,7 @@ _DEFAULTS = {
     "simulate_nesting": False,
     "verbose_logging": False,
     "performance_logging": False,
-    "candidate_geometry_cache": False,
+    "candidate_geometry_cache": CANDIDATE_GEOMETRY_CACHE_DEFAULT,
     "rotation_angles": MINKOWSKI_ROTATION_PRESETS,
 }
 
@@ -58,8 +59,7 @@ class NestingPanel(QtWidgets.QWidget):
             
         # Also ensure visibility is restored if controller didn't fully run
         for obj in self.hidden_originals:
-             if hasattr(obj, "ViewObject"):
-                 obj.ViewObject.Visibility = True
+             set_visibility(obj, True)
                  
         return True
 
@@ -187,6 +187,54 @@ class NestingPanel(QtWidgets.QWidget):
         self.minkowski_compactness_help.setToolTip("Click to learn more about how the Compactness function works.")
         self.minkowski_compactness_help.clicked.connect(self._show_compactness_info)
 
+        # -- performance dials -------------------------------------------------
+        # Both of these were environment variables and are now fields, because
+        # the measurement says they are the two largest levers in a run and a
+        # control nobody can reach is not a control. Defaults are unchanged, so
+        # leaving them alone reproduces the previous behaviour exactly.
+        self.minkowski_step_size_input = QtWidgets.QDoubleSpinBox()
+        self.minkowski_step_size_input.setRange(0.1, 100.0)
+        self.minkowski_step_size_input.setValue(5.0)
+        self.minkowski_step_size_input.setSingleStep(0.5)
+        self.minkowski_step_size_input.setDecimals(2)
+        self.minkowski_step_size_input.setToolTip(
+            "Spacing between candidate positions, in mm.\n\n"
+            "Every position a part can occupy comes from sampling the boundary "
+            "of a No-Fit Polygon at this interval, and a boundary of length L "
+            "yields about L / step positions. Each one is then tested against "
+            "the parts already placed, so the total number of collision tests "
+            "scales with this value and it is the main control over how long a "
+            "run takes.\n\n"
+            "Larger: fewer positions, faster, and coarser packing.\n"
+            "Smaller: more positions, slower, and finer packing.\n\n"
+            "Only affects jobs that need positions away from the sheet corners "
+            "and edges. Where parts simply line up against each other or the "
+            "sheet border, the extra positions are tested and discarded and "
+            "changing this has no visible effect on the result. Where parts "
+            "interlock or have curved or closely spaced features, it does.\n\n"
+            "If you raise it, check that the packing and the number of sheets "
+            "are unchanged before keeping the change.")
+
+        self.minkowski_rotation_workers_input = QtWidgets.QSpinBox()
+        self.minkowski_rotation_workers_input.setRange(0, 64)
+        self.minkowski_rotation_workers_input.setValue(0)
+        self.minkowski_rotation_workers_input.setSpecialValueText("Auto")
+        self.minkowski_rotation_workers_input.setToolTip(
+            "How many rotations are checked at the same time.\n\n"
+            "Each rotation is one candidate orientation of the part, checked "
+            "independently, so this is how many of them are worked on "
+            "concurrently. A separate pool is started for every part placed.\n\n"
+            "Auto uses one thread per CPU core, which is the right setting for "
+            "most machines. Going above the core count is usually slower: the "
+            "geometry work runs outside the interpreter lock, but the code "
+            "around it does not, so extra threads spend their time waiting on "
+            "each other and on the shared NFP cache rather than doing work.\n\n"
+            "Does not affect the packing, only how long it takes.")
+
+        perf_form_layout = QtWidgets.QFormLayout()
+        perf_form_layout.addRow("Candidate Step (mm):", self.minkowski_step_size_input)
+        perf_form_layout.addRow("Rotation Threads:", self.minkowski_rotation_workers_input)
+
         mink_compactness_layout = QtWidgets.QHBoxLayout()
         mink_compactness_layout.addWidget(self.minkowski_compactness_input)
         mink_compactness_layout.addWidget(self.minkowski_compactness_help)
@@ -213,6 +261,7 @@ class NestingPanel(QtWidgets.QWidget):
         minkowski_form_layout.addRow(self.candidate_geometry_cache_checkbox)
         minkowski_form_layout.addRow("Compactness:", mink_compactness_layout)
         
+        minkowski_form_layout.addRow(perf_form_layout)
         self.minkowski_settings_group.setLayout(minkowski_form_layout)
 
         self.physics_settings_group = QtWidgets.QGroupBox("Physics Nesting Settings")
@@ -550,7 +599,8 @@ class NestingPanel(QtWidgets.QWidget):
         self.verbose_logging_checkbox.setChecked(prefs.GetBool("VerboseLogging", False))
         self.performance_logging_checkbox.setChecked(prefs.GetBool("PerformanceLogging", False))
         self.candidate_geometry_cache_checkbox.setChecked(
-            prefs.GetBool("CandidateGeometryCache", False)
+            prefs.GetBool("CandidateGeometryCache",
+                               CANDIDATE_GEOMETRY_CACHE_DEFAULT)
         )
         self.physics_improvement_threshold_input.setValue(prefs.GetFloat("PhysicsStabilityTolerance", 0.01))
         
@@ -565,6 +615,10 @@ class NestingPanel(QtWidgets.QWidget):
         
         # Load Rotation Steps (Isolated)
         # Minkowski
+        self.minkowski_step_size_input.setValue(
+            prefs.GetFloat("MinkowskiStepSize", 5.0) or 5.0)
+        self.minkowski_rotation_workers_input.setValue(
+            prefs.GetInt("MinkowskiRotationWorkers", 0))
         mink_rot_steps = prefs.GetInt("MinkowskiRotationSteps", 4) # Default 90 deg (4 steps)
         if mink_rot_steps > 0:
             target_angle = 360.0 / mink_rot_steps

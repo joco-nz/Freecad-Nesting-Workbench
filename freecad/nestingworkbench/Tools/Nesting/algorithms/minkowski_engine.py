@@ -12,7 +12,7 @@ from shapely.affinity import translate, rotate
 from . import minkowski_utils
 from ....datatypes.shape import Shape
 
-def compute_and_cache_nfp(shape_A, angle_A, part_to_place, angle_B, cache_key, log=None, step_size=5.0, performance_logging=False):
+def compute_and_cache_nfp(shape_A, angle_A, part_to_place, angle_B, cache_key, log=None, step_size=5.0, performance_logging=False, out_timings=None):
     """Computes the NFP for one (A, B, relative-angle) pair and stores it in
     Shape.nfp_cache under cache_key. Pure Shapely — safe on any thread.
     Returns the cache entry."""
@@ -47,7 +47,7 @@ def compute_and_cache_nfp(shape_A, angle_A, part_to_place, angle_B, cache_key, l
     try:
         nfp_data = _compute_nfp_uncached(
             shape_A, angle_A, part_to_place, angle_B, cache_key, log, step_size,
-            performance_logging
+            performance_logging, out_timings
         )
         with Shape.nfp_cache_lock:
             Shape.nfp_cache[cache_key] = nfp_data
@@ -61,7 +61,7 @@ def compute_and_cache_nfp(shape_A, angle_A, part_to_place, angle_B, cache_key, l
             Shape.nfp_inflight.pop(cache_key, None)
 
 
-def _compute_nfp_uncached(shape_A, angle_A, part_to_place, angle_B, cache_key, log, step_size, performance_logging=False):
+def _compute_nfp_uncached(shape_A, angle_A, part_to_place, angle_B, cache_key, log, step_size, performance_logging=False, out_timings=None):
     """Compute one NFP without consulting or updating the shared cache."""
     t_total = time.perf_counter()
     timings = {}
@@ -138,6 +138,11 @@ def _compute_nfp_uncached(shape_A, angle_A, part_to_place, angle_B, cache_key, l
         log(f"Error calculating NFP for {cache_key}: {e}", level="error")
         nfp_data = {'error': str(e)}
     timings["total_ms"] = (time.perf_counter() - t_total) * 1000
+    # Hand the phase breakdown to the caller so the engine can accumulate it.
+    # Placed before the logging block, and on every path that computed including
+    # the error path, so a failed NFP still reports where it died.
+    if out_timings is not None:
+        out_timings.update(timings)
     if performance_logging:
         log(
         "[PERF] NFP phases key={} total={total_ms:.1f}ms "
@@ -219,6 +224,15 @@ def _compute_nfp_uncached(shape_A, angle_A, part_to_place, angle_B, cache_key, l
     )
     return nfp_data
 
+# Count keys whose per-call value is a size rather than a running total, so the
+# run-level view needs both a sum and a maximum. Without this, "the biggest
+# single union took 36,864 inputs" is unrepresentable: summed over 8 rotations
+# it reads as 294,912, which is not a size of anything.
+_COUNT_MAX_KEYS = frozenset({
+    "parts_a", "parts_b", "convex_pairs", "union_inputs",
+})
+
+
 class MinkowskiEngine:
     """
     Handles geometric operations for Minkowski nesting, such as NFP generation,
@@ -238,7 +252,13 @@ class MinkowskiEngine:
         self._log_lock = Lock()
 
         self.bin_polygon = Polygon([(0, 0), (self.bin_width, 0), (self.bin_width, self.bin_height), (0, self.bin_height)])
-        self._perf_stats = {'cache_hits': 0, 'cache_misses': 0, 'nfp_compute_ms': 0.0}
+        self._perf_stats = {'cache_hits': 0, 'cache_misses': 0,
+                            'nfp_compute_ms': 0.0, 'nfp_errors': 0,
+                            'candidate_generation_ms': 0.0,
+                            'candidate_generation_calls': 0,
+                            'candidate_incremental_ms': 0.0,
+                            'candidate_incremental_calls': 0,
+                            'candidate_points_returned': 0}
         self._perf_lock = Lock()
         self._cand_cache_lock = Lock()
 
@@ -378,6 +398,17 @@ class MinkowskiEngine:
         Returns (N,2) float64 array of currently-valid positions, or None when
         a pairwise NFP carries an error flag (skip this rotation).
         """
+        # Timed from here, not from just before the extension loop below, so the
+        # pure cache-hit return is counted too. It is the majority of calls, and
+        # excluding it would report a stage cost that exists only for the
+        # minority that did work.
+        #
+        # `nfp_compute_ms` covers only the miss path -- NFP construction. Before
+        # this, the whole stage between "the NFP exists" and "candidate points
+        # exist" was unmeasured: the timing was computed here, but only logged,
+        # and never aggregated anywhere.
+        t_gen = time.perf_counter()
+
         part_label = part_to_place.source_freecad_object.Label
         key = (part_label, round(angle % 360.0, 4), part_to_place.spacing,
                part_to_place.deflection, part_to_place.simplification)
@@ -422,6 +453,7 @@ class MinkowskiEngine:
         m = len(sheet.parts)
         n_prev = entry['n']
         if n_prev >= m:
+            self._record_candidate_generation(t_gen, None)
             return entry['pts']
 
         t0_total = time.perf_counter()
@@ -462,6 +494,7 @@ class MinkowskiEngine:
                 with self._perf_lock:
                     self._perf_stats['cache_hits'] += n_hits
                     self._perf_stats['cache_misses'] += n_misses
+                self._record_candidate_generation(t_gen, None)
                 return None
 
             master = nfp_data.get('polygon')
@@ -535,7 +568,33 @@ class MinkowskiEngine:
             self.log(f"[PERF] incremental_candidates angle={angle:.1f} "
                      f"new_parts={m - n_prev} hits={n_hits} misses={n_misses} "
                      f"total={dt:.1f}ms candidates={len(pts)}")
+        self._record_candidate_generation(t_gen, t0_total, len(pts))
         return pts
+
+    def _record_candidate_generation(self, t_start, t_incremental, n_points=None):
+        """Accumulate one `get_incremental_candidates` call.
+
+        `t_incremental` is when the extension loop began, or None when the call
+        took the pure cache-hit return and did no work. Two timers rather than
+        one because a single total cannot distinguish "4,000 calls that each did
+        almost nothing" from "4,000 calls that each did something", and those
+        call for completely different fixes.
+
+        Takes the lock once. This is called on every candidate evaluation -- 4,396
+        of them in a single generation of the n70 configuration -- so the
+        accounting has to be cheaper than the thing it accounts for.
+        """
+        with self._perf_lock:
+            stats = self._perf_stats
+            stats['candidate_generation_calls'] += 1
+            stats['candidate_generation_ms'] += (time.perf_counter() - t_start) * 1000
+            if n_points is not None:
+                stats['candidate_points_returned'] += n_points
+            if t_incremental is None:
+                return
+            now = time.perf_counter()
+            stats['candidate_incremental_calls'] += 1
+            stats['candidate_incremental_ms'] += (now - t_incremental) * 1000
 
     @staticmethod
     def score_gravity(pts_np, valid, direction, rng=None):
@@ -561,9 +620,67 @@ class MinkowskiEngine:
         return best_idx, metric
 
     def _calculate_and_cache_nfp(self, shape_A, angle_A, part_to_place, angle_B, cache_key):
-        return compute_and_cache_nfp(
+        # out_timings collects this call's ~25 phase timings and work counts.
+        # They were previously formatted into a [PERF] log line and discarded,
+        # so nothing outside that log could see where NFP time actually went --
+        # answering "which phase dominates?" needed a hand-written probe. The
+        # dict is filled in place rather than returned so the call signature and
+        # the cached payload are both untouched: a timings key stored in
+        # Shape.nfp_cache would be retained per entry and would be stale on a
+        # hit. Filling on the compute path only is also correct for the
+        # in-flight case -- a thread that joins an in-flight computation does
+        # not compute, so it has no timings to contribute.
+        timings = {}
+        nfp_data = compute_and_cache_nfp(
             shape_A, angle_A, part_to_place, angle_B, cache_key, self.log,
-            self.step_size, self.performance_logging)
+            self.step_size, self.performance_logging, out_timings=timings)
+        if timings:
+            with self._perf_lock:
+                self._accumulate_phase_timings(timings)
+        if isinstance(nfp_data, dict) and nfp_data.get('error'):
+            # A failed NFP is turned into {'error': ...} by a broad `except` and
+            # then skipped, so the run continues with one fewer usable placement
+            # region and no crash. That is a silent degradation: it once cost a
+            # whole run its packing (18 sheets instead of 1) because a
+            # NameError in this function was swallowed. Counted here so the
+            # harness can gate on it rather than trusting the summary line.
+            with self._perf_lock:
+                self._perf_stats['nfp_errors'] = self._perf_stats.get('nfp_errors', 0) + 1
+        return nfp_data
+
+    def _accumulate_phase_timings(self, timings):
+        """Folds one call's phase timings and work counts into _perf_stats.
+
+        Sums numeric values and keeps the extremes that are only meaningful as
+        extremes, so a run-level view can answer both "where did the time go"
+        and "what was the worst single NFP".
+
+        Keys are namespaced `phase_` for timings and `work_` for counts, so they
+        cannot collide with the three existing counters (cache_hits,
+        cache_misses, nfp_compute_ms) and so Nester.get_perf_stats()'s `nfp_`
+        prefixing keeps them visibly separate from candidate-stage timings.
+        """
+        for key, value in timings.items():
+            if not isinstance(value, (int, float)) or isinstance(value, bool):
+                continue
+            if key.endswith("_ms"):
+                target = f"phase_{key[:-3]}_ms"
+                self._perf_stats[target] = self._perf_stats.get(target, 0.0) + value
+                worst = f"phase_{key[:-3]}_ms_worst"
+                if value > self._perf_stats.get(worst, 0.0):
+                    self._perf_stats[worst] = value
+            else:
+                target = f"work_{key}"
+                if isinstance(value, int) and not isinstance(value, bool):
+                    self._perf_stats[target] = self._perf_stats.get(target, 0) + value
+                    if key in _COUNT_MAX_KEYS:
+                        # Summed, "how big was the largest single one" has no
+                        # answer at all. A 36,864-input union summed over 8
+                        # rotations reads as 294,912, which is not a size of
+                        # anything.
+                        high = f"work_{key}_max"
+                        if value > self._perf_stats.get(high, 0):
+                            self._perf_stats[high] = value
 
     def get_perf_stats(self):
         with self._perf_lock:
@@ -571,7 +688,13 @@ class MinkowskiEngine:
 
     def reset_perf_stats(self):
         with self._perf_lock:
-            self._perf_stats = {'cache_hits': 0, 'cache_misses': 0, 'nfp_compute_ms': 0.0}
+            self._perf_stats = {'cache_hits': 0, 'cache_misses': 0,
+                            'nfp_compute_ms': 0.0, 'nfp_errors': 0,
+                            'candidate_generation_ms': 0.0,
+                            'candidate_generation_calls': 0,
+                            'candidate_incremental_ms': 0.0,
+                            'candidate_incremental_calls': 0,
+                            'candidate_points_returned': 0}
 
     @staticmethod
     def _discretize_ring_np(ring, step_size):

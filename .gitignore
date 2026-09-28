@@ -36,4 +36,16 @@ Thumbs.db
 
 tests/Test_Files/n70-intercooler-spacer-bottle-nesting.FCStd
 
+# nest benchmark harness scratch status
+tests/freecad_harness/.last_status
+tests/freecad_harness/.last_status_test
+tests/freecad_harness/.last_status_bench
+tests/freecad_harness/.last_status_ga
+tests/freecad_harness/.last_status_probe
+tests/freecad_harness/.last_status_bench_ga
+tests/freecad_harness/.last_status_pytest
+tests/freecad_harness/.last_status_pytest
+tests/freecad_harness/.last_status_bench_cache
+tests/freecad_harness/.last_status_bench_cache
+
 opencode.json

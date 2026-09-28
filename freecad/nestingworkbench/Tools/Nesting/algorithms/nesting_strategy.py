@@ -26,29 +26,102 @@ def _candidate_geometry_key(prefix, x, y):
     return (prefix, float(x), float(y))
 
 
-def _rotation_worker_limit():
-    """Resolve the rotation thread-pool size, or None for the stdlib default.
+def _step_size(kwargs):
+    """Resolve the NFP discretisation interval: env, then kwargs, then 5.0 mm.
 
-    ``ThreadPoolExecutor()`` with no argument defaults to
-    ``min(32, os.cpu_count() + 4)``, which is 8 on the 4-CPU development box --
-    twice the core count. The candidate-geometry work is GEOS-bound and releases
-    the GIL, so oversubscription is not automatically harmful, but it is also not
-    automatically helpful: it trades throughput for cache pressure and
-    contention on the shared NFP cache. The effective width is therefore
-    measurable rather than assumed.
+    The UI field wins when it has been set, so a user who moves it sees the
+    effect; the env is the scripted and benchmark entry point and applies when
+    the caller did not choose. Unset everywhere is the 5.0 mm default.
 
-    ``NESTING_ROTATION_WORKERS`` overrides it. This exists so the 4-vs-8
-    comparison can be run without editing code; unset means "stdlib default",
-    which is the production behaviour and is what the fixture baseline used.
+    `NESTING_STEP_SIZE` exists so the time/density curve can be characterised
+    without building a UI, the same reason `NESTING_ROTATION_WORKERS` exists.
+    Both are now also panel fields, because a control nobody can reach is not a
+    control, and these two are the largest levers measured in a run.
     """
-    raw = os.environ.get('NESTING_ROTATION_WORKERS', '').strip()
-    if not raw:
-        return None
+    explicit = kwargs.get("step_size") if kwargs else None
+    if explicit is not None:
+        try:
+            value = float(explicit)
+            if value > 0:
+                return value
+        except (TypeError, ValueError):
+            pass
+    raw = os.environ.get('NESTING_STEP_SIZE', '').strip()
+    if raw:
+        try:
+            value = float(raw)
+            if value > 0:
+                return value
+        except ValueError:
+            pass
+    return 5.0
+
+
+def _rotation_workers_explicit(kwargs=None):
+    """Whether the pool width was chosen rather than inferred from the core count.
+
+    Separate from `_rotation_worker_limit` because that one always resolves, and
+    once resolved a chosen 4 and an inferred 4 are the same integer. The
+    distinction is what a report needs: a number in the output that might be a
+    decision or might be a default cannot attribute a result.
+    """
+    explicit = kwargs.get('rotation_workers') if kwargs else None
     try:
-        value = int(raw)
-    except ValueError:
-        return None
-    return value if value > 0 else None
+        if explicit is not None and int(explicit) > 0:
+            return True
+    except (TypeError, ValueError):
+        pass
+    raw = os.environ.get('NESTING_ROTATION_WORKERS', '').strip()
+    if raw:
+        try:
+            return int(raw) > 0
+        except ValueError:
+            pass
+    return False
+
+
+def _rotation_worker_limit(kwargs=None):
+    """Resolve the rotation thread-pool width. Always returns a positive int.
+
+    One core per thread is the default. This used to be `None`, meaning "let
+    ThreadPoolExecutor decide", and the stdlib decides `min(32, cpu_count() + 4)`
+    -- twice the core count, which was measured to be no faster than a single
+    worker while a pool sized to the core count was 22% faster. The default is
+    now the measured one rather than the inherited one.
+
+    Auto is `os.cpu_count()`, not `cpu_count() + 4`. The oversubscribed default
+    assumes the work is embarrassingly parallel and releases the GIL. Shapely
+    does release the GIL around GEOS calls, but the surrounding Python does not,
+    so the extra threads contend for the interpreter and the shared NFP cache
+    instead of adding throughput.
+
+    Precedence: an explicit positive value from the caller (the "Rotation
+    Threads" field), then `NESTING_ROTATION_WORKERS` for scripted and benchmark
+    runs, then the core count. 0 and unset both mean auto, so the field can be
+    left alone.
+
+    `NESTING_ROTATION_WORKERS` deliberately survives the UI field: the benchmark
+    harness pins the width for reproducible work counters and never builds an
+    `algo_kwargs`, so the env is its only channel.
+    """
+    explicit = kwargs.get('rotation_workers') if kwargs else None
+    try:
+        if explicit is not None and int(explicit) > 0:
+            return int(explicit)
+    except (TypeError, ValueError):
+        pass
+    raw = os.environ.get('NESTING_ROTATION_WORKERS', '').strip()
+    if raw:
+        try:
+            value = int(raw)
+            if value > 0:
+                return value
+        except ValueError:
+            pass
+    # Never 0: a zero-width pool would silently disable parallelism, and
+    # max_workers must be positive. cpu_count() can return None on platforms
+    # that cannot answer, hence the fallback.
+    return max(1, os.cpu_count() or 1)
 
 
 # Measurement-only. Ring area is needed to classify an interior ring as able or
@@ -224,8 +297,15 @@ class PlacementOptimizer:
     def __init__(
         self, engine, rotation_steps, search_direction, log_callback=None,
         trial_callback=None, rng=None, performance_logging=False,
-        candidate_geometry_key_tracker=None, candidate_geometry_cache=None
+        candidate_geometry_key_tracker=None, candidate_geometry_cache=None,
+        rotation_workers=None, rotation_workers_explicit=True
     ):
+        # Resolved once, here, rather than per call. find_best_placement runs
+        # once per part placed -- 122 times in a GA run -- so re-reading the
+        # environment and the UI value on each call is 122 redundant lookups.
+        # None means "auto": defer to the stdlib default.
+        self.rotation_workers = rotation_workers
+        self.rotation_workers_explicit = rotation_workers_explicit
         self.engine = engine
         self.rotation_steps = max(1, rotation_steps)
         self.search_direction = search_direction
@@ -265,6 +345,25 @@ class PlacementOptimizer:
             'candidate_geometry_ms': 0.0,
             'sheet_difference_ms': 0.0,
             'collision_intersection_ms': 0.0,
+            # The collision stage's decomposition. These are not decoration:
+            # the absorption loop below does `self._perf_stats[key] += ...`, so
+            # a key listed there but absent here raises KeyError inside the
+            # per-rotation future loop. `quiet=True` -- which every benchmark and
+            # every GA layout sets -- routes self.log to nothing, so the
+            # exception is swallowed with no output at all: every rotation
+            # evaluation dies, no candidates are produced, and the run reports
+            # zero placed parts and zero NFP computations while looking
+            # otherwise healthy. Every key in that allowlist must appear here.
+            'collision_intersects_ms': 0.0,
+            'collision_overlay_ms': 0.0,
+            'collision_hole_probe_ms': 0.0,
+            'collision_intersects_calls': 0,
+            'collision_overlay_calls': 0,
+            'collision_hole_probe_calls': 0,
+            'collision_overlay_area_zero': 0,
+            'collision_overlay_area_sub_tol': 0,
+            'collision_overlay_area_over_tol': 0,
+            'collision_overlay_area_total': 0.0,
             # Measurement-only candidate-path counters.
             'placement_wall_ms': 0.0,
             'rotation_wall_ms': 0.0,
@@ -316,6 +415,10 @@ class PlacementOptimizer:
             'candidate_geometry_repeats': 0,
             'max_concurrent_rotations': 0,
             'rotation_workers': 0,
+            # 1 when the width was inferred from the core count rather than
+            # chosen. A report that names only the width cannot say whether a
+            # number was a decision or a default.
+            'rotation_workers_auto': 0,
         }
 
     def log(self, message):
@@ -363,13 +466,19 @@ class PlacementOptimizer:
         # Recorded so the report line is self-describing: a run measured with
         # the env override must say so, otherwise the 4-vs-8 comparison is
         # unattributable. max_workers=None means the stdlib default.
-        worker_limit = _rotation_worker_limit()
+        # Was the width chosen or inferred? Captured before the fallback, or the
+        # flag is always zero and the counter is decoration.
+        was_auto = not self.rotation_workers_explicit
+        worker_limit = self.rotation_workers
+        if worker_limit is None:
+            worker_limit = _rotation_worker_limit()
         with self._perf_lock:
-            self._perf_stats['rotation_workers'] = (
-                worker_limit
-                if worker_limit is not None
-                else min(32, (os.cpu_count() or 1) + 4)
-            )
+            # The width actually used, and whether it was chosen. Both are
+            # recorded because neither is visible in the output otherwise, and
+            # two runs with identical packing can differ in wall clock by 22%
+            # purely on this.
+            self._perf_stats['rotation_workers'] = worker_limit
+            self._perf_stats['rotation_workers_auto'] = int(was_auto)
         with ThreadPoolExecutor(max_workers=worker_limit) as executor:
             futures = {
                 executor.submit(
@@ -416,6 +525,16 @@ class PlacementOptimizer:
                                 '_sheet_difference_ms', 0)
                             self._perf_stats['collision_intersection_ms'] += res.get(
                                 '_collision_intersection_ms', 0)
+                            # The collision stage's decomposition. The probe
+                            # keys arrive here underscore-prefixed -- that is the
+                            # convention every other absorbed key uses, and
+                            # reading them unprefixed yields a silent 0 rather
+                            # than an error, because .get() defaults.
+                            for _key in ('collision_intersects_ms',
+                                          'collision_overlay_ms',
+                                          'collision_hole_probe_ms'):
+                                self._perf_stats[_key] = self._perf_stats.get(
+                                    _key, 0.0) + res.get(f'_{_key}', 0.0)
                             self._perf_stats['rotation_wall_ms'] += res.get(
                                 '_t_wall_ms', 0)
                             self._perf_stats['candidate_evaluation_wall_ms'] += res.get(
@@ -438,6 +557,13 @@ class PlacementOptimizer:
                                 'mask_subthreshold_hole_rings',
                                 'mask_subthreshold_hole_vertices',
                                 'mask_calls', 'mask_batch_candidates',
+                                'collision_intersects_calls',
+                                'collision_overlay_calls',
+                                'collision_hole_probe_calls',
+                                'collision_overlay_area_zero',
+                                'collision_overlay_area_sub_tol',
+                                'collision_overlay_area_over_tol',
+                                'collision_overlay_area_total',
                             ):
                                 self._perf_stats[key] += res.get(f'_{key}', 0)
                             self._perf_stats['mask_batch_max'] = max(
@@ -861,6 +987,30 @@ class PlacementOptimizer:
         cache_ms = 0.0
         sheet_difference_ms = 0.0
         collision_intersection_ms = 0.0
+        # Sub-costs of the collision stage, because "18 seconds in collision" is
+        # not actionable and `collision_intersection_ms` does not decompose on
+        # its own. Three separable pieces:
+        #   intersects_ms  the GEOS boolean predicate, run on every pair
+        #   overlay_ms     candidate.intersection(existing).area, run only when
+        #                  intersects says True
+        #   hole_probe_ms  the interior-ring measurement probe
+        #
+        # The last one is why the split matters. `_holes_touched` is documented
+        # as measurement-only and is correctly gated on `probe is not None`, so
+        # it never runs in production -- but it sits *inside* the
+        # collision_intersection_ms window, so a logged run overstates the real
+        # cost by exactly its own overhead. Splitting it out is what makes
+        # `collision_intersection_ms` usable as a production figure.
+        intersects_ms = 0.0
+        overlay_ms = 0.0
+        hole_probe_ms = 0.0
+        intersects_calls = 0
+        overlay_calls = 0
+        hole_probe_calls = 0
+        overlay_area_zero = 0
+        overlay_area_sub_tol = 0
+        overlay_area_over_tol = 0
+        overlay_area_total = 0.0
         sheet_rejections = 0
         collision_rejections = 0
         bbox_rejections = 0
@@ -950,9 +1100,46 @@ class PlacementOptimizer:
                     # error: it conflated "disjoint" with "touching", since
                     # area <= tol holds for both. See make-faster.md.
                     existing = existing_polygons[e_pos]
-                    if existing.intersects(candidate):
-                        overlaps = candidate.intersection(
-                            existing).area > area_tolerance
+                    t_intersects = time.perf_counter()
+                    hit = existing.intersects(candidate)
+                    intersects_ms += (time.perf_counter() - t_intersects) * 1000
+                    intersects_calls += 1
+                    if hit:
+                        t_overlay = time.perf_counter()
+                        overlap_area = candidate.intersection(
+                            existing).area
+                        overlaps = overlap_area > area_tolerance
+                        overlay_ms += (time.perf_counter() - t_overlay) * 1000
+                        overlay_calls += 1
+                        # How the overlays are decided, three ways. The overlay
+                        # is 65% of the collision stage and `overlaps or
+                        # contains` measures 6-10x cheaper for the same verdict
+                        # (probe_collision_overlay.py), so the obvious
+                        # optimisation is to drop it. Whether that is *exactly*
+                        # equivalent turns on this split:
+                        #
+                        #   zero    an exact boundary touch. The predicate
+                        #           rejects it too, so the two agree.
+                        #   sub-tol positive but at or under the tolerance.
+                        #           The area test ACCEPTS these; a predicate
+                        #           calls them overlaps and REJECTS. The two
+                        #           disagree, and the area test is right.
+                        #   over    a real overlap, rejected by both.
+                        #
+                        # The middle group is the whole question. An earlier
+                        # version of this counter was named `..._below_tol` and
+                        # only tested `<= 0.0`, so it lumped sub-tolerance and
+                        # real overlaps together and the three-way split was not
+                        # visible. It read as 95.8% sub-tolerance when the true
+                        # figure is 89.3% -- the difference is exactly the real
+                        # rejections.
+                        if overlap_area <= 0.0:
+                            overlay_area_zero += 1
+                        elif overlap_area <= area_tolerance:
+                            overlay_area_sub_tol += 1
+                        else:
+                            overlay_area_over_tol += 1
+                        overlay_area_total += overlap_area
                         if probe is not None:
                             probe['collision_intersects_true'] += 1
                             if not overlaps:
@@ -963,6 +1150,7 @@ class PlacementOptimizer:
                             # Measurement-only: the pair's verdict depends on
                             # this part's interior rings rather than its solid
                             # body, so filling holes could flip it.
+                            t_hole = time.perf_counter()
                             if (hole_geoms is not None
                                     and _holes_touched(
                                         candidate, hole_geoms[e_pos],
@@ -971,6 +1159,8 @@ class PlacementOptimizer:
                                         c_maxx[row], c_maxy[row])):
                                 probe['mask_hole_sensitive_pairs'] += 1
                                 row_hole_touched = True
+                            hole_probe_ms += (time.perf_counter() - t_hole) * 1000
+                            hole_probe_calls += 1
                     else:
                         overlaps = False
                         if probe is not None:
@@ -979,6 +1169,7 @@ class PlacementOptimizer:
                             # here, and it is the most hole-dependent placement
                             # of all -- so the touch test must run on this
                             # branch too, not only on the intersects-True one.
+                            t_hole = time.perf_counter()
                             if (hole_geoms is not None
                                     and _holes_touched(
                                         candidate, hole_geoms[e_pos],
@@ -986,6 +1177,8 @@ class PlacementOptimizer:
                                         c_minx[row], c_miny[row],
                                         c_maxx[row], c_maxy[row])):
                                 row_hole_touched = True
+                            hole_probe_ms += (time.perf_counter() - t_hole) * 1000
+                            hole_probe_calls += 1
                     collision_intersection_ms += (
                         time.perf_counter() - checks_start) * 1000
                     polygon_checks += 1
@@ -1025,6 +1218,28 @@ class PlacementOptimizer:
                 'sheet_difference_ms', 0.0) + sheet_difference_ms
             probe['collision_intersection_ms'] = probe.get(
                 'collision_intersection_ms', 0.0) + collision_intersection_ms
+            # The collision stage's own decomposition. Reported alongside the
+            # total so the total can be checked against the parts, and so the
+            # measurement-only probe's cost is visible rather than inflating
+            # the number it is supposed to be explaining.
+            for key, value in (
+                    ('collision_intersects_ms', intersects_ms),
+                    ('collision_overlay_ms', overlay_ms),
+                    ('collision_hole_probe_ms', hole_probe_ms)):
+                probe[key] = probe.get(key, 0.0) + value
+            for key, value in (
+                    ('collision_intersects_calls', intersects_calls),
+                    ('collision_overlay_calls', overlay_calls),
+                    ('collision_hole_probe_calls', hole_probe_calls)):
+                probe[key] = probe.get(key, 0) + value
+            probe['collision_overlay_area_zero'] = probe.get(
+                'collision_overlay_area_zero', 0) + overlay_area_zero
+            probe['collision_overlay_area_sub_tol'] = probe.get(
+                'collision_overlay_area_sub_tol', 0) + overlay_area_sub_tol
+            probe['collision_overlay_area_over_tol'] = probe.get(
+                'collision_overlay_area_over_tol', 0) + overlay_area_over_tol
+            probe['collision_overlay_area_total'] = probe.get(
+                'collision_overlay_area_total', 0.0) + overlay_area_total
             probe['sheet_rejections'] = probe.get('sheet_rejections', 0) + sheet_rejections
             probe['collision_rejections'] = probe.get('collision_rejections', 0) + collision_rejections
             # Skipped candidates (no overlap, inside sheet) were screened
@@ -1066,20 +1281,38 @@ class Nester:
         self.cancel_callback = kwargs.get("cancel_callback") # Called to check if nesting should abort
         self.spawn_more_callback = kwargs.get("spawn_more_callback")  # Mints fill-part instances on the main thread
         
-        step_size = kwargs.get("step_size", 5.0) 
+        # NFP ring discretisation interval: samples one candidate position
+        # every `step_size` mm along each No-Fit Polygon boundary, so it sets the
+        # candidate count. On the n70 GA run that count (639,410) drives both the
+        # collision stage and candidate generation, together 63% of the run, so
+        # this is the largest remaining time/density dial.
+        #
+        # It was reachable only from the Physics panel, so the Minkowski nester
+        # -- every layout in a GA run -- always got the hardcoded 5.0. The env
+        # override makes it measurable without a UI change; the UI question is
+        # separate and is answered in RESULTS-parallelism.md.
+        step_size = _step_size(kwargs)
         self.engine = MinkowskiEngine(
             width, height, step_size, log_callback=self.log_callback,
             verbose=self.verbose,
             performance_logging=self.performance_logging,
             search_direction=self.search_direction, rng=kwargs.get("rng"))
         # quiet (multi-layout GA) silences the optimizer's per-placement [TIMING] lines
+        # Kept on the nester so a run can report what it actually used. Both are
+        # performance dials with no visible effect on the packing, so a reader
+        # of the output has no other way to tell what produced a result.
+        self.step_size = step_size
+        self.rotation_workers = _rotation_worker_limit(kwargs)
+        self.rotation_workers_explicit = _rotation_workers_explicit(kwargs)
         self.optimizer = PlacementOptimizer(
             self.engine, rotation_steps, self.search_direction,
             None if self.quiet else self.log_callback,
             self.trial_callback, rng=kwargs.get("rng"),
             performance_logging=self.performance_logging,
             candidate_geometry_key_tracker=kwargs.get("candidate_geometry_key_tracker"),
-            candidate_geometry_cache=kwargs.get("candidate_geometry_cache")
+            candidate_geometry_cache=kwargs.get("candidate_geometry_cache"),
+            rotation_workers=self.rotation_workers,
+            rotation_workers_explicit=self.rotation_workers_explicit
         )
         self.optimizer.verbose = self.verbose
 

@@ -1,0 +1,895 @@
+#!/usr/bin/env freecadcmd
+"""Tier 2/3 nesting benchmark harness.
+
+Runs a real nest under FreeCAD's own interpreter and records the result as
+JSON, so a change to the nesting code can be gated against a recorded "before"
+rather than against an impression.
+
+Why a plain script and not a pytest module: `freecadcmd` ships its own Python
+without pytest, and the workbench's document-level code (profile extraction,
+master creation, packing) needs a real FreeCAD. The pure-geometry tier lives in
+tests/test_minkowski_utils/ and runs under plain CPython with FreeCAD stubs.
+
+Configuration is by environment variable, not command-line flag -- see the
+Configuration section for why flags are not usable from freecadcmd.
+
+Usage
+-----
+    # Run and print
+    freecadcmd tests/freecad_harness/nest_benchmark.py
+
+    # Compare against the committed baseline (the per-block gate)
+    NEST_BENCH_BASELINE=tests/freecad_harness/baseline/synthetic_v1.json \
+        freecadcmd tests/freecad_harness/nest_benchmark.py
+
+    # Record a new baseline
+    NEST_BENCH_OUT=/tmp/bench.json \
+        freecadcmd tests/freecad_harness/nest_benchmark.py
+
+    # A real FreeCAD document instead of the built-in corpus
+    NEST_BENCH_CORPUS=tests/Test_Files/n70-....FCStd NEST_BENCH_SHEET=700x500 \
+        freecadcmd tests/freecad_harness/nest_benchmark.py
+
+The exit status is also written to tests/freecad_harness/.last_status, because
+freecadcmd does not reliably propagate a script's exit code.
+
+Gates
+-----
+Hard (non-zero exit means reject the change):
+  * sheets must not increase
+  * unplaced must not increase
+  * placed must not decrease
+  * density must not decrease
+
+NEST_BENCH_ALLOW_FEWER_PLACED=1 relaxes the last two. It exists for one case:
+block 2.1 ports main's hole-edge sweeps, which shrink the inner-fit polygon for
+non-convex holes. That is the correctness fix working -- fewer in-hole
+placements are offered because the previous ones overlapped the hole wall --
+so "fewer placed" is the expected outcome there, and the flag makes that
+expectation explicit rather than something a reviewer has to infer.
+
+Deliberately NOT gated: wall-clock time and the `*_ms` perf counters. They are
+recorded and printed, but a timing regression is a judgement call about
+whether a geometry change is worth the time, not something a threshold can
+settle. Gate on correctness and density; read the timings.
+
+Work-counting perf counters ARE reproducible and are reported for review when
+they change -- see Config.apply_rotation_worker_limit for why the thread pool
+has to be pinned off to make that true.
+"""
+import json
+import os
+import sys
+import time
+import traceback
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_REPO = os.path.abspath(os.path.join(_HERE, "..", ".."))
+for _p in (_REPO, _HERE):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
+import harness_common as hc  # noqa: E402  (needs the sys.path above)
+
+SCHEMA_VERSION = 1
+DEFAULT_SEED = 20260925
+STATUS_FILE = os.path.join(_HERE, ".last_status")
+
+
+def emit(message=""):
+    """Prints a report line in a way that survives FreeCAD's console redirect.
+
+    Under freecadcmd, FreeCAD.Console captures plain print() once a document
+    exists, so report output silently disappears. Routing through
+    FreeCAD.Console.PrintMessage keeps it visible; falling back to print covers
+    being run some other way.
+    """
+    try:
+        import FreeCAD
+
+        if FreeCAD is not None and hasattr(FreeCAD, "Console"):
+            FreeCAD.Console.PrintMessage(str(message) + "\n")
+            return
+    except Exception:
+        pass
+    print(message)
+
+
+# --------------------------------------------------------------------------
+# Configuration
+# --------------------------------------------------------------------------
+# Everything is configured by environment variable rather than command-line
+# flag, because freecadcmd parses the whole command line with its own option
+# parser before the script runs, and its `--pass` escape hatch silently drops
+# any forwarded token that starts with '-'.
+#
+# Measured on FreeCAD 26.3.0:
+#     freecadcmd s.py --pass a b c            -> argv ['a','b','c']   works
+#     freecadcmd s.py --pass --alpha --beta   -> script never runs
+#     freecadcmd s.py --pass --alpha v --beta w -> script never runs
+#
+# So a flag-based interface is not reliably reachable from freecadcmd at all.
+# This is the same class of collision described in
+# ga_coordinator.worker_mp_context: inside FreeCAD the launcher claims your
+# command-line flags for itself.
+#
+# The payoff is that the common cases need no arguments at all.
+def _peak_rss_bytes():
+    """Peak resident set size of this process, or None where unavailable.
+
+    `ru_maxrss` is kilobytes on Linux and bytes on macOS, which is a real trap
+    when reading a memory number off a Mac and believing it.
+
+    This is a high-water mark for the whole process, not a per-run figure, so it
+    is only meaningful as a *difference* against a reading taken just before the
+    run -- and only when the process is not otherwise growing. That is enough to
+    answer "does an unbounded cache cost a lot of memory", which is the question
+    being asked of it.
+    """
+    try:
+        import resource
+    except ImportError:
+        return None
+    raw = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    return raw * 1024 if sys.platform.startswith("linux") else raw
+
+
+def _parse_quantities(spec):
+    """Parses "Spacer=2,Bottle Top=60" into {"Spacer": 2, "Bottle Top": 60}.
+
+    Labels in this corpus contain spaces, so the separator is the comma and the
+    split is on the *last* '='. A malformed entry raises rather than being
+    skipped: a silently dropped quantity produces a run that looks fine and
+    measures the wrong workload, which is the exact failure this parser exists
+    to make impossible.
+    """
+    out = {}
+    for chunk in spec.split(","):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        if "=" not in chunk:
+            raise ValueError(
+                f"NEST_BENCH_QUANTITIES entry {chunk!r} is not Label=count")
+        label, _, count = chunk.rpartition("=")
+        label, count = label.strip(), count.strip()
+        if not count.isdigit() or int(count) < 1:
+            raise ValueError(
+                f"NEST_BENCH_QUANTITIES entry {chunk!r} has a non-positive or "
+                f"non-integer count")
+        if not label:
+            raise ValueError(
+                f"NEST_BENCH_QUANTITIES entry {chunk!r} has an empty label")
+        out[label] = int(count)
+    return out
+
+
+class Config:
+    def __init__(self, environ=None):
+        env = os.environ if environ is None else environ
+        self.corpus = env.get("NEST_BENCH_CORPUS", "synthetic")
+        self.out = env.get("NEST_BENCH_OUT", "")
+        self.baseline = env.get("NEST_BENCH_BASELINE", "")
+        self.allow_fewer_placed = bool(env.get("NEST_BENCH_ALLOW_FEWER_PLACED", ""))
+        self.seed = int(env.get("NEST_BENCH_SEED", DEFAULT_SEED))
+        # Sized to fill one sheet at ~56% density with the built-in corpus:
+        # dense enough that a placement regression shows up in the numbers, while
+        # still landing on a single deterministic layout.
+        self.sheet = env.get("NEST_BENCH_SHEET", "450x350")
+        self.spacing = float(env.get("NEST_BENCH_SPACING", "5.0"))
+        self.deflection = float(env.get("NEST_BENCH_DEFLECTION", "0.05"))
+        self.simplification = float(env.get("NEST_BENCH_SIMPLIFICATION", "0.1"))
+        self.rotation_steps = int(env.get("NEST_BENCH_ROTATION_STEPS", "4"))
+        self.rotation_workers = int(env.get("NEST_BENCH_ROTATION_WORKERS", "1"))
+        self.quantity = int(env.get("NEST_BENCH_QUANTITY", "3"))
+        # Per-label overrides, "Spacer=2,Bottle Top=60". Real workloads are not
+        # uniform, and the n70 corpus is the worked example: 2 of the big Spacer,
+        # 60 of each bottle part.
+        self.per_label_quantities = _parse_quantities(
+            env.get("NEST_BENCH_QUANTITIES", ""))
+        self.draw = bool(env.get("NEST_BENCH_DRAW", ""))
+        # Tri-state, and unset means "whatever the workbench does". The harness
+        # exists to measure the product, so pinning its own default would let
+        # the two drift: the workbench could ship default-on while every
+        # committed baseline still described the off path, and the gate would
+        # stay green while measuring something nobody runs.
+        #
+        #   unset  -> follow CANDIDATE_GEOMETRY_CACHE_DEFAULT
+        #   0      -> explicitly off, for the A/B control arm
+        #   1      -> explicitly on
+        spec = env.get("NEST_BENCH_CANDIDATE_GEOMETRY_CACHE", "").strip()
+        if spec in ("", "default"):
+            from freecad.nestingworkbench.constants import (
+                CANDIDATE_GEOMETRY_CACHE_DEFAULT,
+            )
+
+            self.candidate_geometry_cache = CANDIDATE_GEOMETRY_CACHE_DEFAULT
+        else:
+            self.candidate_geometry_cache = spec not in ("0", "no", "false", "off")
+        # Reps run in one process, interleaved with nothing else, each with
+        # cold caches. Timings become a minimum over them; counts and results
+        # must be identical, and a difference is a hard failure rather than
+        # something to average away.
+        self.reps = max(1, int(env.get("NEST_BENCH_REPS", "5")))
+
+    def apply_rotation_worker_limit(self):
+        """Pins the rotation thread-pool width for this process.
+
+        Read at call time by nesting_strategy._rotation_worker_limit(), so
+        setting it before the nest is enough.
+
+        Why the default is 1: above width 1 some work counters stop being exact.
+        Rotation evaluation breaks metric ties by drawing from one shared
+        `random.Random`, and concurrent threads consume it in scheduling order,
+        so the draw order is not fixed.
+
+        An earlier version of this docstring said 28 of 51 counters differed
+        run to run. That was measured before the caches were cleared between
+        reps, and it does not reproduce: 4 reps at width 1, 2, 4 and 8 on the
+        built-in corpus show 59 of 63 counts exact at every width, with
+        nfp_cache_hits/misses, candidate_points and exact_collision_checks
+        moving and nfp_work_convex_pairs, rotation_evaluations and
+        successful_rotations not. The pinning stands, but for the narrower
+        reason that width 1 is the only setting where *every* count is exact --
+        not because a quarter of them are unreliable.
+
+        The nesting *result* is identical either way on both corpora, so this is
+        a measurement-fidelity problem rather than a correctness one. It does
+        mean a baseline recorded with the pool on cannot be compared against a
+        run with it off, which is why the width is recorded in the JSON and in
+        the `noise` block.
+        """
+        os.environ["NESTING_ROTATION_WORKERS"] = str(max(1, self.rotation_workers))
+
+    def as_dict(self):
+        return {
+            "seed": self.seed,
+            "sheet": self.sheet,
+            "spacing": self.spacing,
+            "deflection": self.deflection,
+            "simplification": self.simplification,
+            "rotation_steps": self.rotation_steps,
+            "rotation_workers": self.rotation_workers,
+            "quantity": self.quantity,
+            "draw": self.draw,
+            "candidate_geometry_cache": self.candidate_geometry_cache,
+            "per_label_quantities": self.per_label_quantities,
+            "reps": self.reps,
+        }
+
+
+# --------------------------------------------------------------------------
+# Corpora
+# --------------------------------------------------------------------------
+# FreeCAD scaffolding rather than parts: an Origin and its axes/planes/vertex
+# are the children of every PartDesign::Body, and treating them as parts would
+# nest noise.
+_SKIP_TYPEIDS = {
+    "App::Origin",
+    "App::Line",
+    "App::Plane",
+    "App::Point",
+    "App::Part",
+    "PartDesign::Line",
+    "PartDesign::Plane",
+    "PartDesign::Point",
+    "PartDesign::CoordinateSystem",
+}
+
+
+def build_synthetic_corpus(doc, seed, quantity):
+    """Builds a deterministic part set that exercises the hard geometry.
+
+    Deliberately mixed so the benchmark is sensitive to more than one path:
+      * three rectangles     -- convex, fast path, no decomposition
+      * an L-shape           -- concave, forces triangulation
+      * a triangle           -- convex but non-rectangular
+      * a plate with a hole  -- the inner-fit path, which is exactly what
+                               block 2.1 changes
+
+    Seeded, so identical on every machine. That matters: the n70 .FCStd corpus
+    is gitignored and machine-local, so a baseline keyed to it could not be
+    reproduced by anyone else.
+    """
+    import random
+
+    import FreeCAD
+    import Part
+
+    rng = random.Random(seed)
+    parts = []
+
+    def add(name, shape):
+        obj = doc.addObject("Part::Feature", name)
+        obj.Shape = shape
+        parts.append(obj)
+        return obj
+
+    for i in range(3):
+        add(
+            f"Rect{i}",
+            Part.makeBox(rng.randrange(40, 90), rng.randrange(30, 70), 10),
+        )
+
+    add(
+        "LShape",
+        Part.makeBox(80, 80, 10).cut(
+            Part.makeBox(50, 50, 10, FreeCAD.Vector(30, 30, 0))
+        ),
+    )
+
+    add(
+        "Triangle",
+        Part.makePolygon(
+            [
+                FreeCAD.Vector(0, 0, 0),
+                FreeCAD.Vector(70, 0, 0),
+                FreeCAD.Vector(0, 60, 0),
+                FreeCAD.Vector(0, 0, 0),
+            ]
+        ).extrude(FreeCAD.Vector(0, 0, 10)),
+    )
+
+    add(
+        "HoledPlate",
+        Part.makeBox(100, 100, 10).cut(
+            Part.makeCylinder(22, 20, FreeCAD.Vector(50, 50, -5))
+        ),
+    )
+
+    return parts, {p.Label: quantity for p in parts}
+
+
+def discover_doc_parts(doc):
+    """Finds candidate part objects in an opened document.
+
+    Keeps only top-level candidates: an object already inside a candidate
+    (a Body's Origin, or a Sketch inside a Body) is skipped.
+    """
+    candidates = [
+        o
+        for o in doc.Objects
+        if o.TypeId not in _SKIP_TYPEIDS
+        and hasattr(o, "Shape")
+        and o.Shape
+        and not o.Shape.isNull()
+    ]
+    tops = []
+    for o in candidates:
+        parented = False
+        for other in candidates:
+            if other.Name == o.Name:
+                continue
+            group = getattr(other, "Group", None)
+            if group and any(getattr(c, "Name", None) == o.Name for c in group):
+                parented = True
+                break
+        if not parented:
+            tops.append(o)
+    return tops
+
+
+# --------------------------------------------------------------------------
+# The run
+# --------------------------------------------------------------------------
+def run_nest(doc, parts, quantities, cfg):
+    """Prepares and nests, returning (result, perf, dead_ring, wall_seconds)."""
+    import random as _random
+
+    import FreeCAD
+    from freecad.nestingworkbench.Tools.Nesting import nesting_logic
+    from freecad.nestingworkbench.Tools.Nesting.algorithms import minkowski_utils
+    from freecad.nestingworkbench.Tools.Nesting.shape_preparer import ShapePreparer
+    from freecad.nestingworkbench.datatypes.shape import Shape
+
+    # Every rep must be a cold run. These caches are class-level, so within one
+    # process rep 1 computed every NFP and reps 2..N were pure cache hits --
+    # which moved 24 work counts and made every rep after the first a different
+    # measurement. It was found by the count-stability gate below, not by
+    # inspection, and it is the reason the gate exists.
+    #
+    # clear_nfp_cache() is called explicitly because Shape.clear_caches()
+    # deliberately leaves the NFP cache alone ("expensive and benefits from
+    # persistence"). That default is right for the workbench and wrong for a
+    # benchmark, which must measure a cold cache every time.
+    Shape.clear_nfp_cache()
+    Shape.clear_caches()
+
+    layout_group = doc.addObject("App::DocumentObjectGroup", "Layout_bench")
+    parts_group = doc.addObject("App::DocumentObjectGroup", "PartsToPlace")
+    shared_group = doc.addObject("App::DocumentObjectGroup", "MasterShapes")
+
+    ui_settings = {
+        "spacing": cfg.spacing,
+        "deflection": cfg.deflection,
+        "simplification": cfg.simplification,
+        "rotation_steps": cfg.rotation_steps,
+        "add_labels": False,
+        "font_path": "",
+        "verbose": False,
+    }
+    full_quantities = {
+        label: {
+            "quantity": qty,
+            "rotation_steps": cfg.rotation_steps,
+            "up_direction": "Z+",
+            "fill_sheet": False,
+        }
+        for label, qty in quantities.items()
+    }
+
+    preparer = ShapePreparer(
+        doc,
+        {},
+        create_doc_objects=cfg.draw,
+        master_pool={},
+        shared_master_group=None if cfg.draw else shared_group,
+    )
+    shapes = preparer.prepare_parts(
+        ui_settings, full_quantities, {p.Label: p for p in parts}, layout_group, parts_group
+    )
+
+    # prepare_parts publishes the dead-ring profiles via
+    # ShapePreparer._publish_dead_ring_profiles, and they must stay published
+    # for the nest itself: the pruning happens inside decompose_if_needed,
+    # which is first reached while the NFP cache is cold during the run. An
+    # earlier version of this harness cleared them here, which silently
+    # measured the optimisation switched OFF and produced a dead_ring of {} in
+    # the baseline -- a badly misleading reference for a branch whose whole
+    # point is that optimisation.
+    #
+    # get_dead_ring_stats() is the public check: it returns {} when no part
+    # set has been published. Asserted after the nest in main(), so this stays
+    # a comment rather than a second code path.
+    minkowski_utils.reset_dead_ring_stats()
+
+    width, height = (float(v) for v in cfg.sheet.lower().split("x"))
+    perf = {}
+
+    # A fresh cache per run, never reused: CandidateGeometryCache is an
+    # unbounded per-run dict of translated polygons, so sharing one across reps
+    # would make rep 2..N measure a warm cache -- the same trap the class-level
+    # NFP cache set. Constructed here rather than in main() so that holds for
+    # every caller, including the A/B driver.
+    geometry_cache = None
+    if cfg.candidate_geometry_cache:
+        from freecad.nestingworkbench.Tools.Nesting.algorithms.nesting_strategy import (
+            CandidateGeometryCache,
+        )
+
+        geometry_cache = CandidateGeometryCache()
+
+    rss_before = _peak_rss_bytes()
+    started = time.perf_counter()
+    sheets, unplaced, _sim_steps, _elapsed = nesting_logic.nest(
+        shapes,
+        width,
+        height,
+        rotation_steps=cfg.rotation_steps,
+        algorithm="Minkowski",
+        rng=_random.Random(cfg.seed),
+        quiet=True,
+        perf_stats_callback=perf.update,
+        candidate_geometry_cache=geometry_cache,
+    )
+    wall = time.perf_counter() - started
+    peak_rss = max(_peak_rss_bytes() - rss_before, 0)
+
+    placed_total = 0
+    used_area = 0.0
+    by_label = {}
+    for sheet in sheets:
+        for part in sheet.parts:
+            placed_total += 1
+            label = getattr(part.shape, "master_label", None) or part.shape.id
+            by_label[label] = by_label.get(label, 0) + 1
+            poly = part.shape.polygon
+            if poly is not None and not poly.is_empty:
+                used_area += poly.area
+
+    sheet_area = width * height
+    result = {
+        "sheets": len(sheets),
+        "placed": placed_total,
+        "unplaced": len(unplaced),
+        "sheet_width": width,
+        "sheet_height": height,
+        "sheet_area": sheet_area,
+        "used_area": round(used_area, 4),
+        "density": round((used_area / (sheet_area * len(sheets))) if sheets else 0.0, 6),
+        "prepared_shapes": len(shapes),
+        "placed_by_label": dict(sorted(by_label.items())),
+    }
+    return result, perf, minkowski_utils.get_dead_ring_stats(), wall, peak_rss
+
+
+# --------------------------------------------------------------------------
+# Reporting
+# --------------------------------------------------------------------------
+def validate_perf(perf):
+    """Self-checks on the instrumentation, run on every harness invocation.
+
+    Guards the guard. The phase accumulator was added after a NameError inside
+    `_compute_nfp_uncached` was swallowed by that function's broad `except`:
+    every NFP became `{'error': ...}`, every rotation was skipped, and the run
+    quietly produced 18 single-part sheets instead of 1. Nothing crashed and the
+    summary line looked plausible.
+
+    These invariants turn that class of silent degradation into a hard failure:
+
+      * the phase keys must be present at all, or the accumulator is broken;
+      * `total_ms` must cover the phases it is the sum of, catching a
+        mis-ordered or partially-written accumulator;
+      * `work_convex_pairs` must be non-zero on any run that did real work;
+      * `nfp_errors` must be zero. Any NFP error is a swallowed exception.
+
+    Returns a list of failure strings, empty when the run is sound.
+    """
+    failures = []
+
+    phase_total = perf.get("nfp_phase_total_ms")
+    if phase_total is None:
+        failures.append("no nfp_phase_total_ms: the phase accumulator is not "
+                        "reporting, so phase attribution is unavailable")
+        return failures
+
+    for required in ("nfp_phase_convex_sum_ms", "nfp_phase_union_ms",
+                     "nfp_work_convex_pairs", "nfp_nfp_errors"):
+        if required not in perf:
+            failures.append(f"missing perf key {required}")
+
+    # total_ms is the whole NFP, so it must not be less than the sum of two
+    # phases that sit inside it.
+    inner = perf.get("nfp_phase_convex_sum_ms", 0.0) + perf.get("nfp_phase_union_ms", 0.0)
+    if phase_total + 1e-9 < inner:
+        failures.append(
+            f"phase_total_ms {phase_total:.3f} < convex_sum+union {inner:.3f}: "
+            f"the accumulator is not summing a partition")
+
+    pairs = perf.get("nfp_work_convex_pairs", 0)
+    if pairs <= 0:
+        failures.append(f"nfp_work_convex_pairs is {pairs}: no convex sums ran, "
+                        f"so this is not a comparable run")
+
+    errors = perf.get("nfp_nfp_errors", 0)
+    if errors:
+        failures.append(
+            f"{errors} NFP(s) errored. Each is an exception swallowed by "
+            f"_compute_nfp_uncached's broad except, and each one silently "
+            f"removes a placement region. This run is not comparable.")
+
+    worst_total = perf.get("nfp_phase_total_ms_worst", 0.0)
+    if worst_total > phase_total + 1e-9:
+        failures.append("worst single NFP exceeds the total: accumulator is "
+                        "double counting")
+
+    failures.extend(_validate_union(perf))
+
+    return failures
+
+
+def _validate_union(perf):
+    """Invariants the union counters must satisfy, per RESULTS-union.md.
+
+    Cheap because they are exact counts, not timings: if `union_inputs` and
+    `convex_pairs` ever disagree, either a pair result is being dropped before
+    the union or the counters have drifted apart, and both would quietly
+    invalidate the pair-count arithmetic that the whole union analysis rests on.
+    """
+    failures = []
+    inputs = perf.get("nfp_work_union_inputs")
+    pairs = perf.get("nfp_work_convex_pairs")
+    if inputs is None or pairs is None:
+        return [f"missing union counters (union_inputs={inputs}, "
+                f"convex_pairs={pairs})"]
+
+    if inputs != pairs:
+        failures.append(
+            f"union_inputs {inputs} != convex_pairs {pairs}: every convex pair "
+            f"should reach unary_union exactly once. A mismatch means pair "
+            f"results are being dropped or duplicated before the union, which "
+            f"would invalidate the pair arithmetic.")
+
+    calls = perf.get("nfp_work_union_calls", 0)
+    outputs = perf.get("nfp_work_union_outputs", 0)
+    if calls and outputs != calls:
+        failures.append(
+            f"union_outputs {outputs} != union_calls {calls}: each union should "
+            f"return exactly one polygon (the NFP). More than one means a union "
+            f"produced a MultiPolygon, which is a correctness question, not a "
+            f"performance one.")
+
+    # The max must be a real size, not a sum. If these are equal the accumulator
+    # is summing something it should be maximising.
+    max_inputs = perf.get("nfp_work_union_inputs_max", 0)
+    if max_inputs > inputs:
+        failures.append(
+            f"union_inputs_max {max_inputs} exceeds the total {inputs}: a "
+            f"per-call maximum cannot be larger than the sum it came from")
+
+    return failures
+
+
+def _is_timing(key):
+    """True for wall-clock counters, never comparable run to run.
+
+    Matches both `*_ms` and `*_ms_worst` (the phase accumulator's worst-single-
+    NFP figures). Getting this wrong is not cosmetic: a `_ms_worst` key was
+    classified as a work count and reported as a "reproducible count that
+    changed", which is exactly the noise it is not.
+    """
+    return key.endswith("_ms") or "_ms_" in key
+
+
+def build_record(cfg, corpus_desc, result, perf, dead_ring, wall, peak_rss=None):
+    return {
+        "schema": SCHEMA_VERSION,
+        "corpus": corpus_desc,
+        "config": cfg.as_dict(),
+        "result": result,
+        "perf": {k: perf[k] for k in sorted(perf)},
+        "dead_ring": dead_ring,
+        "wall_seconds": round(wall, 4),
+        "peak_rss_bytes": peak_rss,
+    }
+
+
+def print_record(record):
+    r = record["result"]
+    counts = [k for k in record["perf"] if not _is_timing(k)]
+    timings = [k for k in record["perf"] if _is_timing(k)]
+    emit("")
+    emit("=== nest result ===")
+    emit(f"  corpus            {record['corpus']['kind']}")
+    emit(f"  sheets            {r['sheets']}")
+    emit(f"  placed            {r['placed']}")
+    emit(f"  unplaced          {r['unplaced']}")
+    emit(f"  density           {r['density']:.4f}")
+    emit(f"  prepared shapes   {r['prepared_shapes']}")
+    emit(f"  wall              {record['wall_seconds']:.3f}s")
+    emit(f"  perf counters     {len(record['perf'])} "
+         f"({len(counts)} reproducible counts, {len(timings)} timings)")
+    if record["dead_ring"]:
+        emit(f"  dead rings        {record['dead_ring']}")
+    if record.get("peak_rss_bytes"):
+        emit(f"  peak rss          {record['peak_rss_bytes'] / (1024 * 1024):.0f} MiB "
+             f"(delta over the run, high-water mark)")
+    noise = record.get("noise")
+    if noise:
+        emit(f"  reps              {noise['reps']} in one process, "
+             f"rot width {noise['rotation_workers']}")
+        emit(f"  wall spread       {noise['wall_seconds_spread_pct']:.1f}%")
+        emit(f"  work counts       "
+             f"{'exact' if noise['work_counts_exact'] else 'NOT EXACT: ' + str(noise['work_counts_unstable'])}")
+        emit(f"  timings varying   {noise['timings_vary']} of the `*_ms` keys")
+
+
+def compare(current, baseline, allow_fewer_placed):
+    """Prints a diff; returns True when every gate passes."""
+    c, b = current["result"], baseline["result"]
+    emit("")
+    emit("=== comparison vs baseline ===")
+    failures = []
+
+    def check(label, was, now, gate):
+        delta = now - was
+        if not gate(delta):
+            verdict = "FAIL"
+            failures.append(label)
+        else:
+            verdict = "ok"
+        emit(f"  {label:16s} {was!s:>10s} -> {now!s:>10s}  ({delta:+g})  {verdict}")
+
+    check("sheets", b["sheets"], c["sheets"], lambda d: d <= 0)
+    check("unplaced", b["unplaced"], c["unplaced"], lambda d: d <= 0)
+    check("placed", b["placed"], c["placed"],
+          (lambda d: True) if allow_fewer_placed else (lambda d: d >= 0))
+    check("density", b["density"], c["density"],
+          (lambda d: True) if allow_fewer_placed else (lambda d: d >= -1e-9))
+
+    changed = []
+    for key in sorted(set(baseline["perf"]) & set(current["perf"])):
+        if _is_timing(key):
+            continue
+        was, now = baseline["perf"][key], current["perf"][key]
+        if isinstance(was, (int, float)) and isinstance(now, (int, float)) and was != now:
+            changed.append((key, was, now))
+
+    emit("")
+    emit("  --- timings, not gated ---")
+    emit(f"  wall_seconds      {baseline['wall_seconds']:.3f} -> {current['wall_seconds']:.3f}")
+    if changed:
+        emit("")
+        emit("  --- work counts that changed (reproducible; review these) ---")
+        for key, was, now in changed:
+            pct = f"  ({100.0 * (now - was) / abs(was):+.1f}%)" if was else ""
+            emit(f"  {key:32s} {was!s:>12s} -> {now!s:>12s}{pct}")
+    else:
+        emit("  no reproducible work counts changed")
+
+    emit("")
+    if failures:
+        emit(f"  GATE FAILED: {', '.join(failures)}")
+        return False
+    emit("  GATE PASSED")
+    return True
+
+
+def main():
+    import FreeCAD
+
+    cfg = Config()
+    cfg.apply_rotation_worker_limit()
+
+    # Reps run in one process, interleaved with nothing else in between, and
+    # each clears the class-level caches so every rep is a cold run. That is the
+    # point: a baseline recorded from one sample is a claim about a machine
+    # state that does not repeat.
+    reps = []
+    corpus_desc = None
+    for _rep in range(cfg.reps):
+        doc = FreeCAD.newDocument("bench")
+        if cfg.corpus == "synthetic":
+            parts, quantities = build_synthetic_corpus(doc, cfg.seed, cfg.quantity)
+            corpus_desc = {"kind": "synthetic", "seed": cfg.seed,
+                           "labels": sorted(quantities)}
+        elif cfg.corpus == "heavy":
+            parts, quantities = hc.build_heavy_corpus(
+                doc, cfg.seed, cfg.quantity, cfg.per_label_quantities)
+            corpus_desc = {"kind": "heavy", "seed": cfg.seed,
+                           "labels": sorted(quantities),
+                           "quantities": dict(quantities)}
+        else:
+            if not os.path.exists(cfg.corpus):
+                emit(f"ERROR: corpus not found: {cfg.corpus}")
+                return 2
+            source = FreeCAD.openDocument(cfg.corpus)
+            parts = discover_doc_parts(source)
+            # Previously hardcoded to 1, which silently ignored
+            # NEST_BENCH_QUANTITY: quantity 2 and quantity 5 produced byte-identical
+            # runs. Real workloads are not uniform either -- the notebook's n70
+            # configuration is 2 Spacer, 60 Bottle Top, 60 Bottle Bottom -- so
+            # NEST_BENCH_QUANTITIES takes per-label overrides and quantity is the
+            # fallback for anything not named.
+            quantities = {p.Label: cfg.per_label_quantities.get(p.Label, cfg.quantity)
+                          for p in parts}
+            missing = [label for label in cfg.per_label_quantities
+                       if label not in quantities]
+            if missing:
+                emit(f"ERROR: NEST_BENCH_QUANTITIES names labels not in the "
+                     f"corpus: {missing}. Available: {sorted(quantities)}")
+                return 2
+            corpus_desc = {"kind": "fcstd", "path": cfg.corpus,
+                           "quantities": dict(quantities),
+                           "labels": sorted(quantities)}
+        if not parts:
+            emit("ERROR: corpus produced no parts")
+            return 2
+        result, perf, dead_ring, wall, peak_rss = run_nest(
+            doc, parts, quantities, cfg)
+        reps.append({"result": result, "perf": perf,
+                     "dead_ring": dead_ring, "wall": wall, "peak_rss": peak_rss})
+
+    result_fields = list(reps[0]["result"].keys())
+    perf_list = [r["perf"] for r in reps]
+    results = [r["result"] for r in reps]
+    unstable_counts, unstable_timings, unstable_results = hc.classify_stability(
+        perf_list, results)
+
+    # A result field that moves is a packing change, which the gate reports
+    # anyway. Counts that move at width 1 mean the run is not comparable.
+    if unstable_results:
+        emit("")
+        emit("ERROR: the packing result differed between reps: "
+             f"{unstable_results}. Not a comparable run.")
+        return 3
+
+    walls = [r["wall"] for r in reps]
+    if unstable_counts and cfg.rotation_workers == 1:
+        emit("")
+        emit("ERROR: these work counts are not reproducible at rotation width 1, "
+             f"so this run is not comparable: {unstable_counts}")
+        emit("  A count that should be exact has drifted. Do not average it --")
+        emit("  find out why.")
+        return 3
+    if unstable_counts:
+        emit("")
+        emit(f"NOTE: {len(unstable_counts)} work counts moved because rotation "
+             f"width is {cfg.rotation_workers}, where one shared random.Random is "
+             f"consumed by concurrent threads and tie-breaks are not stable.")
+        emit("  Recording the first value; treat these as indicative only.")
+
+    # Timings: minimum of N is the only defensible estimator. Counts are never
+    # averaged -- see hc.collapse.
+    perf = hc.collapse(perf_list)
+
+    result = reps[0]["result"]
+    dead_ring = reps[0]["dead_ring"]
+    # ru_maxrss is a process high-water mark, so the honest figure across reps is
+    # the largest, not the smallest or the first.
+    rss_values = [r["peak_rss"] for r in reps if r["peak_rss"] is not None]
+    peak_rss = max(rss_values) if rss_values else None
+    record = build_record(cfg, corpus_desc, result, perf, dead_ring, min(walls),
+                          peak_rss)
+    record["noise"] = hc.noise_block(cfg.reps, cfg.rotation_workers,
+                                     unstable_counts, unstable_timings, walls)
+    print_record(record)
+
+    problems = validate_perf(perf)
+    if problems:
+        emit("")
+        emit("ERROR: the run's own instrumentation is not self-consistent, so "
+             "this is not a comparable run:")
+        for problem in problems:
+            emit(f"  - {problem}")
+        return 3
+
+    if not dead_ring:
+        # A run with the optimisation silently off is not a usable reference.
+        # Fail loudly rather than record a baseline that would let a later
+        # regression in dead-ring pruning pass unnoticed.
+        emit("")
+        emit("ERROR: dead-ring pruning produced no counters, so it was not "
+             "active for this run. Refusing to record or compare a baseline "
+             "that does not exercise the optimisation.")
+        return 3
+
+    if cfg.out:
+        os.makedirs(os.path.dirname(os.path.abspath(cfg.out)), exist_ok=True)
+        with open(cfg.out, "w") as handle:
+            json.dump(record, handle, indent=2, sort_keys=True)
+        emit(f"\nwrote {cfg.out}")
+
+    if cfg.baseline:
+        with open(cfg.baseline) as handle:
+            baseline = json.load(handle)
+        if baseline.get("schema") != SCHEMA_VERSION:
+            emit(f"ERROR: baseline schema {baseline.get('schema')} != {SCHEMA_VERSION}")
+            return 2
+        if baseline.get("corpus", {}).get("kind") != corpus_desc["kind"]:
+            emit("ERROR: baseline corpus kind does not match this run")
+            return 2
+        if baseline.get("config", {}).get("rotation_workers") != cfg.rotation_workers:
+            emit("ERROR: baseline was recorded at a different rotation worker "
+                 f"width ({baseline['config'].get('rotation_workers')} vs "
+                 f"{cfg.rotation_workers}); its work counts are not comparable")
+            return 2
+        if baseline.get("config", {}).get("candidate_geometry_cache") != \
+                cfg.candidate_geometry_cache:
+            emit("ERROR: baseline was recorded with the candidate-geometry cache "
+                 f"{'on' if cfg.candidate_geometry_cache else 'off'} and this run "
+                 f"has it {'on' if cfg.candidate_geometry_cache else 'off'}")
+            return 2
+        # The remaining workload-defining fields. Without these a changed sheet
+        # or rotation count is reported as a GATE FAILED regression, which is
+        # both wrong -- nothing regressed, the workload is simply different --
+        # and dangerous, because the obvious "fix" for a failing gate is to
+        # change the code.
+        for key in ("sheet", "quantity", "per_label_quantities",
+                    "rotation_steps", "spacing", "deflection", "simplification",
+                    "seed"):
+            was = baseline.get("config", {}).get(key)
+            now = cfg.as_dict().get(key)
+            if was != now:
+                emit(f"ERROR: baseline {key}={was!r} but this run used {now!r}. "
+                     f"That is a different workload, not a regression.")
+                return 2
+        return 0 if compare(record, baseline, cfg.allow_fewer_placed) else 1
+
+    return 0
+
+
+if __name__ in ("__main__", "nest_benchmark"):
+    try:
+        _status = main()
+    except Exception:
+        traceback.print_exc()
+        _status = 3
+    # freecadcmd does not reliably propagate a script's exit code, so the
+    # status is also written where CI can read it.
+    try:
+        with open(STATUS_FILE, "w") as _handle:
+            _handle.write(str(_status))
+    except OSError:
+        pass
+    sys.exit(_status)

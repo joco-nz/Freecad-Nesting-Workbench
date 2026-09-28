@@ -8,7 +8,7 @@ and managing CAM jobs from the nested layouts.
 
 import FreeCAD
 from ...constants import *
-from ...freecad_helpers import get_nested_containers
+from ...freecad_helpers import get_nested_containers, set_visibility
 
 class CAMManager:
     """Manages the creation of FreeCAD CAM jobs from nested layouts."""
@@ -150,22 +150,19 @@ class CAMManager:
         if parts_shapes:
             parts_compound = self.doc.addObject("Part::Feature", f"CAM_Parts_{sheet_group.Label}")
             parts_compound.Shape = Part.Compound(parts_shapes)
-            if hasattr(parts_compound, 'ViewObject') and parts_compound.ViewObject:
-                parts_compound.ViewObject.Visibility = False
+            set_visibility(parts_compound, False)
             all_models.append(parts_compound)
         
         if labels_shapes:
             labels_compound = self.doc.addObject("Part::Feature", f"CAM_Labels_{sheet_group.Label}")
             labels_compound.Shape = Part.Compound(labels_shapes)
-            if hasattr(labels_compound, 'ViewObject') and labels_compound.ViewObject:
-                labels_compound.ViewObject.Visibility = False
+            set_visibility(labels_compound, False)
             all_models.append(labels_compound)
         
         if outlines_shapes:
             outlines_compound = self.doc.addObject("Part::Feature", f"CAM_Outlines_{sheet_group.Label}")
             outlines_compound.Shape = Part.Compound(outlines_shapes)
-            if hasattr(outlines_compound, 'ViewObject') and outlines_compound.ViewObject:
-                outlines_compound.ViewObject.Visibility = False
+            set_visibility(outlines_compound, False)
             all_models.append(outlines_compound)
         
         # Use GUI Create function which properly sets up all Model-Job linking
@@ -234,8 +231,7 @@ class CAMManager:
                     for model in all_models:
                          cam_group.addObject(model)
                          # Ensure individual models are visible
-                         if hasattr(model, 'ViewObject') and model.ViewObject:
-                             model.ViewObject.Visibility = True
+                         set_visibility(model, True)
                     
                     # Create a parent group for the sheet's CAM artifacts
                     parent_group_name = f"CAM_Sheet_{sheet_group.Label}"
@@ -249,8 +245,7 @@ class CAMManager:
                     parent_group.addObject(cam_group)
                     
                     # Ensure the geometry group is visible so user can see what's being cut
-                    if hasattr(cam_group, 'ViewObject') and cam_group.ViewObject:
-                        cam_group.ViewObject.Visibility = True
+                    set_visibility(cam_group, True)
                         
                 except Exception as e:
                     FreeCAD.Console.PrintWarning(f"Could not group CAM geometry: {e}\n")

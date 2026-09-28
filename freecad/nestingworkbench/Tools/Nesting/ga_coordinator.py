@@ -9,9 +9,35 @@ import math
 import random
 import time
 from ...datatypes.shape import Shape
+from ...constants import CANDIDATE_GEOMETRY_CACHE_DEFAULT
+from ...freecad_helpers import set_visibility, refresh_gui
 from .layout_manager import LayoutManager
+
+# How long the error path waits for the main thread to acknowledge a cleanup
+# before giving up and leaving the layouts in the document. Short on purpose:
+# the run has already failed, and an unrecoverable freeze is a far worse outcome
+# than some leftover objects.
+_ERROR_HANDOFFER_TIMEOUT_S = 5.0
 from .algorithms import genetic_utils
 from .algorithms import minkowski_utils
+
+# NFP phase timers, mapped from the engine's accumulated keys to the GA-level
+# names they are stored under. Sums, not the `*_worst` single-NFP figures.
+_NFP_PHASE_S_TO_ENGINE_MS = {
+    'nfp_total_s': 'nfp_phase_total_ms',
+    'nfp_prepare_s': 'nfp_phase_prepare_ms',
+    'nfp_decompose_s': 'nfp_phase_decompose_ms',
+    'nfp_transform_s': 'nfp_phase_transform_ms',
+    'nfp_convex_sum_s': 'nfp_phase_convex_sum_ms',
+    'nfp_convex_prepare_s': 'nfp_phase_convex_prepare_ms',
+    'nfp_convex_merge_s': 'nfp_phase_convex_merge_ms',
+    'nfp_convex_polygon_create_s': 'nfp_phase_convex_polygon_create_ms',
+    'nfp_convex_pair_loop_s': 'nfp_phase_convex_pair_loop_ms',
+    'nfp_union_s': 'nfp_phase_union_ms',
+    'nfp_holes_ifp_s': 'nfp_phase_holes_ifp_ms',
+    'nfp_assemble_s': 'nfp_phase_assemble_ms',
+    'nfp_discretize_s': 'nfp_phase_discretize_ms',
+}
 
 
 def _safe_ratio(numerator, denominator):
@@ -165,6 +191,55 @@ class GACoordinator:
         self._candidate_geometry_key_tracker = None
         self._candidate_geometry_cache = None
         self._layout_perf = None
+        # Set once run() hands a NestingJob back. While it is False the run
+        # owns the document-level master group outright, which is what lets the
+        # finally block in run() dispose it without racing a pending commit.
+        self._job_committed = False
+
+    def _delete_layouts(self, layouts, verbose=False, best_layout=None,
+                        timeout=None):
+        """Delete layouts, on whichever thread is allowed to touch the document.
+
+        FreeCAD document objects must be created and destroyed on the main
+        thread. `run()` executes on the worker's QThread, so when a draw callback
+        is set -- that is, whenever the run is driven from the panel -- the
+        request has to be handed to the callback's owner, exactly as creation
+        already is. Headless has no such restriction and deletes directly.
+
+        `best_layout` is passed through for the caller's own exclusion, and is
+        compared by the receiving handler. The default of None means "delete
+        everything in the list", which is what the callers that have already
+        chosen their victims want.
+
+        `timeout` is passed to a draw callback that accepts one, for the error
+        path: a run that has already failed should give up on the handover
+        quickly and unwind, rather than leave the layouts behind after waiting
+        the full budget. Leaving layouts is recoverable; a freeze is not.
+
+        Not every call site goes through here. `_build_next_generation` deletes
+        directly, because it is delegated whole to the main thread and a nested
+        handover from inside a handler is a wait that can be lost.
+        """
+        victims = [layout for layout in (layouts or ()) if layout is not None]
+        if not victims:
+            return
+        if self.draw_callback:
+            payload = {
+                'cleanup_layouts': True,
+                'layouts': victims,
+                'best_layout': best_layout,
+                'verbose': verbose,
+            }
+            try:
+                self.draw_callback(payload, timeout=timeout)
+            except TypeError:
+                # A draw callback that does not accept a timeout, such as a
+                # harness stub. TypeError from the call itself is not a reason
+                # to skip the deletion.
+                self.draw_callback(payload)
+            return
+        for layout in victims:
+            self.layout_manager.delete_layout(layout, verbose=verbose)
 
     def _record_layout_time(self, key, seconds):
         """Adds to a layout-management sub-phase timer (Performance Logging only)."""
@@ -246,10 +321,38 @@ class GACoordinator:
         self._ga_perf['sheet_difference_s'] += stats.get('sheet_difference_ms', 0.0) / 1000
         self._ga_perf['collision_intersection_s'] += stats.get(
             'collision_intersection_ms', 0.0) / 1000
+        # Converted like the lines around it. Absorbing these through the
+        # allowlist loop instead lands milliseconds in a dict whose siblings are
+        # all seconds -- which is how the first version read 22184.8 beside a
+        # collision total of 89.6.
+        for _ms_key, _s_key in (
+                ('collision_intersects_ms', 'collision_intersects_s'),
+                ('collision_overlay_ms', 'collision_overlay_s'),
+                ('collision_hole_probe_ms', 'collision_hole_probe_s'),
+                ('nfp_candidate_generation_ms', 'candidate_generation_s'),
+                ('nfp_candidate_incremental_ms', 'candidate_incremental_s')):
+            self._ga_perf[_s_key] = self._ga_perf.get(_s_key, 0.0) + stats.get(
+                _ms_key, 0.0) / 1000
         self._ga_perf['placement_wall_s'] += stats.get('placement_wall_ms', 0.0) / 1000
         self._ga_perf['rotation_wall_s'] += stats.get('rotation_wall_ms', 0.0) / 1000
         self._ga_perf['candidate_evaluation_wall_s'] += stats.get(
             'candidate_evaluation_wall_ms', 0.0) / 1000
+        # NFP phase breakdown, now that the engine accumulates it. nfp_compute_s
+        # above is the whole NFP; these say where inside it the time goes, at the
+        # GA level where the aggregation is actually useful. Aggregates only --
+        # the per-phase `*_worst` figures are single-NFP noise and are left in
+        # the per-layout stats.
+        for ga_key, engine_key in _NFP_PHASE_S_TO_ENGINE_MS.items():
+            self._ga_perf[ga_key] += stats.get(engine_key, 0.0) / 1000
+        # Convex-pair work count, the machine-independent measure of NFP work.
+        # convex_sum_ms is wall clock and noisy; this is not.
+        self._ga_perf['nfp_convex_pairs'] += stats.get('nfp_work_convex_pairs', 0)
+        self._ga_perf['nfp_pieces_a'] += stats.get('nfp_work_parts_a', 0)
+        self._ga_perf['nfp_pieces_b'] += stats.get('nfp_work_parts_b', 0)
+        # Swallowed NFP failures. Each is an exception caught by
+        # _compute_nfp_uncached's broad except that then silently removes a
+        # placement region, so a run with any of these is not comparable.
+        self._ga_perf['nfp_errors'] += stats.get('nfp_nfp_errors', 0)
         for key in ('rotation_evaluations', 'successful_rotations',
                     'candidate_points', 'valid_candidate_points',
                     'bounds_survivors', 'sheet_candidates', 'sheet_rejections',
@@ -260,6 +363,36 @@ class GACoordinator:
                     'bbox_overlap_pairs', 'exact_collision_checks',
                     'collision_intersects_true', 'collision_intersects_false',
                     'collision_grazing_pairs',
+                    # How the grazing pairs are rejected, split. `grazing_pairs`
+                    # counts every intersects-True pair whose area came out at
+                    # or below tolerance, which conflates two different things:
+                    # an exact boundary touch, where the intersection area is
+                    # identically zero, and a positive sliver that only clears
+                    # the bar because of floating-point noise. The first is what
+                    # an `overlaps or contains` predicate also rejects; the
+                    # second is not. So the split decides whether replacing the
+                    # overlay with a predicate is equivalent, and it is the
+                    # number RESULTS-collision.md was missing on the workload
+                    # that matters.
+                    'collision_overlay_area_zero',
+                    'collision_overlay_area_sub_tol',
+                    'collision_overlay_area_over_tol',
+                    'collision_overlay_area_total',
+                    # The collision stage's own call counts. Its two timings
+                    # are NOT here: they are converted to seconds by an explicit
+                    # loop above, because this allowlist adds raw.
+                    'collision_intersects_calls', 'collision_overlay_calls',
+                    # NFP candidate generation: turning an NFP that already
+                    # exists into candidate points. `nfp_compute` only covers
+                    # building the NFP, so this stage had no GA-level figure at
+                    # all -- it was timed in the engine and then only logged.
+                    # The split matters: `_calls` is every evaluation, while
+                    # `_incremental_calls` is the subset that actually extended
+                    # a cached entry, so the ratio says whether the cost is the
+                    # work or the bookkeeping.
+                    'nfp_candidate_generation_calls',
+                    'nfp_candidate_incremental_calls',
+                    'nfp_candidate_points_returned',
                     'mask_hole_rings', 'mask_hole_vertices',
                     'mask_exterior_vertices', 'mask_hole_sensitive_pairs',
                     'mask_hole_exploiting_placements', 'mask_candidate_rings',
@@ -279,6 +412,12 @@ class GACoordinator:
         # A per-run constant, not an accumulator: every find_best_placement call
         # resolves the same limit, so max() is the honest reduction and also
         # makes a mid-run env change visible instead of averaged away.
+        # The width used by the widest layout, since layouts differ. `auto` is
+        # carried alongside rather than folded in, so a report can distinguish a
+        # chosen width from the inferred one.
+        self._ga_perf['rotation_workers_auto'] = max(
+            self._ga_perf.get('rotation_workers_auto', 0),
+            stats.get('rotation_workers_auto', 0))
         self._ga_perf['rotation_workers'] = max(
             self._ga_perf.get('rotation_workers', 0),
             stats.get('rotation_workers', 0),
@@ -328,6 +467,7 @@ class GACoordinator:
         Returns:
             NestingJob — ready to commit or cancel
         """
+        self._job_committed = False
         # Keep the Shapely-dependent strategy import lazy so importing the
         # panel still works when the optional nesting dependency is missing.
         from .algorithms.nesting_strategy import (
@@ -381,7 +521,7 @@ class GACoordinator:
         if self.draw_callback:
             self.draw_callback({'updateGui_only': True})
         else:
-            FreeCADGui.updateGui()
+            refresh_gui()
         
         if self.draw_callback:
             # Marshal to main thread
@@ -438,6 +578,27 @@ class GACoordinator:
             'collision_intersects_true': 0,
             'collision_intersects_false': 0,
             'collision_grazing_pairs': 0,
+            # The overlay rejection split, and the collision stage's own
+            # decomposition. Absorbed from the per-layout stats by an explicit
+            # allowlist, so every key there must appear here: a key listed in
+            # the allowlist but absent from this initialiser raises KeyError
+            # inside the rotation future loop, where `quiet=True` swallows the
+            # exception and the run reports zero placed parts while looking
+            # healthy.
+            'collision_overlay_area_zero': 0,
+            'collision_overlay_area_sub_tol': 0,
+            'collision_overlay_area_over_tol': 0,
+            'collision_overlay_area_total': 0.0,
+            'collision_intersects_calls': 0,
+            'collision_overlay_calls': 0,
+            'collision_intersects_s': 0.0,
+            'collision_overlay_s': 0.0,
+            'collision_hole_probe_s': 0.0,
+            'candidate_generation_s': 0.0,
+            'candidate_incremental_s': 0.0,
+            'nfp_candidate_generation_calls': 0,
+            'nfp_candidate_incremental_calls': 0,
+            'nfp_candidate_points_returned': 0,
             # Interior-ring population of the collision mask. Measurement-only;
             # see _exact_candidate_mask. These are summed, not maxed, except
             # mask_batch_max.
@@ -456,12 +617,30 @@ class GACoordinator:
             'candidate_geometry_repeats': 0,
             'max_concurrent_rotations': 0,
             'rotation_workers': 0,
+            'rotation_workers_auto': 0,
             'candidate_points': 0,
             'valid_candidate_points': 0,
             'rotation_evaluations': 0,
             'successful_rotations': 0,
             'nfp_cache_hits': 0,
             'nfp_cache_misses': 0,
+            'nfp_total_s': 0.0,
+            'nfp_prepare_s': 0.0,
+            'nfp_decompose_s': 0.0,
+            'nfp_transform_s': 0.0,
+            'nfp_convex_sum_s': 0.0,
+            'nfp_convex_prepare_s': 0.0,
+            'nfp_convex_merge_s': 0.0,
+            'nfp_convex_polygon_create_s': 0.0,
+            'nfp_convex_pair_loop_s': 0.0,
+            'nfp_union_s': 0.0,
+            'nfp_holes_ifp_s': 0.0,
+            'nfp_assemble_s': 0.0,
+            'nfp_discretize_s': 0.0,
+            'nfp_convex_pairs': 0,
+            'nfp_pieces_a': 0,
+            'nfp_pieces_b': 0,
+            'nfp_errors': 0,
             'layout_management_s': 0.0,
             'visualization_s': 0.0,
             'offspring_layouts': 0,
@@ -477,7 +656,8 @@ class GACoordinator:
         )
         self._candidate_geometry_cache = (
             CandidateGeometryCache()
-            if algo_kwargs.get('candidate_geometry_cache', False) else None
+            if algo_kwargs.get('candidate_geometry_cache',
+                              CANDIDATE_GEOMETRY_CACHE_DEFAULT) else None
         )
         if performance_logging:
             FreeCAD.Console.PrintMessage(
@@ -518,7 +698,7 @@ class GACoordinator:
                 if self.draw_callback:
                     self.draw_callback({'updateGui_only': True})
                 else:
-                    FreeCADGui.updateGui()
+                    refresh_gui()
                 self._ga_perf['visualization_s'] += time.perf_counter() - gui_start
                 
                 gen_time, interrupted = self._run_generation(
@@ -621,16 +801,8 @@ class GACoordinator:
             survivors = [l for l in layouts if l is not best_layout]
             cleanup_start = time.perf_counter()
             if survivors:
-                if self.draw_callback:
-                    self.draw_callback({
-                        'cleanup_layouts': True,
-                        'layouts': survivors,
-                        'best_layout': best_layout,
-                        'verbose': verbose,
-                    })
-                else:
-                    for layout in survivors:
-                        self.layout_manager.delete_layout(layout, verbose=verbose)
+                self._delete_layouts(survivors, verbose=verbose,
+                                     best_layout=best_layout)
             self._record_layout_time(
                 'lm_cleanup_s', time.perf_counter() - cleanup_start)
             layouts = [best_layout] if best_layout is not None else []
@@ -705,7 +877,8 @@ class GACoordinator:
                     # Thread-pool width actually used, so an NESTING_ROTATION_WORKERS
                     # A/B is attributable from the log alone. Pair it with
                     # rotation_wall / nesting wall to get realised parallelism.
-                    f"rotation_workers={self._ga_perf['rotation_workers']} "
+                    f"rotation_workers={self._ga_perf['rotation_workers']}"
+                    f"{'(auto)' if self._ga_perf.get('rotation_workers_auto') else ''} "
                     # Dead-ring pruning. Read straight from the module because the
                     # part set it needs is run-global state, not something that
                     # travels the per-generation stats dict. Empty when the
@@ -798,15 +971,42 @@ class GACoordinator:
                     "[GA PERF FINALIZE] "
                     f"finalize_dispatch={self._layout_perf['lm_finalize_s']:.2f}s "
                     f"doc_recompute={self._layout_perf['lm_doc_recompute_s']:.2f}s\n")
+            # A job now owns the masters: NestingJob._promote_masters moves them
+            # out of the shared group into the target layout when the
+            # controller commits. Stops the finally block disposing them first.
+            #
+            # Keyed on the job, not on reaching this line. _dispatch_finalize
+            # runs unconditionally -- the `if best_layout is not None and not
+            # cancel_callback()` guard above wraps only the fill phase -- and
+            # _finalize returns None when there is no best layout, as on a
+            # cancelled or empty run. Setting the flag unconditionally let such
+            # a run claim ownership of masters nothing will ever promote, so
+            # the finally block skipped disposal and the shared group leaked.
+            # Found by tests/freecad_harness/test_ga_loop.py.
+            if job is not None:
+                self._job_committed = True
             return job
 
         except Exception as e:
             import traceback
             FreeCAD.Console.PrintError(f"GA Nesting Error: {e}\n{traceback.format_exc()}\n")
             self._set_status(f"Error: {e}")
+            # On the correct thread. This is the one layout deletion that was
+            # not: it sat directly in the handler, so with a draw callback set
+            # -- that is, in the panel -- it removed document objects from the
+            # worker thread, which FreeCAD does not allow. The layouts then
+            # survived, which is the "temporary folders left behind after an
+            # early exit" report.
+            #
+            # It is also the path most likely to be hit by an early exit, since
+            # a cancel that surfaces as an exception, a geometry failure, or a Qt
+            # error all land here rather than on one of the `break`s.
             if 'layouts' in locals():
-                for layout in layouts:
-                    self.layout_manager.delete_layout(layout)
+                # A short budget, deliberately. This is a failing run: if the
+                # handover cannot be acknowledged, leaving layouts behind is a
+                # far better outcome than blocking a thread until the user kills
+                # the process.
+                self._delete_layouts(layouts, timeout=_ERROR_HANDOFFER_TIMEOUT_S)
             self._dispatch_recompute()
             return None
         finally:
@@ -816,6 +1016,25 @@ class GACoordinator:
                 self._candidate_geometry_key_tracker.clear()
             self._candidate_geometry_cache = None
             self._candidate_geometry_key_tracker = None
+            # Headless runs keep their masters in a document-level group, and
+            # delete_layout cannot reach it: it is not under any layout. A run
+            # that ends without a job -- the cancel `break`, or the exception
+            # handler above -- has nothing that will ever promote those masters,
+            # so they are left visible and orphaned in the document. Measured
+            # before this: 6 objects (master_*, master_shape_*, bound_*), none
+            # under a Layout* group, group still Visibility True.
+            #
+            # Gated on `_job_committed` rather than disposed unconditionally.
+            # The success path hands a NestingJob back to the controller, which
+            # commits it later on the main thread, and in worker mode
+            # _dispatch_finalize may not even have run yet -- disposing there
+            # would delete the masters out from under the pending commit.
+            if not self._job_committed and self.layout_manager is not None:
+                disposed = self.layout_manager.dispose_shared_master_group()
+                if disposed:
+                    FreeCAD.Console.PrintMessage(
+                        f"[GA] Disposed {disposed} orphaned master shape(s) "
+                        f"from the abandoned run\n")
 
     def _dispatch_finalize(self, best_layout, best_efficiency, total_time, target_layout, ui_params):
         """Runs _finalize() and doc.recompute() on the main thread if using a worker."""
@@ -976,9 +1195,9 @@ class GACoordinator:
                         sheet.draw(self.doc, ui_params, layout.layout_group, 
                                    parts_to_place_group=layout.parts_group, verbose=verbose)
                     
-                    if len(layouts) > 1 and layout.layout_group and hasattr(layout.layout_group, "ViewObject"):
-                        layout.layout_group.ViewObject.Visibility = False
-                    FreeCADGui.updateGui()
+                    if len(layouts) > 1 and layout.layout_group:
+                        set_visibility(layout.layout_group, False)
+                    refresh_gui()
             
         return total_time, False
 
@@ -996,9 +1215,18 @@ class GACoordinator:
         # Discarding the outgoing layouts is charged to lm_delete_s (measured
         # inside delete_layout); gene bookkeeping starts after it so the
         # sub-phase timers stay disjoint.
-        for e in elites[1:]: self.layout_manager.delete_layout(e, verbose=verbose)
+        # Direct, not through _delete_layouts. This function is delegated whole
+        # to the main thread when a draw callback is set, so these deletions are
+        # already on the thread that is allowed to make them, and going through
+        # the helper would emit a handover from inside a handler that is itself
+        # serving one -- an emit plus a wait, nested. That was tried, uniformity
+        # was the stated reason, and it was wrong: it added a blocking wait and
+        # a lost acknowledgement can freeze FreeCAD outright.
+        for e in elites[1:]:
+            self.layout_manager.delete_layout(e, verbose=verbose)
         for layout in layouts:
-            if layout not in elites: self.layout_manager.delete_layout(layout, verbose=verbose)
+            if layout not in elites:
+                self.layout_manager.delete_layout(layout, verbose=verbose)
 
         gene_ops_start = time.perf_counter()
         population_size = len(layouts)
@@ -1078,8 +1306,8 @@ class GACoordinator:
         from .nesting_job import NestingJob
         if not best_layout: return None
             
-        if best_layout.layout_group and hasattr(best_layout.layout_group, "ViewObject"):
-            best_layout.layout_group.ViewObject.Visibility = True
+        if best_layout.layout_group:
+            set_visibility(best_layout.layout_group, True)
         
         if not getattr(self, 'is_simulating', False):
             # A headless layout has no FreeCAD part objects yet, and
@@ -1102,13 +1330,25 @@ class GACoordinator:
 
         if best_layout.layout_group and hasattr(best_layout.layout_group, "Group"):
             for child in best_layout.layout_group.Group:
-                if child.Label.startswith("MasterShapes") and hasattr(child, "ViewObject"):
-                    child.ViewObject.Visibility = False
+                if child.Label.startswith("MasterShapes"):
+                    set_visibility(child, False)
         
         best_layout.layout_group.Label = "Layout_temp"
         job = NestingJob.from_ga_result(
             doc=self.doc, target_layout=target_layout, params=ui_params, preparer=self.shape_preparer,
-            layout_group=best_layout.layout_group, parts_group=best_layout.parts_group, sheets=best_layout.sheets
+            layout_group=best_layout.layout_group, parts_group=best_layout.parts_group, sheets=best_layout.sheets,
+            # Headless layouts keep their masters in a document-level group, so
+            # the job cannot find them from the layout alone. Without this the
+            # masters were orphaned outside every layout and the previous run's
+            # master row was never replaced.
+            shared_master_group=(self.layout_manager.shared_master_group
+                                 if self.layout_manager else None),
+            # The removal goes through the LayoutManager because it caches the
+            # group reference. Passing the group itself and deleting it from the
+            # job leaves a stale wrapper behind and the next reader raises.
+            dispose_shared_master_group=(
+                self.layout_manager.dispose_shared_master_group
+                if self.layout_manager else None),
         )
         
         unplaced_count = len(getattr(best_layout, 'unplaced', []) or [])

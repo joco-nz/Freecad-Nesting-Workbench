@@ -22,7 +22,13 @@ except ImportError:
     Draft = None
 
 from .label_object import create_label_object
-from ..freecad_helpers import calculate_label_placement, create_part_feature, recursive_delete
+from ..freecad_helpers import (
+    calculate_label_placement,
+    create_part_feature,
+    recursive_delete,
+    get_view_object,
+    set_visibility,
+)
 
 class Sheet:
     """
@@ -147,8 +153,9 @@ class Sheet:
                 doc, sheet_boundary_name, Part.makePlane(self.width, self.height), group=sheet_group, visible=True
             )
             sheet_obj.Placement = FreeCAD.Placement(sheet_origin, FreeCAD.Rotation())
-            if FreeCAD.GuiUp and hasattr(sheet_obj, "ViewObject") and sheet_obj.ViewObject:
-                sheet_obj.ViewObject.Transparency = 75
+            sheet_view = get_view_object(sheet_obj)
+            if sheet_view is not None:
+                sheet_view.Transparency = 75
 
             # Draw the parts placed on this sheet
             for placed_part in self.parts:
@@ -162,12 +169,12 @@ class Sheet:
                 sim_boundary = create_part_feature(
                     doc, sim_boundary_name, Part.makePlane(self.width, self.height), visible=True
                 )
-                if FreeCAD.GuiUp and hasattr(sim_boundary, "ViewObject") and sim_boundary.ViewObject:
-                    sim_boundary.ViewObject.Transparency = 75
-                    sim_boundary.ViewObject.DisplayMode = "Flat Lines"
+                sim_view = get_view_object(sim_boundary)
+                if sim_view is not None:
+                    sim_view.Transparency = 75
+                    sim_view.DisplayMode = "Flat Lines"
             sim_boundary.Placement = FreeCAD.Placement(sheet_origin, FreeCAD.Rotation())
-            if FreeCAD.GuiUp and hasattr(sim_boundary, "ViewObject"):
-                sim_boundary.ViewObject.Visibility = True
+            set_visibility(sim_boundary, True)
             
             # Draw all parts already placed on this sheet
             for placed_part in self.parts:
@@ -214,21 +221,20 @@ class Sheet:
             boundary_obj.Placement = FreeCAD.Placement()
             container.addObject(boundary_obj)
 
-            if hasattr(boundary_obj, "ViewObject"):
-                boundary_obj.ViewObject.Visibility = container.ShowBounds
+            boundary_view = get_view_object(boundary_obj)
+            if boundary_view is not None:
+                boundary_view.Visibility = container.ShowBounds
                 # Set red color for bounds
-                boundary_obj.ViewObject.LineColor = (1.0, 0.0, 0.0)  # Red
-                boundary_obj.ViewObject.LineWidth = 2.0
+                boundary_view.LineColor = (1.0, 0.0, 0.0)  # Red
+                boundary_view.LineWidth = 2.0
 
         # The shape_obj already has the correct placement (centered + rotated)
         # from shape_preparer, so we don't touch it. Just add to container.
 
-        if hasattr(shape_obj, "ViewObject"):
-            shape_obj.ViewObject.Visibility = True
+        set_visibility(shape_obj, True)
         container.addObject(shape_obj)
 
-        if hasattr(container, "ViewObject"):
-            container.ViewObject.Visibility = True
+        set_visibility(container, True)
 
         # Unlink from the temporary "PartsToPlace" bin so cleanup doesn't delete them
         if parts_to_place_group:
@@ -302,13 +308,13 @@ class Sheet:
 
     def _draw_simulation_part(self, shape_obj, final_placement):
         """Draw a part for simulation/preview: move the boundary object and hide the shape."""
-        if hasattr(shape_obj, 'ViewObject'):
-            shape_obj.ViewObject.Visibility = False
+        set_visibility(shape_obj, False)
 
         if hasattr(shape_obj, 'BoundaryObject') and shape_obj.BoundaryObject:
             boundary = shape_obj.BoundaryObject
             boundary.Placement = final_placement
-            if hasattr(boundary, 'ViewObject'):
-                boundary.ViewObject.Visibility = True
-                boundary.ViewObject.LineColor = (0.0, 0.7, 0.0)  # Green for simulation
-                boundary.ViewObject.LineWidth = 2.0
+            boundary_view = get_view_object(boundary)
+            if boundary_view is not None:
+                boundary_view.Visibility = True
+                boundary_view.LineColor = (0.0, 0.7, 0.0)  # Green for simulation
+                boundary_view.LineWidth = 2.0

@@ -1,0 +1,25 @@
+{
+  "arms": {
+    "off": {
+      "candidate_geometry_ms": 10756.667886977084,
+      "fingerprint": "(2, 122, 0, 0.418433, (('Bottle Bottom', 60), ('Bottle Top', 60), ('Spacer', 2)))",
+      "hits": 0,
+      "median_wall": 72.74777688199538,
+      "min_wall": 72.68843306400231,
+      "misses": 0,
+      "spread": 0.9270488150068559
+    },
+    "on": {
+      "candidate_geometry_ms": 886.3168251991738,
+      "fingerprint": "(2, 122, 0, 0.418433, (('Bottle Bottom', 60), ('Bottle Top', 60), ('Spacer', 2)))",
+      "hits": 423903,
+      "median_wall": 62.89155615400523,
+      "min_wall": 62.714865152025595,
+      "misses": 35781,
+      "spread": 0.48384960199473426
+    }
+  },
+  "corpus": "tests/Test_Files/n70-intercooler-spacer-bottle-nesting.FCStd",
+  "layout_neutral": true,
+  "reps": 3
+}

@@ -19,7 +19,7 @@ import time
 import traceback
 from .shape_preparer import ShapePreparer
 from ...datatypes.shape import Shape
-from ...freecad_helpers import recursive_delete, create_part_feature
+from ...freecad_helpers import recursive_delete, create_part_feature, set_visibility
 
 try:
     from shapely.geometry import Polygon
@@ -171,6 +171,47 @@ class LayoutManager:
             self._perf_inc('lm_master_group_objects_created')
         return self._shared_master_group
 
+    @property
+    def shared_master_group(self):
+        """The document-level master group, or None in simulate mode.
+
+        Read-only, and does NOT create the group -- the caller may just be
+        inspecting. NestingJob needs this to find the masters when the winning
+        layout has no MasterShapes child of its own.
+        """
+        return self._shared_master_group
+
+    def dispose_shared_master_group(self):
+        """Deletes the document-level master group, if this manager owns one.
+
+        The group is run-scoped, but it is parented at document level and
+        therefore survives the teardown of every layout in the run:
+        `delete_layout` cannot reach it, because it is not under a layout. On a
+        cancelled or failed run nothing else removes it, which left a visible
+        master row orphaned in the document -- measured: 6 objects
+        (master_*, master_shape_*, bound_*), none under any Layout* group.
+
+        Only correct to call when no NestingJob will commit the masters, since
+        that is what promotes them out of this group. On the success path
+        NestingJob._promote_masters empties the group instead, and an empty
+        group is harmless -- so this is for the cancel and error paths.
+
+        Idempotent: a second call, or a call with no group, does nothing.
+        """
+        group = self._shared_master_group
+        if group is None:
+            return 0
+        # The cached reference is cleared first: recursive_delete removes the
+        # C++ object, and a later caller holding the stale wrapper would raise
+        # rather than see None.
+        self._shared_master_group = None
+        if self.doc.getObject(group.Name) is None:
+            return 0
+        count = len(getattr(group, "Group", []) or [])
+        recursive_delete(self.doc, group)
+        self._perf_inc('lm_shared_master_group_disposed')
+        return count
+
     def create_layout(self, name, master_shapes_map, quantities, ui_params, 
                       chromosome_ordering=None) -> Layout:
         """
@@ -192,8 +233,7 @@ class LayoutManager:
         group_start = time.perf_counter()
         layout_group = self.doc.addObject("App::DocumentObjectGroup", name)
         layout_group.Label = name
-        if hasattr(layout_group, "ViewObject"):
-            layout_group.ViewObject.Visibility = True
+        set_visibility(layout_group, True)
         
         # Create parts bin
         parts_group = self.doc.addObject("App::DocumentObjectGroup", "PartsToPlace")
@@ -217,12 +257,18 @@ class LayoutManager:
         self._perf_add('lm_prepare_parts_s', time.perf_counter() - prepare_start)
         self._perf_inc('lm_parts_created', len(parts))
 
-        # Get master shapes group
+        # Get master shapes group. Headless layouts keep their masters in the
+        # document-level shared group (see _get_shared_master_group), so that
+        # loop never matches and the Layout was left with master_shapes_group
+        # set to None for the whole run -- which is what left NestingJob.commit
+        # unable to find the masters to promote.
         master_shapes_group = None
         for child in layout_group.Group:
             if child.Label == "MasterShapes":
                 master_shapes_group = child
                 break
+        if master_shapes_group is None:
+            master_shapes_group = self._shared_master_group
         
         # Apply chromosome ordering if provided
         order_start = time.perf_counter()

@@ -10,7 +10,12 @@ from .algorithms import shape_processor
 from .algorithms import minkowski_utils
 from ...datatypes.shape_object import create_shape_object
 from ...datatypes.shape import Shape
-from ...freecad_helpers import get_up_direction_rotation, create_part_feature
+from ...freecad_helpers import (
+    get_up_direction_rotation,
+    create_part_feature,
+    get_view_object,
+    set_visibility,
+)
 
 class ShapePreparer:
     """
@@ -274,8 +279,7 @@ class ShapePreparer:
             self._perf_inc('lm_master_group_objects_created')
         
         # Make MasterShapes visible during nesting (will be hidden after commit)
-        if hasattr(master_shapes_group, "ViewObject"):
-            master_shapes_group.ViewObject.Visibility = True
+        set_visibility(master_shapes_group, True)
         return master_shapes_group
 
     def _create_temp_from_reloading(self, master_obj, label, quantities, temp_shape_wrapper, spacing, deflection, simplification, cache_key, layout_obj, master_shapes_group, verbose=False):
@@ -328,10 +332,8 @@ class ShapePreparer:
             temp_master_obj.BoundaryObject = temp_bound
         
         # Shape visible, container visible during nesting
-        if hasattr(temp_master_obj, "ViewObject"): 
-            temp_master_obj.ViewObject.Visibility = True
-        if hasattr(temp_container, "ViewObject"): 
-            temp_container.ViewObject.Visibility = True
+        set_visibility(temp_master_obj, True)
+        set_visibility(temp_container, True)
 
         part_params = quantities.get(original_label, {'quantity': 1})
         if isinstance(part_params, tuple):
@@ -434,8 +436,7 @@ class ShapePreparer:
         master_container.addProperty("App::PropertyBool", "FillSheet", "Nest", "Use to fill remaining space").FillSheet = fill_sheet
         master_container.addProperty("App::PropertyVector", "SourceCentroid", "Nesting", "Original geometry center").SourceCentroid = source_centroid
 
-        if hasattr(master_container, "ViewObject"):
-            master_container.ViewObject.Visibility = True
+        set_visibility(master_container, True)
             
         return master_container, up_direction
 
@@ -513,8 +514,7 @@ class ShapePreparer:
                 boundary_obj.Placement = FreeCAD.Placement()
                 master_shape_obj.BoundaryObject = boundary_obj
                 master_shape_obj.ShowBounds = False
-                if hasattr(boundary_obj, "ViewObject"): 
-                    boundary_obj.ViewObject.Visibility = False
+                set_visibility(boundary_obj, False)
                 if verbose:
                     FreeCAD.Console.PrintMessage(f"     Bounds centroid from polygon: {temp_shape_wrapper.polygon.centroid}\n")
 

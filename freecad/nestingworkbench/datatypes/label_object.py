@@ -7,13 +7,19 @@ This module defines a custom FreeCAD scripted object for representing a text lab
 
 import FreeCAD
 
+from ..freecad_helpers import get_view_object
+
 class LabelObject:
     """A scripted object representing a text label."""
 
     def __init__(self, obj):
         """Called when a new object is created."""
         obj.Proxy = self
-        obj.ViewObject.Proxy = 0 # Use the default view provider
+        # Use the default view provider. Unguarded this raised AttributeError
+        # under a GUI-less FreeCAD, where ViewObject exists but is None.
+        obj_view = get_view_object(obj)
+        if obj_view is not None:
+            obj_view.Proxy = 0
 
     def execute(self, fp):
         """Called on recompute. Does nothing as shape is set externally."""

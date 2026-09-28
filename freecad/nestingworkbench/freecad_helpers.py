@@ -8,6 +8,74 @@ Consolidates common logic that was previously duplicated in multiple modules.
 
 import FreeCAD
 
+def get_view_object(obj):
+    """
+    Returns obj's ViewObject, or None when there is no GUI to attach one to.
+
+    `hasattr(obj, "ViewObject")` is NOT a sufficient test. Under a GUI-less
+    FreeCAD (freecadcmd, FreeCADCmd, `FreeCAD.GuiUp == False`) the attribute
+    still exists — it is simply None. Guarding on hasattr alone therefore lets
+    a None ViewObject through and the following attribute write raises
+    AttributeError. That is how a headless nesting run ended up silently
+    producing zero parts: every master container raised on
+    `ViewObject.Visibility = True` and was skipped.
+
+    Args:
+        obj: A FreeCAD document object, or None.
+
+    Returns:
+        The ViewObject, or None if obj is None or has no live view.
+    """
+    if obj is None:
+        return None
+    view_object = getattr(obj, "ViewObject", None)
+    return view_object if view_object is not None else None
+
+def set_visibility(obj, visible):
+    """
+    Sets obj's Visibility, tolerating a GUI-less document.
+
+    A no-op when there is no ViewObject. Returns True if the visibility was
+    actually applied, so callers can distinguish "set" from "headless no-op"
+    if they ever need to.
+
+    Args:
+        obj: A FreeCAD document object, or None.
+        visible: The bool to assign to Visibility.
+
+    Returns:
+        bool — whether a ViewObject was present and updated.
+    """
+    view_object = get_view_object(obj)
+    if view_object is None:
+        return False
+    view_object.Visibility = visible
+    return True
+
+def refresh_gui():
+    """Processes pending Qt events, tolerating a GUI-less FreeCAD.
+
+    `FreeCADGui` imports fine under freecadcmd but exposes no `updateGui`, so
+    an unguarded call raises AttributeError partway through a nest. That is
+    what stopped the GA loop running under test at all: GACoordinator.run()
+    died on its first redraw.
+
+    The equivalent of get_view_object's reasoning -- a name being importable
+    says nothing about the attribute existing. This is a no-op with no GUI.
+
+    Returns:
+        bool — whether a GUI was present and the event queue pumped.
+    """
+    try:
+        import FreeCADGui
+
+        if FreeCADGui is None or not hasattr(FreeCADGui, "updateGui"):
+            return False
+        FreeCADGui.updateGui()
+        return True
+    except Exception:
+        return False
+
 def get_up_direction_rotation(up_direction):
     """
     Returns a FreeCAD.Rotation that transforms the given up_direction to Z+.
@@ -205,8 +273,7 @@ def create_part_feature(doc, name, shape, group=None, visible=True):
     obj.Shape = shape
     if group:
         group.addObject(obj)
-    if hasattr(obj, "ViewObject") and obj.ViewObject:
-        obj.ViewObject.Visibility = visible
+    set_visibility(obj, visible)
     return obj
 
 

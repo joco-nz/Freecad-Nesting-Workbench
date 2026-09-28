@@ -14,7 +14,7 @@ from .shape_preparer import ShapePreparer
 from .algorithms import minkowski_utils
 from .layout_manager import LayoutManager, Layout
 from .ga_coordinator import GACoordinator
-from ...freecad_helpers import recursive_delete
+from ...freecad_helpers import recursive_delete, set_visibility
 from ...constants import *
 from .nesting_job import NestingJob
 from ... import DEFAULT_FONT
@@ -24,6 +24,12 @@ try:
     from .visualization_manager import VisualizationManager
 except ImportError:
     pass  # Optional dependency missing, proceed without visualization
+
+# How long a handover to the main thread may take before the worker gives up on
+# it. Generous, because drawing a layout or recomputing a document is real work,
+# but finite, because an unbounded wait on a shared event is a hang.
+_DRAW_HANDOVER_TIMEOUT_S = 300.0
+
 
 class NestingWorker(QThread):
     """Runs nesting computation on a background thread.
@@ -68,11 +74,34 @@ class NestingWorker(QThread):
             import traceback
             self.error_signal.emit(f"{e}\n{traceback.format_exc()}")
     
-    def request_draw_on_main_thread(self, payload):
-        """Called from worker thread. Emits signal and blocks until main thread draws."""
+    def request_draw_on_main_thread(self, payload, timeout=None):
+        """Called from the worker; hand work to the main thread and wait for it.
+
+        Returns True if the main thread acknowledged, False if it did not.
+
+        The wait is bounded. An unbounded wait on a single event shared by
+        every handover is a freeze waiting to happen: if the acknowledgement is
+        lost -- the handler raises, the panel is torn down mid-flight, the
+        coordinator is replaced -- this thread never returns, FreeCAD stops
+        responding, and the only remedy is killing the process. That is not a
+        hypothetical; it is what a report of "FreeCAD locked and became
+        unresponsive" looks like from the inside.
+
+        A timeout converts that into a visible error and an unwinding run.
+        Default is generous, because a legitimate handover -- drawing a whole
+        layout, or finalize plus a document recompute -- can be slow.
+        """
         self._draw_event.clear()
         self.draw_requested.emit(payload)
-        self._draw_event.wait()
+        limit = _DRAW_HANDOVER_TIMEOUT_S if timeout is None else timeout
+        if not self._draw_event.wait(limit):
+            FreeCAD.Console.PrintError(
+                f"[Nesting] Main thread did not acknowledge a "
+                f"{sorted(k for k in payload if k not in ('verbose',))} request "
+                f"within {limit:.0f}s. Continuing without it; the run may be "
+                f"incomplete. This used to block forever.\n")
+            return False
+        return True
     
     def notify_draw_complete(self):
         """Called from main thread after draw finishes."""
@@ -120,8 +149,7 @@ class NestingController:
              return # Standard error handled in helper
              
         is_simulating = self.ui.simulate_nesting_checkbox.isChecked()
-        if hasattr(target_layout, "ViewObject"):
-            target_layout.ViewObject.Visibility = False
+        set_visibility(target_layout, False)
 
         ui_params = self._collect_ui_params()
         ui_params, quantities, master_map, rotation_params = self._collect_job_parameters(ui_params)
@@ -170,8 +198,7 @@ class NestingController:
             seen.add(id(obj))
             saved.append((obj, FreeCAD.Placement(obj.Placement)))
             obj.Placement = FreeCAD.Placement()
-            if hasattr(obj, "ViewObject"):
-                obj.ViewObject.Visibility = False
+            set_visibility(obj, False)
         self._saved_source_placements = saved
         if saved:
             self.doc.recompute()
@@ -515,31 +542,44 @@ class NestingController:
         self._worker.start()
 
     def _handle_draw_request(self, payload):
-        """Main-thread handler for draw requests from worker."""
+        """Main-thread handler for draw requests from worker.
+
+        The worker is captured on entry and used throughout, rather than read
+        from `self._worker` each time. `_on_nesting_finished` and `cancel_job`
+        both set `self._worker = None`, and a `draw_requested` signal already
+        sitting in the event queue can be delivered after that. The old code then
+        raised AttributeError in its `finally`, so `notify_draw_complete` was
+        never called and the worker's `wait()` never returned -- an unrecoverable
+        freeze. With the reference captured, the acknowledgement still happens,
+        and if there is genuinely no worker left there is nothing waiting on it.
+        """
+        worker = self._worker
+        if worker is None:
+            return
         try:
             if payload.get('updateGui_only'):
                 FreeCADGui.updateGui()
             elif payload.get('create_population'):
-                layouts = self._worker.coordinator.layout_manager.create_ga_population(
+                layouts = worker.coordinator.layout_manager.create_ga_population(
                     payload['master_map'], payload['quantities'], 
                     payload['ui_params'], payload['population_size'],
                     payload['rotation_steps'], verbose=payload.get('verbose', False)
                 )
-                self._worker.coordinator._pending_layouts = layouts
+                worker.coordinator._pending_layouts = layouts
             elif payload.get('build_next_generation'):
-                layouts = self._worker.coordinator._build_next_generation(
+                layouts = worker.coordinator._build_next_generation(
                     payload['gen'], payload['layouts'], payload['elites'], 
                     payload['master_map'], payload['quantities'], payload['ui_params'], 
                     payload['rotation_steps'], payload['mutation_rate'], 
                     payload['immigrant_ratio'], payload.get('verbose', False)
                 )
-                self._worker.coordinator._pending_layouts = layouts
+                worker.coordinator._pending_layouts = layouts
             elif payload.get('spawn_fill_part'):
                 payload['result_holder'][0] = payload['spawn_fn']()
             elif payload.get('cleanup_layouts'):
                 for layout in payload['layouts']:
                     if layout != payload['best_layout']:
-                        self._worker.coordinator.layout_manager.delete_layout(layout, verbose=payload.get('verbose', False))
+                        worker.coordinator.layout_manager.delete_layout(layout, verbose=payload.get('verbose', False))
             elif payload.get('sheets'):
                 for sheet in payload['sheets']:
                     sheet.draw(payload['doc'], payload['ui_params'], payload['layout_group'],
@@ -547,12 +587,12 @@ class NestingController:
                               verbose=payload.get('verbose', False))
                 if payload.get('hide_layout'):
                     lg = payload['layout_group']
-                    if lg and hasattr(lg, "ViewObject"):
-                        lg.ViewObject.Visibility = False
+                    if lg:
+                        set_visibility(lg, False)
                 FreeCADGui.updateGui()
             elif payload.get('ga_finalize'):
                 # _finalize() and doc.recompute() must run on main thread (ViewObject + recompute)
-                coordinator = self._worker.coordinator
+                coordinator = worker.coordinator
                 job = coordinator._finalize(
                     payload['best_layout'], payload['best_efficiency'],
                     payload['total_time'], payload['target_layout'], payload['ui_params']
@@ -562,12 +602,12 @@ class NestingController:
                 coordinator.doc.recompute()
                 coordinator._record_doc_recompute(time.perf_counter() - recompute_start)
             elif payload.get('doc_recompute_only'):
-                coordinator = self._worker.coordinator
+                coordinator = worker.coordinator
                 recompute_start = time.perf_counter()
                 coordinator.doc.recompute()
                 coordinator._record_doc_recompute(time.perf_counter() - recompute_start)
         finally:
-            self._worker.notify_draw_complete()
+            worker.notify_draw_complete()
 
     def _on_nesting_finished(self, job):
         """Main-thread handler for nesting completion."""
@@ -605,15 +645,15 @@ class NestingController:
             
             self.ui.current_layout = final_layout
             
-            if final_layout and hasattr(final_layout, "ViewObject"):
-                final_layout.ViewObject.Visibility = True
-                
+            if final_layout:
+                set_visibility(final_layout, True)
+
             if final_layout and hasattr(final_layout, "Group"):
                 for child in final_layout.Group:
-                    if child.Label.startswith("MasterShapes") and hasattr(child, "ViewObject"):
-                        child.ViewObject.Visibility = False
-                    elif child.Label.startswith("Sheet_") and hasattr(child, "ViewObject"):
-                        child.ViewObject.Visibility = True
+                    if child.Label.startswith("MasterShapes"):
+                        set_visibility(child, False)
+                    elif child.Label.startswith("Sheet_"):
+                        set_visibility(child, True)
             
             self.current_job = None
             FreeCAD.Console.PrintMessage("Job Finalized & Committed.\n")
@@ -661,15 +701,14 @@ class NestingController:
                             self.ui.current_layout = None
                         FreeCAD.Console.PrintMessage("Removed empty target layout.\n")
                     else:
-                        if hasattr(target, "ViewObject"):
-                            target.ViewObject.Visibility = True
-                        
+                        set_visibility(target, True)
+
                         if hasattr(target, "Group"):
                             for child in target.Group:
-                                if child.Label.startswith("Sheet_") and hasattr(child, "ViewObject"):
-                                    child.ViewObject.Visibility = True
-                                if child.Label.startswith("MasterShapes") and hasattr(child, "ViewObject"):
-                                    child.ViewObject.Visibility = False
+                                if child.Label.startswith("Sheet_"):
+                                    set_visibility(child, True)
+                                if child.Label.startswith("MasterShapes"):
+                                    set_visibility(child, False)
                 except Exception as e:
                     FreeCAD.Console.PrintWarning(f"[NestingController] Cancel cleanup failed for child: {e}\n")
             
@@ -699,13 +738,11 @@ class NestingController:
             
             if obj.Label.startswith("boundary_"):
                 found_count += 1
-                if hasattr(obj, "ViewObject"):
-                    obj.ViewObject.Visibility = is_visible
-                    
+                set_visibility(obj, is_visible)
+
             if hasattr(obj, "BoundaryObject") and obj.BoundaryObject:
                 found_count += 1
-                if hasattr(obj.BoundaryObject, "ViewObject"):
-                    obj.BoundaryObject.ViewObject.Visibility = is_visible
+                set_visibility(obj.BoundaryObject, is_visible)
                 
             if hasattr(obj, "Group"):
                 for child in obj.Group:
@@ -794,11 +831,16 @@ class NestingController:
         prefs.SetFloat("GACompactnessWeight", float(settings['compactness_weight']))
         prefs.SetBool(
             "CandidateGeometryCache",
-            bool(settings.get('candidate_geometry_cache', False)),
+            bool(settings.get('candidate_geometry_cache',
+                               CANDIDATE_GEOMETRY_CACHE_DEFAULT)),
         )
         
         mink_steps = int(360 / self.ui.rotation_angles[self.ui.minkowski_rotation_steps_slider.value()])
         prefs.SetInt("MinkowskiRotationSteps", mink_steps)
+        prefs.SetFloat("MinkowskiStepSize",
+                       float(self.ui.minkowski_step_size_input.value()))
+        prefs.SetInt("MinkowskiRotationWorkers",
+                     int(self.ui.minkowski_rotation_workers_input.value()))
         
         phys_angles = PHYSICS_ROTATION_PRESETS
         phys_steps = int(360 / phys_angles[self.ui.physics_rotation_steps_slider.value()])
@@ -905,8 +947,15 @@ class NestingController:
             algo_kwargs['generations'] = self.ui.minkowski_generations_input.value()
             algo_kwargs['clear_nfp_cache'] = self.ui.clear_cache_checkbox.isChecked()
             algo_kwargs['candidate_geometry_cache'] = ui_params.get(
-                'candidate_geometry_cache', False
+                'candidate_geometry_cache', CANDIDATE_GEOMETRY_CACHE_DEFAULT
             )
+            # The two performance dials. 0 threads means "auto" and is passed
+            # through as 0 so the nester can tell "user chose auto" from
+            # "nobody said anything" -- both land on the stdlib default, but
+            # only one of them is a decision.
+            algo_kwargs['step_size'] = self.ui.minkowski_step_size_input.value()
+            algo_kwargs['rotation_workers'] = (
+                self.ui.minkowski_rotation_workers_input.value())
 
         algo_kwargs['spacing'] = ui_params['spacing']
         algo_kwargs['random_seed'] = ui_params.get('random_seed')
