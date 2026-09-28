@@ -526,6 +526,14 @@ useful outcome.
   bit-identical — a regression recovered, **not** a gain over main. It does not
   show on a GA run of that configuration, where NFP construction is 4.5% of the
   total.
+- [RESULTS-parallelism.md](RESULTS-parallelism.md) — where the n70 GA run's time
+  goes, and the search for 20–30 s. The answer is mostly not an optimisation:
+  the rotation pool defaults to `cpu_count() + 4` (8 threads on a 4-CPU box) and
+  4 workers is **22.3% faster than 1 and 8 is no better than 1** — 41.6 s, with
+  packing density bit-identical. Also the three optimisations that were measured
+  and rejected: body-only overlays (2.9× on the Spacer, weighted 1.11×),
+  `shapely.prepare` (no effect), and `overlaps or contains` (13.3× cheaper and
+  wrong). The remaining lever is the unmeasured `step_size` density dial.
 - [RESULTS-collision.md](RESULTS-collision.md) — the collision stage decomposed
   into overlay 65.6% / `intersects` 24.7% / bookkeeping 9.7% on the n70 GA run,
   where it is 49% of wall. Replacing the overlay with `overlaps or contains` is
