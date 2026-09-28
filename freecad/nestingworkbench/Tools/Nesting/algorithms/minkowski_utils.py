@@ -11,6 +11,7 @@ import time
 import threading
 from concurrent.futures import Future
 import numpy as np
+import shapely  # for _merge_convex_parts, ported from main
 from shapely import GeometryType, from_ragged_array
 from shapely.geometry import Polygon, MultiPoint
 from shapely.ops import unary_union, triangulate
@@ -284,6 +285,73 @@ def decompose_if_needed(polygon, logger):
             Shape.decomposition_inflight.pop(cache_key, None)
 
 
+# Ported from main@eac1e30 as-is. This branch previously had NO merge at all:
+# the earlier attempt (c43b0a1, reverted -- see make-faster.md "Greedy
+# convex-piece merging rejected") was an O(n^3) variant that broke out of both
+# loops and restarted the whole scan after every single merge, and it left only
+# the dead `merged_pieces` plumbing behind.
+#
+# A branch-local rewrite was written and measured against this, then dropped in
+# favour of converging on main. Both were run on the real n70 parts, on identical
+# input:
+#
+#     polygon        holes    raw   main pc   main ms   alt pc   alt ms   symdiff
+#     Spacer            13    442       194    541.2      193    48.4   0.0
+#     Bottle Top         3     72        25     17.4       27     7.8   0.0
+#     Bottle Bottom      2     67        22     14.6       24     7.2   0.0
+#     Sketch             0    107        18     25.9       19    11.6   0.0
+#
+# The alternative was an adjacency-restricted pass (shared boundary edge only,
+# O(E) with union-find) and it is 2-11x cheaper to compute. It was dropped
+# anyway: the piece counts are within +/-2 and NOT uniformly in its favour --
+# coarser on the Spacer, finer on both bottle parts -- so the NFP work is a wash,
+# and the merge runs once per distinct polygon per process because
+# decompose_if_needed memoises on WKT. On the n70 GA configuration that is about
+# 0.5 s of a 128 s run. Keeping a divergent copy of a function main already ships
+# is a fork to be paid back on every rebase, for under half a percent.
+#
+# Both variants produce valid partitions whose symmetric difference is exactly
+# 0, with no piece non-convex and none carrying interiors. The `u.interiors` guard
+# in this version looks stricter than the alternative's, but it is unreachable:
+# the union of two convex sets is always simply connected, so `u.interiors` can
+# never be non-empty for inputs this pass actually merges. It is defensive, not a
+# behavioural difference, and removing the guard leaves the test suite green --
+# which is how that was established rather than assumed.
+def _merge_convex_parts(parts):
+    """Greedily merge convex pieces whose union is still convex (Hertel-Mehlhorn).
+
+    Raw Delaunay output gives ~n pieces for an n-gon, and minkowski_sum costs
+    len(parts_A) * len(parts_B) convex sums -- so piece count is quadratic in
+    run time. Merging is union-preserving (two pieces are only ever replaced
+    by their exact union), so the covering guarantee decompose_if_needed
+    depends on is unchanged.
+    """
+    if len(parts) < 2:
+        return parts
+    merged = list(parts)
+    changed = True
+    while changed:
+        changed = False
+        out, consumed = [], set()
+        for i in range(len(merged)):
+            if i in consumed:
+                continue
+            cur = merged[i]
+            for j in range(i + 1, len(merged)):
+                if j in consumed or not cur.intersects(merged[j]):
+                    continue
+                u = shapely.union(cur, merged[j])
+                if u.geom_type != 'Polygon' or u.interiors or u.is_empty:
+                    continue
+                if math.isclose(u.area, u.convex_hull.area, rel_tol=1e-9):
+                    cur = u
+                    consumed.add(j)
+                    changed = True
+            consumed.add(i)
+            out.append(cur)
+        merged = out
+    return merged
+
 def _decompose_uncached(polygon, logger, cache_key):
     def cache_result(
         parts,
@@ -367,11 +435,20 @@ def _decompose_uncached(polygon, logger, cache_key):
             # never return that for a real polygon.
             decomposed = [polygon.convex_hull]
 
+        # Coarsen before caching, so every consumer of this part sees the
+        # smaller partition. `_merge_convex_parts` returns only the list, so the
+        # count is taken here -- it feeds the `merged_pieces` entry that
+        # decomposition_stats has carried unused since the reverted attempt.
+        before_merge = len(decomposed)
+        decomposed = _merge_convex_parts(decomposed)
+        merged_pieces = before_merge - len(decomposed)
+
         return cache_result(
             decomposed,
             source_vertices=source_vertices,
             triangles=len(triangles),
             clipped_pieces=clipped_pieces,
+            merged_pieces=merged_pieces,
         )
     except Exception as e:
         logger(f"      - Triangulation failed: {e}. Falling back to convex hull.", level="warning")

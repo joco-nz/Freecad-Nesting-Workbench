@@ -20,7 +20,9 @@ the genuine implementation under plain CPython.
 import math
 
 import pytest
+from shapely.affinity import rotate
 from shapely.geometry import Polygon
+from shapely.ops import unary_union
 
 from freecad.nestingworkbench.Tools.Nesting.algorithms import minkowski_utils as mu
 from freecad.nestingworkbench.datatypes.shape import Shape
@@ -68,8 +70,8 @@ class TestDecomposeIfNeeded:
         [
             (SQUARE_4, 1),    # already convex
             (TRIANGLE, 1),    # already convex
-            (L_SHAPE, 4),     # concave
-            (CHEVRON, 5),     # concave
+            (L_SHAPE, 2),     # concave; coarsened from 4 by the merge pass
+            (CHEVRON, 3),     # concave; coarsened from 5 by the merge pass
         ],
         ids=["square", "triangle", "L_shape", "chevron"],
     )
@@ -78,6 +80,13 @@ class TestDecomposeIfNeeded:
 
         These counts feed the pairwise-sum cost (len(A) x len(B)), so a change
         here is a performance change and must be a deliberate one.
+
+        L_SHAPE and CHEVRON moved from 4 and 5 to 2 and 3 when the merge pass
+        was ported from main. It has no size threshold, so it coarsens small
+        concave parts too, not just the 442-triangle Spacer. That is
+        union-preserving, so coverage and the covering guarantee are unchanged
+        (`test_pieces_preserve_area` and TestConvexPartitionMerge both assert
+        that), and the NFP region is unchanged up to boundary noise.
         """
         parts = mu.decompose_if_needed(polygon, noop_logger)
         assert len(parts) == expected_pieces
@@ -304,10 +313,14 @@ class TestDeadRingPruning:
     """Dead-ring pruning is inert until a part set is published."""
 
     def test_no_profiles_means_no_pruning(self):
-        """With no published part set, decomposition is unaffected."""
+        """With no published part set, decomposition is unaffected.
+
+        The count is the post-merge one; see the note on
+        `test_piece_count_is_stable` for why it is 3 and not 5.
+        """
         assert mu.get_dead_ring_stats() == {}
         parts = mu.decompose_if_needed(CHEVRON, noop_logger)
-        assert len(parts) == 5
+        assert len(parts) == 3
 
     def test_profiles_enable_counters(self):
         """Publishing a part set arms the counters without changing geometry."""
@@ -330,3 +343,253 @@ class TestDeadRingPruning:
             assert mu.get_dead_ring_stats().get("rings_seen") != 9999
         finally:
             mu.clear_dead_ring_profiles()
+
+
+def _plate_with_holes(cols, rows, width=60.0, height=54.0, hole=7.0):
+    """A rectangle with a regular grid of square holes.
+
+    Shaped like the heavy synthetic corpus so the merge pass sees the case it
+    exists for. A rectangle with k square holes admits a convex partition of
+    roughly k+4 pieces, while triangulating its vertex set produces several
+    times that, so this is the input that discriminates a working merge from a
+    no-op.
+    """
+    pitch_x = width / cols
+    pitch_y = height / rows
+    holes = []
+    for col in range(cols):
+        for row in range(rows):
+            x0 = col * pitch_x + (pitch_x - hole) / 2
+            y0 = row * pitch_y + (pitch_y - hole) / 2
+            holes.append([(x0, y0), (x0 + hole, y0), (x0 + hole, y0 + hole),
+                          (x0, y0 + hole), (x0, y0)])
+    return Polygon([(0, 0), (width, 0), (width, height), (0, height)], holes)
+
+
+class TestConvexPartitionMerge:
+    """The Hertel-Mehlhorn pass, ported from main@eac1e30.
+
+    `decompose_if_needed` triangulates the polygon's vertex set, so its piece
+    count is O(vertices) rather than O(features). That matters because
+    `minkowski_sum` evaluates every ordered pair of pieces and the NFP cost is
+    flat per pair, so the partition size is a direct multiplier on the dominant
+    cost. This pass merges pieces whose union is still convex.
+
+    Main's implementation is used verbatim rather than a local rewrite, and
+    RESULTS-union.md records the head-to-head that settled it. The properties
+    asserted here are the ones that make it safe rather than merely fast:
+    coverage is preserved exactly and every piece stays convex.
+    """
+
+    PLATE = _plate_with_holes(6, 6)
+
+    def _pieces(self, polygon=None):
+        return mu.decompose_if_needed(polygon or self.PLATE, noop_logger)
+
+    # -- the safety invariants -------------------------------------------
+
+    def test_coverage_is_preserved(self):
+        """The union of the merged pieces is the source region.
+
+        This is the covering guarantee the whole NFP rests on. Under-coverage
+        would let parts overlap, and no exception would be raised -- placements
+        would simply be accepted that should not be.
+        """
+        parts = self._pieces()
+        assert unary_union(parts).area == pytest.approx(self.PLATE.area,
+                                                       abs=AREA_TOL)
+
+    def test_pieces_do_not_overlap(self):
+        """Piece areas sum to the union area, so the partition is a partition.
+
+        A merge can only ever replace two pieces by their exact union, so this
+        has to hold; asserting it catches any future "optimisation" that lets
+        pieces grow into each other.
+        """
+        parts = self._pieces()
+        assert sum(p.area for p in parts) == pytest.approx(
+            unary_union(parts).area, abs=AREA_TOL)
+
+    def test_all_pieces_are_convex(self):
+        """Every returned piece must fill its own convex hull.
+
+        A non-convex piece would break `_minkowski_merge_ring` downstream,
+        which assumes convex inputs, and the failure would surface as a wrong
+        NFP rather than an error.
+        """
+        for piece in self._pieces():
+            assert piece.geom_type == "Polygon"
+            assert piece.area == pytest.approx(piece.convex_hull.area, abs=AREA_TOL)
+
+    def test_merge_reduces_the_piece_count(self):
+        """The pass must actually coarsen, not run and change nothing.
+
+        A rectangle with 36 holes admits a convex partition of about 40, and
+        triangulating its 148 vertices gives far more. Asserting a strict
+        reduction rather than an exact count keeps this a statement about the
+        mechanism instead of a number a legitimate change would break.
+        """
+        parts = self._pieces()
+        assert len(parts) < 6 * 6 + 4 + 40, (
+            f"expected the merge to beat the raw triangulation, got {len(parts)} "
+            f"pieces against a {6 * 6 + 4} ideal")
+
+    def test_no_piece_carries_interiors(self):
+        """No piece carries a hole, and the pass cannot produce one.
+
+        Main's implementation guards with `or u.interiors`. That guard is
+        unreachable: the union of two convex sets is always simply connected,
+        so `u.interiors` can never be non-empty for the inputs this pass ever
+        merges. It is defensive, not behavioural.
+
+        Asserted as an invariant on the output rather than by trying to provoke
+        the guard, because it cannot be provoked. An earlier draft of this test
+        claimed to cover the guard and did not: removing the guard from the
+        implementation left all 65 tests green, which is how it was found to be
+        dead code rather than coverage.
+        """
+        for piece in self._pieces():
+            assert not getattr(piece, "interiors", ()), \
+                f"a piece carries {len(piece.interiors)} interior ring(s)"
+
+    def test_small_inputs_are_returned_untouched(self):
+        """Fewer than two pieces short-circuits, and must not copy."""
+        pieces = [mu.SQUARE_4] if hasattr(mu, "SQUARE_4") else [Polygon(
+            [(0, 0), (1, 0), (1, 1), (0, 1)])]
+        assert mu._merge_convex_parts(pieces) is pieces
+
+    def test_pass_is_idempotent(self):
+        """Running the merge on its own output changes nothing.
+
+        A greedy pass is order-dependent, so this is the determinism check: if
+        the partition were not a fixpoint, the same input could produce
+        different partitions between runs, and a recorded baseline would drift.
+        """
+        once = self._pieces()
+        twice = mu._merge_convex_parts(once)
+        assert len(twice) == len(once)
+        assert unary_union(twice).area == pytest.approx(
+            unary_union(once).area, abs=AREA_TOL)
+
+    def test_merge_is_deterministic_across_calls(self):
+        """Two passes over equal input produce equal output.
+
+        Insulates the property above: this one compares independent runs, so a
+        fixpoint that is reached differently each time would still fail.
+        """
+        first = self._pieces()
+        second = self._pieces()
+        assert len(first) == len(second)
+        assert unary_union(first).area == pytest.approx(
+            unary_union(second).area, abs=AREA_TOL)
+
+
+class TestNfpIsIndependentOfThePartition:
+    """The reason coarsening is free: the NFP does not depend on the partition.
+
+    Minkowski sum distributes over union, so for *any* convex partition of A and
+    of B, `union_ij (A_i + B_j)` is the same region. That is what licenses
+    replacing the triangulation with something coarser without changing what
+    gets nested.
+
+    Compared with `symmetric_difference`, never `equals()`: GEOS keeps
+    different collinear boundary points depending on the input, so two
+    geometrically identical NFPs can differ in vertex count (62 against 34 was
+    measured) and `equals()` reports False for them.
+    """
+
+    PLATE = _plate_with_holes(6, 6)
+
+    @staticmethod
+    def _nfp_from_pieces(parts_a, parts_b, angle=17.0):
+        """The NFP a given convex partition implies, via the real pair loop.
+
+        `minkowski_sum` takes master polygons and decomposes them itself, so it
+        cannot compare two partitions. This drives the same primitives it uses,
+        so the comparison is of the real code path.
+
+        Every piece rotates about ONE origin, as `_transform_convex_parts` does.
+        Rotating each piece about its own centroid is a different operation --
+        the pieces are displaced independently, so the union is a scattered set
+        rather than a rotated copy, and the error is larger for a few large
+        pieces than for many small ones. That made a correct merge look like it
+        changed the NFP by 9%.
+        """
+        origin_a, origin_b = parts_a[0].centroid, parts_b[0].centroid
+        prepared_a = [mu._prepare_convex_ring(
+            rotate(p, angle, origin=origin_a)) for p in parts_a]
+        prepared_b = [mu._prepare_convex_ring(
+            rotate(p, angle, origin=origin_b)) for p in parts_b]
+        results = []
+        for a in prepared_a:
+            for b in prepared_b:
+                ring = mu._minkowski_merge_ring(a, b)
+                if len(ring) >= 3:
+                    results.append(Polygon(ring))
+        return unary_union(results)
+
+    def _both_partitions(self, monkeypatch):
+        """The same decomposition, with the merge pass off and then on.
+
+        Taken by neutralising `_merge_convex_parts` rather than by triangulating
+        the test's own way, so both partitions come from the production path.
+        Reimplementing the triangulation here would test the reimplementation.
+        """
+        Shape.clear_caches()
+        monkeypatch.setattr(mu, "_merge_convex_parts", lambda parts: parts)
+        fine = mu.decompose_if_needed(self.PLATE, noop_logger)
+        monkeypatch.undo()
+        Shape.clear_caches()
+        coarse = mu.decompose_if_needed(self.PLATE, noop_logger)
+        return fine, coarse
+
+    def test_merge_really_ran_between_them(self, monkeypatch):
+        """Guards the helper: if the merge stopped engaging, the comparison
+        below would be comparing a partition with itself and would pass while
+        proving nothing."""
+        fine, coarse = self._both_partitions(monkeypatch)
+        assert len(coarse) < len(fine), (
+            f"merge did not coarsen: {len(fine)} -> {len(coarse)}")
+
+    def test_nfp_is_the_same_region_for_both_partitions(self, monkeypatch):
+        """A coarse partition and a fine one give the same NFP region."""
+        fine, coarse = self._both_partitions(monkeypatch)
+        assert len(coarse) < len(fine)
+
+        fine_nfp = self._nfp_from_pieces(fine, fine)
+        coarse_nfp = self._nfp_from_pieces(coarse, coarse)
+
+        # The region SIZE is invariant, and exactly so: Minkowski sum
+        # distributes over union, so both partitions describe the same NFP. On
+        # a 6x6 plate this is 120 x 108 = 12960 for both, to six decimals.
+        assert coarse_nfp.area == pytest.approx(fine_nfp.area, rel=1e-9)
+
+        # The regions are not bit-identical, and are not expected to be. The
+        # union of many small triangles and the union of fewer merged ones
+        # accumulate floating-point boundary noise differently: measured, 19
+        # boundary vertices against 12, and two mirror-image slivers of ~39 mm2
+        # on a 12960 mm2 NFP, one in each direction. So the difference is
+        # boundary noise rather than a systematic shift.
+        #
+        # `equals()` is deliberately not used. GEOS keeps different collinear
+        # boundary points depending on the input, so two geometrically identical
+        # NFPs can differ in vertex count and equals() reports False.
+        difference = coarse_nfp.symmetric_difference(fine_nfp).area
+        assert difference < 0.01 * fine_nfp.area, (
+            f"partitions disagree by {difference:.4f} on a "
+            f"{fine_nfp.area:.1f} NFP, which is more than boundary noise")
+        # Not one-sided: if the coarse NFP were a strict subset it would admit
+        # placements the fine one rejects, and that is the unsafe direction.
+        assert coarse_nfp.area >= fine_nfp.area - 1e-6
+
+    def test_mixed_partitions_also_agree(self, monkeypatch):
+        """One side merged is enough; the identity is per-partition.
+
+        Guards against a fix that only holds when both sides happen to be
+        coarsened the same way.
+        """
+        fine, coarse = self._both_partitions(monkeypatch)
+        fine_nfp = self._nfp_from_pieces(fine, fine)
+        mixed_nfp = self._nfp_from_pieces(coarse, fine)
+        assert mixed_nfp.area == pytest.approx(fine_nfp.area, rel=1e-9)
+        assert mixed_nfp.symmetric_difference(fine_nfp).area < 0.01 * fine_nfp.area

@@ -501,7 +501,13 @@ useful outcome.
   54 756 inputs hold 98.4% of the work, and 99.98% of the input geometry does
   not survive into the answer. Not removable at the union: 6 duplicates in
   54 756, and the containment filter is O(n²). The lever is the decomposition
-  upstream — 234 convex pieces for 36 rectangular holes.
+  upstream — 234 convex pieces for 36 rectangular holes — and `main@eac1e30`
+  already ships that merge, which this branch had lost along with a reverted
+  O(n³) attempt at the same idea. Porting it takes the heavy corpus from
+  445 616 convex pairs to 19 256 and the run from 59.4 s to 37.2 s, packing
+  bit-identical — a regression recovered, **not** a gain over main. It does not
+  show on a GA run of that configuration, where NFP construction is 4.5% of the
+  total.
 - [RESULTS-collision.md](RESULTS-collision.md) — the collision stage decomposed
   into overlay 65.7% / `intersects` 23.7% / measurement probe 8.8%. The overlay
   rejects 144 981 of 144 981. Replacing it with `overlaps or contains` is 6–10×
