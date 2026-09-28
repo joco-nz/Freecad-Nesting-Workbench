@@ -26,6 +26,28 @@ def _candidate_geometry_key(prefix, x, y):
     return (prefix, float(x), float(y))
 
 
+def _step_size(kwargs):
+    """Resolve the NFP discretisation interval: env, then kwargs, then 5.0 mm.
+
+    `NESTING_STEP_SIZE` exists so the time/density curve can be characterised
+    without editing code or building a UI, the same reason
+    `NESTING_ROTATION_WORKERS` exists. Both are reported in the run output so a
+    measurement taken with an override is self-describing.
+    """
+    raw = os.environ.get('NESTING_STEP_SIZE', '').strip()
+    if raw:
+        try:
+            value = float(raw)
+            if value > 0:
+                return value
+        except ValueError:
+            pass
+    try:
+        return float(kwargs.get("step_size", 5.0))
+    except (TypeError, ValueError):
+        return 5.0
+
+
 def _rotation_worker_limit():
     """Resolve the rotation thread-pool size, or None for the stdlib default.
 
@@ -1191,7 +1213,17 @@ class Nester:
         self.cancel_callback = kwargs.get("cancel_callback") # Called to check if nesting should abort
         self.spawn_more_callback = kwargs.get("spawn_more_callback")  # Mints fill-part instances on the main thread
         
-        step_size = kwargs.get("step_size", 5.0) 
+        # NFP ring discretisation interval: samples one candidate position
+        # every `step_size` mm along each No-Fit Polygon boundary, so it sets the
+        # candidate count. On the n70 GA run that count (639,410) drives both the
+        # collision stage and candidate generation, together 63% of the run, so
+        # this is the largest remaining time/density dial.
+        #
+        # It was reachable only from the Physics panel, so the Minkowski nester
+        # -- every layout in a GA run -- always got the hardcoded 5.0. The env
+        # override makes it measurable without a UI change; the UI question is
+        # separate and is answered in RESULTS-parallelism.md.
+        step_size = _step_size(kwargs)
         self.engine = MinkowskiEngine(
             width, height, step_size, log_callback=self.log_callback,
             verbose=self.verbose,

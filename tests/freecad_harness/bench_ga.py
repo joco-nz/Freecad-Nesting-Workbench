@@ -102,6 +102,7 @@ def cfg():
         # Real workloads are not uniform, and the n70 one is 2 Spacer against 60
         # of each bottle part. Split out rather than inlined so nest_benchmark
         # and this share one parser.
+        "compactness_weight": float(os.environ.get("NEST_BENCH_COMPACTNESS", "0.0")),
         "per_label_quantities": _parse_quantities(
             os.environ.get("NEST_BENCH_QUANTITIES", "")),
         "reps": int(os.environ.get("NEST_BENCH_REPS", "3")),
@@ -167,7 +168,13 @@ def one_run(c):
         "add_labels": False, "font_path": "", "show_bounds": False,
         "label_height": 25.0, "label_size": 10.0, "verbose": False,
         "performance_logging": True, "algorithm": "Minkowski",
-        "compactness_weight": 0.0, "generations": c["generations"],
+        # The UI default is 0.0, but a real user often runs 1.0, and the term
+        # is not free: it computes the largest contiguous open area of the last
+        # sheet with shapely arithmetic on every layout. Measuring at 0.0 and
+        # reporting a time for someone running 1.0 would be measuring something
+        # they do not run.
+        "compactness_weight": c["compactness_weight"],
+        "generations": c["generations"],
         "population_size": c["population"], "random_seed": c["seed"],
         "sheet_thickness": 3.0, "deflection_angle": 30.0,
         "nesting_direction": 0, "use_random_direction": False,
@@ -506,7 +513,8 @@ def main():
             return 2
         for key in ("population", "generations", "sheet", "seed", "quantity",
                     "rotation_workers", "candidate_geometry_cache",
-                    "per_label_quantities", "rotation_steps"):
+                    "per_label_quantities", "rotation_steps",
+                    "compactness_weight"):
             if baseline["config"].get(key) != c[key]:
                 hc.emit(f"ERROR: baseline {key}={baseline['config'].get(key)} "
                         f"but this run used {c[key]}")
