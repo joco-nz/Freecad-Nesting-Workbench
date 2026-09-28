@@ -57,28 +57,52 @@ def _step_size(kwargs):
     return 5.0
 
 
+def _rotation_workers_explicit(kwargs=None):
+    """Whether the pool width was chosen rather than inferred from the core count.
+
+    Separate from `_rotation_worker_limit` because that one always resolves, and
+    once resolved a chosen 4 and an inferred 4 are the same integer. The
+    distinction is what a report needs: a number in the output that might be a
+    decision or might be a default cannot attribute a result.
+    """
+    explicit = kwargs.get('rotation_workers') if kwargs else None
+    try:
+        if explicit is not None and int(explicit) > 0:
+            return True
+    except (TypeError, ValueError):
+        pass
+    raw = os.environ.get('NESTING_ROTATION_WORKERS', '').strip()
+    if raw:
+        try:
+            return int(raw) > 0
+        except ValueError:
+            pass
+    return False
+
+
 def _rotation_worker_limit(kwargs=None):
-    """Resolve the rotation thread-pool size, or None for the stdlib default.
+    """Resolve the rotation thread-pool width. Always returns a positive int.
 
-    ``ThreadPoolExecutor()`` with no argument defaults to
-    ``min(32, os.cpu_count() + 4)``, which is 8 on the 4-CPU development box --
-    twice the core count. The candidate-geometry work is GEOS-bound and releases
-    the GIL, so oversubscription is not automatically harmful, but it is also not
-    automatically helpful: it trades throughput for cache pressure and
-    contention on the shared NFP cache. The effective width is therefore
-    measurable rather than assumed.
+    One core per thread is the default. This used to be `None`, meaning "let
+    ThreadPoolExecutor decide", and the stdlib decides `min(32, cpu_count() + 4)`
+    -- twice the core count, which was measured to be no faster than a single
+    worker while a pool sized to the core count was 22% faster. The default is
+    now the measured one rather than the inherited one.
 
-    The width is now also a UI field (Minkowski panel, "Rotation Threads"),
-    because the measurement says it is worth 22% of the run. Precedence: an
-    explicit positive value from the caller, then `NESTING_ROTATION_WORKERS` for
-    scripted and benchmark runs, then the stdlib default. 0 means "auto", which
-    is the stdlib default -- so leaving the field at 0 changes nothing, while
-    still being distinguishable from "nobody chose".
+    Auto is `os.cpu_count()`, not `cpu_count() + 4`. The oversubscribed default
+    assumes the work is embarrassingly parallel and releases the GIL. Shapely
+    does release the GIL around GEOS calls, but the surrounding Python does not,
+    so the extra threads contend for the interpreter and the shared NFP cache
+    instead of adding throughput.
+
+    Precedence: an explicit positive value from the caller (the "Rotation
+    Threads" field), then `NESTING_ROTATION_WORKERS` for scripted and benchmark
+    runs, then the core count. 0 and unset both mean auto, so the field can be
+    left alone.
 
     `NESTING_ROTATION_WORKERS` deliberately survives the UI field: the benchmark
     harness pins the width for reproducible work counters and never builds an
-    `algo_kwargs`, so removing the env would have broken every recorded
-    baseline's reproducibility.
+    `algo_kwargs`, so the env is its only channel.
     """
     explicit = kwargs.get('rotation_workers') if kwargs else None
     try:
@@ -87,13 +111,17 @@ def _rotation_worker_limit(kwargs=None):
     except (TypeError, ValueError):
         pass
     raw = os.environ.get('NESTING_ROTATION_WORKERS', '').strip()
-    if not raw:
-        return None
-    try:
-        value = int(raw)
-    except ValueError:
-        return None
-    return value if value > 0 else None
+    if raw:
+        try:
+            value = int(raw)
+            if value > 0:
+                return value
+        except ValueError:
+            pass
+    # Never 0: a zero-width pool would silently disable parallelism, and
+    # max_workers must be positive. cpu_count() can return None on platforms
+    # that cannot answer, hence the fallback.
+    return max(1, os.cpu_count() or 1)
 
 
 # Measurement-only. Ring area is needed to classify an interior ring as able or
@@ -270,13 +298,14 @@ class PlacementOptimizer:
         self, engine, rotation_steps, search_direction, log_callback=None,
         trial_callback=None, rng=None, performance_logging=False,
         candidate_geometry_key_tracker=None, candidate_geometry_cache=None,
-        rotation_workers=None
+        rotation_workers=None, rotation_workers_explicit=True
     ):
         # Resolved once, here, rather than per call. find_best_placement runs
         # once per part placed -- 122 times in a GA run -- so re-reading the
         # environment and the UI value on each call is 122 redundant lookups.
         # None means "auto": defer to the stdlib default.
         self.rotation_workers = rotation_workers
+        self.rotation_workers_explicit = rotation_workers_explicit
         self.engine = engine
         self.rotation_steps = max(1, rotation_steps)
         self.search_direction = search_direction
@@ -386,6 +415,10 @@ class PlacementOptimizer:
             'candidate_geometry_repeats': 0,
             'max_concurrent_rotations': 0,
             'rotation_workers': 0,
+            # 1 when the width was inferred from the core count rather than
+            # chosen. A report that names only the width cannot say whether a
+            # number was a decision or a default.
+            'rotation_workers_auto': 0,
         }
 
     def log(self, message):
@@ -433,15 +466,19 @@ class PlacementOptimizer:
         # Recorded so the report line is self-describing: a run measured with
         # the env override must say so, otherwise the 4-vs-8 comparison is
         # unattributable. max_workers=None means the stdlib default.
+        # Was the width chosen or inferred? Captured before the fallback, or the
+        # flag is always zero and the counter is decoration.
+        was_auto = not self.rotation_workers_explicit
         worker_limit = self.rotation_workers
         if worker_limit is None:
             worker_limit = _rotation_worker_limit()
         with self._perf_lock:
-            self._perf_stats['rotation_workers'] = (
-                worker_limit
-                if worker_limit is not None
-                else min(32, (os.cpu_count() or 1) + 4)
-            )
+            # The width actually used, and whether it was chosen. Both are
+            # recorded because neither is visible in the output otherwise, and
+            # two runs with identical packing can differ in wall clock by 22%
+            # purely on this.
+            self._perf_stats['rotation_workers'] = worker_limit
+            self._perf_stats['rotation_workers_auto'] = int(was_auto)
         with ThreadPoolExecutor(max_workers=worker_limit) as executor:
             futures = {
                 executor.submit(
@@ -1266,6 +1303,7 @@ class Nester:
         # of the output has no other way to tell what produced a result.
         self.step_size = step_size
         self.rotation_workers = _rotation_worker_limit(kwargs)
+        self.rotation_workers_explicit = _rotation_workers_explicit(kwargs)
         self.optimizer = PlacementOptimizer(
             self.engine, rotation_steps, self.search_direction,
             None if self.quiet else self.log_callback,
@@ -1273,7 +1311,8 @@ class Nester:
             performance_logging=self.performance_logging,
             candidate_geometry_key_tracker=kwargs.get("candidate_geometry_key_tracker"),
             candidate_geometry_cache=kwargs.get("candidate_geometry_cache"),
-            rotation_workers=self.rotation_workers
+            rotation_workers=self.rotation_workers,
+            rotation_workers_explicit=self.rotation_workers_explicit
         )
         self.optimizer.verbose = self.verbose
 

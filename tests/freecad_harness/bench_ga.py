@@ -57,6 +57,20 @@ STATUS_FILE = os.path.join(_HERE, ".last_status_bench_ga")
 SCHEMA_VERSION = 1
 
 
+def _worker_pin_is_explicit():
+    """True unless the width is "auto" (i.e. measure the product default)."""
+    return os.environ.get("NEST_BENCH_ROTATION_WORKERS", "1").strip().lower() != "auto"
+
+
+def _rotation_worker_pin():
+    """The width to pin, or the core count when the width is "auto"."""
+    raw = os.environ.get("NEST_BENCH_ROTATION_WORKERS", "1").strip()
+    if raw.lower() == "auto":
+        import os as _os
+        return max(1, _os.cpu_count() or 1)
+    return max(1, int(raw or 1))
+
+
 def _parse_quantities(spec):
     """Parses "Spacer=2,Bottle Top=60" into {"Spacer": 2, "Bottle Top": 60}.
 
@@ -109,7 +123,6 @@ def cfg():
         # 22% of wall) and step size changes the candidate count (54% of wall),
         # so a baseline without them is not attributable.
         "step_size": float(os.environ.get("NESTING_STEP_SIZE", "5.0")),
-        "rotation_workers": int(os.environ.get("NEST_BENCH_ROTATION_WORKERS", "0")) or None,
         "per_label_quantities": _parse_quantities(
             os.environ.get("NEST_BENCH_QUANTITIES", "")),
         "reps": int(os.environ.get("NEST_BENCH_REPS", "3")),
@@ -118,7 +131,13 @@ def cfg():
         "deflection": float(os.environ.get("NEST_BENCH_DEFLECTION", "0.05")),
         "simplification": float(os.environ.get("NEST_BENCH_SIMPLIFICATION", "0.1")),
         "rotation_steps": int(os.environ.get("NEST_BENCH_ROTATION_STEPS", "4")),
-        "rotation_workers": int(os.environ.get("NEST_BENCH_ROTATION_WORKERS", "1")),
+        # Pinned to a width, because the work counts are only exact at width 1
+        # and a baseline that drifts is not a baseline. Set to "auto" to stop
+        # pinning and measure whatever the product default resolves to, which is
+        # the only way to check that the default is any good -- a harness that
+        # can only ever run one setting cannot tell you that.
+        "rotation_workers": _rotation_worker_pin(),
+        "rotation_workers_pinned": _worker_pin_is_explicit(),
         # Recorded rather than inherited, so a baseline cannot silently
         # change meaning when the product default moves.
         "candidate_geometry_cache": _cache_setting(),
@@ -330,8 +349,9 @@ def report(c, runs):
     hc.emit(f"  reps         {c['reps']}")
     hc.emit(f"  sheet        {c['sheet']}")
     hc.emit(f"  corpus       {c['corpus']}")
-    hc.emit(f"  rot workers  {c['rotation_workers']}  (pinned: counts are exact only "
-            f"at width 1)")
+    hc.emit(f"  rot workers  {c['rotation_workers']}"
+            + ("" if c["rotation_workers_pinned"]
+               else "  (product default, not pinned)"))
     hc.emit(f"  cand cache   {'on' if c['candidate_geometry_cache'] else 'off'}")
     walls = [r["wall"] for r in runs]
     best = runs[0]["result"]
@@ -443,7 +463,12 @@ def main():
     # width > 1 is measurable but not outcome-affecting; width 1 is simply the
     # only setting where the counts are exact. The noise block below reports
     # this per run, so the pin is self-enforcing rather than a comment.
-    os.environ["NESTING_ROTATION_WORKERS"] = str(max(1, c["rotation_workers"]))
+    if c["rotation_workers_pinned"]:
+        os.environ["NESTING_ROTATION_WORKERS"] = str(c["rotation_workers"])
+    else:
+        # Removing it, not setting it: leaving a stale value from an earlier
+        # invocation in the environment would silently measure the wrong width.
+        os.environ.pop("NESTING_ROTATION_WORKERS", None)
     runs = []
     for rep in range(c["reps"]):
         result, ga_perf, layout_perf, wall, corpus = one_run(c)
@@ -521,7 +546,8 @@ def main():
         for key in ("population", "generations", "sheet", "seed", "quantity",
                     "rotation_workers", "candidate_geometry_cache",
                     "per_label_quantities", "rotation_steps",
-                    "compactness_weight", "step_size", "rotation_workers"):
+                    "compactness_weight", "step_size", "rotation_workers",
+                    "rotation_workers_pinned"):
             if baseline["config"].get(key) != c[key]:
                 hc.emit(f"ERROR: baseline {key}={baseline['config'].get(key)} "
                         f"but this run used {c[key]}")

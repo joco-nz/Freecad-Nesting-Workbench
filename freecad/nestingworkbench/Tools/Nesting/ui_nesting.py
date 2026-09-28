@@ -198,31 +198,38 @@ class NestingPanel(QtWidgets.QWidget):
         self.minkowski_step_size_input.setSingleStep(0.5)
         self.minkowski_step_size_input.setDecimals(2)
         self.minkowski_step_size_input.setToolTip(
-            "How finely No-Fit Polygon boundaries are sampled, in mm.\n"
-            "One candidate position is generated per interval, so this sets "
-            "how many candidate positions a rotation is tested at, and the "
-            "collision and candidate-generation cost scales with it.\n\n"
-            "Larger = faster, coarser. Lower gives denser packing when parts "
-            "need positions that are not corner or edge flushes.\n\n"
-            "Measured on the n70 intercooler job (122 parts, 8 generations):\n"
-            "  5 mm (default) 139 s    10 mm 93 s (33% faster)\n"
-            "  15 mm 77 s               20 mm 64 s (54% faster)\n"
-            "Packing was identical in every one of those runs, because that "
-            "job's parts fit by corner flush. A job whose parts interlock will "
-            "lose density here, so raise it only after checking the result.")
+            "Spacing between candidate positions, in mm.\n\n"
+            "Every position a part can occupy comes from sampling the boundary "
+            "of a No-Fit Polygon at this interval, and a boundary of length L "
+            "yields about L / step positions. Each one is then tested against "
+            "the parts already placed, so the total number of collision tests "
+            "scales with this value and it is the main control over how long a "
+            "run takes.\n\n"
+            "Larger: fewer positions, faster, and coarser packing.\n"
+            "Smaller: more positions, slower, and finer packing.\n\n"
+            "Only affects jobs that need positions away from the sheet corners "
+            "and edges. Where parts simply line up against each other or the "
+            "sheet border, the extra positions are tested and discarded and "
+            "changing this has no visible effect on the result. Where parts "
+            "interlock or have curved or closely spaced features, it does.\n\n"
+            "If you raise it, check that the packing and the number of sheets "
+            "are unchanged before keeping the change.")
 
         self.minkowski_rotation_workers_input = QtWidgets.QSpinBox()
         self.minkowski_rotation_workers_input.setRange(0, 64)
         self.minkowski_rotation_workers_input.setValue(0)
         self.minkowski_rotation_workers_input.setSpecialValueText("Auto")
         self.minkowski_rotation_workers_input.setToolTip(
-            "Threads used to evaluate rotations in parallel. 0 = one per CPU "
-            "plus four, which is the default and is usually too many.\n\n"
-            "The work is largely GIL-bound, so oversubscribing costs time "
-            "without buying any: measured on a 4-CPU machine, 8 threads "
-            "(the default) was no faster than 1 thread, and 4 threads was "
-            "22% faster than either.\n\n"
-            "Set this to the number of CPU cores. Packing is unaffected.")
+            "How many rotations are checked at the same time.\n\n"
+            "Each rotation is one candidate orientation of the part, checked "
+            "independently, so this is how many of them are worked on "
+            "concurrently. A separate pool is started for every part placed.\n\n"
+            "Auto uses one thread per CPU core, which is the right setting for "
+            "most machines. Going above the core count is usually slower: the "
+            "geometry work runs outside the interpreter lock, but the code "
+            "around it does not, so extra threads spend their time waiting on "
+            "each other and on the shared NFP cache rather than doing work.\n\n"
+            "Does not affect the packing, only how long it takes.")
 
         perf_form_layout = QtWidgets.QFormLayout()
         perf_form_layout.addRow("Candidate Step (mm):", self.minkowski_step_size_input)

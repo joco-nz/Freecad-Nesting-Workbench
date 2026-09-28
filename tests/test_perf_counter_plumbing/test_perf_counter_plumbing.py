@@ -621,3 +621,88 @@ class TestPerformanceDialsAreReachable:
         # an explicit non-positive value must fall through, not be honoured
         assert "int(explicit) > 0" in workers, (
             "a 0 from the UI must mean auto, not a zero-width pool")
+
+    def test_auto_means_one_thread_per_core_not_core_count_plus_four(self):
+        """Auto is `cpu_count()`. The stdlib default it replaces is not.
+
+        `ThreadPoolExecutor()` with no argument sizes itself
+        `min(32, cpu_count() + 4)` -- twice the core count on a small machine.
+        Returning None to get that default is what this replaced, and it measured
+        no faster than a single worker while a pool sized to the core count was
+        meaningfully faster. So "auto" has to name a concrete width, and it has
+        to be the core count.
+
+        Executed rather than pattern-matched, because the four ways this can be
+        wrong -- return None, return cpu_count()+4, return cpu_count() unguarded,
+        or invert the precedence -- are all one line of source each, and a text
+        check cannot tell them apart from the surrounding prose.
+        """
+        strategy = os.path.join(_REPO, "freecad", "nestingworkbench", "Tools",
+                                "Nesting", "algorithms", "nesting_strategy.py")
+        tree = ast.parse(open(strategy).read())
+        fn = next(n for n in tree.body
+                  if isinstance(n, ast.FunctionDef)
+                  and n.name == "_rotation_worker_limit")
+        os.environ.pop("NESTING_ROTATION_WORKERS", None)
+        ns = {"os": os}
+        exec(compile(ast.unparse(fn), "<fn>", "exec"), ns)
+        resolve = ns["_rotation_worker_limit"]
+
+        cores = os.cpu_count() or 1
+        auto = resolve({})
+        assert auto == cores, (
+            f"auto resolved to {auto!r}, expected the core count {cores}. The "
+            f"stdlib default it replaced, cpu_count() + 4, is "
+            f"{min(32, cores + 4)} -- measured no faster than one worker")
+        assert resolve({}) != min(32, cores + 4) or cores == min(32, cores + 4), (
+            "auto must not be the stdlib default")
+
+        for kwargs in ({}, {"rotation_workers": 0}, {"rotation_workers": -3},
+                       {"rotation_workers": "nonsense"}, {"rotation_workers": None}):
+            value = resolve(kwargs)
+            assert isinstance(value, int) and value > 0, (
+                f"_rotation_worker_limit({kwargs!r}) returned {value!r}. A "
+                f"non-positive width silently disables parallelism, and "
+                f"max_workers rejects it outright")
+        assert resolve({"rotation_workers": 3}) == 3, (
+            "an explicit width must still win over the core count")
+
+        # The degenerate case has to be exercised, not left to whichever machine
+        # the suite happens to run on. `os.cpu_count()` returns None on platforms
+        # that cannot answer, and an unguarded `return os.cpu_count()` would
+        # pass on any box with cores -- which is every box this is developed on,
+        # and so never catches the bug it exists to catch.
+        for bogus in (None, 0, -1):
+            ns["os"] = type("_os", (), {"cpu_count": staticmethod(lambda b=bogus: b),
+                                        "environ": {}})
+            value = resolve({})
+            assert isinstance(value, int) and value >= 1, (
+                f"with os.cpu_count() returning {bogus!r} the resolver gave "
+                f"{value!r}. A width below 1 disables parallelism silently and "
+                f"max_workers raises on it")
+
+    def test_the_reported_width_says_whether_it_was_chosen(self):
+        """A report naming only the width cannot say chosen from default.
+
+        Two runs with identical packing can differ in wall clock by more than a
+        fifth on this alone, so a bare number in the output that might be a
+        decision or might be a default is not enough to attribute a result.
+        """
+        strategy = open(STRATEGY).read()
+        assert "'rotation_workers_auto': 0," in strategy, (
+            "rotation_workers_auto is never initialised, so the += would raise "
+            "KeyError inside the rotation future loop, where quiet=True swallows "
+            "it and the run places nothing while reporting no error")
+        assert "self._perf_stats['rotation_workers_auto'] = int(was_auto)" in strategy
+        assert "def _rotation_workers_explicit(kwargs=None):" in strategy, (
+            "once the width is resolved, a chosen 4 and an inferred 4 are the "
+            "same int, so the distinction needs its own function")
+        assert "self.rotation_workers_explicit = _rotation_workers_explicit(kwargs)" \
+            in strategy, (
+            "the chosen-or-inferred distinction has to survive the nester, or "
+            "the flag is always zero by the time it is recorded")
+        captured = strategy.index("was_auto = not self.rotation_workers_explicit")
+        fallback = strategy.index("worker_limit = _rotation_worker_limit()")
+        assert captured < fallback, (
+            "the auto flag must be captured before the fallback, or it is always "
+            "zero and the counter is decoration")

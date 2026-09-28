@@ -30,11 +30,36 @@ of tests.
 
 ## 2. The one lever that works: the thread-pool width — 41.6 s, 22%
 
-`_rotation_worker_limit()` returns `None` when `NESTING_ROTATION_WORKERS` is
-unset, so `ThreadPoolExecutor()` takes the stdlib default of
+`ThreadPoolExecutor()` with no argument takes the stdlib default of
 `min(32, os.cpu_count() + 4)` — **8 threads on this 4-CPU box.** The docstring
-already concedes the width "is measurable rather than assumed"; nobody measured
+already conceded the width "is measurable rather than assumed"; nobody measured
 it.
+
+**The default is now `os.cpu_count()`.** "Auto" on the panel resolves to one
+thread per core instead of deferring to the stdlib, so a user on this class of
+machine gets the measured width rather than twice it. `_rotation_worker_limit`
+now always returns a positive int, so there is one code path rather than a
+`None` special case, and the run reports both the width and whether it was
+chosen or inferred (`rotation_workers=4(auto)`) — a bare number cannot
+distinguish a decision from a default.
+
+A run also reports the width actually used, because two runs with identical
+packing can differ in wall clock by more than a fifth on this alone.
+
+### A measurement caveat, found the hard way
+
+The wall-clock numbers in this file were produced by **interleaved** runs, close
+in time, and that matters more than it should. Measured minutes apart on the
+same machine, the same configuration at 4 workers gave 144.6 s, then 155.4 s,
+then 174.6 s — while `/proc/loadavg` read between 2.4 and 3.7 on 4 CPUs, with
+the desktop itself consuming most of it. Two of those runs happened to disagree
+by enough to invert the comparison against 8 workers.
+
+So: the 4-vs-8 conclusion rests on the interleaved A/B in the table below, and
+any single run here is worth treating as indicative only. `bench_ga.py` reports
+its own wall spread for exactly this reason, and `NEST_BENCH_ROTATION_WORKERS=auto`
+exists so the product default can be measured the same way rather than argued
+about.
 
 Interleaved A/B, two runs per configuration, same process, same corpus:
 

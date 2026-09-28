@@ -361,6 +361,12 @@ class GACoordinator:
         # A per-run constant, not an accumulator: every find_best_placement call
         # resolves the same limit, so max() is the honest reduction and also
         # makes a mid-run env change visible instead of averaged away.
+        # The width used by the widest layout, since layouts differ. `auto` is
+        # carried alongside rather than folded in, so a report can distinguish a
+        # chosen width from the inferred one.
+        self._ga_perf['rotation_workers_auto'] = max(
+            self._ga_perf.get('rotation_workers_auto', 0),
+            stats.get('rotation_workers_auto', 0))
         self._ga_perf['rotation_workers'] = max(
             self._ga_perf.get('rotation_workers', 0),
             stats.get('rotation_workers', 0),
@@ -560,6 +566,7 @@ class GACoordinator:
             'candidate_geometry_repeats': 0,
             'max_concurrent_rotations': 0,
             'rotation_workers': 0,
+            'rotation_workers_auto': 0,
             'candidate_points': 0,
             'valid_candidate_points': 0,
             'rotation_evaluations': 0,
@@ -827,7 +834,8 @@ class GACoordinator:
                     # Thread-pool width actually used, so an NESTING_ROTATION_WORKERS
                     # A/B is attributable from the log alone. Pair it with
                     # rotation_wall / nesting wall to get realised parallelism.
-                    f"rotation_workers={self._ga_perf['rotation_workers']} "
+                    f"rotation_workers={self._ga_perf['rotation_workers']}"
+                    f"{'(auto)' if self._ga_perf.get('rotation_workers_auto') else ''} "
                     # Dead-ring pruning. Read straight from the module because the
                     # part set it needs is run-global state, not something that
                     # travels the per-generation stats dict. Empty when the
