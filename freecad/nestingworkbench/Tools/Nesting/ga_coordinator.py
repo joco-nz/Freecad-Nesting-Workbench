@@ -190,6 +190,39 @@ class GACoordinator:
         # finally block in run() dispose it without racing a pending commit.
         self._job_committed = False
 
+    def _delete_layouts(self, layouts, verbose=False, best_layout=None):
+        """Delete layouts, on whichever thread is allowed to touch the document.
+
+        FreeCAD document objects must be created and destroyed on the main
+        thread. `run()` executes on the worker's QThread, so when a draw callback
+        is set -- that is, whenever the run is driven from the panel -- the
+        request has to be handed to the callback's owner, exactly as creation
+        already is. Headless has no such restriction and deletes directly.
+
+        `best_layout` is passed through for the caller's own exclusion, and is
+        compared by the receiving handler. The default of None means "delete
+        everything in the list", which is what the callers that have already
+        chosen their victims want.
+
+        Every layout deletion in this class goes through here. A bare
+        `delete_layout` inside `run()` is a document mutation on the worker
+        thread, which is the defect this helper exists to make impossible;
+        `test_ga_layout_cleanup` fails if one reappears.
+        """
+        victims = [layout for layout in (layouts or ()) if layout is not None]
+        if not victims:
+            return
+        if self.draw_callback:
+            self.draw_callback({
+                'cleanup_layouts': True,
+                'layouts': victims,
+                'best_layout': best_layout,
+                'verbose': verbose,
+            })
+            return
+        for layout in victims:
+            self.layout_manager.delete_layout(layout, verbose=verbose)
+
     def _record_layout_time(self, key, seconds):
         """Adds to a layout-management sub-phase timer (Performance Logging only)."""
         stats = self._layout_perf
@@ -750,16 +783,8 @@ class GACoordinator:
             survivors = [l for l in layouts if l is not best_layout]
             cleanup_start = time.perf_counter()
             if survivors:
-                if self.draw_callback:
-                    self.draw_callback({
-                        'cleanup_layouts': True,
-                        'layouts': survivors,
-                        'best_layout': best_layout,
-                        'verbose': verbose,
-                    })
-                else:
-                    for layout in survivors:
-                        self.layout_manager.delete_layout(layout, verbose=verbose)
+                self._delete_layouts(survivors, verbose=verbose,
+                                     best_layout=best_layout)
             self._record_layout_time(
                 'lm_cleanup_s', time.perf_counter() - cleanup_start)
             layouts = [best_layout] if best_layout is not None else []
@@ -948,9 +973,18 @@ class GACoordinator:
             import traceback
             FreeCAD.Console.PrintError(f"GA Nesting Error: {e}\n{traceback.format_exc()}\n")
             self._set_status(f"Error: {e}")
+            # On the correct thread. This is the one layout deletion that was
+            # not: it sat directly in the handler, so with a draw callback set
+            # -- that is, in the panel -- it removed document objects from the
+            # worker thread, which FreeCAD does not allow. The layouts then
+            # survived, which is the "temporary folders left behind after an
+            # early exit" report.
+            #
+            # It is also the path most likely to be hit by an early exit, since
+            # a cancel that surfaces as an exception, a geometry failure, or a Qt
+            # error all land here rather than on one of the `break`s.
             if 'layouts' in locals():
-                for layout in layouts:
-                    self.layout_manager.delete_layout(layout)
+                self._delete_layouts(layouts)
             self._dispatch_recompute()
             return None
         finally:
@@ -1159,9 +1193,14 @@ class GACoordinator:
         # Discarding the outgoing layouts is charged to lm_delete_s (measured
         # inside delete_layout); gene bookkeeping starts after it so the
         # sub-phase timers stay disjoint.
-        for e in elites[1:]: self.layout_manager.delete_layout(e, verbose=verbose)
-        for layout in layouts:
-            if layout not in elites: self.layout_manager.delete_layout(layout, verbose=verbose)
+        # Through the helper for uniformity. This function is delegated whole to
+        # the main thread when a draw callback is set, so these deletions were
+        # already on the right thread; the helper is a no-op hop in that case
+        # and keeps the invariant "one way to delete a layout" true everywhere.
+        self._delete_layouts(
+            [e for e in elites[1:]]
+            + [layout for layout in layouts if layout not in elites],
+            verbose=verbose)
 
         gene_ops_start = time.perf_counter()
         population_size = len(layouts)
