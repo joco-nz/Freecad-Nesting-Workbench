@@ -25,6 +25,12 @@ try:
 except ImportError:
     pass  # Optional dependency missing, proceed without visualization
 
+# How long a handover to the main thread may take before the worker gives up on
+# it. Generous, because drawing a layout or recomputing a document is real work,
+# but finite, because an unbounded wait on a shared event is a hang.
+_DRAW_HANDOVER_TIMEOUT_S = 300.0
+
+
 class NestingWorker(QThread):
     """Runs nesting computation on a background thread.
     
@@ -68,11 +74,34 @@ class NestingWorker(QThread):
             import traceback
             self.error_signal.emit(f"{e}\n{traceback.format_exc()}")
     
-    def request_draw_on_main_thread(self, payload):
-        """Called from worker thread. Emits signal and blocks until main thread draws."""
+    def request_draw_on_main_thread(self, payload, timeout=None):
+        """Called from the worker; hand work to the main thread and wait for it.
+
+        Returns True if the main thread acknowledged, False if it did not.
+
+        The wait is bounded. An unbounded wait on a single event shared by
+        every handover is a freeze waiting to happen: if the acknowledgement is
+        lost -- the handler raises, the panel is torn down mid-flight, the
+        coordinator is replaced -- this thread never returns, FreeCAD stops
+        responding, and the only remedy is killing the process. That is not a
+        hypothetical; it is what a report of "FreeCAD locked and became
+        unresponsive" looks like from the inside.
+
+        A timeout converts that into a visible error and an unwinding run.
+        Default is generous, because a legitimate handover -- drawing a whole
+        layout, or finalize plus a document recompute -- can be slow.
+        """
         self._draw_event.clear()
         self.draw_requested.emit(payload)
-        self._draw_event.wait()
+        limit = _DRAW_HANDOVER_TIMEOUT_S if timeout is None else timeout
+        if not self._draw_event.wait(limit):
+            FreeCAD.Console.PrintError(
+                f"[Nesting] Main thread did not acknowledge a "
+                f"{sorted(k for k in payload if k not in ('verbose',))} request "
+                f"within {limit:.0f}s. Continuing without it; the run may be "
+                f"incomplete. This used to block forever.\n")
+            return False
+        return True
     
     def notify_draw_complete(self):
         """Called from main thread after draw finishes."""
@@ -513,31 +542,44 @@ class NestingController:
         self._worker.start()
 
     def _handle_draw_request(self, payload):
-        """Main-thread handler for draw requests from worker."""
+        """Main-thread handler for draw requests from worker.
+
+        The worker is captured on entry and used throughout, rather than read
+        from `self._worker` each time. `_on_nesting_finished` and `cancel_job`
+        both set `self._worker = None`, and a `draw_requested` signal already
+        sitting in the event queue can be delivered after that. The old code then
+        raised AttributeError in its `finally`, so `notify_draw_complete` was
+        never called and the worker's `wait()` never returned -- an unrecoverable
+        freeze. With the reference captured, the acknowledgement still happens,
+        and if there is genuinely no worker left there is nothing waiting on it.
+        """
+        worker = self._worker
+        if worker is None:
+            return
         try:
             if payload.get('updateGui_only'):
                 FreeCADGui.updateGui()
             elif payload.get('create_population'):
-                layouts = self._worker.coordinator.layout_manager.create_ga_population(
+                layouts = worker.coordinator.layout_manager.create_ga_population(
                     payload['master_map'], payload['quantities'], 
                     payload['ui_params'], payload['population_size'],
                     payload['rotation_steps'], verbose=payload.get('verbose', False)
                 )
-                self._worker.coordinator._pending_layouts = layouts
+                worker.coordinator._pending_layouts = layouts
             elif payload.get('build_next_generation'):
-                layouts = self._worker.coordinator._build_next_generation(
+                layouts = worker.coordinator._build_next_generation(
                     payload['gen'], payload['layouts'], payload['elites'], 
                     payload['master_map'], payload['quantities'], payload['ui_params'], 
                     payload['rotation_steps'], payload['mutation_rate'], 
                     payload['immigrant_ratio'], payload.get('verbose', False)
                 )
-                self._worker.coordinator._pending_layouts = layouts
+                worker.coordinator._pending_layouts = layouts
             elif payload.get('spawn_fill_part'):
                 payload['result_holder'][0] = payload['spawn_fn']()
             elif payload.get('cleanup_layouts'):
                 for layout in payload['layouts']:
                     if layout != payload['best_layout']:
-                        self._worker.coordinator.layout_manager.delete_layout(layout, verbose=payload.get('verbose', False))
+                        worker.coordinator.layout_manager.delete_layout(layout, verbose=payload.get('verbose', False))
             elif payload.get('sheets'):
                 for sheet in payload['sheets']:
                     sheet.draw(payload['doc'], payload['ui_params'], payload['layout_group'],
@@ -550,7 +592,7 @@ class NestingController:
                 FreeCADGui.updateGui()
             elif payload.get('ga_finalize'):
                 # _finalize() and doc.recompute() must run on main thread (ViewObject + recompute)
-                coordinator = self._worker.coordinator
+                coordinator = worker.coordinator
                 job = coordinator._finalize(
                     payload['best_layout'], payload['best_efficiency'],
                     payload['total_time'], payload['target_layout'], payload['ui_params']
@@ -560,12 +602,12 @@ class NestingController:
                 coordinator.doc.recompute()
                 coordinator._record_doc_recompute(time.perf_counter() - recompute_start)
             elif payload.get('doc_recompute_only'):
-                coordinator = self._worker.coordinator
+                coordinator = worker.coordinator
                 recompute_start = time.perf_counter()
                 coordinator.doc.recompute()
                 coordinator._record_doc_recompute(time.perf_counter() - recompute_start)
         finally:
-            self._worker.notify_draw_complete()
+            worker.notify_draw_complete()
 
     def _on_nesting_finished(self, job):
         """Main-thread handler for nesting completion."""

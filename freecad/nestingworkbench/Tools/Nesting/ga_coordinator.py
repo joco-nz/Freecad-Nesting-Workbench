@@ -12,6 +12,12 @@ from ...datatypes.shape import Shape
 from ...constants import CANDIDATE_GEOMETRY_CACHE_DEFAULT
 from ...freecad_helpers import set_visibility, refresh_gui
 from .layout_manager import LayoutManager
+
+# How long the error path waits for the main thread to acknowledge a cleanup
+# before giving up and leaving the layouts in the document. Short on purpose:
+# the run has already failed, and an unrecoverable freeze is a far worse outcome
+# than some leftover objects.
+_ERROR_HANDOFFER_TIMEOUT_S = 5.0
 from .algorithms import genetic_utils
 from .algorithms import minkowski_utils
 
@@ -190,7 +196,8 @@ class GACoordinator:
         # finally block in run() dispose it without racing a pending commit.
         self._job_committed = False
 
-    def _delete_layouts(self, layouts, verbose=False, best_layout=None):
+    def _delete_layouts(self, layouts, verbose=False, best_layout=None,
+                        timeout=None):
         """Delete layouts, on whichever thread is allowed to touch the document.
 
         FreeCAD document objects must be created and destroyed on the main
@@ -204,21 +211,32 @@ class GACoordinator:
         everything in the list", which is what the callers that have already
         chosen their victims want.
 
-        Every layout deletion in this class goes through here. A bare
-        `delete_layout` inside `run()` is a document mutation on the worker
-        thread, which is the defect this helper exists to make impossible;
-        `test_ga_layout_cleanup` fails if one reappears.
+        `timeout` is passed to a draw callback that accepts one, for the error
+        path: a run that has already failed should give up on the handover
+        quickly and unwind, rather than leave the layouts behind after waiting
+        the full budget. Leaving layouts is recoverable; a freeze is not.
+
+        Not every call site goes through here. `_build_next_generation` deletes
+        directly, because it is delegated whole to the main thread and a nested
+        handover from inside a handler is a wait that can be lost.
         """
         victims = [layout for layout in (layouts or ()) if layout is not None]
         if not victims:
             return
         if self.draw_callback:
-            self.draw_callback({
+            payload = {
                 'cleanup_layouts': True,
                 'layouts': victims,
                 'best_layout': best_layout,
                 'verbose': verbose,
-            })
+            }
+            try:
+                self.draw_callback(payload, timeout=timeout)
+            except TypeError:
+                # A draw callback that does not accept a timeout, such as a
+                # harness stub. TypeError from the call itself is not a reason
+                # to skip the deletion.
+                self.draw_callback(payload)
             return
         for layout in victims:
             self.layout_manager.delete_layout(layout, verbose=verbose)
@@ -984,7 +1002,11 @@ class GACoordinator:
             # a cancel that surfaces as an exception, a geometry failure, or a Qt
             # error all land here rather than on one of the `break`s.
             if 'layouts' in locals():
-                self._delete_layouts(layouts)
+                # A short budget, deliberately. This is a failing run: if the
+                # handover cannot be acknowledged, leaving layouts behind is a
+                # far better outcome than blocking a thread until the user kills
+                # the process.
+                self._delete_layouts(layouts, timeout=_ERROR_HANDOFFER_TIMEOUT_S)
             self._dispatch_recompute()
             return None
         finally:
@@ -1193,14 +1215,18 @@ class GACoordinator:
         # Discarding the outgoing layouts is charged to lm_delete_s (measured
         # inside delete_layout); gene bookkeeping starts after it so the
         # sub-phase timers stay disjoint.
-        # Through the helper for uniformity. This function is delegated whole to
-        # the main thread when a draw callback is set, so these deletions were
-        # already on the right thread; the helper is a no-op hop in that case
-        # and keeps the invariant "one way to delete a layout" true everywhere.
-        self._delete_layouts(
-            [e for e in elites[1:]]
-            + [layout for layout in layouts if layout not in elites],
-            verbose=verbose)
+        # Direct, not through _delete_layouts. This function is delegated whole
+        # to the main thread when a draw callback is set, so these deletions are
+        # already on the thread that is allowed to make them, and going through
+        # the helper would emit a handover from inside a handler that is itself
+        # serving one -- an emit plus a wait, nested. That was tried, uniformity
+        # was the stated reason, and it was wrong: it added a blocking wait and
+        # a lost acknowledgement can freeze FreeCAD outright.
+        for e in elites[1:]:
+            self.layout_manager.delete_layout(e, verbose=verbose)
+        for layout in layouts:
+            if layout not in elites:
+                self.layout_manager.delete_layout(layout, verbose=verbose)
 
         gene_ops_start = time.perf_counter()
         population_size = len(layouts)
