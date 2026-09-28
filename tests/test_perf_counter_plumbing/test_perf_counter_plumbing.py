@@ -31,6 +31,9 @@ STRATEGY = os.path.join(
     "nesting_strategy.py")
 COORDINATOR = os.path.join(
     _REPO, "freecad", "nestingworkbench", "Tools", "Nesting", "ga_coordinator.py")
+ENGINE = os.path.join(
+    _REPO, "freecad", "nestingworkbench", "Tools", "Nesting", "algorithms",
+    "minkowski_engine.py")
 
 _TREE = ast.parse(open(STRATEGY).read())
 
@@ -188,6 +191,7 @@ def _guarded_by_probe(node, parents):
 # The same trap, one module over.
 # ---------------------------------------------------------------------------
 _COORD_TREE = ast.parse(open(COORDINATOR).read())
+_ENGINE_TREE = ast.parse(open(ENGINE).read())
 
 
 def _ga_allowlist(tree):
@@ -251,6 +255,68 @@ def _ga_loop_allowlist(tree):
     return keys
 
 
+def _perf_stats_literals(tree, attr="_perf_stats"):
+    """Key sets of every `self.<attr> = {...}` initialiser, as separate sets.
+
+    Returned as a list rather than a union on purpose: the hazard is a key
+    missing from one of them, and a union cannot express that.
+    """
+    out = []
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Assign) and isinstance(node.value, ast.Dict)
+                and any(_is_stats_attr(t, attr) for t in node.targets)):
+            out.append({key.value for key in node.value.keys
+                        if isinstance(key, ast.Constant)
+                        and isinstance(key.value, str)})
+    return out
+
+
+def _ms_to_s_pairs(tree):
+    """The literal `(ms_key, s_key)` pairs of an explicit unit-conversion loop.
+
+    Matches the shape
+
+        for _ms_key, _s_key in (('a_ms', 'a_s'), ...):
+            self._ga_perf[_s_key] = self._ga_perf.get(...) + stats.get(_ms_key, 0)/1000
+
+    The pair is resolved out of the iterable's own tuples, not out of the body.
+    An earlier version walked the body for the subscript, which only ever found
+    the *variable* names -- so it reported the pairs ('_ms_key', '_s_key') and
+    asserted that a variable existed in the schema, passing while checking
+    nothing.
+
+    The body is still consulted, to tie the tuple to a real conversion: a loop
+    that iterates the pairs without writing `_s_key` into `_ga_perf` is not one
+    of these and must not be read as one.
+    """
+    pairs = set()
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.For)
+                and isinstance(node.iter, (ast.Tuple, ast.List))
+                and isinstance(node.target, ast.Tuple)):
+            continue
+        names = [t.id for t in node.target.elts if isinstance(t, ast.Name)]
+        if len(names) != 2:
+            continue
+        # Does the body assign through the second variable into `_ga_perf`?
+        writes_second = any(
+            isinstance(sub, ast.Assign) and sub.targets
+            and isinstance(sub.targets[0], ast.Subscript)
+            and _is_stats_attr(sub.targets[0].value, "_ga_perf")
+            and isinstance(sub.targets[0].slice, ast.Name)
+            and sub.targets[0].slice.id == names[1]
+            for sub in ast.walk(ast.Module(body=node.body, type_ignores=[])))
+        if not writes_second:
+            continue
+        for element in node.iter.elts:
+            if (isinstance(element, (ast.Tuple, ast.List))
+                    and len(element.elts) == 2
+                    and all(isinstance(e, ast.Constant)
+                            and isinstance(e.value, str) for e in element.elts)):
+                pairs.add((element.elts[0].value, element.elts[1].value))
+    return pairs
+
+
 def _ga_schema():
     return _schema_keys("_ga_perf", _COORD_TREE)
 
@@ -305,14 +371,98 @@ class TestGaCounterPlumbing:
         """
         schema = _ga_schema()
         raw = _ga_loop_allowlist(_COORD_TREE)
+        # The conversion loop itself, not just the keys it produces. Asserting
+        # only that the `_s` keys are in the schema passes vacuously: deleting a
+        # line from the loop leaves every schema entry intact and every number
+        # reading zero, which is what happened to the first version of these.
+        converted = _ms_to_s_pairs(_COORD_TREE)
+        assert converted, "the ms->s conversion loop was not found"
+        for source, target in sorted(converted):
+            assert target in schema, (
+                f"{target} is produced by the conversion loop but absent from "
+                f"the _ga_perf initialiser, so the `get` defaults it to 0 and "
+                f"the figure never appears")
+            assert source not in raw, (
+                f"{source} is both converted explicitly and absorbed raw, so "
+                f"it is counted twice at two different scales")
+            assert source.endswith('_ms'), (
+                f"{source} is not named like a millisecond value, and the "
+                f"conversion divides it by 1000 on the assumption that it is")
         for key in ("collision_intersects_s", "collision_overlay_s",
-                    "collision_hole_probe_s", "collision_intersection_s"):
+                    "collision_hole_probe_s", "collision_intersection_s",
+                    "candidate_generation_s", "candidate_incremental_s"):
             assert key in schema, f"{key} missing from the _ga_perf initialiser"
+        for source, target in (("nfp_candidate_generation_ms",
+                                "candidate_generation_s"),
+                               ("nfp_candidate_incremental_ms",
+                                "candidate_incremental_s")):
+            assert (source, target) in converted, (
+                f"the conversion loop no longer maps {source} -> {target}, so "
+                f"{target} reads 0 with no error")
             assert key not in raw, (
                 f"{key} is in the loop allowlist, which adds raw, so it would "
                 f"land in milliseconds beside seconds")
-        for key in ("collision_intersects_ms", "collision_overlay_ms"):
+        for key in ("collision_intersects_ms", "collision_overlay_ms",
+                    "nfp_candidate_generation_ms",
+                    "nfp_candidate_incremental_ms"):
             assert key not in raw, (
                 f"{key} is a millisecond key in the raw allowlist")
             assert key not in schema, (
                 f"{key} is a millisecond key in a seconds dict")
+
+    def test_candidate_generation_is_measured_end_to_end(self):
+        """The NFP-to-candidates stage has a GA-level figure.
+
+        It is the stage between "the NFP exists" and "candidate points exist",
+        and until now it had none: the engine computed the timing and only
+        logged it, so `nfp_compute` was being read as the whole NFP cost when it
+        covers only the miss path that builds the NFP.
+
+        The engine prefixes its own keys with `nfp_` when the nester reports
+        them, so both the counts and the converted timings have to be present at
+        the GA level or the number is computed and then dropped.
+        """
+        schema = _ga_schema()
+        for key in ("candidate_generation_s", "candidate_incremental_s",
+                    "nfp_candidate_generation_calls",
+                    "nfp_candidate_incremental_calls",
+                    "nfp_candidate_points_returned"):
+            assert key in schema, f"{key} missing from the _ga_perf initialiser"
+        for key in ("nfp_candidate_generation_calls",
+                    "nfp_candidate_incremental_calls",
+                    "nfp_candidate_points_returned"):
+            assert key in _ga_allowlist(_COORD_TREE), (
+                f"{key} is initialised but never absorbed, so it reads zero")
+
+    def test_engine_declares_every_counter_it_accumulates(self):
+        """The engine's own `_perf_stats` has the keys it increments.
+
+        Its two initialisers -- the constructor and the reset -- are separate
+        literals, so a key added to one and not the other is reported by the
+        nester and then dropped by the reset halfway through a run. That is the
+        same shape of hazard as the GA allowlist one module over, and silent in
+        the same way.
+        """
+        literals = _perf_stats_literals(_ENGINE_TREE)
+        assert len(literals) == 2, (
+            f"expected the engine to have 2 _perf_stats initialisers "
+            f"(constructor and reset), found {len(literals)}")
+        # Compared per literal, not merged. Merging finds nothing wrong, because
+        # a key present in either one satisfies the merged set -- which is the
+        # defect: the reset wipes the counters, so a key present only in the
+        # constructor reads non-zero until the first reset and zero forever
+        # after, and nothing raises.
+        base = literals[0]
+        for index, keys in enumerate(literals[1:], start=1):
+            missing = sorted(base - keys)
+            assert not missing, (
+                f"_perf_stats initialiser #{index} is missing {missing}, which "
+                f"initialiser #0 has. The reset discards them, so those "
+                f"counters read non-zero until the first reset and zero after, "
+                f"with no error.")
+        for key in ("candidate_generation_ms", "candidate_generation_calls",
+                    "candidate_incremental_ms", "candidate_incremental_calls",
+                    "candidate_points_returned"):
+            assert key in base, (
+                f"the engine accumulates {key} but no initialiser declares it, "
+                f"so the first reset silently discards it")

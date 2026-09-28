@@ -227,11 +227,49 @@ no `/1000`. They read `collision_intersects_ms 22184.8` beside
 `test_perf_counter_plumbing.py` checks the raw loop never carries a millisecond
 key.
 
+## The stage in between, which was not measured at all
+
+The map above adds up to less than the run, and the remainder turned out to be
+a real stage rather than bookkeeping: turning an NFP that already exists into
+the candidate points that get collision-tested.
+
+`nfp_compute` measures only the miss path — building the NFP. Everything after
+that, in `MinkowskiEngine.get_incremental_candidates`, was timed and then only
+logged: the engine computed a duration and wrote it to a log line that nothing
+aggregates. So the stage was invisible, and `nfp_compute` was easy to read as
+"the NFP cost" when it is the cost of the 2.3% of calls that missed.
+
+Timed, on the same n70 GA run:
+
+| | s | % of generations | % of wall |
+|---|---:|---:|---:|
+| candidate generation, whole stage | **36.56** | **20.1%** | **19.8%** |
+| — of which incremental extension | 36.39 | 20.0% | 19.7% |
+| — so cache-hit and seed overhead | 0.18 | 0.1% | 0.1% |
+| NFP construction (the misses) | 4.15 | 2.3% | 2.2% |
+| *NFP to candidates, end to end* | *40.71* | *22.4%* | *22.0%* |
+
+4,396 calls, **3,914 of which (89.0%) actually extended a cached entry**, at
+8.3 ms per call and 9.3 ms for the ones that did work, returning 639,182 points.
+So it is not the bookkeeping: the incremental path is doing real work on the
+large majority of calls, and the cache-hit path costs 0.18 s in total.
+
+**Candidate generation is 9× the cost of building the NFP.** Reporting
+`nfp_compute` as the NFP cost understated it by that factor.
+
+The cross-check that makes the number credible: rotation wall is 171.21 s and
+candidate evaluation 132.20 s, leaving 39.01 s unaccounted for between them.
+The measured stage is 36.56 s, so it explains **93.7%** of the gap, and the
+remaining 2.44 s is scoring, placement bookkeeping and master ordering. A timer
+that does not close most of a known hole is usually measuring the wrong thing.
+
 ## Summary, second edition
 
 | question | answer |
 |---|---|
 | how big is collision on the real config? | 88.4 s of 180.5 s — 49% of the run |
+| how big is NFP candidate generation? | **36.6 s — 20.1%**, and it was unmeasured until now |
+| is `nfp_compute` the NFP cost? | no — it is 2.3%, and only the miss path; end to end it is 22.4% |
 | how big is the NFP stage there? | 4.07 s — **2.3%**, so NFP work is bounded by a couple of percent |
 | can a predicate replace the overlay? | no — **89.4%** of overlays are sub-tolerance noise it would reject |
 | is there a real opportunity? | 51.8 s measures 0.033 mm² in total, but it is necessary work: disproving an overlap is the point |

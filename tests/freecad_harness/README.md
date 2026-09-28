@@ -361,9 +361,18 @@ cannot, because the n70 corpus is a gitignored customer part.
 **A single cold nest and a GA run are different regimes, and optimising one
 tells you almost nothing about the other.** Measured on the n70 configuration:
 NFP construction is over half of a single cold nest but **2.3%** of the GA run,
-because the 82 NFP misses are computed once and then hit 26 468 times across 19
-layouts. The collision stage is the reverse — a third of a single nest, **49%**
-of the GA run. Every throughput claim should say which one it measured.
+because the NFP misses are computed once and then hit tens of thousands of
+times across the layouts. The collision stage is the reverse — a third of a
+single nest, **49%** of the GA run. Every throughput claim should say which one
+it measured.
+
+**And "the NFP cost" is ambiguous, which cost this work a wrong conclusion.**
+`nfp_compute` covers only the miss path that *builds* an NFP. Turning an NFP
+that exists into the candidate points to test is a separate stage, 8.3 ms per
+call over 4,396 calls, and it was timed and then only logged, so it was
+invisible. It is **20.1%** of the GA run — 9× the construction cost, and 22.4%
+end to end. So the NFP work is not 2% of the run; it is a fifth of it, in a
+different place than assumed.
 
 ### Tier 2: the heavy synthetic corpus
 

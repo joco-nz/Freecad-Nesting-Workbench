@@ -252,7 +252,13 @@ class MinkowskiEngine:
         self._log_lock = Lock()
 
         self.bin_polygon = Polygon([(0, 0), (self.bin_width, 0), (self.bin_width, self.bin_height), (0, self.bin_height)])
-        self._perf_stats = {'cache_hits': 0, 'cache_misses': 0, 'nfp_compute_ms': 0.0, 'nfp_errors': 0}
+        self._perf_stats = {'cache_hits': 0, 'cache_misses': 0,
+                            'nfp_compute_ms': 0.0, 'nfp_errors': 0,
+                            'candidate_generation_ms': 0.0,
+                            'candidate_generation_calls': 0,
+                            'candidate_incremental_ms': 0.0,
+                            'candidate_incremental_calls': 0,
+                            'candidate_points_returned': 0}
         self._perf_lock = Lock()
         self._cand_cache_lock = Lock()
 
@@ -392,6 +398,17 @@ class MinkowskiEngine:
         Returns (N,2) float64 array of currently-valid positions, or None when
         a pairwise NFP carries an error flag (skip this rotation).
         """
+        # Timed from here, not from just before the extension loop below, so the
+        # pure cache-hit return is counted too. It is the majority of calls, and
+        # excluding it would report a stage cost that exists only for the
+        # minority that did work.
+        #
+        # `nfp_compute_ms` covers only the miss path -- NFP construction. Before
+        # this, the whole stage between "the NFP exists" and "candidate points
+        # exist" was unmeasured: the timing was computed here, but only logged,
+        # and never aggregated anywhere.
+        t_gen = time.perf_counter()
+
         part_label = part_to_place.source_freecad_object.Label
         key = (part_label, round(angle % 360.0, 4), part_to_place.spacing,
                part_to_place.deflection, part_to_place.simplification)
@@ -436,6 +453,7 @@ class MinkowskiEngine:
         m = len(sheet.parts)
         n_prev = entry['n']
         if n_prev >= m:
+            self._record_candidate_generation(t_gen, None)
             return entry['pts']
 
         t0_total = time.perf_counter()
@@ -476,6 +494,7 @@ class MinkowskiEngine:
                 with self._perf_lock:
                     self._perf_stats['cache_hits'] += n_hits
                     self._perf_stats['cache_misses'] += n_misses
+                self._record_candidate_generation(t_gen, None)
                 return None
 
             master = nfp_data.get('polygon')
@@ -549,7 +568,33 @@ class MinkowskiEngine:
             self.log(f"[PERF] incremental_candidates angle={angle:.1f} "
                      f"new_parts={m - n_prev} hits={n_hits} misses={n_misses} "
                      f"total={dt:.1f}ms candidates={len(pts)}")
+        self._record_candidate_generation(t_gen, t0_total, len(pts))
         return pts
+
+    def _record_candidate_generation(self, t_start, t_incremental, n_points=None):
+        """Accumulate one `get_incremental_candidates` call.
+
+        `t_incremental` is when the extension loop began, or None when the call
+        took the pure cache-hit return and did no work. Two timers rather than
+        one because a single total cannot distinguish "4,000 calls that each did
+        almost nothing" from "4,000 calls that each did something", and those
+        call for completely different fixes.
+
+        Takes the lock once. This is called on every candidate evaluation -- 4,396
+        of them in a single generation of the n70 configuration -- so the
+        accounting has to be cheaper than the thing it accounts for.
+        """
+        with self._perf_lock:
+            stats = self._perf_stats
+            stats['candidate_generation_calls'] += 1
+            stats['candidate_generation_ms'] += (time.perf_counter() - t_start) * 1000
+            if n_points is not None:
+                stats['candidate_points_returned'] += n_points
+            if t_incremental is None:
+                return
+            now = time.perf_counter()
+            stats['candidate_incremental_calls'] += 1
+            stats['candidate_incremental_ms'] += (now - t_incremental) * 1000
 
     @staticmethod
     def score_gravity(pts_np, valid, direction, rng=None):
@@ -643,7 +688,13 @@ class MinkowskiEngine:
 
     def reset_perf_stats(self):
         with self._perf_lock:
-            self._perf_stats = {'cache_hits': 0, 'cache_misses': 0, 'nfp_compute_ms': 0.0, 'nfp_errors': 0}
+            self._perf_stats = {'cache_hits': 0, 'cache_misses': 0,
+                            'nfp_compute_ms': 0.0, 'nfp_errors': 0,
+                            'candidate_generation_ms': 0.0,
+                            'candidate_generation_calls': 0,
+                            'candidate_incremental_ms': 0.0,
+                            'candidate_incremental_calls': 0,
+                            'candidate_points_returned': 0}
 
     @staticmethod
     def _discretize_ring_np(ring, step_size):

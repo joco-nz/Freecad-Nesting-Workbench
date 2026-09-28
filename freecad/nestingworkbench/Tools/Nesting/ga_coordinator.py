@@ -277,7 +277,9 @@ class GACoordinator:
         for _ms_key, _s_key in (
                 ('collision_intersects_ms', 'collision_intersects_s'),
                 ('collision_overlay_ms', 'collision_overlay_s'),
-                ('collision_hole_probe_ms', 'collision_hole_probe_s')):
+                ('collision_hole_probe_ms', 'collision_hole_probe_s'),
+                ('nfp_candidate_generation_ms', 'candidate_generation_s'),
+                ('nfp_candidate_incremental_ms', 'candidate_incremental_s')):
             self._ga_perf[_s_key] = self._ga_perf.get(_s_key, 0.0) + stats.get(
                 _ms_key, 0.0) / 1000
         self._ga_perf['placement_wall_s'] += stats.get('placement_wall_ms', 0.0) / 1000
@@ -329,6 +331,17 @@ class GACoordinator:
                     # are NOT here: they are converted to seconds by an explicit
                     # loop above, because this allowlist adds raw.
                     'collision_intersects_calls', 'collision_overlay_calls',
+                    # NFP candidate generation: turning an NFP that already
+                    # exists into candidate points. `nfp_compute` only covers
+                    # building the NFP, so this stage had no GA-level figure at
+                    # all -- it was timed in the engine and then only logged.
+                    # The split matters: `_calls` is every evaluation, while
+                    # `_incremental_calls` is the subset that actually extended
+                    # a cached entry, so the ratio says whether the cost is the
+                    # work or the bookkeeping.
+                    'nfp_candidate_generation_calls',
+                    'nfp_candidate_incremental_calls',
+                    'nfp_candidate_points_returned',
                     'mask_hole_rings', 'mask_hole_vertices',
                     'mask_exterior_vertices', 'mask_hole_sensitive_pairs',
                     'mask_hole_exploiting_placements', 'mask_candidate_rings',
@@ -524,6 +537,11 @@ class GACoordinator:
             'collision_intersects_s': 0.0,
             'collision_overlay_s': 0.0,
             'collision_hole_probe_s': 0.0,
+            'candidate_generation_s': 0.0,
+            'candidate_incremental_s': 0.0,
+            'nfp_candidate_generation_calls': 0,
+            'nfp_candidate_incremental_calls': 0,
+            'nfp_candidate_points_returned': 0,
             # Interior-ring population of the collision mask. Measurement-only;
             # see _exact_candidate_mask. These are summed, not maxed, except
             # mask_batch_max.
