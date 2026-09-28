@@ -29,11 +29,23 @@ def _candidate_geometry_key(prefix, x, y):
 def _step_size(kwargs):
     """Resolve the NFP discretisation interval: env, then kwargs, then 5.0 mm.
 
+    The UI field wins when it has been set, so a user who moves it sees the
+    effect; the env is the scripted and benchmark entry point and applies when
+    the caller did not choose. Unset everywhere is the 5.0 mm default.
+
     `NESTING_STEP_SIZE` exists so the time/density curve can be characterised
-    without editing code or building a UI, the same reason
-    `NESTING_ROTATION_WORKERS` exists. Both are reported in the run output so a
-    measurement taken with an override is self-describing.
+    without building a UI, the same reason `NESTING_ROTATION_WORKERS` exists.
+    Both are now also panel fields, because a control nobody can reach is not a
+    control, and these two are the largest levers measured in a run.
     """
+    explicit = kwargs.get("step_size") if kwargs else None
+    if explicit is not None:
+        try:
+            value = float(explicit)
+            if value > 0:
+                return value
+        except (TypeError, ValueError):
+            pass
     raw = os.environ.get('NESTING_STEP_SIZE', '').strip()
     if raw:
         try:
@@ -42,13 +54,10 @@ def _step_size(kwargs):
                 return value
         except ValueError:
             pass
-    try:
-        return float(kwargs.get("step_size", 5.0))
-    except (TypeError, ValueError):
-        return 5.0
+    return 5.0
 
 
-def _rotation_worker_limit():
+def _rotation_worker_limit(kwargs=None):
     """Resolve the rotation thread-pool size, or None for the stdlib default.
 
     ``ThreadPoolExecutor()`` with no argument defaults to
@@ -59,10 +68,24 @@ def _rotation_worker_limit():
     contention on the shared NFP cache. The effective width is therefore
     measurable rather than assumed.
 
-    ``NESTING_ROTATION_WORKERS`` overrides it. This exists so the 4-vs-8
-    comparison can be run without editing code; unset means "stdlib default",
-    which is the production behaviour and is what the fixture baseline used.
+    The width is now also a UI field (Minkowski panel, "Rotation Threads"),
+    because the measurement says it is worth 22% of the run. Precedence: an
+    explicit positive value from the caller, then `NESTING_ROTATION_WORKERS` for
+    scripted and benchmark runs, then the stdlib default. 0 means "auto", which
+    is the stdlib default -- so leaving the field at 0 changes nothing, while
+    still being distinguishable from "nobody chose".
+
+    `NESTING_ROTATION_WORKERS` deliberately survives the UI field: the benchmark
+    harness pins the width for reproducible work counters and never builds an
+    `algo_kwargs`, so removing the env would have broken every recorded
+    baseline's reproducibility.
     """
+    explicit = kwargs.get('rotation_workers') if kwargs else None
+    try:
+        if explicit is not None and int(explicit) > 0:
+            return int(explicit)
+    except (TypeError, ValueError):
+        pass
     raw = os.environ.get('NESTING_ROTATION_WORKERS', '').strip()
     if not raw:
         return None
@@ -246,8 +269,14 @@ class PlacementOptimizer:
     def __init__(
         self, engine, rotation_steps, search_direction, log_callback=None,
         trial_callback=None, rng=None, performance_logging=False,
-        candidate_geometry_key_tracker=None, candidate_geometry_cache=None
+        candidate_geometry_key_tracker=None, candidate_geometry_cache=None,
+        rotation_workers=None
     ):
+        # Resolved once, here, rather than per call. find_best_placement runs
+        # once per part placed -- 122 times in a GA run -- so re-reading the
+        # environment and the UI value on each call is 122 redundant lookups.
+        # None means "auto": defer to the stdlib default.
+        self.rotation_workers = rotation_workers
         self.engine = engine
         self.rotation_steps = max(1, rotation_steps)
         self.search_direction = search_direction
@@ -404,7 +433,9 @@ class PlacementOptimizer:
         # Recorded so the report line is self-describing: a run measured with
         # the env override must say so, otherwise the 4-vs-8 comparison is
         # unattributable. max_workers=None means the stdlib default.
-        worker_limit = _rotation_worker_limit()
+        worker_limit = self.rotation_workers
+        if worker_limit is None:
+            worker_limit = _rotation_worker_limit()
         with self._perf_lock:
             self._perf_stats['rotation_workers'] = (
                 worker_limit
@@ -1230,13 +1261,19 @@ class Nester:
             performance_logging=self.performance_logging,
             search_direction=self.search_direction, rng=kwargs.get("rng"))
         # quiet (multi-layout GA) silences the optimizer's per-placement [TIMING] lines
+        # Kept on the nester so a run can report what it actually used. Both are
+        # performance dials with no visible effect on the packing, so a reader
+        # of the output has no other way to tell what produced a result.
+        self.step_size = step_size
+        self.rotation_workers = _rotation_worker_limit(kwargs)
         self.optimizer = PlacementOptimizer(
             self.engine, rotation_steps, self.search_direction,
             None if self.quiet else self.log_callback,
             self.trial_callback, rng=kwargs.get("rng"),
             performance_logging=self.performance_logging,
             candidate_geometry_key_tracker=kwargs.get("candidate_geometry_key_tracker"),
-            candidate_geometry_cache=kwargs.get("candidate_geometry_cache")
+            candidate_geometry_cache=kwargs.get("candidate_geometry_cache"),
+            rotation_workers=self.rotation_workers
         )
         self.optimizer.verbose = self.verbose
 

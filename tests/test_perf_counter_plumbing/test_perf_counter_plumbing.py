@@ -24,6 +24,7 @@ be charged to the feature it was built to measure.
 """
 import ast
 import os
+import re
 
 _REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 STRATEGY = os.path.join(
@@ -466,3 +467,157 @@ class TestGaCounterPlumbing:
             assert key in base, (
                 f"the engine accumulates {key} but no initialiser declares it, "
                 f"so the first reset silently discards it")
+
+
+# ===========================================================================
+# The two performance dials must be reachable from the panel, not just the env.
+# ===========================================================================
+PANEL = os.path.join(_REPO, "freecad", "nestingworkbench", "Tools", "Nesting",
+                     "ui_nesting.py")
+CONTROLLER = os.path.join(_REPO, "freecad", "nestingworkbench", "Tools",
+                          "Nesting", "nesting_controller.py")
+_PANEL_SRC = open(PANEL).read()
+_CTRL_SRC = open(CONTROLLER).read()
+
+
+def _flat(text):
+    """Collapse runs of whitespace, so an assertion can match a wrapped line.
+
+    Matching source text literally is brittle in a way that produces false
+    negatives: `rotation_workers` is assigned across two lines for line length,
+    and the first version of this test could not see it. It also produces false
+    positives, because a substring survives reformatting that changes what it
+    refers to. Whitespace is the only difference that does not matter here.
+    """
+    return re.sub(r"\s+", " ", text)
+
+
+class TestPerformanceDialsAreReachable:
+    """step_size and the rotation pool width must be settable without an env var.
+
+    Both were measured to be the largest levers in a run -- the pool width 22%
+    of wall clock, step_size up to 54% -- and both were reachable only through
+    `NESTING_ROTATION_WORKERS` / `NESTING_STEP_SIZE`. A user launching FreeCAD
+    from a desktop icon cannot set those, so as shipped the two biggest knobs in
+    the workbench were unusable by the person using it.
+
+    Structural rather than behavioural, because the panel needs Qt. The GUI probe
+    `probe_ui_performance_dials.py` is the behavioural check: it builds the
+    panel, moves both fields, and asserts they reach the nester and survive a
+    preferences round trip.
+    """
+
+    def test_panel_declares_both_fields(self):
+        for widget, default in (("minkowski_step_size_input", "5.0"),
+                                ("minkowski_rotation_workers_input", "0")):
+            flat = _flat(_PANEL_SRC)
+            assert widget in _PANEL_SRC, f"{widget} is not declared in the panel"
+            assert f"self.{widget}.setValue({default})" in flat, (
+                f"{widget} default should be {default} so leaving the panel "
+                f"alone reproduces the previous behaviour")
+
+    def test_fields_are_in_the_minkowski_group(self):
+        """They must land in the Minkowski group, not the Physics one.
+
+        step_size already existed on the Physics panel, where it does nothing for
+        Minkowski -- that is the gap that started this. A field that exists but
+        is wired to the other algorithm looks correct and is inert.
+        """
+        assert "minkowski_form_layout.addRow(perf_form_layout)" \
+            in _flat(_PANEL_SRC), (
+            "the performance fields are not added to the Minkowski form layout")
+        flat = _flat(_PANEL_SRC)
+        group = flat.index("minkowski_form_layout.addRow(perf_form_layout)")
+        physics = flat.index("physics_form_layout = ")
+        assert group < physics, "the fields are added after the Physics layout"
+
+    def test_controller_passes_both_to_the_nester(self):
+        """Scoped to the Minkowski `else:` branch, located by AST.
+
+        Three attempts at this check failed in three different ways, all from
+        slicing the source as text:
+
+          - `"algo_kwargs['step_size']" in source` passed while the Minkowski
+            branch was stripped out, because the Physics branch still contains
+            that exact line. The one algorithm where the field does nothing
+            satisfied the check for the one where it must.
+          - anchoring on the first `else:` in the file picked up an unrelated
+            `else` in an earlier method.
+          - anchoring on the first `else:` after the Physics `if` picked up the
+            Physics branch's own `if random_checkbox ... else ...`, so the slice
+            covered the wrong code.
+
+        The dispatch is a real `if`, so the tree is the reliable way to name the
+        branch. Anything that needs to distinguish two occurrences of the same
+        construct has stopped being a text search.
+        """
+        tree = ast.parse(_CTRL_SRC)
+        branch = None
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.If):
+                continue
+            test_src = ast.unparse(node.test)
+            if test_src.replace(" ", "") == "algorithm=='Physics'":
+                assert node.orelse, "the Physics branch has no else; the Minkowski "\
+                                    "branch is gone and the dials cannot work"
+                branch = ast.unparse(ast.Module(body=node.orelse, type_ignores=[]))
+                break
+        assert branch is not None, (
+            "could not find the `if algorithm == 'Physics'` dispatch in the "
+            "controller")
+        flat = _flat(branch)
+
+        for key, widget in (("step_size", "minkowski_step_size_input"),
+                            ("rotation_workers",
+                             "minkowski_rotation_workers_input")):
+            assert f"algo_kwargs['{key}'] = self.ui.{widget}.value()" in flat, (
+                f"the Minkowski branch does not pass {key} from {widget}, so "
+                f"moving the field in the UI would do nothing")
+
+        # The whole original defect in one assertion: the Minkowski step size
+        # must not be sourced from a Physics widget anywhere in that branch.
+        assert "physics_step_size_input" not in flat, (
+            "the Minkowski branch reads the Physics step-size field, so a field "
+            "that looks right is inert -- that is how the original gap survived")
+    def test_both_survive_a_preferences_round_trip(self):
+        for key, setter in (("MinkowskiStepSize", "SetFloat"),
+                            ("MinkowskiRotationWorkers", "SetInt")):
+            assert f'prefs.{setter}("{key}"' in _CTRL_SRC, (
+                f"{key} is never written to preferences, so it resets every "
+                f"session")
+            assert f'prefs.GetFloat("{key}"' in _PANEL_SRC or \
+                   f'prefs.GetInt("{key}"' in _PANEL_SRC, (
+                f"{key} is never read back, so a saved value would not "
+                f"reappear")
+
+    def test_env_still_works_for_benchmarking(self):
+        """The harness pins the pool width via the env; that must keep working.
+
+        The GA coordinator copies `algo_kwargs` into the nest call, but the
+        benchmark harness never builds one -- it calls `nest()` directly. So the
+        env is the only channel a benchmark has, and taking it away to add a UI
+        field would have broken every recorded baseline's reproducibility.
+        """
+        strategy = open(STRATEGY).read()
+        for env in ("NESTING_ROTATION_WORKERS", "NESTING_STEP_SIZE"):
+            assert env in strategy, f"{env} is no longer read"
+
+    def test_resolver_precedence_is_explicit_and_distinguishes_auto(self):
+        """kwargs beat the env; 0 means auto, and is not the same as absent.
+
+        0 has to survive the trip as 0 rather than being dropped, because "the
+        user chose Auto" and "nobody said anything" both land on the stdlib
+        default but only one of them is a decision -- and a future default
+        change must be able to tell them apart.
+        """
+        src = open(STRATEGY).read()
+        step = src[src.index("def _step_size"):src.index("def _rotation_worker_limit")]
+        assert "kwargs.get(\"step_size\")" in step
+        assert "os.environ.get('NESTING_STEP_SIZE'" in step
+        workers = src[src.index("def _rotation_worker_limit"):
+                      src.index("class CandidateGeometryCache")]
+        assert "kwargs.get('rotation_workers')" in workers
+        assert "os.environ.get('NESTING_ROTATION_WORKERS'" in workers
+        # an explicit non-positive value must fall through, not be honoured
+        assert "int(explicit) > 0" in workers, (
+            "a 0 from the UI must mean auto, not a zero-width pool")

@@ -103,6 +103,13 @@ def cfg():
         # of each bottle part. Split out rather than inlined so nest_benchmark
         # and this share one parser.
         "compactness_weight": float(os.environ.get("NEST_BENCH_COMPACTNESS", "0.0")),
+        # Recorded, not passed: the coordinator's algo_kwargs is empty here, so
+        # the env is what drives the run, and a baseline has to say which
+        # values produced it. Pool width changes the work materially (it is
+        # 22% of wall) and step size changes the candidate count (54% of wall),
+        # so a baseline without them is not attributable.
+        "step_size": float(os.environ.get("NESTING_STEP_SIZE", "5.0")),
+        "rotation_workers": int(os.environ.get("NEST_BENCH_ROTATION_WORKERS", "0")) or None,
         "per_label_quantities": _parse_quantities(
             os.environ.get("NEST_BENCH_QUANTITIES", "")),
         "reps": int(os.environ.get("NEST_BENCH_REPS", "3")),
@@ -514,7 +521,7 @@ def main():
         for key in ("population", "generations", "sheet", "seed", "quantity",
                     "rotation_workers", "candidate_geometry_cache",
                     "per_label_quantities", "rotation_steps",
-                    "compactness_weight"):
+                    "compactness_weight", "step_size", "rotation_workers"):
             if baseline["config"].get(key) != c[key]:
                 hc.emit(f"ERROR: baseline {key}={baseline['config'].get(key)} "
                         f"but this run used {c[key]}")

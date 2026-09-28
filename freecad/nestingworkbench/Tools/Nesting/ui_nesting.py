@@ -187,6 +187,47 @@ class NestingPanel(QtWidgets.QWidget):
         self.minkowski_compactness_help.setToolTip("Click to learn more about how the Compactness function works.")
         self.minkowski_compactness_help.clicked.connect(self._show_compactness_info)
 
+        # -- performance dials -------------------------------------------------
+        # Both of these were environment variables and are now fields, because
+        # the measurement says they are the two largest levers in a run and a
+        # control nobody can reach is not a control. Defaults are unchanged, so
+        # leaving them alone reproduces the previous behaviour exactly.
+        self.minkowski_step_size_input = QtWidgets.QDoubleSpinBox()
+        self.minkowski_step_size_input.setRange(0.1, 100.0)
+        self.minkowski_step_size_input.setValue(5.0)
+        self.minkowski_step_size_input.setSingleStep(0.5)
+        self.minkowski_step_size_input.setDecimals(2)
+        self.minkowski_step_size_input.setToolTip(
+            "How finely No-Fit Polygon boundaries are sampled, in mm.\n"
+            "One candidate position is generated per interval, so this sets "
+            "how many candidate positions a rotation is tested at, and the "
+            "collision and candidate-generation cost scales with it.\n\n"
+            "Larger = faster, coarser. Lower gives denser packing when parts "
+            "need positions that are not corner or edge flushes.\n\n"
+            "Measured on the n70 intercooler job (122 parts, 8 generations):\n"
+            "  5 mm (default) 139 s    10 mm 93 s (33% faster)\n"
+            "  15 mm 77 s               20 mm 64 s (54% faster)\n"
+            "Packing was identical in every one of those runs, because that "
+            "job's parts fit by corner flush. A job whose parts interlock will "
+            "lose density here, so raise it only after checking the result.")
+
+        self.minkowski_rotation_workers_input = QtWidgets.QSpinBox()
+        self.minkowski_rotation_workers_input.setRange(0, 64)
+        self.minkowski_rotation_workers_input.setValue(0)
+        self.minkowski_rotation_workers_input.setSpecialValueText("Auto")
+        self.minkowski_rotation_workers_input.setToolTip(
+            "Threads used to evaluate rotations in parallel. 0 = one per CPU "
+            "plus four, which is the default and is usually too many.\n\n"
+            "The work is largely GIL-bound, so oversubscribing costs time "
+            "without buying any: measured on a 4-CPU machine, 8 threads "
+            "(the default) was no faster than 1 thread, and 4 threads was "
+            "22% faster than either.\n\n"
+            "Set this to the number of CPU cores. Packing is unaffected.")
+
+        perf_form_layout = QtWidgets.QFormLayout()
+        perf_form_layout.addRow("Candidate Step (mm):", self.minkowski_step_size_input)
+        perf_form_layout.addRow("Rotation Threads:", self.minkowski_rotation_workers_input)
+
         mink_compactness_layout = QtWidgets.QHBoxLayout()
         mink_compactness_layout.addWidget(self.minkowski_compactness_input)
         mink_compactness_layout.addWidget(self.minkowski_compactness_help)
@@ -213,6 +254,7 @@ class NestingPanel(QtWidgets.QWidget):
         minkowski_form_layout.addRow(self.candidate_geometry_cache_checkbox)
         minkowski_form_layout.addRow("Compactness:", mink_compactness_layout)
         
+        minkowski_form_layout.addRow(perf_form_layout)
         self.minkowski_settings_group.setLayout(minkowski_form_layout)
 
         self.physics_settings_group = QtWidgets.QGroupBox("Physics Nesting Settings")
@@ -566,6 +608,10 @@ class NestingPanel(QtWidgets.QWidget):
         
         # Load Rotation Steps (Isolated)
         # Minkowski
+        self.minkowski_step_size_input.setValue(
+            prefs.GetFloat("MinkowskiStepSize", 5.0) or 5.0)
+        self.minkowski_rotation_workers_input.setValue(
+            prefs.GetInt("MinkowskiRotationWorkers", 0))
         mink_rot_steps = prefs.GetInt("MinkowskiRotationSteps", 4) # Default 90 deg (4 steps)
         if mink_rot_steps > 0:
             target_angle = 360.0 / mink_rot_steps

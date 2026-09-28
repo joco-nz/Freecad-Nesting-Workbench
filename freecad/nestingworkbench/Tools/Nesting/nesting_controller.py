@@ -795,6 +795,10 @@ class NestingController:
         
         mink_steps = int(360 / self.ui.rotation_angles[self.ui.minkowski_rotation_steps_slider.value()])
         prefs.SetInt("MinkowskiRotationSteps", mink_steps)
+        prefs.SetFloat("MinkowskiStepSize",
+                       float(self.ui.minkowski_step_size_input.value()))
+        prefs.SetInt("MinkowskiRotationWorkers",
+                     int(self.ui.minkowski_rotation_workers_input.value()))
         
         phys_angles = PHYSICS_ROTATION_PRESETS
         phys_steps = int(360 / phys_angles[self.ui.physics_rotation_steps_slider.value()])
@@ -903,6 +907,13 @@ class NestingController:
             algo_kwargs['candidate_geometry_cache'] = ui_params.get(
                 'candidate_geometry_cache', CANDIDATE_GEOMETRY_CACHE_DEFAULT
             )
+            # The two performance dials. 0 threads means "auto" and is passed
+            # through as 0 so the nester can tell "user chose auto" from
+            # "nobody said anything" -- both land on the stdlib default, but
+            # only one of them is a decision.
+            algo_kwargs['step_size'] = self.ui.minkowski_step_size_input.value()
+            algo_kwargs['rotation_workers'] = (
+                self.ui.minkowski_rotation_workers_input.value())
 
         algo_kwargs['spacing'] = ui_params['spacing']
         algo_kwargs['random_seed'] = ui_params.get('random_seed')
