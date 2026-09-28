@@ -29,23 +29,25 @@ _REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__
 STRATEGY = os.path.join(
     _REPO, "freecad", "nestingworkbench", "Tools", "Nesting", "algorithms",
     "nesting_strategy.py")
+COORDINATOR = os.path.join(
+    _REPO, "freecad", "nestingworkbench", "Tools", "Nesting", "ga_coordinator.py")
 
 _TREE = ast.parse(open(STRATEGY).read())
 
 
-def _is_stats_attr(node):
+def _is_stats_attr(node, attr="_perf_stats"):
     return (isinstance(node, ast.Attribute)
-            and node.attr == "_perf_stats"
+            and node.attr == attr
             and isinstance(node.value, ast.Name)
             and node.value.id == "self")
 
 
-def _schema_keys():
-    """Keys present in the `self._perf_stats = {...}` initialiser."""
+def _schema_keys(attr="_perf_stats", tree=None):
+    """Keys present in a `self.<attr> = {...}` initialiser."""
     keys = set()
-    for node in ast.walk(_TREE):
+    for node in ast.walk(tree if tree is not None else _TREE):
         if isinstance(node, ast.Assign) and isinstance(node.value, ast.Dict):
-            if any(_is_stats_attr(t) for t in node.targets):
+            if any(_is_stats_attr(t, attr) for t in node.targets):
                 for key in node.value.keys:
                     if isinstance(key, ast.Constant) and isinstance(key.value, str):
                         keys.add(key.value)
@@ -180,3 +182,137 @@ def _guarded_by_probe(node, parents):
         if "probe is not None" in test or "hole_geoms is not None" in test:
             return True
     return False
+
+
+# ---------------------------------------------------------------------------
+# The same trap, one module over.
+# ---------------------------------------------------------------------------
+_COORD_TREE = ast.parse(open(COORDINATOR).read())
+
+
+def _ga_allowlist(tree):
+    """Every key accumulated into `_ga_perf` by any route.
+
+    Both the explicit form (`self._ga_perf['k'] += stats.get('k_ms', 0)/1000`,
+    which converts) and the loop form (`for k in (...): self._ga_perf[k] += ...`,
+    which adds raw). This is what the schema check wants: everything touched.
+    """
+    keys = set()
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.AugAssign)
+                and isinstance(node.target, ast.Subscript)
+                and _is_stats_attr(node.target.value, "_ga_perf")):
+            key = node.target.slice
+            if isinstance(key, ast.Constant) and isinstance(key.value, str):
+                keys.add(key.value)
+        if isinstance(node, ast.For) and isinstance(node.iter, (ast.Tuple, ast.List)):
+            loop_vars = {t.id for t in ast.walk(node.target)
+                         if isinstance(t, ast.Name)}
+            body = ast.Module(body=node.body, type_ignores=[])
+            for sub in ast.walk(body):
+                if not (isinstance(sub, ast.AugAssign)
+                        and isinstance(sub.target, ast.Subscript)
+                        and _is_stats_attr(sub.target.value, "_ga_perf")):
+                    continue
+                key_node = sub.target.slice
+                if isinstance(key_node, ast.Name) and key_node.id in loop_vars:
+                    for element in node.iter.elts:
+                        if (isinstance(element, ast.Constant)
+                                and isinstance(element.value, str)):
+                            keys.add(element.value)
+    return keys
+
+
+def _ga_loop_allowlist(tree):
+    """Only the loop-form keys -- the ones added raw, with no unit conversion.
+
+    The loop is `self._ga_perf[key] += stats.get(key, 0)`, so a millisecond key
+    placed in it lands in a seconds dict unscaled. An explicit line can convert,
+    so it is not this function's business.
+    """
+    keys = set()
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.For)
+                and isinstance(node.iter, (ast.Tuple, ast.List))):
+            continue
+        loop_vars = {t.id for t in ast.walk(node.target) if isinstance(t, ast.Name)}
+        body = ast.Module(body=node.body, type_ignores=[])
+        for sub in ast.walk(body):
+            if not (isinstance(sub, ast.AugAssign)
+                    and isinstance(sub.target, ast.Subscript)
+                    and _is_stats_attr(sub.target.value, "_ga_perf")):
+                continue
+            key_node = sub.target.slice
+            if isinstance(key_node, ast.Name) and key_node.id in loop_vars:
+                for element in node.iter.elts:
+                    if (isinstance(element, ast.Constant)
+                            and isinstance(element.value, str)):
+                        keys.add(element.value)
+    return keys
+
+
+def _ga_schema():
+    return _schema_keys("_ga_perf", _COORD_TREE)
+
+
+class TestGaCounterPlumbing:
+    """`_ga_perf` has the same allowlist-versus-initialiser hazard.
+
+    It bit once already, in `nesting_strategy`: a key in the absorption list but
+    not in the initialiser raises KeyError inside the per-rotation future loop,
+    and `quiet=True` routes the log nowhere, so every rotation evaluation dies
+    silently and the run reports zero placed parts. `_record_nest_perf` copies an
+    explicit allowlist into `_ga_perf`, so the same mistake is available here.
+    """
+
+    def test_extractors_find_something(self):
+        assert len(_ga_schema()) > 40, "the _ga_perf initialiser was not found"
+        assert len(_ga_allowlist(_COORD_TREE)) > 40, "no _ga_perf absorption found"
+
+    def test_every_absorbed_counter_exists_in_the_schema(self):
+        missing = sorted(_ga_allowlist(_COORD_TREE) - _ga_schema())
+        assert not missing, (
+            f"counters accumulated into _ga_perf but absent from its initialiser, "
+            f"so each raises KeyError: {missing}\n"
+            "With quiet=True the exception is swallowed with no output and the "
+            "run places nothing while reporting no error.")
+
+    def test_overlay_rejection_split_is_recorded(self):
+        """The split that decides whether a predicate could replace the overlay.
+
+        `collision_grazing_pairs` conflates an exact touch with a
+        positive-but-negligible sliver. Both reaching `_ga_perf` is what lets
+        RESULTS-collision.md's open question be answered on a GA run rather than
+        only on a single-nest probe.
+        """
+        schema = _ga_schema()
+        for key in ("collision_overlay_area_zero",
+                    "collision_overlay_area_sub_tol",
+                    "collision_overlay_area_over_tol",
+                    "collision_overlay_area_total",
+                    "collision_intersects_calls", "collision_overlay_calls"):
+            assert key in schema, f"{key} missing from the _ga_perf initialiser"
+            assert key in _ga_allowlist(_COORD_TREE), (
+                f"{key} is initialised but never accumulated, so it reads zero")
+
+    def test_timings_are_converted_to_seconds(self):
+        """The `_ga_perf` timings are seconds; the stats they absorb are ms.
+
+        The conversion has to be explicit, because the allowlist loop adds raw.
+        The first version of the collision sub-timers was absorbed, and read
+        22184.8 next to a collision total of 89.6 -- a factor of a thousand, in
+        the same dict, with nothing to say so.
+        """
+        schema = _ga_schema()
+        raw = _ga_loop_allowlist(_COORD_TREE)
+        for key in ("collision_intersects_s", "collision_overlay_s",
+                    "collision_hole_probe_s", "collision_intersection_s"):
+            assert key in schema, f"{key} missing from the _ga_perf initialiser"
+            assert key not in raw, (
+                f"{key} is in the loop allowlist, which adds raw, so it would "
+                f"land in milliseconds beside seconds")
+        for key in ("collision_intersects_ms", "collision_overlay_ms"):
+            assert key not in raw, (
+                f"{key} is a millisecond key in the raw allowlist")
+            assert key not in schema, (
+                f"{key} is a millisecond key in a seconds dict")

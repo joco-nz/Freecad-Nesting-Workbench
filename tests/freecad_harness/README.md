@@ -350,11 +350,20 @@ schema version in step with the reader; the harness refuses a mismatch.
 | tier | runner | corpus | cost | what it catches |
 |---|---|---|---|---|
 | 1 | `run.sh` | synthetic, 450×350, 18 parts | ~10 s | packing regressions, instrumentation drift |
-| 2 | `run_heavy.sh` | heavy synthetic, 1200×600, 122 parts | ~3.5 min | throughput and algorithmic regressions |
-| 3 | ad hoc | n70 (gitignored) | ~25 min | geometry-specific behaviour |
+| 2 | `run_heavy.sh` | heavy synthetic, 1200×600, 122 parts | ~3.5 min | throughput on a single cold nest |
+| 2 | `run_ga.sh` | heavy synthetic, GA | ~1 min | throughput across layouts and generations |
+| 3 | `run_ga.sh GA_CORPUS=n70` | n70 (gitignored), GA | ~3 min | the configuration actually run |
 
-`run.sh` is the fast contract and runs on every commit. `run_heavy.sh` costs
-minutes, so it is separate and opt-in. Both are committed baselines.
+`run.sh` is the fast contract and runs on every commit. The rest cost minutes, so
+they are separate and opt-in. Tiers 1 and 2 have committed baselines; tier 3
+cannot, because the n70 corpus is a gitignored customer part.
+
+**A single cold nest and a GA run are different regimes, and optimising one
+tells you almost nothing about the other.** Measured on the n70 configuration:
+NFP construction is over half of a single cold nest but **2.3%** of the GA run,
+because the 82 NFP misses are computed once and then hit 26 468 times across 19
+layouts. The collision stage is the reverse — a third of a single nest, **49%**
+of the GA run. Every throughput claim should say which one it measured.
 
 ### Tier 2: the heavy synthetic corpus
 
@@ -509,11 +518,12 @@ useful outcome.
   show on a GA run of that configuration, where NFP construction is 4.5% of the
   total.
 - [RESULTS-collision.md](RESULTS-collision.md) — the collision stage decomposed
-  into overlay 65.7% / `intersects` 23.7% / measurement probe 8.8%. The overlay
-  rejects 144 981 of 144 981. Replacing it with `overlaps or contains` is 6–10×
-  cheaper and would be worth ~17% of wall clock — and is wrong, because 98.8% of
-  those rejections are positive areas below tolerance summing to 0 mm², which the
-  predicate would reject as real overlaps.
+  into overlay 65.6% / `intersects` 24.7% / bookkeeping 9.7% on the n70 GA run,
+  where it is 49% of wall. Replacing the overlay with `overlaps or contains` is
+  6–10× cheaper and would be worth ~17% — and is wrong: **89.4%** of overlays
+  measure a positive area below tolerance, totalling 0.033 mm², and a predicate
+  would reject them as real overlaps. That 51.8 s of necessary work is 29% of
+  the run.
 
 `probe_union_cost.py`, `probe_union_determinism.py` and
 `probe_collision_overlay.py` produce those; `probe_decomposition.py` reports

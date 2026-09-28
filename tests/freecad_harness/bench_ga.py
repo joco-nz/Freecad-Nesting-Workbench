@@ -57,6 +57,25 @@ STATUS_FILE = os.path.join(_HERE, ".last_status_bench_ga")
 SCHEMA_VERSION = 1
 
 
+def _parse_quantities(spec):
+    """Parses "Spacer=2,Bottle Top=60" into {"Spacer": 2, "Bottle Top": 60}.
+
+    Delegates to nest_benchmark's parser rather than reimplementing it, because a
+    second implementation is a second set of edge cases: labels in this corpus
+    contain spaces, so the split is on the last '='. Loading by path rather than
+    importing, because under freecadcmd a plain import of that module would
+    satisfy its own `__name__` guard and run a whole benchmark from here.
+    """
+    import importlib.util
+
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        "nest_benchmark.py")
+    module_spec = importlib.util.spec_from_file_location("nb_for_quantities", path)
+    module = importlib.util.module_from_spec(module_spec)
+    module_spec.loader.exec_module(module)
+    return module._parse_quantities(spec)
+
+
 def _cache_setting():
     """Tri-state, unset means follow the workbench default. See nest_benchmark.
 
@@ -80,6 +99,11 @@ def cfg():
         "sheet": os.environ.get("NEST_BENCH_GA_SHEET", os.environ.get("NEST_BENCH_SHEET", "300x220")),
         "seed": int(os.environ.get("NEST_BENCH_SEED", "20260925")),
         "quantity": int(os.environ.get("NEST_BENCH_QUANTITY", "2")),
+        # Real workloads are not uniform, and the n70 one is 2 Spacer against 60
+        # of each bottle part. Split out rather than inlined so nest_benchmark
+        # and this share one parser.
+        "per_label_quantities": _parse_quantities(
+            os.environ.get("NEST_BENCH_QUANTITIES", "")),
         "reps": int(os.environ.get("NEST_BENCH_REPS", "3")),
         "corpus": os.environ.get("NEST_BENCH_CORPUS", "synthetic"),
         "spacing": float(os.environ.get("NEST_BENCH_SPACING", "5.0")),
@@ -109,9 +133,28 @@ def one_run(c):
     if c["corpus"] == "synthetic":
         parts, quantities = hc.build_synthetic_corpus(doc, c["seed"], c["quantity"])
         corpus = {"kind": "synthetic", "labels": sorted(quantities)}
+    elif c["corpus"] == "heavy":
+        parts, quantities = hc.build_heavy_corpus(
+            doc, c["seed"], c["quantity"], c["per_label_quantities"])
+        corpus = {"kind": "heavy", "labels": sorted(quantities),
+                  "quantities": dict(quantities)}
     else:
-        parts, quantities = hc.load_corpus(c["corpus"], c["quantity"])
-        corpus = {"kind": "fcstd", "path": c["corpus"], "labels": sorted(quantities)}
+        parts = hc.discover_doc_parts(FreeCAD.openDocument(c["corpus"]))
+        # Per-label overrides, with the uniform quantity as the fallback. Going
+        # through hc.load_corpus here applied the uniform quantity to every
+        # part, so the n70 configuration -- 2 Spacer against 60 of each bottle
+        # part -- silently became 2 of each: six parts placed on one sheet
+        # instead of 122 on two, with no error anywhere.
+        quantities = {p.Label: c["per_label_quantities"].get(p.Label, c["quantity"])
+                      for p in parts}
+        missing = [label for label in c["per_label_quantities"]
+                   if label not in quantities]
+        if missing:
+            raise ValueError(
+                f"NEST_BENCH_QUANTITIES names labels not in the corpus: {missing}. "
+                f"Available: {sorted(quantities)}")
+        corpus = {"kind": "fcstd", "path": c["corpus"],
+                  "labels": sorted(quantities), "quantities": dict(quantities)}
 
     target = doc.addObject("App::DocumentObjectGroup", "Layout_target")
     width, height = (float(v) for v in c["sheet"].lower().split("x"))
@@ -462,7 +505,8 @@ def main():
             hc.emit(f"ERROR: baseline schema {baseline.get('schema')} != {SCHEMA_VERSION}")
             return 2
         for key in ("population", "generations", "sheet", "seed", "quantity",
-                    "rotation_workers", "candidate_geometry_cache"):
+                    "rotation_workers", "candidate_geometry_cache",
+                    "per_label_quantities", "rotation_steps"):
             if baseline["config"].get(key) != c[key]:
                 hc.emit(f"ERROR: baseline {key}={baseline['config'].get(key)} "
                         f"but this run used {c[key]}")

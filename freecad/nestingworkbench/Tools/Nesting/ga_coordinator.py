@@ -270,6 +270,16 @@ class GACoordinator:
         self._ga_perf['sheet_difference_s'] += stats.get('sheet_difference_ms', 0.0) / 1000
         self._ga_perf['collision_intersection_s'] += stats.get(
             'collision_intersection_ms', 0.0) / 1000
+        # Converted like the lines around it. Absorbing these through the
+        # allowlist loop instead lands milliseconds in a dict whose siblings are
+        # all seconds -- which is how the first version read 22184.8 beside a
+        # collision total of 89.6.
+        for _ms_key, _s_key in (
+                ('collision_intersects_ms', 'collision_intersects_s'),
+                ('collision_overlay_ms', 'collision_overlay_s'),
+                ('collision_hole_probe_ms', 'collision_hole_probe_s')):
+            self._ga_perf[_s_key] = self._ga_perf.get(_s_key, 0.0) + stats.get(
+                _ms_key, 0.0) / 1000
         self._ga_perf['placement_wall_s'] += stats.get('placement_wall_ms', 0.0) / 1000
         self._ga_perf['rotation_wall_s'] += stats.get('rotation_wall_ms', 0.0) / 1000
         self._ga_perf['candidate_evaluation_wall_s'] += stats.get(
@@ -300,6 +310,25 @@ class GACoordinator:
                     'bbox_overlap_pairs', 'exact_collision_checks',
                     'collision_intersects_true', 'collision_intersects_false',
                     'collision_grazing_pairs',
+                    # How the grazing pairs are rejected, split. `grazing_pairs`
+                    # counts every intersects-True pair whose area came out at
+                    # or below tolerance, which conflates two different things:
+                    # an exact boundary touch, where the intersection area is
+                    # identically zero, and a positive sliver that only clears
+                    # the bar because of floating-point noise. The first is what
+                    # an `overlaps or contains` predicate also rejects; the
+                    # second is not. So the split decides whether replacing the
+                    # overlay with a predicate is equivalent, and it is the
+                    # number RESULTS-collision.md was missing on the workload
+                    # that matters.
+                    'collision_overlay_area_zero',
+                    'collision_overlay_area_sub_tol',
+                    'collision_overlay_area_over_tol',
+                    'collision_overlay_area_total',
+                    # The collision stage's own call counts. Its two timings
+                    # are NOT here: they are converted to seconds by an explicit
+                    # loop above, because this allowlist adds raw.
+                    'collision_intersects_calls', 'collision_overlay_calls',
                     'mask_hole_rings', 'mask_hole_vertices',
                     'mask_exterior_vertices', 'mask_hole_sensitive_pairs',
                     'mask_hole_exploiting_placements', 'mask_candidate_rings',
@@ -479,6 +508,22 @@ class GACoordinator:
             'collision_intersects_true': 0,
             'collision_intersects_false': 0,
             'collision_grazing_pairs': 0,
+            # The overlay rejection split, and the collision stage's own
+            # decomposition. Absorbed from the per-layout stats by an explicit
+            # allowlist, so every key there must appear here: a key listed in
+            # the allowlist but absent from this initialiser raises KeyError
+            # inside the rotation future loop, where `quiet=True` swallows the
+            # exception and the run reports zero placed parts while looking
+            # healthy.
+            'collision_overlay_area_zero': 0,
+            'collision_overlay_area_sub_tol': 0,
+            'collision_overlay_area_over_tol': 0,
+            'collision_overlay_area_total': 0.0,
+            'collision_intersects_calls': 0,
+            'collision_overlay_calls': 0,
+            'collision_intersects_s': 0.0,
+            'collision_overlay_s': 0.0,
+            'collision_hole_probe_s': 0.0,
             # Interior-ring population of the collision mask. Measurement-only;
             # see _exact_candidate_mask. These are summed, not maxed, except
             # mask_batch_max.

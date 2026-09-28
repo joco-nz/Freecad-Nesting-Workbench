@@ -132,3 +132,107 @@ $FREECADCMD tests/freecad_harness/probe_collision_overlay.py   # the predicate t
 | can a predicate replace it? | it is 6–10× cheaper and would be worth ~17%, but **no** |
 | why not? | 98.8% of the rejections are positive areas below tolerance, summing to 0 mm²; the predicate would reject the correct placements |
 | is the win real? | measured, and disproved. That is the useful outcome |
+
+---
+
+# Second edition — measured on the configuration that actually runs
+
+Everything above was measured on a single cold nest of the heavy synthetic
+corpus. The configuration that is actually run is a GA run of the n70 file —
+1200×600, 2 Spacer + 60 Bottle Top + 60 Bottle Bottom, 8 generations, population
+4 — and the two regimes differ enough that the conclusions had to be re-derived
+on it. It is now a harness configuration (`run_ga.sh GA_CORPUS=n70`), gated
+locally, because n70 is a gitignored customer part.
+
+## The shape of that run
+
+180.5 s wall, 122 parts placed, 2 sheets, efficiency 0.418433.
+
+```
+collision stage          88.42 s      49% of wall
+  intersection().area    58.01 s      65.6% of collision    157.2 us x 368,954
+  intersects()           21.80 s      24.7% of collision     29.8 us x 732,514
+  bookkeeping             8.61 s       9.7% of collision
+nfp_compute               4.07 s       2.3% of generations
+```
+
+**NFP construction is 2.3% of this run**, against 4.5% of the 132.59 s the same
+configuration took on a loaded box. The NFP misses are computed once — 82 of
+them — and then hit 26 468 times. Any NFP-stage optimisation is bounded by a
+couple of percent here. That is the finding that redirected this work.
+
+## The predicate replacement is unsafe here too, and now provably
+
+The open question from the first edition was the split of the grazing pairs.
+`grazing_pairs` conflates two very different things — an exact boundary touch and
+a positive sliver under the tolerance — and only the first is one a
+`overlaps or contains` predicate also rejects. Counters added, on the GA
+distribution:
+
+| overlay calls | 368,954 | |
+|---|---:|---|
+| area == 0 exactly | 15 311 | **4.1%** — a true touch; the predicate agrees |
+| 0 < area ≤ tolerance | **329 690** | **89.4%** — floating-point noise; a predicate would **wrongly reject** these |
+| area > tolerance | 23 953 | 6.5% — real overlaps; both reject, 258 mm² each |
+
+So `overlaps or contains` would reject 329 690 pairs that the area test accepts
+as valid placements. It is 6–10× cheaper and it is wrong, on the workload that
+matters as well as on the synthetic one.
+
+## The opportunity, and why the obvious fix is the wrong one
+
+The striking number is what the noise group costs:
+
+```
+329,690 overlays that together measure at most  0.033 mm²
+costing                                            51.8 s
+which is                            89% of the overlay, 29% of the run
+```
+
+**29% of the n70 GA run is spent measuring intersection areas that sum to less
+than a third of a square millimetre.** Those pairs are boundary touches that
+GEOS reports as having a small positive intersection area; the 1e-7 tolerance
+exists precisely to absorb that, and it is doing its job. So this is not a
+redundancy to be optimised — it is a robustness workaround for the geometry
+library, and the work is necessary to *disprove* an overlap.
+
+That closes the question the first edition left open. The remaining levers are
+all about getting fewer pairs to the collision stage, or none of them are
+available at this layer:
+
+- The bbox prefilter already runs first and rejects 17.7 M of 21.0 M checks.
+  `intersects` then rejects a further 363 560 of 732 514, so 49.6% never reach
+  the overlay.
+- The internal-fit path is genuinely exercised here, unlike either synthetic
+  corpus: `hole_pct=52.0%`, `hole_exploiting_placements=121 500`,
+  `hole_sensitive_pairs=66 359`. That is the case the overlay exists for, and on
+  a workload without it the 100%-grazing figure was misleading.
+
+## Two defects in the instrumentation, found by this measurement
+
+Both were in code added to answer this question, and both produced numbers that
+looked plausible.
+
+**The split counter was two-way, not three-way.** `collision_overlay_area_below_tol`
+only tested `<= 0.0`, so it counted every overlay with *positive* area —
+including the real overlaps — as sub-tolerance. It read 95.8% sub-tolerance when
+the true figure is 89.4%. The difference is exactly the 23 953 real rejections,
+i.e. the number that decides the question. Now split three ways: zero, sub-tolerance,
+over.
+
+**Milliseconds in a seconds dict.** The collision sub-timers were added through
+`_record_nest_perf`'s allowlist loop, which does `self._ga_perf[key] += stats.get(key, 0)` —
+no `/1000`. They read `collision_intersects_ms 22184.8` beside
+`collision_intersection_s 89.6` in the same record. Converted explicitly now, and
+`test_perf_counter_plumbing.py` checks the raw loop never carries a millisecond
+key.
+
+## Summary, second edition
+
+| question | answer |
+|---|---|
+| how big is collision on the real config? | 88.4 s of 180.5 s — 49% of the run |
+| how big is the NFP stage there? | 4.07 s — **2.3%**, so NFP work is bounded by a couple of percent |
+| can a predicate replace the overlay? | no — **89.4%** of overlays are sub-tolerance noise it would reject |
+| is there a real opportunity? | 51.8 s measures 0.033 mm² in total, but it is necessary work: disproving an overlap is the point |
+| what would move it? | fewer pairs reaching collision, not a cheaper test of the pairs that do |

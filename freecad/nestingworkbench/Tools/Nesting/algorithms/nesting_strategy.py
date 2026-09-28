@@ -281,7 +281,8 @@ class PlacementOptimizer:
             'collision_overlay_calls': 0,
             'collision_hole_probe_calls': 0,
             'collision_overlay_area_zero': 0,
-            'collision_overlay_area_below_tol': 0,
+            'collision_overlay_area_sub_tol': 0,
+            'collision_overlay_area_over_tol': 0,
             'collision_overlay_area_total': 0.0,
             # Measurement-only candidate-path counters.
             'placement_wall_ms': 0.0,
@@ -470,7 +471,8 @@ class PlacementOptimizer:
                                 'collision_overlay_calls',
                                 'collision_hole_probe_calls',
                                 'collision_overlay_area_zero',
-                                'collision_overlay_area_below_tol',
+                                'collision_overlay_area_sub_tol',
+                                'collision_overlay_area_over_tol',
                                 'collision_overlay_area_total',
                             ):
                                 self._perf_stats[key] += res.get(f'_{key}', 0)
@@ -916,7 +918,8 @@ class PlacementOptimizer:
         overlay_calls = 0
         hole_probe_calls = 0
         overlay_area_zero = 0
-        overlay_area_below_tol = 0
+        overlay_area_sub_tol = 0
+        overlay_area_over_tol = 0
         overlay_area_total = 0.0
         sheet_rejections = 0
         collision_rejections = 0
@@ -1018,21 +1021,34 @@ class PlacementOptimizer:
                         overlaps = overlap_area > area_tolerance
                         overlay_ms += (time.perf_counter() - t_overlay) * 1000
                         overlay_calls += 1
-                        # How the rejected pairs are rejected. The overlay is
-                        # 65.7% of the collision stage and `overlaps or contains`
-                        # measures 6-10x cheaper for the same verdict
+                        # How the overlays are decided, three ways. The overlay
+                        # is 65% of the collision stage and `overlaps or
+                        # contains` measures 6-10x cheaper for the same verdict
                         # (probe_collision_overlay.py), so the obvious
                         # optimisation is to drop it. Whether that is *exactly*
-                        # equivalent turns on this split: a pair whose
-                        # intersection is exactly zero is a boundary touch and
-                        # both forms reject it, but a pair with a sliver of
-                        # area below the tolerance is accepted today and would
-                        # be rejected by the predicate form. If the second group
-                        # is empty, the swap is free.
+                        # equivalent turns on this split:
+                        #
+                        #   zero    an exact boundary touch. The predicate
+                        #           rejects it too, so the two agree.
+                        #   sub-tol positive but at or under the tolerance.
+                        #           The area test ACCEPTS these; a predicate
+                        #           calls them overlaps and REJECTS. The two
+                        #           disagree, and the area test is right.
+                        #   over    a real overlap, rejected by both.
+                        #
+                        # The middle group is the whole question. An earlier
+                        # version of this counter was named `..._below_tol` and
+                        # only tested `<= 0.0`, so it lumped sub-tolerance and
+                        # real overlaps together and the three-way split was not
+                        # visible. It read as 95.8% sub-tolerance when the true
+                        # figure is 89.3% -- the difference is exactly the real
+                        # rejections.
                         if overlap_area <= 0.0:
                             overlay_area_zero += 1
+                        elif overlap_area <= area_tolerance:
+                            overlay_area_sub_tol += 1
                         else:
-                            overlay_area_below_tol += 1
+                            overlay_area_over_tol += 1
                         overlay_area_total += overlap_area
                         if probe is not None:
                             probe['collision_intersects_true'] += 1
@@ -1128,8 +1144,10 @@ class PlacementOptimizer:
                 probe[key] = probe.get(key, 0) + value
             probe['collision_overlay_area_zero'] = probe.get(
                 'collision_overlay_area_zero', 0) + overlay_area_zero
-            probe['collision_overlay_area_below_tol'] = probe.get(
-                'collision_overlay_area_below_tol', 0) + overlay_area_below_tol
+            probe['collision_overlay_area_sub_tol'] = probe.get(
+                'collision_overlay_area_sub_tol', 0) + overlay_area_sub_tol
+            probe['collision_overlay_area_over_tol'] = probe.get(
+                'collision_overlay_area_over_tol', 0) + overlay_area_over_tol
             probe['collision_overlay_area_total'] = probe.get(
                 'collision_overlay_area_total', 0.0) + overlay_area_total
             probe['sheet_rejections'] = probe.get('sheet_rejections', 0) + sheet_rejections
