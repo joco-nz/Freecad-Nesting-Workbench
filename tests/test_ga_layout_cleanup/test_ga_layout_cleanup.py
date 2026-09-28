@@ -262,3 +262,180 @@ class TestKnownLeakOnTheNonCommitPath:
             "block. Either the non-commit leak has been fixed -- in which case "
             "delete this test and the note beside it -- or the disposal was "
             "lost, which leaks the whole shared master group.")
+
+
+JOB = os.path.join(_REPO, "freecad", "nestingworkbench", "Tools", "Nesting",
+                   "nesting_job.py")
+_JOB_SRC = open(JOB).read()
+_JOB_TREE = ast.parse(_JOB_SRC)
+
+
+def _job_fn(name):
+    return next(n for n in ast.walk(_JOB_TREE)
+                if isinstance(n, ast.FunctionDef) and n.name == name)
+
+
+class TestTheSharedMasterGroupIsJobOwned:
+    """One MasterShapes row per run, not one accumulating per run.
+
+    Measured with the real panel and a real QThread, two successful runs with
+    the controller's own inter-run cleanup:
+
+        before:  after run 1 -> MasterShapes
+                 after run 2 -> MasterShapes, MasterShapes001      (228 objects)
+        after:   after run 1 -> MasterShapes
+                 after run 2 -> MasterShapes                       (194 objects)
+
+    Two separate things had to be true, and only one of them was the obvious
+    bug:
+
+      - The group lives at document level, so it survives the teardown of every
+        layout in the run and `delete_layout` cannot reach it. It was not in
+        `NestingJob._owned_object_names`, so every cleanup -- on commit, on
+        supersede, and on cancel -- left it behind.
+
+      - `NestingJob._promote_masters` emptied the shared group and deliberately
+        left the empty shell, on the stated grounds that "the next run reuses it
+        harmlessly". It does not: `dispose_shared_master_group`'s own docstring
+        calls the group run-scoped, so each run builds a fresh one and FreeCAD
+        suffixed the old shell to MasterShapes001. That was true even when the
+        user did click OK and the commit path ran.
+
+    Owning the group fixes both: on commit `_promote_masters` has already
+    re-parented the masters into a new group under the target layout, so the
+    source is empty when `commit()` calls `cleanup()`; on supersede the masters
+    inside are that run's own.
+    """
+
+    def test_the_group_is_disposed_through_its_owner(self):
+        """cleanup() disposes the group, via the LayoutManager that caches it.
+
+        The first version of this fix added the group to
+        `NestingJob._owned_object_names`, which is the obvious move and is wrong.
+        The group is parented at document level, so the job does not own it in the
+        sense that set implies, and `LayoutManager` holds a *cached reference* to
+        it for the run. Deleting it from behind that cache left a stale wrapper,
+        and the next reader raised
+
+            ReferenceError: Cannot access attribute 'Group' of deleted object
+
+        which `test_master_promotion.py` caught immediately. So the job is handed
+        a disposer, and `dispose_shared_master_group` is the one to use: it
+        clears the cache before removing the object, for exactly that reason, and
+        it is idempotent.
+        """
+        body = ast.unparse(_job_fn("from_ga_result"))
+        assert "job.dispose_shared_master_group = dispose_shared_master_group" in body, (
+            "the job is not given a way to dispose the shared master group, so "
+            "cleanup() cannot remove it and one MasterShapes row accumulates per "
+            "run.")
+        assert "shared_master_group=None, dispose_shared_master_group=None" in \
+            _JOB_SRC, (
+            "from_ga_result does not accept a disposer. Without the keyword the "
+            "call is a NameError inside the factory, which is how this was first "
+            "broken.")
+
+    def test_the_group_is_not_added_to_the_owned_set(self):
+        """Pins the failure mode of the obvious fix.
+
+        The owned set is keyed by name and resolved with `doc.getObject`, and
+        nothing in it clears the LayoutManager's cache. So this assertion is not
+        pedantry: it is the difference between the group disappearing and the
+        next reader raising on a deleted wrapper.
+        """
+        body = ast.unparse(_job_fn("from_ga_result"))
+        assert "job._owned_object_names.add(shared_master_group.Name)" not in body, (
+            "the shared master group is back in the owned set. That deletes it "
+            "without clearing LayoutManager's cached reference, so the next "
+            "reader gets a deleted wrapper and raises ReferenceError.")
+        cleanup = ast.unparse(_job_fn("cleanup"))
+        assert "dispose_shared_master_group" in cleanup, (
+            "cleanup() does not call the disposer, so nothing removes the group "
+            "on commit, on supersede, or on cancel.")
+        # The two removals are independent: the group is not in the owned set,
+        # and the things it holds are this run's master shapes rather than the
+        # job's layout and parts groups. An earlier version of this test asserted
+        # an ordering between them, with a rationale that was simply wrong, and
+        # it could not fail because `str.index` finds the first occurrence of the
+        # cleared-set call either way. So what is actually required is checked
+        # instead: the disposer runs at method level, not inside the loop that
+        # deletes the owned objects, so it still happens when that loop empties
+        # the set or when the set was already empty.
+        fn = _job_fn("cleanup")
+        disposer_calls = [
+            n for n in ast.walk(fn)
+            if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+            and n.func.id == "dispose"
+        ]
+        assert disposer_calls, "cleanup() never calls the disposer"
+        loops = [n for n in ast.walk(fn)
+                 if isinstance(n, ast.For)]
+        for call in disposer_calls:
+            for loop in loops:
+                assert not (loop.lineno <= call.lineno <= (loop.end_lineno or 0)), (
+                    "the disposer is called inside the owned-objects loop, so it "
+                    "is skipped whenever that loop does not iterate -- including "
+                    "on a re-run where the set is already empty")
+
+    def test_cleanup_survives_a_failing_disposer(self):
+        """A disposal that raises must not stop the rest of the teardown.
+
+        The group is the last thing removed, so a failure there is the easiest
+        place to abandon the rest of cleanup. Losing the group is the bug being
+        fixed; raising out of cleanup() instead would leave the run's own groups
+        behind too, which is strictly worse.
+        """
+        cleanup = ast.unparse(_job_fn("cleanup"))
+        assert "except Exception" in cleanup, (
+            "cleanup() calls the disposer unguarded. One failure there would "
+            "abort the teardown and leak the layout and parts groups as well.")
+        assert "PrintWarning" in cleanup or "PrintError" in cleanup, (
+            "a failed disposal must be reported, not swallowed silently")
+
+    def test_promote_no_longer_claims_the_group_is_reused(self):
+        """The stale assumption is the part that made this look harmless.
+
+        Worth pinning as text because the reasoning, not the code, is what
+        allowed the leak to persist: the code looked deliberate and reasonable.
+        """
+        source = open(JOB).read()
+        # Phrase-checked rather than argued, and the comment in nesting_job.py
+        # deliberately paraphrases the stale claim rather than quoting it: the
+        # first version of that comment quoted it verbatim while explaining why
+        # it was wrong, and this assertion then failed on the explanation.
+        for phrase in ("reuses it harmlessly", "reused harmlessly",
+                       "the next run reuses"):
+            assert phrase not in source, (
+                f"the comment claiming a later run re-picks the emptied shared "
+                f"group is back ({phrase!r}). It does not -- the group is "
+                f"run-scoped, so every run builds a fresh one and the empty "
+                f"shell accumulates, taking the MasterShapes name with it.")
+        # And the removal this now relies on has to be real. Asserting only that
+        # the name appears is worthless: replacing `list(self._owned_object_names)`
+        # with `list()` leaves the identifier in the source and the loop iterates
+        # nothing, which is how the first version of this check passed against a
+        # cleanup() that deleted nothing at all.
+        cleanup = ast.unparse(_job_fn("cleanup"))
+        assert "self._owned_object_names" in cleanup, (
+            "cleanup() no longer references the owned set, so nothing removes "
+            "the shared group on any path.")
+        loops_over_it = any(
+            isinstance(n, ast.For)
+            and isinstance(n.iter, ast.Call)
+            and isinstance(n.iter.func, ast.Name)
+            and n.iter.func.id == "list"
+            and any(isinstance(a, ast.Attribute) and a.attr == "_owned_object_names"
+                    for a in ast.walk(n.iter))
+            for n in ast.walk(_job_fn("cleanup")))
+        assert loops_over_it, (
+            "cleanup() mentions the owned set but does not iterate it, so it "
+            "deletes nothing. The master group would accumulate again.")
+        assert "recursive_delete" in cleanup, (
+            "cleanup() must delete each owned object, not merely clear the set")
+        commit = ast.unparse(_job_fn("commit"))
+        assert "_promote_masters()" in commit and "self.cleanup()" in commit, (
+            "commit() must promote first and then clean up, in that order. "
+            "Reordering would delete the masters before they were re-parented.")
+        assert commit.index("_promote_masters()") < commit.index("self.cleanup()"), (
+            "commit() cleans up before promoting; the masters would be deleted "
+            "rather than moved to the target layout")

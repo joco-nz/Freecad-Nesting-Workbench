@@ -53,8 +53,10 @@ def strays(doc):
         label = obj.Label
         if not label.startswith(("Layout", "MasterShapes")):
             continue
-        if any(label == p or label.startswith(p) and label[len(p):].isdigit()
-               for p in EXPECTED_PREFIXES):
+        # Only the bare labels are legitimate. An earlier version of this also
+        # accepted `Layout_temp001`, which hid the accumulation it was written to
+        # detect: three runs left 580 objects and the census said CLEAN.
+        if label in EXPECTED_PREFIXES:
             continue
         out.append(label)
     return out
@@ -177,21 +179,46 @@ def main():
         controller._worker = None
         return finished
 
-    one_run(1)
-    census(doc, "after a successful run")
+    def master_groups():
+        """Every MasterShapes group, with its parent and how many children.
 
-    # ---- the early exit, which is what the report is about ----------------
-    #
-    # `_on_nesting_finished` only cleans up `if job:` -- and run()'s own comment
-    # records that _finalize returns None when there is no best layout, which is
-    # exactly the cancel case. `current_job` is only set on the success branch,
-    # so `cancel_job()` then finds nothing either. Both cleanup paths can be
-    # skipped together, with the coordinator's layouts and master group left in
-    # the document.
-    #
-    # Cancelling after the first generation has completed is the interesting
-    # case, because then a best layout exists and the job is real. Cancelling
-    # before anything is nested is the other half; both are run.
+        The parent distinguishes the two kinds that share a label: the run-scoped
+        shared group lives at document level and is emptied by
+        NestingJob._promote_masters, while the promoted copy is a child of the
+        target layout and is the run's actual result. They collide on label, so
+        FreeCAD suffixes the second one to MasterShapes001.
+        """
+        out = []
+        for obj in doc.Objects:
+            if not obj.Label.startswith("MasterShapes"):
+                continue
+            parent = next((p.Label for p in doc.Objects
+                           if obj in (getattr(p, "Group", None) or ())), None)
+            out.append((obj.Label, parent or "<document level>",
+                        len(getattr(obj, "Group", None) or ())))
+        return sorted(out)
+
+    # Two successful runs in one document, calling the controller's own cleanup
+    # between them the way execute_nesting does. A single run cannot show the
+    # accumulation: the leaked group is the *previous* run's, so the count only
+    # grows from the second run on.
+    for index in (1, 2):
+        if controller.current_job is not None:
+            # What execute_nesting does before starting a run. Without this the
+            # previous run's Layout_temp also accumulates, which is a probe
+            # artefact rather than a product fault -- the job owns that group and
+            # would remove it.
+            controller.current_job.cleanup()
+            controller.current_job = None
+        one_run(index)
+        e("  after run %d:" % index)
+        for label, parent, kids in master_groups():
+            e("      %-18s parent=%-16s children=%d%s"
+              % (label, parent, kids, "   <-- EMPTY, orphaned" if kids == 0 else ""))
+        e("      Layout* = %s"
+          % [o.Label for o in doc.Objects if o.Label.startswith("Layout")])
+    census(doc, "after two successful runs, with the job cleanup in between")
+
     # Trip the cancel on observable progress rather than on a call count. A
     # count is useless here: the callback is called a handful of times early in
     # a run, so both counts tried either fired before a population existed (and

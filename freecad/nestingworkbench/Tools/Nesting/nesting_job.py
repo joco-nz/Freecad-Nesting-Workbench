@@ -13,13 +13,16 @@ class NestingJob:
     """
     @classmethod
     def from_ga_result(cls, doc, target_layout, params, preparer, layout_group, parts_group, sheets,
-                       shared_master_group=None):
+                       shared_master_group=None, dispose_shared_master_group=None):
         """Creates a NestingJob from a completed GA layout.
 
         This is the sole entry point. The GACoordinator and LayoutManager own
         the sandbox lifecycle; this class only handles commit/cancel.
 
         Args:
+            dispose_shared_master_group: callable that removes that group, or
+                None. Supplied by the coordinator, which owns the LayoutManager
+                and so the cached reference to it. Called by cleanup().
             shared_master_group: The document-level group holding the pooled
                 master shapes in headless mode, or None in simulate mode. A
                 headless layout has no MasterShapes child of its own -- see
@@ -42,6 +45,26 @@ class NestingJob:
         job._owned_object_names = set()
         if layout_group: job._owned_object_names.add(layout_group.Name)
         if parts_group: job._owned_object_names.add(parts_group.Name)
+        # The shared master group is disposed by the run's teardown, which is
+        # what stops one MasterShapes row accumulating per run.
+        #
+        # It lives at document level, so it survives the teardown of every layout
+        # in the run and `delete_layout` cannot reach it. Nothing removed it:
+        # cleanup() -- which runs on commit, on supersede, and on cancel -- did
+        # not own it. The next run's LayoutManager builds a *fresh* run-scoped
+        # group, so FreeCAD suffixed the old one: MasterShapes, MasterShapes001,
+        # MasterShapes002, one per run. Measured with the real panel and a real
+        # QThread: one row after run 1, two after run 2.
+        #
+        # Disposal goes through `dispose_shared_master_group` rather than adding
+        # the group to `_owned_object_names`. An earlier version did the latter
+        # and it was wrong: the group is not owned by anything the job can see
+        # being removed, and LayoutManager caches a reference to it for the run.
+        # Deleting it behind that cache left a stale wrapper, and the next
+        # reader raised "Cannot access attribute 'Group' of deleted object".
+        # `dispose_shared_master_group` already clears the cache before removing
+        # the object, for exactly that reason, and is idempotent.
+        job.dispose_shared_master_group = dispose_shared_master_group
 
         return job
 
@@ -128,9 +151,15 @@ class NestingJob:
 
         if is_shared:
             # Re-parent into a group of our own, then hand that to the target
-            # layout. The shared group is left in place but empty: LayoutManager
-            # caches the reference for the rest of the run, and the next run
-            # reuses it harmlessly.
+            # layout. The shared group is left empty *here*, and removed by the
+            # cleanup() that commit() calls immediately afterwards, because it is
+            # job-owned.
+            #
+            # It used to be left in place, on the reasoning that a later run
+            # would pick the emptied shell back up. It does not: the group is
+            # run-scoped, so every run builds a fresh one and the shell sat in
+            # the document for good, holding on to the MasterShapes name. That
+            # assumption is what produced the 001, 002, 003 suffixing.
             target_group = self.doc.addObject("App::DocumentObjectGroup", "MasterShapes")
             target_group.Label = "MasterShapes"
             for master in list(source.Group):
@@ -154,6 +183,20 @@ class NestingJob:
             if obj:
                 recursive_delete(self.doc, obj)
         self._owned_object_names.clear()
+
+        # Then the shared master group, through its owner. On commit this runs
+        # after _promote_masters has re-parented the masters into a new group
+        # under the target layout, so the source is empty. On supersede or
+        # cancel the masters inside are this run's own and go with it. Either
+        # way the row does not survive to be suffixed 001 on the next run.
+        dispose = getattr(self, 'dispose_shared_master_group', None)
+        if dispose is not None:
+            try:
+                dispose()
+            except Exception as exc:
+                FreeCAD.Console.PrintWarning(
+                    f"[NestingJob] Could not dispose the shared master group: "
+                    f"{exc}\n")
         
         self.temp_layout = None
         self.parts_group = None

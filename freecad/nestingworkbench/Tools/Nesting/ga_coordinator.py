@@ -1343,6 +1343,12 @@ class GACoordinator:
             # master row was never replaced.
             shared_master_group=(self.layout_manager.shared_master_group
                                  if self.layout_manager else None),
+            # The removal goes through the LayoutManager because it caches the
+            # group reference. Passing the group itself and deleting it from the
+            # job leaves a stale wrapper behind and the next reader raises.
+            dispose_shared_master_group=(
+                self.layout_manager.dispose_shared_master_group
+                if self.layout_manager else None),
         )
         
         unplaced_count = len(getattr(best_layout, 'unplaced', []) or [])
