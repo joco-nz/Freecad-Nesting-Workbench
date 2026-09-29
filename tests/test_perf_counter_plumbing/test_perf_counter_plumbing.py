@@ -517,17 +517,28 @@ class TestPerformanceDialsAreReachable:
                 f"alone reproduces the previous behaviour")
 
     def test_fields_are_in_the_minkowski_group(self):
-        """They must land in the Minkowski group, not the Physics one.
+        """They must land in a Minkowski group, not the Physics one.
 
         step_size already existed on the Physics panel, where it does nothing for
         Minkowski -- that is the gap that started this. A field that exists but
         is wired to the other algorithm looks correct and is inert.
+
+        The layout variable was renamed from `minkowski_form_layout` to
+        `minkowski_opt_layout` when the single Minkowski group was split into
+        "Nesting Settings" and "Optimizations". The check accepts either name,
+        because the property being asserted is which ALGORITHM owns the fields,
+        not which variable spells it -- and hard-coding one spelling is exactly
+        the brittleness that made this fail on a rename that changed nothing
+        about the behaviour.
         """
-        assert "minkowski_form_layout.addRow(perf_form_layout)" \
-            in _flat(_PANEL_SRC), (
-            "the performance fields are not added to the Minkowski form layout")
         flat = _flat(_PANEL_SRC)
-        group = flat.index("minkowski_form_layout.addRow(perf_form_layout)")
+        candidates = [
+            name for name in ("minkowski_form_layout", "minkowski_opt_layout")
+            if f"{name}.addRow(perf_form_layout)" in flat
+        ]
+        assert candidates, (
+            "the performance fields are not added to any Minkowski form layout")
+        group = min(flat.index(f"{n}.addRow(perf_form_layout)") for n in candidates)
         physics = flat.index("physics_form_layout = ")
         assert group < physics, "the fields are added after the Physics layout"
 
