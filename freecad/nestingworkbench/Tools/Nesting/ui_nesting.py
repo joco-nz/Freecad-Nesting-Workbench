@@ -50,6 +50,13 @@ class NestingPanel(QtWidgets.QWidget):
         self.hidden_originals = []
         self.current_layout = None
         self.selected_font_path = ""
+        # Re-entrancy guard for reject(). The in-panel "Cancel Nesting" button
+        # calls controller.request_cancel(), which closes the dialog via
+        # ui.reject() once the run is not in flight -- and that lands back
+        # here, which calls request_cancel() again. Without this the pair
+        # recurses until RecursionError. Set for the duration of the call only;
+        # a second, genuine Cancel press later still gets through.
+        self._rejecting = False
         self._setup_ui()
         self.set_default_font()
     
@@ -60,14 +67,37 @@ class NestingPanel(QtWidgets.QWidget):
         return True
 
     def reject(self):
-        """Called when the user clicks Standard Button Cancel / Close."""
-        if hasattr(self, 'controller'):
-            self.controller.cancel_job()
-            
-        # Also ensure visibility is restored if controller didn't fully run
-        for obj in self.hidden_originals:
-             set_visibility(obj, True)
-                 
+        """Called when the user clicks Standard Button Cancel / Close.
+
+        Routed through controller.request_cancel() rather than cancel_job()
+        directly. Those are not interchangeable: request_cancel() sets
+        cancel_requested, which is the only thing the running worker's
+        _check_cancel consults, and it also unblocks the worker if it is waiting
+        on a main-thread draw handover. Calling cancel_job() straight from here
+        -- which is what this used to do -- tidies a job that does not exist yet
+        and closes the panel, so the nesting run carried on invisibly to
+        completion with nothing on screen to indicate it. The user was left
+        looking at a closed dialog and a still-running nest.
+
+        request_cancel() falls through to cancel_job() when no run is in flight,
+        so the idle case still cleans up.
+        """
+        if self._rejecting:
+            # Already unwinding a reject() that came through here from
+            # request_cancel(). Re-entering would bounce between the two
+            # forever; the outer call does the work.
+            return True
+        self._rejecting = True
+        try:
+            if hasattr(self, 'controller'):
+                self.controller.request_cancel()
+
+            # Also ensure visibility is restored if controller didn't fully run
+            for obj in self.hidden_originals:
+                 set_visibility(obj, True)
+        finally:
+            self._rejecting = False
+
         return True
 
     def _setup_ui(self):
@@ -174,6 +204,34 @@ class NestingPanel(QtWidgets.QWidget):
         self.minkowski_generations_input.setValue(1) # Default to 1 (No Genetic Loop)
         self.minkowski_generations_input.setToolTip("Set to 1 for a single pass. Increase to optimize using Genetic Algorithm.")
 
+        # Deliberately not persisted, like Generations and Population Size:
+        # it is meaningless without a GA configuration next to it, and a stale
+        # target armed against a default single-pass run is a surprise.
+        # 0 = off, following the Rotation Threads "Auto" convention.
+        self.minkowski_target_sheets_input = QtWidgets.QSpinBox()
+        self.minkowski_target_sheets_input.setRange(0, 100)
+        self.minkowski_target_sheets_input.setValue(0)
+        self.minkowski_target_sheets_input.setSpecialValueText("Off")
+        self.minkowski_target_sheets_input.setToolTip(
+            "Stop the run as soon as one layout places every part on this "
+            "many sheets.\n\n"
+            "Off (0) by default, which is the normal behaviour: run every "
+            "generation, and stop early only when the search stops improving.\n\n"
+            "A target is a maximum, not a goal to beat. Nothing can do better "
+            "than every part on one sheet, so the run ends the moment one "
+            "layout achieves it and the layouts and generations still to come "
+            "are skipped. Note that a target looser than the natural result "
+            "(3 target, 1 sheet needed) is therefore met by the very first "
+            "layout.\n\n"
+            "This does not make the search find a good layout sooner -- it only "
+            "caps the time once the target is met. If the target is not "
+            "achievable the run behaves exactly as it does now and finishes on "
+            "the usual rules, and the log says the target was not reached.\n\n"
+            "Fill parts are best-effort: they are placed after the search ends "
+            "and are not counted towards the target.\n\n"
+            "Only affects GA runs (population/generations > 1)."
+        )
+
         self.candidate_geometry_cache_checkbox = QtWidgets.QCheckBox("Candidate Geometry Cache")
         self.candidate_geometry_cache_checkbox.setChecked(_DEFAULTS["candidate_geometry_cache"])
         self.candidate_geometry_cache_checkbox.setToolTip(
@@ -274,6 +332,7 @@ class NestingPanel(QtWidgets.QWidget):
         # than in an orphan group.
         minkowski_opt_layout.addRow("Generations:", self.minkowski_generations_input)
         minkowski_opt_layout.addRow("Population Size:", self.minkowski_population_size_input)
+        minkowski_opt_layout.addRow("Stop At Sheets:", self.minkowski_target_sheets_input)
         minkowski_opt_layout.addRow(perf_form_layout)
         minkowski_opt_layout.addRow(self.candidate_geometry_cache_checkbox)
         minkowski_opt_layout.addRow("Compactness:", mink_compactness_layout)

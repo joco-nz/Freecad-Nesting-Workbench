@@ -522,24 +522,56 @@ class NestingController:
         coordinator = GACoordinator(
             doc=self.doc,
             shape_preparer=self.shape_preparer,
+            # _safe_ui here as well as on the signal slots below. GACoordinator
+            # already wraps these in its own try/except RuntimeError, so this is
+            # belt-and-braces for the headless path -- but the two must not
+            # disagree, and a guard that only lives in the caller cannot protect
+            # a call site someone adds later.
             ui_callbacks={
-                'set_status': lambda msg: self.ui.status_label.setText(msg),
-                'update_progress': lambda c, t, m: self.ui.update_progress(c, t, m),
-                'reset_progress': lambda: self.ui.reset_progress(),
-                'play_sound': lambda: QtWidgets.QApplication.beep() if self.ui.sound_checkbox.isChecked() else None,
+                'set_status': lambda msg: self._safe_ui(self.ui.status_label.setText, msg),
+                'update_progress': lambda c, t, m: self._safe_ui(self.ui.update_progress, c, t, m),
+                'reset_progress': lambda: self._safe_ui(self.ui.reset_progress),
+                'play_sound': lambda: self._safe_ui(
+                    QtWidgets.QApplication.beep) if self._safe_ui(
+                        self.ui.sound_checkbox.isChecked) else None,
             },
             draw_callback=self._worker.request_draw_on_main_thread,
             worker=self._worker
         )
         self._worker.coordinator = coordinator
         
-        self._worker.status_changed.connect(lambda msg: self.ui.status_label.setText(msg))
-        self._worker.progress_updated.connect(lambda c, t, m: self.ui.update_progress(c, t, m))
+        # Routed through _safe_ui: these are queued cross-thread signals, so the
+        # slot can run after the panel has been closed and its widgets destroyed.
+        # Guarding at the emit site in GACoordinator would not help -- emit()
+        # returns long before the slot executes.
+        self._worker.status_changed.connect(
+            lambda msg: self._safe_ui(self.ui.status_label.setText, msg))
+        self._worker.progress_updated.connect(
+            lambda c, t, m: self._safe_ui(self.ui.update_progress, c, t, m))
         self._worker.draw_requested.connect(self._handle_draw_request)
         self._worker.finished_signal.connect(self._on_nesting_finished)
         self._worker.error_signal.connect(self._on_nesting_error)
         
         self._worker.start()
+
+    def _safe_ui(self, fn, *args):
+        """Invoke a widget method, tolerating a panel that has been closed.
+
+        The worker outlives the panel. Its signals are queued, so a slot can run
+        long after the widgets it touches were destroyed, and PySide6 then raises
+        RuntimeError from the C++ side. GACoordinator already absorbs this for the
+        callbacks it calls directly, but that guard cannot cover the worker path:
+        emit() returns long before the slot executes, so the slot itself has to
+        absorb it. request_cancel guards the same hazard locally; this is the
+        shared form for the signal handlers.
+
+        Only for direct widget calls. Wrapping job cleanup or document work in
+        this would swallow a real failure as though the panel had merely closed.
+        """
+        try:
+            return fn(*args)
+        except RuntimeError:
+            return None
 
     def _handle_draw_request(self, payload):
         """Main-thread handler for draw requests from worker.
@@ -619,24 +651,30 @@ class NestingController:
             self.current_job = job
             self._restore_source_placements()
             
+        # State first, then widgets. With _safe_ui in place the widget calls
+        # cannot raise, so the order is not what fixes the reported bug -- the
+        # guard is. This ordering is belt-and-braces: it keeps the invariant
+        # ("a run is never left looking live") true on its own terms, so a later
+        # unguarded widget call cannot strand a worker reference either.
         self.is_running = False
         self.cancel_requested = False
-        self.ui.nest_button.setEnabled(True)
-        self.ui.cancel_button.setEnabled(False)
-        self.ui.reset_progress()
         self._worker = None
+        self._safe_ui(self.ui.nest_button.setEnabled, True)
+        self._safe_ui(self.ui.cancel_button.setEnabled, False)
+        self._safe_ui(self.ui.reset_progress)
 
     def _on_nesting_error(self, error_msg):
         """Main-thread handler for nesting errors."""
         FreeCAD.Console.PrintError(f"Nesting Error: {error_msg}\n")
         self._restore_source_placements()
-        self.ui.status_label.setText(f"Error: {error_msg.split(chr(10))[0]}")
         self.is_running = False
         self.cancel_requested = False
-        self.ui.nest_button.setEnabled(True)
-        self.ui.cancel_button.setEnabled(False)
-        self.ui.reset_progress()
         self._worker = None
+        self._safe_ui(self.ui.status_label.setText,
+                      f"Error: {error_msg.split(chr(10))[0]}")
+        self._safe_ui(self.ui.nest_button.setEnabled, True)
+        self._safe_ui(self.ui.cancel_button.setEnabled, False)
+        self._safe_ui(self.ui.reset_progress)
     
     def finalize_job(self):
         """Called when User clicks OK."""
@@ -660,21 +698,30 @@ class NestingController:
             self.doc.recompute()
 
     def request_cancel(self):
-        """Called when the custom Cancel Nesting button is clicked."""
+        """Cancel a run, or dismiss the panel when nothing is running.
+
+        Reached from two places: the in-panel "Cancel Nesting" button, and the
+        dialog's own Cancel/Close via NestingPanel.reject(). Both need the same
+        thing while a run is live -- set cancel_requested, which is the only
+        flag the worker's _check_cancel reads, and unblock the worker if it is
+        parked on a main-thread draw handover.
+        """
         if self.is_running:
             self.cancel_requested = True
-            try:
-                self.ui.status_label.setText("Cancelling... Please wait.")
-                self.ui.cancel_button.setEnabled(False) # Prevent double-click
-            except Exception:
-                pass  # UI widget may be destroyed if user closed panel while cancelling
-            
+            self._safe_ui(self.ui.status_label.setText, "Cancelling... Please wait.")
+            self._safe_ui(self.ui.cancel_button.setEnabled, False)  # prevent double-click
+
             # If worker is running, also unblock it from any draw wait
-            if hasattr(self, '_worker') and self._worker:
-                self._worker.notify_draw_complete() # Unblock if waiting for draw
+            if getattr(self, '_worker', None):
+                self._worker.notify_draw_complete()  # unblock if waiting for draw
         else:
             self.cancel_job()
-            if hasattr(self.ui, 'reject'):
+            # Only dismiss the panel when this came from the in-panel button.
+            # reject() calls us, so calling back would bounce between the two;
+            # NestingPanel guards that with _rejecting, and this is the other
+            # half of the same guard -- the panel is already closing, so there
+            # is nothing to dismiss.
+            if not getattr(self.ui, '_rejecting', False) and hasattr(self.ui, 'reject'):
                 self.ui.reject()
 
     def _check_cancel(self):

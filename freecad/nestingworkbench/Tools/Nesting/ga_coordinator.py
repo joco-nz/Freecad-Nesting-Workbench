@@ -482,6 +482,13 @@ class GACoordinator:
         mutation_rate = 0.1
         immigrant_ratio = 0.15
         early_stop_threshold = 5
+        # Optional target sheet count, 0 = off. A target is a maximum rather
+        # than a threshold to exceed -- once a layout has every part on N
+        # sheets there is nothing better to find, so the run ends there rather
+        # than evaluating the rest of the population. Orthogonal to
+        # early_stop_threshold: an unreachable target simply never fires and
+        # the run finishes on the usual rules.
+        target_sheets = algo_kwargs.get('target_sheets', 0) or 0
         verbose = algo_kwargs.get('verbose', False)
         performance_logging = algo_kwargs.get('performance_logging', False)
         cancel_callback = algo_kwargs.get('cancel_callback', lambda: False)
@@ -499,7 +506,10 @@ class GACoordinator:
             FreeCAD.Console.PrintMessage("NFP cache cleared (user request).\n")
         
         if verbose:
-            FreeCAD.Console.PrintMessage(f"GA Mode: {generations} generations, {population_size} population\n")
+            FreeCAD.Console.PrintMessage(
+                f"GA Mode: {generations} generations, {population_size} population"
+                + (f", target {target_sheets} sheet(s)" if target_sheets else "")
+                + "\n")
         
         # Layout-management sub-phase instrumentation. Only materialized when
         # Performance Logging is on; LayoutManager/ShapePreparer/recursive_delete
@@ -544,6 +554,10 @@ class GACoordinator:
         best_layout = None
         best_efficiency = 0
         generations_without_improvement = 0
+        # Whether the loop ended on a met sheet target rather than on the
+        # budget, the stagnation stop, a cancel or an interrupt. Read after the
+        # loop to tell the user when a target was set but never reached.
+        self._target_met = False
         total_nesting_time = 0
         self._ga_perf = {
             'generation_s': 0.0,
@@ -701,7 +715,11 @@ class GACoordinator:
                     refresh_gui()
                 self._ga_perf['visualization_s'] += time.perf_counter() - gui_start
                 
-                gen_time, interrupted = self._run_generation(
+                # Named met_target_layout, not target_layout: the latter is
+                # run()'s own first parameter (the layout the job commits
+                # into) and shadowing it here passes None to _dispatch_finalize,
+                # so the returned job cannot commit.
+                gen_time, interrupted, met_target_layout = self._run_generation(
                     layouts, gen, generations, ui_params, rotation_steps, 
                     algo_kwargs, is_simulating, cancel_callback, verbose, viz_manager
                 )
@@ -736,7 +754,8 @@ class GACoordinator:
                 early_stop = generations_without_improvement >= early_stop_threshold
 
                 # STEP 2 & 3: Build next generation
-                if gen < generations - 1 and not early_stop:
+                # A met target ends the run, so there is nothing to breed for.
+                if gen < generations - 1 and not early_stop and met_target_layout is None:
                     layout_management_start = time.perf_counter()
                     actual_elite = min(elite_count, len(layouts))
                     elites = layouts[:actual_elite]
@@ -790,12 +809,38 @@ class GACoordinator:
                         f"{early_stop_threshold} generations\n")
                     break
 
+                if met_target_layout is not None:
+                    # Forced, rather than left to the fitness comparison above:
+                    # a sibling can tie on fitness (same sheet count, same
+                    # bbox tie-break) while leaving parts unplaced, and the
+                    # target layout is the one known to have placed
+                    # everything. The tie-break does not capture that.
+                    best_layout = met_target_layout
+                    best_efficiency = met_target_layout.efficiency
+                    self._target_met = True
+                    self._set_status(
+                        f"Target reached: {len(met_target_layout.sheets)} sheet(s), "
+                        f"stopping early.")
+                    FreeCAD.Console.PrintMessage(
+                        f"Target reached: all parts placed on "
+                        f"{len(met_target_layout.sheets)} sheet(s) "
+                        f"(target {target_sheets}) — stopped early.\n")
+                    break
+
+            # A target that never fired is harmless to the run but invisible to
+            # the user otherwise, and an unreachable one is the expected case
+            # often enough to be worth saying out loud.
+            if target_sheets and not self._target_met:
+                FreeCAD.Console.PrintMessage(
+                    f"Target of {target_sheets} sheet(s) was not reached; "
+                    f"the run finished on the usual rules.\n")
+
             # Final cleanup: discard every layout except the winner.
             #
             # Deliberately done once after the loop rather than in the last
-            # generation: the cancel, interrupt and early-stop exits all leave
-            # a full population behind, and leaving those layouts in the
-            # document leaks their FreeCAD objects into the commit path.
+            # generation: the cancel, interrupt, early-stop and target-met exits
+            # all leave a full population behind, and leaving those layouts in
+            # the document leaks their FreeCAD objects into the commit path.
             # delete_layout is re-entry safe, so layouts already discarded by
             # _build_next_generation are skipped here.
             survivors = [l for l in layouts if l is not best_layout]
@@ -1079,12 +1124,20 @@ class GACoordinator:
 
     def _run_generation(self, layouts, gen, generations, ui_params, rotation_steps, algo_kwargs,
                         is_simulating, cancel_callback, verbose, viz_manager=None):
-        """Nests each layout in the population and calculates fitness/efficiency."""
+        """Nests each layout in the population and calculates fitness/efficiency.
+
+        Returns (elapsed_seconds, interrupted, target_layout). `interrupted` is a
+        user cancel only. `target_layout` is the layout that met the optional
+        sheet target, and is set the moment one does -- the caller must treat
+        that as a success, not an abort, or the fill phase and the completion
+        message are skipped for a run that actually succeeded.
+        """
         from .nesting_logic import nest
+        target_sheets = algo_kwargs.get('target_sheets', 0) or 0
         total_time = 0
-        
+
         for idx, layout in enumerate(layouts):
-            if cancel_callback(): return total_time, True
+            if cancel_callback(): return total_time, True, None
 
             if verbose:
                 FreeCAD.Console.PrintMessage(f"  [Gen {gen+1}] Layout {idx+1}/{len(layouts)}: {layout.name}\n")
@@ -1175,6 +1228,27 @@ class GACoordinator:
             unplaced_regular = [p for p in unplaced if getattr(p, 'fill_sheet', False) is not True]
             if unplaced_regular:
                 layout.fitness += len(unplaced_regular) * ui_params['sheet_width'] * ui_params['sheet_height'] * 10
+
+            # Target stop. Checked here because this is the first point where
+            # both the sheet count and the unplaced list are final for this
+            # layout. `layout.sheets` must be non-empty: a fill-only job nests an
+            # empty part list, so it comes back with no sheets AND no unplaced
+            # parts -- calculate_efficiency early-returns on `if not
+            # layout.sheets` (layout_manager.py) without even assigning
+            # fitness -- which would satisfy both tests below and win on an
+            # empty layout. Requiring a sheet also keeps the post-fill count
+            # honest, because _nest_fill_parts only ever constructs a Sheet
+            # under `if not sheets` (nesting_strategy.py), so a layout that
+            # already has one can never gain another from fill.
+            #
+            # `unplaced` is regular-only: fill parts are filtered out of the
+            # nest() call above and are placed afterwards, best-effort, on the
+            # single winner. That matches the fitness function, which penalises
+            # only unplaced regular parts.
+            if (target_sheets and layout.sheets
+                    and len(layout.sheets) <= target_sheets
+                    and not layout.unplaced):
+                return total_time, False, layout
             
             # Draw (simulate mode only — non-sim draws just the winner in _finalize)
             if is_simulating:
@@ -1199,7 +1273,7 @@ class GACoordinator:
                         set_visibility(layout.layout_group, False)
                     refresh_gui()
             
-        return total_time, False
+        return total_time, False, None
 
     def _build_next_generation(self, gen, layouts, elites, master_map, quantities, ui_params, 
                                rotation_steps, mutation_rate, immigrant_ratio, verbose):

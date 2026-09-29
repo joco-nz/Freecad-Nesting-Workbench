@@ -105,7 +105,7 @@ ALGO_KWARGS = {
 STALE_MASTER_LABELS = ("master_STALE",)
 
 
-def build_doc(name):
+def build_doc(name, parts=None):
     import FreeCAD
     import Part
 
@@ -113,7 +113,7 @@ def build_doc(name):
 
     doc = FreeCAD.newDocument(name)
     sources = {}
-    for label, length, width in PARTS:
+    for label, length, width in (parts or PARTS):
         obj = doc.addObject("Part::Feature", label)
         obj.Shape = Part.makeBox(length, width, 10)
         sources[label] = obj
@@ -309,8 +309,141 @@ def case_error():
           any(c.Label.startswith("MasterShapes") for c in target.Group))
 
 
+# --------------------------------------------------------------------------
+# Cases 4-7: the optional sheet target
+# --------------------------------------------------------------------------
+# A target is a maximum, not a threshold to exceed, so the run may end the
+# moment one layout places every part on that many sheets. Three things have
+# to hold for that to be safe, and each gets a case: a met target is a success
+# rather than a cancel, an unreachable target changes nothing about how the run
+# behaves, and a layout cannot satisfy the target by leaving parts unplaced.
+
+def case_target_met():
+    emit("")
+    emit("--- target met: stop as soon as one layout fits ---")
+    doc, sources, target = build_doc("ga_target_met")
+    coordinator = make_coordinator(doc)
+
+    job = coordinator.run(
+        target, UI_PARAMS, quantities_for(sources), sources, {},
+        dict(ALGO_KWARGS, target_sheets=1, cancel_callback=lambda: False),
+        False, viz_manager=None,
+    )
+
+    perf = coordinator._ga_perf or {}
+    check("the run reports the target as met", coordinator._target_met is True)
+    # The whole point of the feature: the budget was 2 generations x 2
+    # layouts, and the first layout satisfied it.
+    check("the run stopped on the first layout",
+          perf.get("layout_evaluations") == 1,
+          f"layout_evaluations={perf.get('layout_evaluations')}")
+    # A target hit must not travel the cancel path, or the fill phase and the
+    # completion message are skipped for a run that actually succeeded.
+    check("a target hit is a success, not a cancel", job is not None,
+          f"got {type(job).__name__}")
+    check("a target hit still claims the masters",
+          coordinator._job_committed is True)
+    if job is not None:
+        check("the winner is within the target", len(job.sheets) <= 1,
+              f"sheets={len(job.sheets)}")
+        placed = sum(len(s) for s in job.sheets)
+        check("the winner placed every part", placed == 6, f"placed={placed}")
+
+
+def case_target_not_met_by_dropping_parts():
+    """A layout must not satisfy the target by leaving parts unplaced.
+
+    The part below is larger than the sheet, so the nester cannot place it even
+    on a fresh sheet -- it only records a part as unplaced after trying one
+    (nesting_strategy._nest_standard). That yields a one-sheet layout with an
+    unplaced part, which is precisely the shape the target must refuse: the
+    fitness penalty for unplaced parts only influences selection and does
+    nothing to stop the check itself.
+    """
+    emit("")
+    emit("--- target not met by dropping parts ---")
+    doc, sources, target = build_doc(
+        "ga_target_dropped",
+        parts=(("Oversize", 100.0, 50.0), ("Small", 20.0, 20.0)))
+    coordinator = make_coordinator(doc)
+
+    job = coordinator.run(
+        target, dict(UI_PARAMS, sheet_width=60.0, sheet_height=60.0),
+        quantities_for(sources), sources, {},
+        dict(ALGO_KWARGS, target_sheets=1, cancel_callback=lambda: False),
+        False, viz_manager=None,
+    )
+
+    perf = coordinator._ga_perf or {}
+    check("a layout that dropped parts does not meet the target",
+          coordinator._target_met is False)
+    check("that layout did not stop the run",
+          perf.get("layout_evaluations", 0) > 1,
+          f"layout_evaluations={perf.get('layout_evaluations')}")
+    check("the run still returns a job", job is not None,
+          f"got {type(job).__name__}")
+
+
+def case_target_unreachable():
+    """A target that cannot be met must behave exactly like no target."""
+    emit("")
+    emit("--- target unreachable: normal run ---")
+    doc, sources, target = build_doc("ga_target_unreachable")
+    coordinator = make_coordinator(doc)
+
+    job = coordinator.run(
+        target, UI_PARAMS, quantities_for(sources), sources, {},
+        dict(ALGO_KWARGS, target_sheets=0, cancel_callback=lambda: False),
+        False, viz_manager=None,
+    )
+
+    perf = coordinator._ga_perf or {}
+    check("an off target is not reported as met", coordinator._target_met is False)
+    check("an off target does not stop the run early",
+          perf.get("layout_evaluations", 0) > 1,
+          f"layout_evaluations={perf.get('layout_evaluations')}")
+    check("the run still returns a job", job is not None,
+          f"got {type(job).__name__}")
+
+
+def case_target_fill_only_job():
+    """A fill-only job must not meet the target on an empty layout.
+
+    Fill parts are filtered out of the generation nest call, so such a job
+    comes back with no sheets AND no unplaced parts. That satisfies "one sheet
+    and nothing left over" on a layout that placed nothing at all, which is why
+    the check requires a non-empty sheet list.
+    """
+    emit("")
+    emit("--- fill-only job: no target hit on an empty layout ---")
+    doc, sources, target = build_doc("ga_target_fill_only")
+    coordinator = make_coordinator(doc)
+
+    fill_quantities = {
+        label: {"quantity": 2, "rotation_steps": 4,
+                "up_direction": "Z+", "fill_sheet": True}
+        for label in sources
+    }
+    job = coordinator.run(
+        target, UI_PARAMS, fill_quantities, sources, {},
+        dict(ALGO_KWARGS, target_sheets=1, cancel_callback=lambda: False),
+        False, viz_manager=None,
+    )
+
+    check("a fill-only job does not meet the target on an empty layout",
+          coordinator._target_met is False)
+    check("the run still returns a job", job is not None,
+          f"got {type(job).__name__}")
+    if job is not None:
+        placed = sum(len(s) for s in job.sheets)
+        check("the fill phase still ran on the winner", placed > 0,
+              f"placed={placed} sheets={len(job.sheets)}")
+
+
 def main():
-    for case in (case_success, case_cancel, case_error):
+    for case in (case_success, case_cancel, case_error,
+                 case_target_met, case_target_not_met_by_dropping_parts,
+                 case_target_unreachable, case_target_fill_only_job):
         try:
             case()
         except Exception:

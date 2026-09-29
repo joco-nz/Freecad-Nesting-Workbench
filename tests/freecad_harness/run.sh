@@ -30,15 +30,17 @@ export NEST_BENCH_BASELINE
 BENCH_STATUS="$HARNESS_DIR/.last_status"
 TEST_STATUS="$HARNESS_DIR/.last_status_test"
 GA_STATUS="$HARNESS_DIR/.last_status_ga"
+PANEL_STATUS="$HARNESS_DIR/.last_status_panel"
 PYTEST_STATUS="$HARNESS_DIR/.last_status_pytest"
-rm -f "$BENCH_STATUS" "$TEST_STATUS" "$GA_STATUS" "$PYTEST_STATUS"
+rm -f "$BENCH_STATUS" "$TEST_STATUS" "$GA_STATUS" "$PANEL_STATUS" "$PYTEST_STATUS"
 
 cd "$REPO_ROOT"
 "$FREECADCMD" "$HARNESS_DIR/nest_benchmark.py" || true
 "$FREECADCMD" "$HARNESS_DIR/test_master_promotion.py" || true
 "$FREECADCMD" "$HARNESS_DIR/test_ga_loop.py" || true
+"$FREECADCMD" "$HARNESS_DIR/test_panel_teardown.py" || true
 
-for f in "$BENCH_STATUS" "$TEST_STATUS" "$GA_STATUS"; do
+for f in "$BENCH_STATUS" "$TEST_STATUS" "$GA_STATUS" "$PANEL_STATUS"; do
     if [ ! -f "$f" ]; then
         echo "harness did not write $f -- it probably did not run" >&2
         exit 3
@@ -82,6 +84,12 @@ fi
 GA=$(cat "$GA_STATUS")
 if [ "$GA" -ne 0 ]; then
     echo "GA-loop integration test FAILED (status $GA)" >&2
+    [ "$STATUS" -eq 0 ] && STATUS=1
+fi
+
+PANEL=$(cat "$PANEL_STATUS")
+if [ "$PANEL" -ne 0 ]; then
+    echo "panel-teardown regression test FAILED (status $PANEL)" >&2
     [ "$STATUS" -eq 0 ] && STATUS=1
 fi
 
