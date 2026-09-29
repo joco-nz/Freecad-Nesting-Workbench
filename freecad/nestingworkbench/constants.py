@@ -36,6 +36,25 @@ PREFS_PATH = "User parameter:BaseApp/Preferences/NestingWorkbench"
 PHYSICS_ROTATION_PRESETS = [360, 90, 45, 30, 15, 10, 5, 2, 1]
 MINKOWSKI_ROTATION_PRESETS = [360, 180, 120, 90, 45, 30, 15, 10, 5, 1]
 
+# -- Nesting Direction --
+# Dial reading for each named direction, and the default.
+#
+# The dial is an absolute Qt angle, and nesting_controller converts it with
+# `angle_deg = (270 - value) % 360` before taking cos/sin. The dial reading is
+# therefore NOT the compass bearing, and the two differ by a 90-degree turn plus
+# a flip. Verified by conversion:
+#
+#       0 -> 270 deg -> ( 0, -1)  Down      180 ->  90 deg -> (0,  1)  Up
+#      90 -> 180 deg -> (-1,  0)  Left      270 ->   0 deg -> (1,  0)  Right
+#
+# Default is Left (90). Was Down (0).
+#
+# Lives in constants rather than in the panel because NestingJob needs the same
+# value as a fallback, and a job object has no business importing a GUI module
+# to read a number.
+DIRECTION_LABELS = {0: "Down", 90: "Left", 180: "Up", 270: "Right"}
+DEFAULT_DIRECTION_DIAL = 90
+
 
 # -- Behaviour Defaults --
 # Lives here rather than beside CandidateGeometryCache because ui_nesting needs it

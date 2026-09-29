@@ -220,7 +220,14 @@ class NestingJob:
 
         # Save Nesting Direction as a vector/tuple if possible, or just the dial value
         # For simplicity and transparency in the UI, we'll save the dial value (degrees)
-        dial_val = p.get('nesting_direction', 0)
+        #
+        # The fallback must match the panel's default (ui_nesting
+        # ._DEFAULT_DIRECTION_DIAL, 90 = Left). It previously fell back to 0,
+        # which is Down, so a params dict missing the key would silently record
+        # a different direction from the one the run actually used -- and the
+        # recorded value is what _load_params_from_layout restores, so the
+        # error would outlive the run that made it.
+        dial_val = p.get('nesting_direction', DEFAULT_DIRECTION_DIAL)
         self._set_prop(target_layout, PROP_INTEGER, PROP_NESTING_DIRECTION, dial_val)
 
     def _set_prop(self, obj, type_str, name, val):
