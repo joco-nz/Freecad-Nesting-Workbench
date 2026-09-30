@@ -1,0 +1,676 @@
+"""Validate that a .FCStd can drive a CAM replay, and report what it contains.
+
+Run it against a candidate fixture before writing the real test. It answers
+two questions:
+
+  1. Does the file satisfy the structural contract the replay depends on?
+  2. Does the replay, run against it, do something sensible?
+
+It is a diagnostic, not a gate. Nothing is saved: the document is opened,
+inspected, and closed. If the dry run is included the document is left mutated
+in memory and simply discarded, so a crash mid-run costs nothing.
+
+Run directly:
+
+    freecadcmd tests/freecad_harness/validate_replay_fixture.py <file.FCStd>
+
+Options, as environment variables because freecadcmd's own parser eats
+anything starting with a dash:
+
+    REPLAY_FIXTURE_FILE    path to the .FCStd      (or pass it as argv[1])
+    REPLAY_FIXTURE_JOB     name of the CAM job to treat as the recipe
+    REPLAY_FIXTURE_NOREPLAY=1   skip the dry run, structure only
+
+Exit status: 0 when nothing failed, 1 when something did, 2 on a usage error.
+"""
+import os
+import sys
+import time
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_REPO = os.path.abspath(os.path.join(_HERE, "..", ".."))
+if _REPO not in sys.path:
+    sys.path.insert(0, _REPO)
+
+import FreeCAD
+
+from freecad.nestingworkbench.Tools.Cam import cam_replay
+
+
+# -- reporting ------------------------------------------------------------
+
+_failures = []
+_warnings = []
+_notes = []
+
+
+def emit(message=""):
+    """Print a line in a way that survives FreeCAD's console redirect.
+
+    Once a document exists, FreeCAD.Console captures plain print(), so output
+    silently disappears. Same reason the other harness scripts use this.
+    """
+    try:
+        if FreeCAD is not None and hasattr(FreeCAD, "Console"):
+            FreeCAD.Console.PrintMessage(str(message) + "\n")
+            return
+    except Exception:
+        pass
+    print(message)
+
+
+def ok(message):
+    emit("  [ ok ] %s" % message)
+
+
+def warn(message, detail=None):
+    """Record and print a warning, with optional indented detail.
+
+    Detail is printed but not recorded: a warning is already one line long,
+    and the summary should not grow a paragraph per one.
+    """
+    _warnings.append(message)
+    emit("  [warn] %s" % message)
+    if detail:
+        for line in str(detail).split("\n"):
+            emit("         %s" % line)
+
+
+def fail(message, detail=None):
+    _failures.append(message)
+    emit("  [FAIL] %s" % message)
+    if detail:
+        for line in str(detail).split("\n"):
+            emit("         %s" % line)
+
+
+def note(message):
+    _notes.append(message)
+    emit("  [note] %s" % message)
+
+
+def heading(text):
+    emit("")
+    emit(text)
+    emit("-" * len(text))
+
+
+# -- what this validator assumes -----------------------------------------
+
+def print_assumptions():
+    """State, before checking anything, what this thinks the starting point is.
+
+    Printed first on purpose. A misunderstanding about what the file is meant
+    to contain should be visible immediately, rather than showing up later as
+    a confusing structural failure.
+    """
+    heading("WHAT THIS VALIDATOR ASSUMES")
+    emit(
+        "  1. SOURCE GEOMETRY -- sketch-based PartDesign::Body objects.\n"
+        "     These are what a CAM job is set up on, and what gets nested.\n"
+        "\n"
+        "  2. A nesting LAYOUT, i.e. the RESULT of running the nester on that\n"
+        "     geometry:\n"
+        "       a Layout_* group carrying SheetWidth / SheetHeight /\n"
+        "       SheetThickness, and one Sheet_N group per sheet, each holding\n"
+        "         - Sheet_Boundary_N : a plane whose Placement is the sheet's\n"
+        "                             world origin\n"
+        "         - Shapes_N         : a subgroup of nested_* App::Part\n"
+        "                             containers, each holding a part_*\n"
+        "                             Part::Feature with the geometry\n"
+        "\n"
+        "  3. A CAM JOB whose Operations.Group holds the operations and\n"
+        "     dressups set up on the source bodies. That is the recipe. It\n"
+        "     references the SOURCE geometry, not the nested copies.\n"
+        "\n"
+        "  Then: the user selects the job, the replay finds the layout\n"
+        "  automatically, and applies the recipe to EVERY sheet.\n"
+        "\n"
+        "  Note the distinction in 1 and 2, because it is easy to get wrong and\n"
+        "  the existing n70 fixture gets it wrong: that file holds three\n"
+        "  PartDesign bodies and NOTHING else -- no layout, no sheets, no nested\n"
+        "  parts. It is an INPUT to the nester, not a nesting result, so it\n"
+        "  cannot drive a replay on its own. A replay fixture needs all three."
+    )
+    emit("")
+    emit("  If that is not what you built, stop here and say so.")
+
+
+# -- structure ------------------------------------------------------------
+
+def validate_layout(doc):
+    """Check the layout side. Returns the layout group, or None."""
+    heading("LAYOUT")
+
+    layout, layout_warnings = cam_replay.resolve_layout_group(doc)
+    for warning in layout_warnings:
+        warn(warning)
+
+    if layout is None:
+        # Distinguish "wrong kind of file" from "incomplete file", because the
+        # n70 fixture is a perfectly good nester input and a useless replay
+        # fixture, and conflating those sends people looking in the wrong place.
+        bodies = [o for o in doc.Objects
+                  if o.TypeId in ("PartDesign::Body", "Part::Feature",
+                                  "Part::Part2DObject")]
+        if bodies and not any(o.Label.startswith(("Layout_", "__temp_Layout",
+                                                   "Sheet_", "nested_"))
+                              for o in doc.Objects):
+            fail("No layout group, but this document holds %d source object(s)."
+                 % len(bodies),
+                 "It looks like SOURCE GEOMETRY only -- an input to the\n"
+                 "nester, not a nesting result. The n70 fixture is exactly\n"
+                 "this: three PartDesign bodies and nothing else. To drive a\n"
+                 "replay you also need a Layout_* group with Sheet_N groups,\n"
+                 "Sheet_Boundary_N planes and nested_* containers. Run the\n"
+                 "nester on this geometry and save the result alongside it.")
+        else:
+            fail("No layout group found.",
+                 "Expected an App::DocumentObjectGroup whose Label starts "
+                 "with 'Layout_' or '__temp_Layout'.")
+        return None
+    ok("Layout group: %r (%s)" % (layout.Label, layout.TypeId))
+
+    width, height, thickness = cam_replay.read_sheet_dimensions(layout)
+    emit("         sheet dimensions: %g x %g x %g mm" % (width, height, thickness))
+    for prop in ("SheetWidth", "SheetHeight", "SheetThickness"):
+        if not hasattr(layout, prop):
+            warn("Layout has no %s property; defaults were used." % prop)
+
+    from freecad.nestingworkbench.freecad_helpers import get_sheet_groups
+    sheets = get_sheet_groups(layout)
+    if not sheets:
+        fail("Layout has no Sheet_* groups.",
+             "The replay iterates Sheet_* children. Run nesting first.")
+        return None
+    ok("%d sheet group(s): %s" % (len(sheets), ", ".join(s.Label for s in sheets)))
+    if len(sheets) < 2:
+        warn("Only one sheet. The one-job-per-sheet path is then untested at scale.")
+
+    return layout
+
+
+def validate_sheet(sheet, thickness):
+    """Check one sheet's structure. Returns a list of nested containers."""
+    from freecad.nestingworkbench.freecad_helpers import get_nested_containers
+
+    heading("SHEET %s" % sheet.Label)
+
+    # -- the boundary, which is the one that is genuinely required --
+    boundary = [c for c in sheet.Group if c.Label.startswith("Sheet_Boundary_")]
+    if not boundary:
+        fail("No Sheet_Boundary_* child.",
+             "sheet_origin_for() reads the sheet's world origin from it. Without "
+             "it the parts are never moved to local coordinates, so they keep "
+             "their world X offset, leave the stock, and the toolpath runs off "
+             "the material. This is not cosmetic.")
+    else:
+        origin = cam_replay.sheet_origin_for(sheet)
+        ok("Sheet_Boundary_*: %r, origin (%.2f, %.2f)"
+           % (boundary[0].Label, origin.x, origin.y))
+        if abs(origin.x) < 1e-9 and abs(origin.y) < 1e-9:
+            note("origin is (0, 0). Correct for a single sheet; later sheets "
+                 "are normally offset in X.")
+
+    containers = get_nested_containers(sheet)
+    if not containers:
+        fail("No nested_* containers found.",
+             "get_nested_containers() looks for an App::Part labelled "
+             "'nested_*' inside a 'Shapes_*' subgroup OF this sheet group. "
+             "Checked %d child group(s): %s"
+             % (len(sheet.Group), [c.Label for c in sheet.Group]))
+        return []
+
+    ok("%d nested container(s)" % len(containers))
+
+    # -- per-container sanity --
+    bad_type = [c.Label for c in containers if c.TypeId != "App::Part"]
+    if bad_type:
+        fail("Containers that are not App::Part: %s" % bad_type)
+
+    no_part = []
+    null_shape = []
+    for container in containers:
+        part = cam_replay.find_part_in_container(container)
+        if part is None:
+            no_part.append(container.Label)
+            continue
+        shape = getattr(part, "Shape", None)
+        if shape is None or shape.isNull():
+            null_shape.append(part.Label)
+    if no_part:
+        fail("%d container(s) have no part_* child: %s" % (len(no_part), no_part))
+    if null_shape:
+        fail("%d part(s) have a null shape: %s" % (len(null_shape), null_shape))
+
+    return containers
+
+
+def survey_source(doc):
+    """Report the source geometry the CAM job is set up on.
+
+    Reported unconditionally, including for a file that turns out to hold
+    source geometry only. A source-only document is the n70 fixture's shape,
+    and telling it what it *does* contain is more use than "no layout found".
+    """
+    heading("SOURCE GEOMETRY")
+    # A CAM tool bit is itself a PartDesign::Body, so filter by name: a tool
+    # reported as nestable source geometry is a false positive that would send
+    # the fixture builder looking for a part that does not exist.
+    bodies = [o for o in doc.Objects
+              if o.TypeId == "PartDesign::Body"
+              and "endmill" not in o.Label.lower()
+              and "drill" not in o.Label.lower()
+              and not o.Label.lower().startswith(("tool", "cutter"))]
+    tool_bits = [o for o in doc.Objects
+                 if o.TypeId == "PartDesign::Body" and o not in bodies]
+    if tool_bits:
+        emit("  (%d tool bit(s) excluded: %s)"
+             % (len(tool_bits), [t.Label for t in tool_bits]))
+    sketches = [o for o in doc.Objects
+                if o.TypeId == "Sketcher::SketchObject"]
+    features = [o for o in doc.Objects
+                if o.TypeId == "Part::Feature"
+                and not o.Label.startswith("part_")]
+
+    if bodies:
+        ok("%d PartDesign::Body: %s" % (len(bodies), [b.Label for b in bodies]))
+    else:
+        warn("No PartDesign::Body in this document.",
+             "The fixture is meant to use sketch-based geometry, which is what "
+             "real parts are. Every current check uses Part::Feature built "
+             "from primitives, which has different topology.")
+    emit("  %d sketch(es)" % len(sketches))
+    if features:
+        emit("  %d other Part::Feature(s): %s"
+             % (len(features), [f.Label for f in features][:8]))
+    if not bodies and not features:
+        fail("No source geometry found.",
+             "A replay fixture needs geometry for the CAM job to reference.")
+
+
+def survey_parts(sheets_with_containers):
+    """Report the part inventory, and flag the cases the replay is weakest on."""
+    heading("PART INVENTORY")
+
+    by_type = {}
+    rotations = set()
+    total = 0
+
+    for sheet, containers in sheets_with_containers:
+        for container in containers:
+            part = cam_replay.find_part_in_container(container)
+            if part is None:
+                continue
+            # The type is the middle of nested_<Type>_<n>, which is exactly
+            # what clones_for_source parses, so report what it will see.
+            pieces = container.Label.split("_")
+            part_type = "_".join(pieces[1:-1]) if len(pieces) >= 3 else container.Label
+            entry = by_type.setdefault(part_type, {"count": 0,
+                                                   "per_sheet": {},
+                                                   "containers": []})
+            entry["count"] += 1
+            entry["per_sheet"][sheet.Label] = \
+                entry["per_sheet"].get(sheet.Label, 0) + 1
+            entry["containers"].append(container)
+            total += 1
+            angle = container.Placement.Rotation.Angle
+            rotations.add(round(__import__("math").degrees(angle) % 360, 1))
+
+    for part_type in sorted(by_type):
+        entry = by_type[part_type]
+        per_sheet = ", ".join(
+            "%s:%d" % (name.split("_")[-1], count)
+            for name, count in sorted(entry["per_sheet"].items()))
+        emit("  %-20s %3d   (%s)" % (part_type, entry["count"], per_sheet))
+    emit("  %d part(s) across %d type(s)" % (total, len(by_type)))
+
+    if not by_type:
+        return {}
+
+    # -- the gaps this fixture is meant to close --
+    over_ten = {t: e["count"] for t, e in by_type.items() if e["count"] > 10}
+    if over_ten:
+        ok("Crosses the 10-per-type boundary: %s"
+           % ", ".join("%s (%d)" % (t, c) for t, c in sorted(over_ten.items())))
+    else:
+        warn("No part type has more than 10 copies.",
+             "Label uniquification only starts to matter at 10+, which is where "
+             "findObjects(Label=...) over-matched. This fixture will not "
+             "exercise that.")
+
+    underscored = [t for t in by_type if "_" in t]
+    if underscored:
+        ok("Part type(s) with an underscore in the name: %s" % ", ".join(underscored))
+    else:
+        note("No part type has an underscore in its name. That case is verified "
+             "in the pytest tier but not here.")
+
+    if len(rotations) > 1:
+        ok("Distinct rotations present: %d" % len(rotations))
+    else:
+        warn("Every part has the same rotation. Rotated geometry is the normal "
+             "case and exercises the placement arithmetic.")
+
+    return by_type
+
+
+def survey_holes(sheets_with_containers):
+    """Report which parts have holes, and whether any could host a nested part.
+
+    This is the expensive part -- part_footprint is ~15 ms per part -- and it is
+    reported with timing because its cost at n70's scale is currently assumed
+    rather than known.
+    """
+    heading("INTERNAL FEATURES")
+
+    parts = []
+    for _sheet, containers in sheets_with_containers:
+        for container in containers:
+            part = cam_replay.find_part_in_container(container)
+            if part is not None:
+                parts.append(part)
+
+    start = time.perf_counter()
+    footprints = {}
+    for part in parts:
+        footprint = cam_replay.part_footprint(part)
+        if footprint is not None:
+            footprints[id(part)] = footprint
+    elapsed = time.perf_counter() - start
+
+    with_holes = {i: f for i, f in footprints.items() if f.interiors}
+    emit("  %d part(s), %d footprint(s) in %.0f ms (%.1f ms each)"
+         % (len(parts), len(footprints), 1000 * elapsed,
+            1000 * elapsed / max(len(parts), 1)))
+    emit("  %d part(s) have internal features" % len(with_holes))
+    if not with_holes:
+        warn("No part has an internal feature.",
+             "Holes and slots are what the hole-nesting ordering and the "
+             "interior/exterior distinction are about.")
+
+    # Circular vs not: the current harness only ever uses circles.
+    circular = 0
+    non_circular = 0
+    for footprint in with_holes.values():
+        for ring in footprint.interiors:
+            coords = list(ring.coords)
+            xs = [c[0] for c in coords]
+            ys = [c[1] for c in coords]
+            width = max(xs) - min(xs)
+            height = max(ys) - min(ys)
+            if width > 1e-6 and abs(width - height) < 1e-3:
+                circular += 1
+            else:
+                non_circular += 1
+    emit("  interior rings that look circular: %d, non-circular: %d"
+         % (circular, non_circular))
+    if non_circular == 0 and circular:
+        note("All internal features look circular. Slots and rectangular "
+             "pockets are a different ring count and sub-element set, and are "
+             "untested outside the pytest tier.")
+
+    # Would anything actually host a nested part?
+    start = time.perf_counter()
+    nestings = cam_replay.find_hole_nestings(parts)
+    nest_elapsed = time.perf_counter() - start
+    emit("  find_hole_nestings: %.0f ms, %d nesting(s) found"
+         % (1000 * nest_elapsed, len(nestings)))
+    if not nestings:
+        note("No hole nesting found, so the ordering step will not reorder "
+             "anything in this fixture.")
+
+    if parts:
+        projected = 1000 * (nest_elapsed + elapsed) * 122 / max(len(parts), 1)
+        emit("  extrapolated to 122 parts: ~%.0f ms" % projected)
+
+    return with_holes
+
+
+# -- the CAM job ----------------------------------------------------------
+
+def _matches(container, source_label):
+    """True if `container`'s label encodes `source_label` as its part type.
+
+    The same parse `clones_for_source` does: the middle of `nested_<type>_<n>`.
+    """
+    pieces = container.Label.split("_")
+    if len(pieces) < 3:
+        return False
+    return "_".join(pieces[1:-1]) == source_label
+
+
+def _c_stub(container):
+    """A stand-in for clones_for_source, which wants job clones.
+
+    Only the label is consulted here, so the raw container is enough.
+    """
+    return type("_S", (), {"Objects": [container], "Label": container.Label})()
+
+
+def validate_job(doc, wanted_name=None, all_containers=()):
+    """Check the CAM job and inventory the recipe. Returns the job, or None."""
+    heading("CAM JOB")
+
+    jobs = [o for o in doc.Objects if cam_replay.is_cam_job(o)]
+    if not jobs:
+        fail("No CAM job in this document.",
+             "The replay reads Operations.Group from a job the user selects. "
+             "is_cam_job() wants a Path::Feature carrying Operations, Model "
+             "and Stock.")
+        return None
+
+    for job in jobs:
+        emit("  found job %r (%s)" % (job.Label, job.TypeId))
+
+    if wanted_name:
+        matching = [j for j in jobs if j.Label == wanted_name]
+        if not matching:
+            fail("No job named %r. Candidates: %s"
+                 % (wanted_name, [j.Label for j in jobs]))
+            return None
+        job = matching[0]
+    else:
+        job = jobs[0]
+        if len(jobs) > 1:
+            warn("%d jobs present; using %r. Set REPLAY_FIXTURE_JOB to choose."
+                 % (len(jobs), job.Label))
+
+    ok("Using job %r" % job.Label)
+
+    recipe = cam_replay.read_recipe(job)
+    if not len(recipe):
+        fail("The job has no operations, so there is nothing to replay.")
+        return job
+    if recipe.unresolved_dressups:
+        warn("%d dressup(s) could not be attached: %s"
+             % (len(recipe.unresolved_dressups),
+                [getattr(d, "Label", "?") for d in recipe.unresolved_dressups]))
+
+    emit("  Operations.Group, in order:")
+    group = getattr(job.Operations, "Group", []) or []
+    order = [o.Label for o in group]
+    emit("    %s" % order)
+    for entry in group:
+        if cam_replay.is_dressup(entry):
+            emit("      %-22s dressup, wraps %s"
+                 % (entry.Label, getattr(entry.Base, "Label", "?")))
+        else:
+            emit("      %-22s operation, %s"
+                 % (entry.Label, type(entry.Proxy).__module__))
+
+    emit("  recipe as read:")
+    for item in recipe:
+        subs = sorted({s for _g, subs_list in item.base_entries
+                       for s in subs_list})
+        emit("    %-22s %d property/-ies, %d base entry/-ies, subs=%s"
+             % (item.label, len(item.properties), len(item.base_entries),
+                subs if subs else "whole object"))
+        if not subs:
+            note("%s selects the WHOLE object, so its holes and its external "
+                 "boundary are not separable. Ordering treats it as "
+                 "hole-cutting, which is the safe direction." % item.label)
+
+    # -- identity: does each op's geometry correspond to a nested part type? --
+    #
+    # This is the cross-check that matters most, because it is the one place
+    # the replay can be confidently wrong without anything raising. An
+    # operation whose source part has no matching nested parts still replays;
+    # clones_for_source falls back to "every clone", so the operation would cut
+    # the wrong feature on parts it was never meant to touch, and every
+    # downstream check would pass.
+    emit("  identity cross-check (operation -> source part -> nested parts):")
+    for item in recipe:
+        for geometry, _subs in item.base_entries:
+            original = cam_replay.resolve_source_object(geometry) or geometry
+            label = getattr(original, "Label", "?")
+            containers = [c for c in all_containers
+                          if cam_replay.clones_for_source([_c_stub(c)], geometry)
+                          or _matches(c, label)]
+            if containers:
+                emit("    %-22s -> %r -> %d nested part(s)"
+                     % (item.label, label, len(containers)))
+            else:
+                fail("Operation %r references source part %r, which has no "
+                     "matching nested part." % (item.label, label),
+                     "The replay would fall back to targeting every clone, "
+                     "cutting a feature on parts it was not set up for. The "
+                     "nested label must be nested_<that part's label>_<n>.")
+
+    tools = getattr(job, "Tools", None)
+    if tools is not None and getattr(tools, "Group", None):
+        ok("%d tool controller(s): %s"
+           % (len(tools.Group), [t.Label for t in tools.Group]))
+    else:
+        warn("The job has no tool controller, so operations replay without a tool.")
+
+    return job
+
+
+# -- dry run --------------------------------------------------------------
+
+def dry_run(doc, layout, job):
+    """Actually run the replay, and report what it did."""
+    heading("REPLAY DRY RUN")
+    if layout is None or job is None:
+        warn("Skipped: no layout or no job.")
+        return
+
+    start = time.perf_counter()
+    try:
+        outcomes = cam_replay.replay_layout(doc, layout, job)
+    except Exception as exc:
+        import traceback
+        traceback.print_exc()
+        fail("replay_layout raised: %s" % exc)
+        return
+    elapsed = time.perf_counter() - start
+
+    for outcome in outcomes:
+        emit("")
+        emit("  %s" % outcome.sheet_label)
+        for line in cam_replay.describe_sheet_outcome(outcome):
+            emit("    %s" % line)
+
+        if outcome.replay_job is not None and outcome.result is not None:
+            replay = outcome.replay_job
+            ok("stock %g x %g x %g mm"
+               % (replay.stock.Length, replay.stock.Width, replay.stock.Height))
+            # Checked against the ACTUAL stock, not a hardcoded range. The
+            # first version asserted X 0..300 and reported four parts outside
+            # a 400 mm sheet that were plainly inside it.
+            for label in cam_replay.parts_outside_stock(replay.clones, replay.stock):
+                fail("%s: %s is outside the stock" % (outcome.sheet_label, label))
+            for operation in outcome.result.operations:
+                if not cam_replay.has_cutting_motion(operation):
+                    fail("%s: %s has no cutting motion"
+                         % (outcome.sheet_label, operation.Label))
+
+    emit("")
+    emit("  replay wall clock: %.0f ms" % (1000 * elapsed))
+    emit("  (nothing was saved; the document is discarded)")
+
+
+# -- main -----------------------------------------------------------------
+
+def main(path):
+    print_assumptions()
+
+    heading("FILE")
+    if not os.path.isfile(path):
+        emit("  [FAIL] not a file: %s" % path)
+        return 2
+    emit("  %s" % path)
+    emit("  %d bytes" % os.path.getsize(path))
+
+    doc = FreeCAD.openDocument(path)
+    emit("  opened %r: %d object(s)" % (doc.Name, len(doc.Objects)))
+
+    layout = validate_layout(doc)
+
+    sheets_with_containers = []
+    if layout is not None:
+        from freecad.nestingworkbench.freecad_helpers import get_sheet_groups
+        _w, _h, thickness = cam_replay.read_sheet_dimensions(layout)
+        for sheet in get_sheet_groups(layout):
+            containers = validate_sheet(sheet, thickness)
+            if containers:
+                sheets_with_containers.append((sheet, containers))
+
+    # Unconditional: a source-only document should still be told what it holds.
+    survey_source(doc)
+
+    if sheets_with_containers:
+        survey_parts(sheets_with_containers)
+        survey_holes(sheets_with_containers)
+    else:
+        heading("PART INVENTORY")
+        fail("No nested parts found, so there is nothing to replay onto.")
+
+    all_containers = [c for _sheet, containers in sheets_with_containers
+                      for c in containers]
+    job = validate_job(doc, os.environ.get("REPLAY_FIXTURE_JOB") or None,
+                       all_containers)
+
+    if not os.environ.get("REPLAY_FIXTURE_NOREPLAY"):
+        dry_run(doc, layout, job)
+
+    heading("SUMMARY")
+    emit("  %d failure(s), %d warning(s), %d note(s)"
+         % (len(_failures), len(_warnings), len(_notes)))
+    if _failures:
+        emit("")
+        for failure in _failures:
+            emit("  FAIL: %s" % failure)
+    if _warnings:
+        emit("")
+        for warning in _warnings:
+            emit("  WARN: %s" % warning)
+    if not _failures:
+        emit("")
+        emit("  Structurally usable as a replay fixture.")
+
+    FreeCAD.closeDocument(doc.Name)
+    return 1 if _failures else 0
+
+
+if __name__ in ("__main__", "validate_replay_fixture"):
+    # Under freecadcmd, sys.argv is [freecadcmd, <script>, <user args...>]
+    # and __name__ is the script basename without its extension. So the user's
+    # path is argv[2], not argv[1]: taking argv[1] made the validator open
+    # itself, which FreeCAD reports as an iostream error on a .py.
+    _args = sys.argv[2:] if len(sys.argv) > 2 else []
+    _path = os.environ.get("REPLAY_FIXTURE_FILE", "") or (_args[0] if _args else "")
+    if not _path:
+        emit("usage: REPLAY_FIXTURE_FILE=<path> freecadcmd "
+             "validate_replay_fixture.py")
+        emit("   or: freecadcmd validate_replay_fixture.py <path>")
+        sys.exit(2)
+    try:
+        _status = main(_path)
+    except Exception:
+        import traceback
+        traceback.print_exc()
+        emit("validator raised")
+        _status = 2
+    sys.exit(_status)

@@ -382,6 +382,34 @@ Note `tests/Test_Files/` currently has **no tracked files at all**: both the
 n70 `.FCStd` and its 5.3 MB `.dxf` are gitignored, so nothing in the repo is
 openable in a GUI today.
 
+### Validating the fixture before the test is written
+
+`tests/freecad_harness/validate_replay_fixture.py` checks a candidate file and
+reports what it contains, without saving anything:
+
+    freecadcmd tests/freecad_harness/validate_replay_fixture.py <path.FCStd>
+
+It prints its assumptions about the starting point **before** any checking, so
+a misunderstanding is visible immediately rather than surfacing later as a
+confusing structural failure. Structure checks are followed by a dry run of the
+whole pipeline, reporting per-sheet outcome, operation count, sub-element
+resolution, containment and wall clock.
+
+Verified against both cases: the n70 file (correctly reported as *source
+geometry only*), and a purpose-built valid fixture, which it passes with
+**0 failures**. A diagnostic that can only fail is not a diagnostic.
+
+Two things it caught while being written, both in code written minutes earlier
+— which is the argument for having it:
+
+  * a throwaway fixture generator placed parts at x=20 with a half-width of 30,
+    so they started at x=-10. The dry run's containment check reported them
+    outside the stock, and the replay's own containment check agreed. The
+    generator was wrong, not the replay;
+  * the validator's own containment assertion was hardcoded to X 0..300 and
+    reported four parts "outside the stock" that were plainly inside a 400 mm
+    sheet. It now measures against the actual stock object.
+
 ### What the fixture must contain
 
 Labels matter — the replay matches on conventions the nester writes. Getting
