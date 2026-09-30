@@ -13,21 +13,116 @@ import os
 from ...constants import *
 from ... import FONTS_DIR, DEFAULT_FONT
 from ...freecad_helpers import set_visibility
+from ...length_field import LengthField
+from ... import units
 
 _MINKOWSKI_DIR_MAX = 359
+
+# Spacing for the two-column grids. Slightly tighter than a QFormLayout's
+# default, because these rows are 4 and 8 fields rather than 1 or 2, and the
+# default row gap starts to dominate once the labels are short.
+_GRID_COLUMN_SPACING = 12
+_GRID_ROW_SPACING = 6
+
+# QFormLayout adds a margin of its own, which inside a QGroupBox stacks with
+# the box's frame and indents the controls twice over. The group already has
+# the frame; the layout does not need a second one.
+_MARGINS_NONE = (0, 0, 0, 0)
+
+# Fixed width for the dial's column in the Nesting Settings grid. A QDial is a
+# circle and has no reason to grow with the panel, and pinning it stops the
+# slider beside it from claiming the surplus width. Comfortably wider than the
+# 100px the widget asks for, so the readout below the dial is not clipped.
+_DIAL_COLUMN_WIDTH = 120
+
+
+def _snap_to_step(value, step=None):
+    """Round ``value`` to the nearest multiple of the dial's step.
+
+    A stored reading from a build with a different step would otherwise land
+    between notches: the dial would show the value it snapped to, the readout
+    would follow, and the stored number the user last chose would be
+    unreachable. Snapping is done on load rather than on store so the stored
+    figure stays whatever the dial actually held.
+    """
+    step = DIRECTION_STEP_DEGREES if step is None else step
+    try:
+        value = int(value)
+    except (TypeError, ValueError):
+        return _DEFAULT_DIRECTION_DIAL
+    return int(round(value / float(step))) * int(step)
+
+
+def _set_group_collapsed(group, expanded):
+    """Show or hide a collapsible QGroupBox's contents.
+
+    A checkable QGroupBox that is unchecked DISABLES its children; it does not
+    hide them. Measured on a two-widget group, 64px checked and 64px unchecked,
+    with the child reporting isHidden()=False in both states. So the toggle on
+    its own greys the controls out and reclaims no space, which is the worst of
+    both -- it looks broken and saves nothing. The hiding has to be done here.
+
+    setVisible rather than setEnabled, deliberately: a hidden widget still
+    returns its real checked state, so _collect_ui_params keeps reading
+    verbose_logging, add_labels, the font path and the label fields exactly as
+    it does when the group is open. Disabling them would have been the obvious
+    one-liner and would have silently changed what a run uses.
+
+    Only DIRECT children are touched, so a nested group inside this one would
+    keep its own state rather than being flattened into the parent's.
+    """
+    for child in group.findChildren(QtWidgets.QWidget,
+                                    options=QtCore.Qt.FindDirectChildrenOnly):
+        child.setVisible(expanded)
+
+
+def _place(grid, widget, row, column, span):
+    """Add ``widget`` to ``grid``, accepting a widget or a nested layout.
+
+    addWidget() only takes a QWidget, so a field that is a QHBoxLayout (the
+    Compactness spin box and its help button) has to go in through addLayout().
+    Both are the same placement; only the call differs, and the branch belongs
+    here rather than being written out at each of the call sites.
+    """
+    if isinstance(widget, QtWidgets.QLayout):
+        grid.addLayout(widget, row, column, 1, span)
+    else:
+        grid.addWidget(widget, row, column, 1, span)
 
 # Direction naming and the default live in constants (DIRECTION_LABELS,
 # DEFAULT_DIRECTION_DIAL) so NestingJob can share the default without importing
 # this module. See the comment there for why the dial reading is not the
 # compass bearing.
-_DIRECTION_LABELS = DIRECTION_LABELS
+#
+# DIRECTION_LABELS is imported wholesale by the constants star-import and is
+# used directly below, so it needs no local alias. It used to have one -- the
+# _DIRECTION_LABELS name the four cardinal buttons were generated from -- and
+# that was the only reader, so the alias went with the buttons.
 _DEFAULT_DIRECTION_DIAL = DEFAULT_DIRECTION_DIAL
 
+# DIRECTION_LABELS is keyed on the DIAL reading; the readout has to be keyed on
+# the BEARING, because that is the number the search uses. Derived here rather
+# than hand-written so the two cannot disagree: 0 -> Down is a fact about the
+# conversion, and repeating it in a second table is how it would start
+# disagreeing.
+_BEARING_LABELS = {dial_to_bearing(dial): name
+                   for dial, name in DIRECTION_LABELS.items()}
+
 _DEFAULTS = {
+    # Every length below is in millimetres, and stays in millimetres all the
+    # way to the field. The field converts for display; nothing upstream of it
+    # ever sees a display unit.
     "sheet_width": 600.0,
     "sheet_height": 600.0,
     "part_spacing": 12.5,
     "sheet_thickness": 3.0,
+    "simplification": 1.0,
+    "minkowski_step_size": 5.0,
+    "physics_step_size": 5.0,
+    "physics_anneal_min_amp": 0.1,
+    "physics_anneal_max_amp": 100.0,
+    "label_height": 25.0,
+    "label_size": 10.0,
     "deflection_angle": 30.0,
     "add_labels": False,
     "simulate_nesting": False,
@@ -50,6 +145,9 @@ class NestingPanel(QtWidgets.QWidget):
         self.hidden_originals = []
         self.current_layout = None
         self.selected_font_path = ""
+        # The unit schema the fields are currently rendered in. None means "not
+        # yet", so the first refresh_unit_display always does its work.
+        self._rendered_schema = None
         # Re-entrancy guard for reject(). The in-panel "Cancel Nesting" button
         # calls controller.request_cancel(), which closes the dialog via
         # ui.reject() once the run is not in flight -- and that lands back
@@ -115,10 +213,26 @@ class NestingPanel(QtWidgets.QWidget):
         table_button_layout = QtWidgets.QHBoxLayout()
         action_button_layout = QtWidgets.QHBoxLayout()
 
-        self.sheet_width_input = QtWidgets.QDoubleSpinBox(); self.sheet_width_input.setRange(1, 10000); self.sheet_width_input.setValue(_DEFAULTS["sheet_width"])
-        self.sheet_height_input = QtWidgets.QDoubleSpinBox(); self.sheet_height_input.setRange(1, 10000); self.sheet_height_input.setValue(_DEFAULTS["sheet_height"])
-        self.sheet_thickness_input = QtWidgets.QDoubleSpinBox(); self.sheet_thickness_input.setRange(0.1, 1000); self.sheet_thickness_input.setValue(_DEFAULTS["sheet_thickness"])
-        self.part_spacing_input = QtWidgets.QDoubleSpinBox(); self.part_spacing_input.setRange(0, 1000); self.part_spacing_input.setValue(_DEFAULTS["part_spacing"])
+        # Every length in the panel is a LengthField: a unit-aware spin box
+        # that shows the document's units and parses whatever FreeCAD's
+        # quantity parser does ("1/2 in", "1' 11\"", "2ft 6in"), while the
+        # value the rest of the workbench receives stays a plain millimetre
+        # float. See length_field.py for why the value is kept in Python rather
+        # than read back out of the widget.
+        self.sheet_width_input = LengthField(mm_min=1, mm_max=10000)
+        self.sheet_height_input = LengthField(mm_min=1, mm_max=10000)
+        self.sheet_thickness_input = LengthField(mm_min=0.1, mm_max=1000)
+        self.part_spacing_input = LengthField(mm_min=0, mm_max=1000)
+        self.sheet_width_input.set_mm(_DEFAULTS["sheet_width"])
+        self.sheet_height_input.set_mm(_DEFAULTS["sheet_height"])
+        self.sheet_thickness_input.set_mm(_DEFAULTS["sheet_thickness"])
+        self.part_spacing_input.set_mm(_DEFAULTS["part_spacing"])
+        # Bounds above are the same ones the QDoubleSpinBoxes these replaced
+        # had, so nothing that used to be rejected is now accepted.
+        self._length_fields = [
+            self.sheet_width_input, self.sheet_height_input,
+            self.sheet_thickness_input, self.part_spacing_input,
+        ]
         
         # Deflection is now specified as an angle (degrees) for more intuitive control
         # Internally converted to linear deflection: deflection_mm = angle / 200.0
@@ -136,10 +250,12 @@ class NestingPanel(QtWidgets.QWidget):
             "<i>Tip: 10° is good for most parts. Use 5° for precision, 30°+ for speed.</i>"
         )
         
-        self.simplification_input = QtWidgets.QDoubleSpinBox(); self.simplification_input.setRange(0.001, 10.0); self.simplification_input.setValue(1.0); self.simplification_input.setSingleStep(0.1); self.simplification_input.setDecimals(3)
-        self.simplification_input.setToolTip(
+        self.simplification_input = LengthField(mm_min=0.001, mm_max=10.0, single_step_mm=0.1)
+        self.simplification_input.set_mm(_DEFAULTS["simplification"])
+        self._length_fields.append(self.simplification_input)
+        self._simplification_tooltip = (
             "<b>Simplify (Point Reduction):</b><br>"
-            "Tolerance (mm) for dropping boundary points. Larger = coarser, faster.<br><br>"
+            "Tolerance for dropping boundary points. Larger = coarser, faster.<br><br>"
             "<b>Measured</b> on a 122-part nest (3 sheets, all parts placed at every "
             "setting), wall clock against material yield:<br>"
             "<table cellspacing='0' cellpadding='2'>"
@@ -153,10 +269,14 @@ class NestingPanel(QtWidgets.QWidget):
             "about a third of the time to gain 0.3% yield. Dropping to 0.25 saves ~15% "
             "of the time for ~0.1% yield. The large jump is <i>below</i> 0.1, where "
             "4x the time buys 0.1% yield.<br><br>"
-            "<b>Tip:</b> set this to your machine's precision tolerance (1mm for a "
-            "router). Below ~0.25 it stops being worth the time unless a part has fine "
-            "internal detail."
+            "<b>Tip:</b> set this to your machine's precision tolerance "
+            "({router_tolerance} for a router). Below ~0.25 it stops being worth "
+            "the time unless a part has fine internal detail."
         )
+        # The measured table above is quoted in millimetres because that is what
+        # it was measured in, and it is left that way deliberately: the figures
+        # are a record of an experiment, not a live readout. Only the tip's
+        # recommendation follows the document's units.
 
         self.shape_table = QtWidgets.QTableWidget()
         self.shape_table.setColumnCount(6)
@@ -169,15 +289,24 @@ class NestingPanel(QtWidgets.QWidget):
         # Two Minkowski groups rather than one, split by what the user is
         # deciding: how the part is oriented (Nesting Settings) versus how hard
         # the run works to get a better answer (Optimizations).
+        #
+        # Nesting Settings collapses like Helpers and Logging do, and starts
+        # collapsed. Its dial is the tallest single control in the panel by a
+        # wide margin, and it is a set-and-forget choice -- a run uses whatever
+        # direction it is left on. See _set_group_collapsed for why the toggle
+        # flag alone is not enough.
         self.minkowski_settings_group = QtWidgets.QGroupBox("Nesting Settings")
+        self.minkowski_settings_group.setCheckable(True)
+        self.minkowski_settings_group.setChecked(False)
+        self.minkowski_settings_group.toggled.connect(
+            lambda checked: _set_group_collapsed(self.minkowski_settings_group, checked))
         minkowski_form_layout = QtWidgets.QFormLayout()
 
         self.minkowski_optimization_group = QtWidgets.QGroupBox("Optimizations")
-        minkowski_opt_layout = QtWidgets.QFormLayout()
 
         # Direction Dial for Minkowski
-        minkowski_dial_widget, self.minkowski_direction_dial, self.minkowski_direction_label, \
-            self.minkowski_direction_buttons = self._build_direction_control()
+        minkowski_dial_widget, self.minkowski_direction_dial, self.minkowski_direction_label = \
+            self._build_direction_control()
 
         # Random Direction Checkbox for Minkowski
         self.minkowski_random_checkbox = QtWidgets.QCheckBox("Use Random Direction")
@@ -185,9 +314,6 @@ class NestingPanel(QtWidgets.QWidget):
         self.minkowski_random_checkbox.stateChanged.connect(
             lambda state: self._set_direction_control_enabled(
                 not self.minkowski_random_checkbox.isChecked()))
-
-        minkowski_form_layout.addRow("Nesting Direction:", minkowski_dial_widget)
-        minkowski_form_layout.addRow(self.minkowski_random_checkbox)
 
         self.clear_cache_checkbox = QtWidgets.QCheckBox("Clear NFP Cache")
         self.clear_cache_checkbox.setChecked(False)
@@ -262,28 +388,27 @@ class NestingPanel(QtWidgets.QWidget):
         # the measurement says they are the two largest levers in a run and a
         # control nobody can reach is not a control. Defaults are unchanged, so
         # leaving them alone reproduces the previous behaviour exactly.
-        self.minkowski_step_size_input = QtWidgets.QDoubleSpinBox()
-        self.minkowski_step_size_input.setRange(0.1, 100.0)
-        self.minkowski_step_size_input.setValue(5.0)
-        self.minkowski_step_size_input.setSingleStep(0.5)
-        self.minkowski_step_size_input.setDecimals(2)
-        self.minkowski_step_size_input.setToolTip(
-            "Spacing between candidate positions, in mm.\n\n"
+        self.minkowski_step_size_input = LengthField(mm_min=0.1, mm_max=100.0, single_step_mm=0.5)
+        self.minkowski_step_size_input.set_mm(_DEFAULTS["minkowski_step_size"])
+        self._length_fields.append(self.minkowski_step_size_input)
+        self._step_size_tooltip = (
+            "Spacing between candidate positions.<br><br>"
             "Every position a part can occupy comes from sampling the boundary "
             "of a No-Fit Polygon at this interval, and a boundary of length L "
             "yields about L / step positions. Each one is then tested against "
             "the parts already placed, so the total number of collision tests "
             "scales with this value and it is the main control over how long a "
-            "run takes.\n\n"
-            "Larger: fewer positions, faster, and coarser packing.\n"
-            "Smaller: more positions, slower, and finer packing.\n\n"
+            "run takes.<br><br>"
+            "Larger: fewer positions, faster, and coarser packing.<br>"
+            "Smaller: more positions, slower, and finer packing.<br><br>"
             "Only affects jobs that need positions away from the sheet corners "
             "and edges. Where parts simply line up against each other or the "
             "sheet border, the extra positions are tested and discarded and "
             "changing this has no visible effect on the result. Where parts "
-            "interlock or have curved or closely spaced features, it does.\n\n"
+            "interlock or have curved or closely spaced features, it does.<br><br>"
             "If you raise it, check that the packing and the number of sheets "
-            "are unchanged before keeping the change.")
+            "are unchanged before keeping the change."
+        )
 
         self.minkowski_rotation_workers_input = QtWidgets.QSpinBox()
         self.minkowski_rotation_workers_input.setRange(0, 64)
@@ -300,10 +425,6 @@ class NestingPanel(QtWidgets.QWidget):
             "around it does not, so extra threads spend their time waiting on "
             "each other and on the shared NFP cache rather than doing work.\n\n"
             "Does not affect the packing, only how long it takes.")
-
-        perf_form_layout = QtWidgets.QFormLayout()
-        perf_form_layout.addRow("Candidate Step (mm):", self.minkowski_step_size_input)
-        perf_form_layout.addRow("Rotation Threads:", self.minkowski_rotation_workers_input)
 
         mink_compactness_layout = QtWidgets.QHBoxLayout()
         mink_compactness_layout.addWidget(self.minkowski_compactness_input)
@@ -322,41 +443,131 @@ class NestingPanel(QtWidgets.QWidget):
         mink_rot_layout = QtWidgets.QHBoxLayout()
         mink_rot_layout.addWidget(self.minkowski_rotation_steps_slider)
         mink_rot_layout.addWidget(self.minkowski_rotation_display_label)
-        minkowski_form_layout.addRow("Rotation Angle:", mink_rot_layout)
-        self.minkowski_settings_group.setLayout(minkowski_form_layout)
+
+        # Layout of the three controls:
+        #
+        #     Use Random Direction  |   Nesting Direction
+        #     ----------------------+   (dial, spanning both rows)
+        #     Rotation Angle        |
+        #
+        # Built as a QGridLayout rather than the QFormLayout it replaces,
+        # because QFormLayout cannot express this: its label column is
+        # shared, so a labelled "Rotation Angle" row would start to the right of
+        # the checkbox and run its slider underneath the dial. That is what the
+        # first attempt did, and the two controls overlapped in width rather
+        # than stacking in columns. A grid has a label cell per row and a
+        # spanning cell for the dial, so the left column is genuinely its own
+        # column and the slider cannot grow into the dial's space.
+        #
+        # The dial spans both rows on the right because it is the tallest of
+        # the three by an order of magnitude. It defines the group's height, and
+        # the two smaller controls stack alongside it instead of the group being
+        # three rows tall.
+        #
+        # The checkbox sits above the slider because it qualifies the dial it
+        # sits beside -- it decides whether the dial is used at all -- and the
+        # rotation angle is the one control of the three that is independent of
+        # both.
+        #
+        # Column 0 is sized to its widest cell, and the widest is the
+        # "Use Random Direction" checkbox, not the "Rotation Angle:" label. That
+        # left the left column far wider than either control needs and pushed
+        # the slider right until it ran under the dial. Sizing the column to the
+        # LABEL instead and letting the checkbox keep its own natural size
+        # within it is what makes the two rows of column 1 start at the same x,
+        # which is the whole point of the arrangement.
+        direction_grid = QtWidgets.QGridLayout()
+        direction_grid.setHorizontalSpacing(_GRID_COLUMN_SPACING)
+        direction_grid.setVerticalSpacing(_GRID_ROW_SPACING)
+        direction_grid.setContentsMargins(*_MARGINS_NONE)
+
+        # Column 0 is the whole left side -- the checkbox above, the rotation
+        # angle below -- and the dial owns column 1 across both rows. The
+        # rotation angle's label and slider are stacked in a VBox and placed as
+        # ONE cell, which is what makes the left column a column: laid out as
+        # separate cells the slider took the full width of the grid and ran
+        # underneath the dial, because a slider has a large sizeHint and the
+        # grid gives one cell whatever width it asks for.
+        rotation_angle_column = QtWidgets.QVBoxLayout()
+        rotation_angle_column.setContentsMargins(*_MARGINS_NONE)
+        rotation_angle_column.setSpacing(2)
+        rotation_angle_label = QtWidgets.QLabel("Rotation Angle:")
+        rotation_angle_label.setAlignment(
+            QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
+        rotation_angle_column.addWidget(rotation_angle_label)
+        rotation_angle_column.addLayout(mink_rot_layout)
+        rotation_angle_column.addStretch()
+
+        direction_grid.addWidget(self.minkowski_random_checkbox, 0, 0)
+        _place(direction_grid, rotation_angle_column, 1, 0, 1)
+        direction_grid.addWidget(minkowski_dial_widget, 0, 1, 2, 1)
+
+        # Column widths. A QSlider's sizeHint is wide enough to claim the
+        # panel on its own: measured, the left column took 348px and left the
+        # dial 118px, because a grid gives column 0 every pixel the dial does
+        # not ask for. setColumnMinimumWidth is a floor, not a ceiling, so it
+        # does nothing here.
+        #
+        # The dial is instead given a FIXED width -- it is a circle, so it has
+        # no reason to grow -- and column 0 takes what is left. A
+        # maximumWidth on the slider's containing widget is what actually stops
+        # it claiming the surplus, and the slider itself is told it may shrink,
+        # so a narrow panel shortens the slider rather than clipping the dial.
+        self.minkowski_rotation_steps_slider.setMinimumWidth(0)
+        minkowski_dial_widget.setFixedWidth(_DIAL_COLUMN_WIDTH)
+        direction_grid.setColumnStretch(0, 1)
+        direction_grid.setColumnStretch(1, 0)
+        # The dial is the tall one, so it decides the group's height. Give it
+        # the slack in column 1 and let the left column's rows share what is
+        # left, which is what the two row-stretches below ask for.
+        direction_grid.setRowStretch(0, 1)
+        direction_grid.setRowStretch(1, 1)
+        self.minkowski_settings_group.setLayout(direction_grid)
 
         # Optimizations. Compactness and Clear NFP Cache were not on the
         # requested list but are Minkowski-only controls, and this is the only
         # group they belong in now that the old single Minkowski group is
         # split. Both are genuinely optimisation knobs, so they sit here rather
         # than in an orphan group.
-        minkowski_opt_layout.addRow("Generations:", self.minkowski_generations_input)
-        minkowski_opt_layout.addRow("Population Size:", self.minkowski_population_size_input)
-        minkowski_opt_layout.addRow("Stop At Sheets:", self.minkowski_target_sheets_input)
-        minkowski_opt_layout.addRow(perf_form_layout)
-        minkowski_opt_layout.addRow(self.candidate_geometry_cache_checkbox)
-        minkowski_opt_layout.addRow("Compactness:", mink_compactness_layout)
-        minkowski_opt_layout.addRow(self.clear_cache_checkbox)
-        self.minkowski_optimization_group.setLayout(minkowski_opt_layout)
+        # A two-column grid rather than the QFormLayout these rows started
+        # as. Reading order is unchanged -- the entries are the same and in
+        # the same sequence, so entry N is still where it was -- but four rows
+        # of labels have become two, which is the difference between the
+        # Optimizations box needing a scrollbar and not.
+        #
+        # Candidate Geometry Cache and Clear NFP Cache are passed with no
+        # label: a checkbox carries its own text, and giving it a label column
+        # of its own would leave a gap where the word should be.
+        self.minkowski_optimization_group.setLayout(self._two_column_grid([
+            ("Generations:", self.minkowski_generations_input),
+            ("Population Size:", self.minkowski_population_size_input),
+            ("Stop At Sheets:", self.minkowski_target_sheets_input),
+            ("Candidate Step:", self.minkowski_step_size_input.widget()),
+            ("Rotation Threads:", self.minkowski_rotation_workers_input),
+            (None, self.candidate_geometry_cache_checkbox),
+            ("Compactness:", mink_compactness_layout),
+            (None, self.clear_cache_checkbox),
+        ]))
 
         self.physics_settings_group = QtWidgets.QGroupBox("Physics Nesting Settings")
         physics_form_layout = QtWidgets.QFormLayout()
 
-        # Direction Dial for Physics. Shares the default and the label map with
-        # the Minkowski dial above: the two are read by the same conversion and
-        # a per-algorithm divergence here would be invisible until someone ran
-        # the other algorithm and got a different nest.
-        physics_dial_widget, self.physics_direction_dial, self.physics_direction_label, \
-            self.physics_direction_buttons = self._build_direction_control()
+        # Direction Dial for Physics. Shares the default, the label map and the
+        # step with the Minkowski dial above: the two are read by the same
+        # conversion and a per-algorithm divergence here would be invisible
+        # until someone ran the other algorithm and got a different nest.
+        physics_dial_widget, self.physics_direction_dial, self.physics_direction_label = \
+            self._build_direction_control()
 
         self.physics_random_checkbox = QtWidgets.QCheckBox("Use Random Direction")
         self.physics_random_checkbox.stateChanged.connect(
             lambda state: self._set_direction_control_enabled(
                 not self.physics_random_checkbox.isChecked(),
-                dial=self.physics_direction_dial,
-                buttons=self.physics_direction_buttons))
+                dial=self.physics_direction_dial))
 
-        self.physics_step_size_input = QtWidgets.QDoubleSpinBox(); self.physics_step_size_input.setRange(0.1, 100); self.physics_step_size_input.setValue(5.0)
+        self.physics_step_size_input = LengthField(mm_min=0.1, mm_max=100)
+        self.physics_step_size_input.set_mm(_DEFAULTS["physics_step_size"])
+        self._length_fields.append(self.physics_step_size_input)
         self.physics_max_spawn_input = QtWidgets.QSpinBox(); self.physics_max_spawn_input.setRange(1, 1000); self.physics_max_spawn_input.setValue(100)
         self.physics_max_nesting_steps_input = QtWidgets.QSpinBox(); self.physics_max_nesting_steps_input.setRange(1, 5000); self.physics_max_nesting_steps_input.setValue(500)
         
@@ -375,8 +586,12 @@ class NestingPanel(QtWidgets.QWidget):
         self.physics_anneal_curve_type = QtWidgets.QComboBox()
         self.physics_anneal_curve_type.addItems(["Logarithmic", "Linear", "Power 1.5", "Quadratic", "Exponential"])
         
-        self.physics_anneal_min_amp = QtWidgets.QDoubleSpinBox(); self.physics_anneal_min_amp.setRange(0.0, 1000.0); self.physics_anneal_min_amp.setValue(0.1)
-        self.physics_anneal_max_amp = QtWidgets.QDoubleSpinBox(); self.physics_anneal_max_amp.setRange(0.0, 5000.0); self.physics_anneal_max_amp.setValue(100.0)
+        self.physics_anneal_min_amp = LengthField(mm_min=0.0, mm_max=1000.0)
+        self.physics_anneal_min_amp.set_mm(_DEFAULTS["physics_anneal_min_amp"])
+        self._length_fields.append(self.physics_anneal_min_amp)
+        self.physics_anneal_max_amp = LengthField(mm_min=0.0, mm_max=5000.0)
+        self.physics_anneal_max_amp.set_mm(_DEFAULTS["physics_anneal_max_amp"])
+        self._length_fields.append(self.physics_anneal_max_amp)
         
         self.physics_improvement_threshold_input = QtWidgets.QDoubleSpinBox()
         self.physics_improvement_threshold_input.setRange(0.000001, 1.0)
@@ -397,7 +612,7 @@ class NestingPanel(QtWidgets.QWidget):
         self.physics_rotation_display_label.setFixedWidth(120)
         self.physics_rotation_steps_slider.valueChanged.connect(lambda: self._update_rotation_label())
 
-        physics_form_layout.addRow("Step Size:", self.physics_step_size_input)
+        physics_form_layout.addRow("Step Size:", self.physics_step_size_input.widget())
         physics_form_layout.addRow("Max Spawn Attempts:", self.physics_max_spawn_input)
         physics_form_layout.addRow("Max Nesting Steps:", self.physics_max_nesting_steps_input)
 
@@ -421,8 +636,8 @@ class NestingPanel(QtWidgets.QWidget):
         physics_form_layout.addRow("Improvement Threshold:", self.physics_improvement_threshold_input)
         physics_form_layout.addRow(QtWidgets.QLabel("")) # Spacer
         physics_form_layout.addRow("Curve Type:", self.physics_anneal_curve_type)
-        physics_form_layout.addRow("Min Amplitude:", self.physics_anneal_min_amp)
-        physics_form_layout.addRow("Max Amplitude:", self.physics_anneal_max_amp)
+        physics_form_layout.addRow("Min Amplitude:", self.physics_anneal_min_amp.widget())
+        physics_form_layout.addRow("Max Amplitude:", self.physics_anneal_max_amp.widget())
         physics_form_layout.addRow(self.anneal_random_shake_checkbox)
 
         self.physics_settings_group.setLayout(physics_form_layout)
@@ -437,9 +652,38 @@ class NestingPanel(QtWidgets.QWidget):
         # when Physics is selected would not merely tidy the panel, it would
         # make those controls unreachable for half the algorithms -- so the
         # algorithm toggle only touches the Minkowski groups.
+        # Collapsed by default, and checkable so the title becomes the toggle.
+        #
+        # These two are diagnostic controls -- a font picker, a log verbosity
+        # switch -- and between them they were taller than the four sheet
+        # fields at the top of the panel, which is a poor trade for a run that
+        # changes neither. The state is deliberately NOT persisted: every open
+        # starts in the same shape, so the space saving is guaranteed rather
+        # than a one-off that decays the first time somebody expands a group.
+        #
+        # setCheckable alone is NOT enough, and looks like it works. An
+        # unchecked checkable QGroupBox only DISABLES its children; it does not
+        # hide them. Measured on a two-widget group, the height is 64px checked
+        # and 64px unchecked, and the child reports isHidden()=False in both
+        # states. So the first version of this greyed the controls out and
+        # reclaimed no space at all -- the worst of both, looking broken and
+        # saving nothing. _set_group_collapsed does the hiding.
+        #
+        # Nothing here conflicts with the algorithm toggle above, which shows
+        # and hides the Minkowski groups by setVisible. A collapsed group's
+        # children are hidden but alive, so _collect_ui_params still reads
+        # them and refresh_unit_display can still re-render their fields.
         self.helpers_group = QtWidgets.QGroupBox("Helpers")
+        self.helpers_group.setCheckable(True)
+        self.helpers_group.setChecked(False)
+        self.helpers_group.toggled.connect(
+            lambda checked: _set_group_collapsed(self.helpers_group, checked))
         helpers_layout = QtWidgets.QVBoxLayout()
         self.logging_group = QtWidgets.QGroupBox("Logging")
+        self.logging_group.setCheckable(True)
+        self.logging_group.setChecked(False)
+        self.logging_group.toggled.connect(
+            lambda checked: _set_group_collapsed(self.logging_group, checked))
         logging_box_layout = QtWidgets.QVBoxLayout()
 
         # Set initial visibility
@@ -450,10 +694,14 @@ class NestingPanel(QtWidgets.QWidget):
 
         self.show_bounds_checkbox = QtWidgets.QCheckBox("Show Bounds"); self.show_bounds_checkbox.setChecked(True)
         self.add_labels_checkbox = QtWidgets.QCheckBox("Add Identifier Labels"); self.add_labels_checkbox.setChecked(_DEFAULTS["add_labels"])
-        self.label_height_input = QtWidgets.QDoubleSpinBox(); self.label_height_input.setRange(0, 1000); self.label_height_input.setValue(25.0)
-        self.label_height_input.setToolTip("The height (Z-offset) for the identifier labels.")
-        self.label_size_input = QtWidgets.QDoubleSpinBox(); self.label_size_input.setRange(1, 100); self.label_size_input.setValue(10.0)
-        self.label_size_input.setToolTip("The text size for identifier labels in mm.")
+        self.label_height_input = LengthField(mm_min=0, mm_max=1000)
+        self.label_height_input.set_mm(_DEFAULTS["label_height"])
+        self.label_height_input.widget().setToolTip("The height (Z-offset) for the identifier labels.")
+        self._length_fields.append(self.label_height_input)
+        self.label_size_input = LengthField(mm_min=1, mm_max=100)
+        self.label_size_input.set_mm(_DEFAULTS["label_size"])
+        self.label_size_input.widget().setToolTip("The text size for identifier labels.")
+        self._length_fields.append(self.label_size_input)
         self.simulate_nesting_checkbox = QtWidgets.QCheckBox("Simulate Nesting (slower)"); self.simulate_nesting_checkbox.setChecked(_DEFAULTS["simulate_nesting"])
         self.verbose_logging_checkbox = QtWidgets.QCheckBox("Verbose Logging"); self.verbose_logging_checkbox.setChecked(_DEFAULTS["verbose_logging"])
         self.verbose_logging_checkbox.setToolTip("Enables detailed logging of the nesting process in the FreeCAD console.")
@@ -481,22 +729,35 @@ class NestingPanel(QtWidgets.QWidget):
         label_options_layout = QtWidgets.QHBoxLayout()
         label_options_layout.addWidget(self.add_labels_checkbox)
         label_options_layout.addWidget(QtWidgets.QLabel("Size:"))
-        label_options_layout.addWidget(self.label_size_input)
+        label_options_layout.addWidget(self.label_size_input.widget())
         label_options_layout.addWidget(QtWidgets.QLabel("Height (Z):"))
-        label_options_layout.addWidget(self.label_height_input)
+        label_options_layout.addWidget(self.label_height_input.widget())
         label_options_layout.addStretch()
 
-        form_layout.addRow("Sheet Width:", self.sheet_width_input)
-        form_layout.addRow("Sheet Height:", self.sheet_height_input)
-        form_layout.addRow("Sheet Thickness:", self.sheet_thickness_input)
-        form_layout.addRow("Part Spacing:", self.part_spacing_input)
-        
-        # Advanced Curve Settings
+        # No unit in the row labels: the fields show their own unit inline,
+        # and a label that says "mm" beside a field reading "23.62 in" is
+        # worse than no label at all.
+        #
+        # Two columns, so width/height pair across the top and
+        # thickness/spacing across the bottom. A sheet is described by its
+        # width and height together, and stacking those two as rows one and two
+        # read as two unrelated numbers; the same applies to the two numbers
+        # that describe the gap between parts.
+        form_layout.addRow(self._two_column_grid([
+            ("Sheet Width:", self.sheet_width_input.widget()),
+            ("Sheet Height:", self.sheet_height_input.widget()),
+            ("Sheet Thickness:", self.sheet_thickness_input.widget()),
+            ("Part Spacing:", self.part_spacing_input.widget()),
+        ]))
+
+        # Advanced Curve Settings. The Curve field is an ANGLE, not a length,
+        # so it stays a plain QDoubleSpinBox with a degree suffix; Simplify is
+        # a linear tolerance and is unit-aware.
         curve_settings_layout = QtWidgets.QHBoxLayout()
         curve_settings_layout.addWidget(QtWidgets.QLabel("Curve:"))
         curve_settings_layout.addWidget(self.deflection_input)
         curve_settings_layout.addWidget(QtWidgets.QLabel("Simplify:"))
-        curve_settings_layout.addWidget(self.simplification_input)
+        curve_settings_layout.addWidget(self.simplification_input.widget())
         
         form_layout.addRow("Bounds Resolution:", curve_settings_layout)
 
@@ -519,6 +780,16 @@ class NestingPanel(QtWidgets.QWidget):
         logging_box_layout.addWidget(self.verbose_logging_checkbox)
         logging_box_layout.addWidget(self.performance_logging_checkbox)
         self.logging_group.setLayout(logging_box_layout)
+
+        # Collapse for real, now that all three groups have content. The
+        # toggled connections above only fire on a CHANGE, and every group is
+        # created unchecked, so without these calls the panel opens with the
+        # controls shown and merely greyed -- which is what the first version
+        # did, saving no space at all. Applied after setLayout because there is
+        # nothing to hide until the children exist.
+        _set_group_collapsed(self.minkowski_settings_group, False)
+        _set_group_collapsed(self.helpers_group, False)
+        _set_group_collapsed(self.logging_group, False)
 
         form_layout.addRow(self.helpers_group)
         form_layout.addRow(self.logging_group)
@@ -551,9 +822,9 @@ class NestingPanel(QtWidgets.QWidget):
         # Link label inputs to the add labels checkbox
         def toggle_label_inputs(state):
             enabled = state == QtCore.Qt.Checked
-            self.label_size_input.setEnabled(enabled)
-            self.label_height_input.setEnabled(enabled)
-        
+            self.label_size_input.widget().setEnabled(enabled)
+            self.label_height_input.widget().setEnabled(enabled)
+
         self.add_labels_checkbox.stateChanged.connect(toggle_label_inputs)
         toggle_label_inputs(QtCore.Qt.Checked if self.add_labels_checkbox.isChecked() else QtCore.Qt.Unchecked)
 
@@ -566,14 +837,124 @@ class NestingPanel(QtWidgets.QWidget):
         self.show_bounds_checkbox.stateChanged.connect(self.controller.toggle_bounds_visibility)
         self.add_parts_button.clicked.connect(self.controller.add_selected_shapes)
         self.remove_parts_button.clicked.connect(self.controller.remove_selected_shapes)
-        
+
         self.load_persisted_settings()
-        
+
+        # Render the fields and the unit-bearing tooltips for the document as
+        # it stands now. Done after the settings load so the first thing the
+        # user sees is already in their units.
+        self.refresh_unit_display(force=True)
+
         # Ensure initial labels are correct
         self._update_rotation_label()
-        
+
         # Load initial selection
         self.controller.load_selection()
+
+    def refresh_unit_display(self, force=False):
+        """Re-render every unit-aware field for the active document.
+
+        Called when the panel is built, when the user switches document (via
+        the controller's document observer), and immediately before a run --
+        see the note on the last of those below.
+
+        The fields hold millimetres, so this cannot lose a value; the widget
+        inside each one re-reads the document's unit system when it is handed
+        a new figure, and re-seeding it is the whole of the re-render. Cheap
+        enough to be unconditional, but it returns early when the schema has
+        not moved so that the common case does no work at all.
+        """
+        doc = getattr(self.controller, "doc", None) or FreeCAD.ActiveDocument
+        schema = units.doc_unit_schema(doc)
+        if not force and schema == self._rendered_schema:
+            return
+        self._rendered_schema = schema
+        for field in self._length_fields:
+            field.refresh()
+        self._refresh_unit_tooltips(schema)
+
+    def _refresh_unit_tooltips(self, schema):
+        """Rebuild the tooltips whose text quotes a measurement in mm.
+
+        Only two, and only because both quote a number the user is meant to
+        compare against their own machine. The rest of the panel's help text
+        deliberately names no unit at all, because the field shows its unit
+        inline and a tooltip asserting "mm" beside a field reading "0.49 in"
+        is simply wrong.
+        """
+        try:
+            self.simplification_input.widget().setToolTip(
+                self._simplification_tooltip.format(
+                    router_tolerance=units.format_length(1.0, schema)))
+            self.minkowski_step_size_input.widget().setToolTip(
+                self._step_size_tooltip)
+        except RuntimeError:
+            pass  # Panel closed; the widgets are gone.
+
+    def dispose(self):
+        """Release anything the panel registered outside itself.
+
+        Reached from NestingTaskPanel.cleanup, which is the one teardown path
+        every close route goes through. The document observer holds a raw
+        pointer to a Python object on the C++ side, so leaving it registered
+        after the panel is collected is a crash rather than a leak.
+        """
+        dispose = getattr(self.controller, "dispose", None)
+        if dispose is not None:
+            try:
+                dispose()
+            except Exception as exc:
+                FreeCAD.Console.PrintWarning(
+                    f"[NestingPanel] Controller teardown failed: {exc}\n")
+
+    # -- Two-column form grid --------------------------------------------
+    #
+    # Built by a method for the same reason the direction control is: it is
+    # used by two groups, and a layout written out twice is two layouts free to
+    # drift. Both uses are the panel's densest blocks of labelled fields, and
+    # both are halved in height by pairing them.
+    #
+    # Entries fill left to right, then down. A None label means the widget
+    # carries its own text (a checkbox) and should occupy the whole of its
+    # half-row rather than sit in a field column beside an empty label.
+
+    def _two_column_grid(self, entries):
+        """Lay ``entries`` out as two label/field columns, filling row-major.
+
+        Args:
+            entries: list of (label, widget) pairs, or (None, widget) for a
+                widget that spans both cells of its column. Flattened into
+                one widget per column-pair, so a trailing odd entry still works
+                (it just leaves the last cell empty) rather than being dropped.
+
+        Returns:
+            The QGridLayout, ready to hand to a group or addRow.
+        """
+        grid = QtWidgets.QGridLayout()
+        grid.setHorizontalSpacing(_GRID_COLUMN_SPACING)
+        grid.setVerticalSpacing(_GRID_ROW_SPACING)
+
+        for index, (label, widget) in enumerate(entries):
+            row, column = divmod(index, 2)
+            if label is None:
+                # No label of its own: let the widget take the full width of
+                # this column so it reads as a checkbox, not a field with a
+                # blank caption.
+                _place(grid, widget, row, column * 2, 2)
+                continue
+            text = QtWidgets.QLabel(label)
+            # Right-aligned with a trailing colon, matching the QFormLayout
+            # rows elsewhere in the panel, so the two styles read as one.
+            text.setAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
+            grid.addWidget(text, row, column * 2)
+            _place(grid, widget, row, column * 2 + 1, 1)
+
+        # Fields absorb the slack; the label columns stay at their natural
+        # width, so the two field columns end up the same size and the rows
+        # line up across the pair.
+        grid.setColumnStretch(1, 1)
+        grid.setColumnStretch(3, 1)
+        return grid
 
     # -- Nesting direction control ---------------------------------------
     #
@@ -589,100 +970,75 @@ class NestingPanel(QtWidgets.QWidget):
     # position as well, and lands below the dial until one is given.
 
     def _build_direction_control(self):
-        """Dial + readout + four cardinal buttons.
+        """Dial + readout, no surrounding buttons.
 
-        Returns (container_widget, dial, label, buttons) so the caller can wire
-        the "Use Random Direction" checkbox to disable the whole control. The
-        buttons are returned rather than looked up later because the checkbox
-        has to grey them out too: leaving them live while the dial is disabled
-        would let a user set a direction that is then ignored, which looks like
-        a bug in the run rather than in the UI.
+        Returns (container_widget, dial, label) so the caller can wire the
+        "Use Random Direction" checkbox to disable the whole control.
+
+        The four cardinal buttons are gone. They existed to snap the dial to
+        the four directions DIRECTION_LABELS names, which is a job a 15-degree
+        step does better: 24 positions include all four cardinals, so nothing
+        is lost by dropping the buttons, and the grid they sat in was three
+        rows tall for a control the panel has to fit above a table.
+
+        The readout is a direction NAME where the bearing lands on a cardinal
+        and a bearing in degrees otherwise -- NOT the dial reading. The two
+        differ by a quarter turn and a flip (see constants.dial_to_bearing), so
+        a raw reading would have told the user 90 where the run searched 180.
+        That was survivable when the only reachable values were the four the
+        buttons snapped to, and wrong at 20 of the 24 positions now reachable.
         """
         dial = QtWidgets.QDial()
         dial.setRange(0, _MINKOWSKI_DIR_MAX)
         dial.setValue(_DEFAULT_DIRECTION_DIAL)
         dial.setWrapping(True)
         dial.setNotchesVisible(True)
+        # Both, not just singleStep: a mouse click and an arrow key are the
+        # same gesture to the user, and the default page step of 10 would skip
+        # past a 15-degree grid and land somewhere that is not a step.
+        dial.setSingleStep(DIRECTION_STEP_DEGREES)
+        dial.setPageStep(DIRECTION_STEP_DEGREES)
+        dial.setToolTip(
+            f"Nesting direction. Click or use the arrow keys to move in "
+            f"{DIRECTION_STEP_DEGREES}° steps.\n\n"
+            f"The dial reading is not the compass bearing -- it is rotated a "
+            f"quarter turn and flipped. The readout below gives the direction "
+            f"the run will actually search.")
 
-        # Seeded from the value, not written as a literal. Previously this was
-        # a hardcoded "Down" beside a hardcoded setValue(0), so the two had to
-        # be kept in agreement by hand and nothing checked them.
-        label = QtWidgets.QLabel(
-            _DIRECTION_LABELS.get(_DEFAULT_DIRECTION_DIAL, ""))
+        label = QtWidgets.QLabel("")
         label.setAlignment(QtCore.Qt.AlignCenter)
 
         def update_label(value):
-            text = _DIRECTION_LABELS.get(value, "")
-            label.setText(text if text else f"{value}°")
+            bearing = dial_to_bearing(value)
+            name = _BEARING_LABELS.get(bearing, "")
+            label.setText(f"{name} ({bearing}°)" if name else f"{bearing}°")
         dial.valueChanged.connect(update_label)
-
-        # Buttons sit at their compass positions around the dial: Up at 12
-        # o'clock, Right at 3, Down at 6, Left at 9, in a 3x3 grid with the dial
-        # in the middle cell.
-        #
-        # The grid is keyed on the NAME, not on the dial reading, because the
-        # dial reading is not the compass bearing. It is rotated by a quarter
-        # turn and flipped: 0 is Down but is drawn at the bottom, 90 is Left
-        # but is drawn on the right. Placing buttons by reading would have put
-        # Left on the right-hand side, which is precisely the confusion this
-        # layout exists to remove.
-        _CLOCK_POSITION = {"Up": (0, 1), "Right": (1, 2),
-                           "Down": (2, 1), "Left": (1, 0)}
-        grid = QtWidgets.QGridLayout()
-        grid.setSpacing(4)
-        grid.addWidget(dial, 1, 1, QtCore.Qt.AlignCenter)
-
-        buttons = []
-        for value, name in sorted(_DIRECTION_LABELS.items()):
-            button = QtWidgets.QPushButton(name)
-            # setValue on the dial, so the readout and anything else watching
-            # valueChanged stay in step. Writing the label directly instead
-            # would skip both, and the label would then disagree with the value
-            # the run actually uses.
-            button.clicked.connect(lambda _checked=False, v=value: dial.setValue(v))
-            button.setToolTip(f"Set nesting direction to {name}")
-            # Small and square: the grid cells have to be roughly the size of
-            # the dial, and long words like "Right" would otherwise widen the
-            # whole control.
-            button.setFixedSize(40, 28)
-            position = _CLOCK_POSITION.get(name)
-            if position is None:
-                # A name added to DIRECTION_LABELS with no clock position
-                # defined. Ignoring it silently would look like a button had
-                # been provided and was missing, so it goes below the dial
-                # rather than nowhere.
-                grid.addWidget(button, 3, 0, 1, 3, QtCore.Qt.AlignCenter)
-            else:
-                # AlignCenter, because a fixed-size widget is otherwise placed
-                # at the top-left of its cell. The cells are as wide as the
-                # dial, so without this the 12 and 6 o'clock buttons sit visibly
-                # off the vertical axis of the needle while the 3 and 9 stay
-                # put -- correct by row, lopsided by eye.
-                grid.addWidget(button, position[0], position[1],
-                               QtCore.Qt.AlignCenter)
-            buttons.append(button)
+        update_label(_DEFAULT_DIRECTION_DIAL)
 
         layout = QtWidgets.QVBoxLayout()
-        layout.addLayout(grid)
+        layout.addWidget(dial)
         layout.addWidget(label)
         container = QtWidgets.QWidget()
         container.setLayout(layout)
-        return container, dial, label, buttons
+        return container, dial, label
 
-    def _set_direction_control_enabled(self, enabled, dial=None, buttons=None):
+
+    def _set_direction_control_enabled(self, enabled, dial=None):
         """Enable or disable a direction control as a unit.
 
         Called by both "Use Random Direction" checkboxes. Defaults to the
         Minkowski control, which is the one whose checkbox is connected without
         arguments; the Physics one passes its own.
+
+        There used to be a button list here as well. Greying out the dial alone
+        is not enough while the surrounding buttons stayed live, because a user
+        could then set a direction that the run ignores -- which reads as a bug
+        in the run rather than in the UI. With the buttons gone the dial is the
+        only way to set a direction, so disabling it is sufficient.
         """
         if dial is None:
             dial = self.minkowski_direction_dial
-        if buttons is None:
-            buttons = self.minkowski_direction_buttons
         dial.setEnabled(enabled)
-        for button in buttons:
-            button.setEnabled(enabled)
 
     def add_part_row(self, row_index, label, quantity=1, rotation_steps=4, override_rotation=False, 
                        up_direction="Z+", fill_sheet=False):
@@ -786,15 +1142,22 @@ class NestingPanel(QtWidgets.QWidget):
             pass  # GUI window closed
 
     def load_persisted_settings(self):
-        """Loads settings from FreeCAD preferences."""
+        """Loads settings from FreeCAD preferences.
+
+        The length settings are read and written as bare millimetre floats and
+        stay that way on purpose. Preferences outlive any one document, so a
+        schema that is imperial today and metric next week must not leave a
+        user's 600 mm sheet stored as 23.62 -- the stored figure is the
+        document-independent one, and the fields convert for display.
+        """
         prefs = FreeCAD.ParamGet(PREFS_PATH)
-        self.sheet_width_input.setValue(prefs.GetFloat(PROP_SHEET_WIDTH, 600.0))
-        self.sheet_height_input.setValue(prefs.GetFloat(PROP_SHEET_HEIGHT, 600.0))
-        self.part_spacing_input.setValue(prefs.GetFloat(PROP_PART_SPACING, 12.5))
-        self.sheet_thickness_input.setValue(prefs.GetFloat(PROP_SHEET_THICKNESS, 3.0))
-        self.label_size_input.setValue(prefs.GetFloat(PROP_LABEL_SIZE, 10.0))
+        self.sheet_width_input.set_mm(prefs.GetFloat(PROP_SHEET_WIDTH, 600.0))
+        self.sheet_height_input.set_mm(prefs.GetFloat(PROP_SHEET_HEIGHT, 600.0))
+        self.part_spacing_input.set_mm(prefs.GetFloat(PROP_PART_SPACING, 12.5))
+        self.sheet_thickness_input.set_mm(prefs.GetFloat(PROP_SHEET_THICKNESS, 3.0))
+        self.label_size_input.set_mm(prefs.GetFloat(PROP_LABEL_SIZE, 10.0))
         self.deflection_input.setValue(prefs.GetFloat(PROP_DEFLECTION_ANGLE, 30.0) or 30.0)
-        self.simplification_input.setValue(prefs.GetFloat(PROP_SIMPLIFICATION, 1.0))
+        self.simplification_input.set_mm(prefs.GetFloat(PROP_SIMPLIFICATION, 1.0))
         self.minkowski_compactness_input.setValue(prefs.GetFloat("GACompactnessWeight", 0.0))
         self.verbose_logging_checkbox.setChecked(prefs.GetBool("VerboseLogging", False))
         self.performance_logging_checkbox.setChecked(prefs.GetBool("PerformanceLogging", False))
@@ -803,19 +1166,56 @@ class NestingPanel(QtWidgets.QWidget):
                                CANDIDATE_GEOMETRY_CACHE_DEFAULT)
         )
         self.physics_improvement_threshold_input.setValue(prefs.GetFloat("PhysicsStabilityTolerance", 0.01))
-        
+
         self.physics_anneal_curve_type.setCurrentText(prefs.GetString("PhysicsAnnealCurveType", "Logarithmic"))
-        self.physics_anneal_min_amp.setValue(prefs.GetFloat("PhysicsAnnealMinAmp", 0.1))
-        self.physics_anneal_max_amp.setValue(prefs.GetFloat("PhysicsAnnealMaxAmp", 100.0))
-        
+        self.physics_anneal_min_amp.set_mm(prefs.GetFloat("PhysicsAnnealMinAmp", 0.1))
+        self.physics_anneal_max_amp.set_mm(prefs.GetFloat("PhysicsAnnealMaxAmp", 100.0))
+
         self.physics_anneal_rot_steps.setValue(prefs.GetInt("PhysicsAnnealRotSteps", 10))
         self.physics_anneal_rot_curve_type.setCurrentText(prefs.GetString("PhysicsAnnealRotCurveType", "Logarithmic"))
         self.physics_anneal_rot_min.setValue(prefs.GetFloat("PhysicsAnnealRotMin", 1.0))
         self.physics_anneal_rot_max.setValue(prefs.GetFloat("PhysicsAnnealRotMax", 90.0))
-        
+
+        # Generations and Population Size are persisted so a GA configuration
+        # survives closing the panel, which it did not: both used to reset to
+        # 1 every session unless you reopened a layout that had recorded them.
+        #
+        # The default stays 1. Measured on the heavy corpus at a contested sheet
+        # size and on the n70 customer part, population 1/3/4/10 all return the
+        # same sheet count, placed count and density while wall clock goes 18s
+        # -> 86s and 49s -> 197s. Layout 0 is exempt from the population's
+        # shuffle-and-rotate (layout_manager.create_ga_population), so it is
+        # the best layout every time and best-of-N converges on it; crossover
+        # does run (offspring 0 -> 2 -> 16 across those populations). Raising
+        # the default would multiply the cost of everyone's first run for no
+        # measured gain, so it is left where it is until the search strategy
+        # makes a larger population worth setting.
+        self.minkowski_generations_input.setValue(
+            prefs.GetInt(PROP_GENERATIONS, 1))
+        self.minkowski_population_size_input.setValue(
+            prefs.GetInt(PROP_POPULATION_SIZE, 1))
+
+        # Direction, as a DIAL reading and not a bearing -- the same form the
+        # layout group stores it in, and the form dial_to_bearing converts.
+        # Snapped to the step, because a stored value from a build with a
+        # different step would otherwise land between notches and silently
+        # disagree with the readout the user is looking at.
+        self.minkowski_direction_dial.setValue(
+            _snap_to_step(prefs.GetInt(PROP_NESTING_DIRECTION,
+                                       _DEFAULT_DIRECTION_DIAL)))
+        self.minkowski_random_checkbox.setChecked(
+            prefs.GetBool(PROP_RANDOM_DIRECTION, False))
+        self.physics_random_checkbox.setChecked(
+            prefs.GetBool("PhysicsRandomDirection", False))
+        # Restored after the checkbox, because checking it disables the dial and
+        # the order matters: the reverse would leave the dial enabled under a
+        # "random" run whose direction was then ignored.
+        self._set_direction_control_enabled(
+            not self.minkowski_random_checkbox.isChecked())
+
         # Load Rotation Steps (Isolated)
         # Minkowski
-        self.minkowski_step_size_input.setValue(
+        self.minkowski_step_size_input.set_mm(
             prefs.GetFloat("MinkowskiStepSize", 5.0) or 5.0)
         self.minkowski_rotation_workers_input.setValue(
             prefs.GetInt("MinkowskiRotationWorkers", 0))

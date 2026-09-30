@@ -220,6 +220,193 @@ worker-mode test therefore needs a faithful reproduction of
 `NestingController._handle_draw_request` (about 50 lines), or should drive the
 controller itself. Tractable, and the natural next piece of work.
 
+## Document units
+
+The panel's length fields show and accept the **document's** unit system
+(`doc.UnitSystem`, which also drives the global one), while everything
+downstream of them stays in millimetres. Two files, two interpreters:
+
+| file | covers | runs under |
+|---|---|---|
+| `test_document_units.py` | `units.py` — schema resolution, length/area formatting, `parse_length`, `length_mm` | `freecadcmd`, wired into `run.sh` |
+| `probe_unit_panel.py` | `length_field.py` and the real `NestingPanel` | `freecad` (GUI), run by hand |
+
+The split is forced: `freecadcmd` has no `FreeCADGui.UiLoader`, so
+`Gui::QuantitySpinBox` cannot be constructed there at all
+(`AttributeError: module 'FreeCADGui' has no attribute 'UiLoader'`). No Xvfb
+needed — see above.
+
+### The invariant the probe exists to hold
+
+A `Gui::QuantitySpinBox` rounds whatever is written into it to the display
+unit's precision, and what comes back out is the **rounded** number:
+
+| set | reads back | schema |
+|---|---|---|
+| 600 mm | 599.948 mm | Imperial decimal |
+| 12.5 mm | 12.446 mm | Imperial decimal |
+| 0.5 mm | **0.0 mm** | Building US (ft-in) |
+| 0.5 mm | **0.0 mm** | Imperial for Civil Eng (ft) |
+
+The last two are the reason `length_field.py` exists. A 0.5 mm Part Spacing
+becoming no gap at all is not a rounding argument, it is a wrong machine
+setting, and it would be silent. So the millimetre value lives in Python, is
+written into the widget for display, and is never read back —
+`LengthField.mm()` returns the stored figure and only a real user edit replaces
+it. The probe asserts exactly that, across all four imperial schemas.
+
+Verified by injection, both ways round: making `refresh()` trust the widget's
+read-back fails 24 checks, and making the clamp a no-op fails 6.
+
+### Two more traps the probe demonstrates rather than assumes
+
+1. **A bounded `QuantitySpinBox` is worse than an unbounded one.** Set a value
+   above its maximum and the *text* updates correctly while the `Quantity`
+   behind it goes stale — and it stays stale through the next user edit:
+
+   ```python
+   widget.setProperty("maximum", 10000.0)             # mm
+   widget.setProperty("value", Quantity("600 mm"))
+   widget.setProperty("value", Quantity("20000 mm"))  # text '787.40 in', value 12.7 mm
+   # user types "500 in"                               # text '500 in',    value 12.7 mm
+   ```
+
+   So the widget is left unbounded (its defaults are ±DBL_MAX) and the range is
+   enforced in Python. That is also why bounds apply to *typed input only*: a
+   saved 20000 mm layout is the user's data and is stored verbatim.
+
+2. **`w.setValue(Quantity(...))` silently writes `0.0`.** PySide resolves the
+   overload to the wrong slot, and the widget announces the change with
+   `valueChanged(0.0)`. Everything goes through `setProperty`/`property`
+   instead. `setRange`, `setSingleStep`, `setDecimals` and `value()` do not
+   exist on the PySide wrapper at all — its declared type is `QAbstractSpinBox`.
+
+## Panel layout
+
+Two structural properties of the panel are asserted in `probe_unit_panel.py`,
+because neither is observable from a value and both fail silently.
+
+### Collapsed groups must hide, never disable
+
+`Nesting Settings`, `Helpers` and `Logging` all start collapsed, and the load-bearing property is
+**reclaimed height**, not the toggle flag. An unchecked checkable `QGroupBox`
+only *disables* its children; it does not hide them. Measured on two identical
+four-checkbox groups:
+
+| approach | height |
+|---|---|
+| `setCheckable(True)` + `setChecked(False)`, nothing else | **138 px** |
+| same, plus the contents hidden | **40 px** |
+
+The first is the house pattern — it is what FreeCAD's own BIM workbench does
+for its "Sun Position" group (`Mod/BIM/ArchSite.py`, `setCheckable` and
+`setChecked` with no hiding code). It looks like it works: the title is a
+checkbox, the controls grey out, and the panel is exactly as tall as before.
+The first version of this shipped that way and passed an `isCheckable()` test.
+
+So the probe asserts the height, and verifies by injection that removing the
+hiding fails it with `collapsed=179px expanded=179px`.
+
+Two further properties, because either would silently change what a run uses:
+
+- **Collapsed means hidden, never disabled.** Everything in these groups is
+  read unconditionally by `_collect_ui_params`, so a collapse that disabled
+  the children would quietly turn off verbose logging, labels and the font. The
+  probe sets those controls *while they are invisible* and asserts the
+  collected params see through the collapse.
+- **`refresh_unit_display` still re-renders a `LengthField` inside a collapsed
+  group** — a hidden widget is not a destroyed one.
+
+Note that `setVisible` is the right call for the hiding and `setEnabled` is not:
+a hidden widget still reports its real checked state.
+
+### GA field persistence
+
+`Generations` and `Population Size` round-trip through preferences, exercised
+through `_collect_ui_params` (the path a real run takes) rather than a direct
+`save_settings` call that could drift from it. The default is asserted to stay
+1; see the measurement in the changelog for why it is not higher.
+
+## The direction dial
+
+Three properties that a QDial does not give you and that the panel had to
+supply, all asserted in `probe_unit_panel.py`.
+
+**A checkable `QGroupBox` is not a layout** — see the collapse section above,
+which is the same class of mistake: the obvious Qt call looks like it works and
+does not.
+
+**A QDial reading is not a compass bearing.** The reading is rotated a quarter
+turn and flipped, so reading 0 is bearing 270 (Down) and reading 90 is bearing
+180 (Left). The readout shows the bearing, and names it when the bearing is one
+of the four cardinals. Displaying the reading instead was survivable while the
+only reachable values were the four the removed buttons snapped to, and wrong
+at 20 of the 24 positions now reachable. `constants.dial_to_bearing()` owns the
+conversion so the readout and the controller's `search_direction` cannot
+disagree — the controller had it written out by hand twice.
+
+**The 15-degree step has to be on both paths.** `setSingleStep` covers a mouse
+click and the arrow keys; `setPageStep` covers PageUp/PageDown, whose default of
+10 would skip past the grid and land somewhere that is not a step. Verified by
+injection: dropping the page-step call fails
+`the dial's page step matches ... pageStep=10`.
+
+Persistence is stored as a **reading**, not a bearing, and snapped to the step
+on load — a value from a build with a different step would otherwise land
+between notches, showing a direction the user never chose. Verified by
+injection: removing the snap fails with `got 37`.
+
+## Population and the layout-0 finding
+
+`Population Size` defaults to 1 and the reason is measured, not assumed. On
+the heavy corpus at a contested 560x400 sheet, and on the n70 customer part at
+1200x600, with generations 3:
+
+| population | offspring | sheets | placed | efficiency | wall |
+|---|---|---|---|---|---|
+| 1 | 0 | 2 | 120 | 0.652988 | 18.0 s |
+| 3 | 2 | 2 | 120 | 0.652988 | 31.2 s |
+| 10 | 16 | 2 | 120 | 0.652988 | 86.0 s |
+
+Identical to six decimals while wall goes up 4.8x. Crossover is genuinely
+running — offspring goes 0 -> 2 -> 16 — so this is **not** the degenerate
+small-population case where no genes are ever combined.
+
+The mechanism: `LayoutManager.create_ga_population` applies the shuffle and the
+random rotations to every layout **except the first** (`if layout.parts and
+i > 0`). Layout 0 keeps the master input ordering. Across nine
+generation/seed combinations, layout 0 had the lowest fitness every time, by
+about 1%, and the per-layout sheet counts at a contested size show the others
+splitting 2/3 or 3/4 while layout 0 stayed at the better count. Randomising a
+good ordering only degrades it, so best-of-N converges on layout 0 and the
+reported `efficiency` — `parts_area / (sheets * sheet_area)`, with
+`parts_area` constant — cannot move.
+
+Two consequences worth knowing when reading any population measurement:
+
+- **The efficiency metric can only move if the sheet count moves.** Reading a
+  flat efficiency at a sheet size every layout fits on proves nothing; the
+  measurement above uses 560x400, where layouts genuinely disagree.
+- **`elite_count = max(2, population_size // 5)`,** so population 10 still has
+  only 2 possible parents. A larger population widens sampling, not the gene
+  pool.
+
+Both are properties of the search strategy rather than of the panel, and neither
+is fixed here. Measured on one machine with `compactness_weight=0` across two
+corpora, so a job whose master ordering is genuinely poor would be expected to
+behave differently.
+
+## Areas
+
+`schemaTranslate` and `getUserPreferred` are length formatters and given an
+Area quantity both return `('0.00', 1.0, '')` with no complaint. A yield report
+that silently printed `0.00` would be worse than one that printed nothing, so
+`units.format_area` converts through the schema's *stable* length unit,
+squared. "Stable" is the operative word: `schemaTranslate` is
+magnitude-autoscaling, and asked for 1 mm under the US-customary schema it
+answers `thou` while for 1000 mm it answers `yd`. Neither works as a unit label
+on a field that has to stay put while the number changes.
+
 ## Phase attribution and the GA level
 
 Two levels of counters, both now exposed rather than log-only.
@@ -349,7 +536,7 @@ schema version in step with the reader; the harness refuses a mismatch.
 
 | tier | runner | corpus | cost | what it catches |
 |---|---|---|---|---|
-| 1 | `run.sh` | synthetic, 450×350, 18 parts | ~10 s | packing regressions, instrumentation drift |
+| 1 | `run.sh` | synthetic, 450×350, 18 parts | ~10 s | packing regressions, instrumentation drift, unit formatting |
 | 2 | `run_heavy.sh` | heavy synthetic, 1200×600, 122 parts | ~3.5 min | throughput on a single cold nest |
 | 2 | `run_ga.sh` | heavy synthetic, GA | ~1 min | throughput across layouts and generations |
 | 3 | `run_ga.sh GA_CORPUS=n70` | n70 (gitignored), GA | ~3 min | the configuration actually run |

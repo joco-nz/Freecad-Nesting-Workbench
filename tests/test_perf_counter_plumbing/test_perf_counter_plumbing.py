@@ -492,6 +492,33 @@ def _flat(text):
     return re.sub(r"\s+", " ", text)
 
 
+def _panel_defaults():
+    """The literal entries of the panel module's `_DEFAULTS` table, via the AST.
+
+    Parsed rather than scraped, because resolving a default *through* the table
+    is the point: the table is the single source of truth, and reading the
+    literal back out of the source would re-create exactly the coupling the
+    indirection avoids.
+
+    Entries whose value is a name rather than a literal (the cache default and
+    the rotation presets are both imported from constants) are skipped instead
+    of failing the whole read -- a caller asking about one numeric default has
+    no use for them, and resolving them would mean importing the module.
+    """
+    for node in ast.parse(_PANEL_SRC).body:
+        targets = getattr(node, "targets", None) or []
+        if not any(isinstance(t, ast.Name) and t.id == "_DEFAULTS" for t in targets):
+            continue
+        values = {}
+        for key, value in zip(node.value.keys, node.value.values):
+            try:
+                values[ast.literal_eval(key)] = ast.literal_eval(value)
+            except ValueError:
+                continue  # a name, not a literal
+        return values
+    raise AssertionError("ui_nesting.py no longer defines a module-level _DEFAULTS")
+
+
 class TestPerformanceDialsAreReachable:
     """step_size and the rotation pool width must be settable without an env var.
 
@@ -508,13 +535,33 @@ class TestPerformanceDialsAreReachable:
     """
 
     def test_panel_declares_both_fields(self):
-        for widget, default in (("minkowski_step_size_input", "5.0"),
-                                ("minkowski_rotation_workers_input", "0")):
-            flat = _flat(_PANEL_SRC)
+        """Each dial exists and starts where it did before.
+
+        The two are written differently, and the difference is deliberate:
+        minkowski_step_size_input is a LengthField (millimetres in, the
+        document's units on screen) seeded from the module's _DEFAULTS table,
+        while minkowski_rotation_workers_input is a plain QSpinBox counting
+        threads. So the assertion is on the RESOLVED default, not on a spelling
+        -- a literal here would fail on a rename that changed nothing about the
+        behaviour, which is the same brittleness _flat() documents.
+        """
+        defaults = _panel_defaults()
+        for widget, key, accessor, expected in (
+                ("minkowski_step_size_input", "minkowski_step_size", "set_mm", 5.0),
+                ("minkowski_rotation_workers_input", None, "setValue", 0)):
             assert widget in _PANEL_SRC, f"{widget} is not declared in the panel"
-            assert f"self.{widget}.setValue({default})" in flat, (
-                f"{widget} default should be {default} so leaving the panel "
-                f"alone reproduces the previous behaviour")
+            if key is not None:
+                assert defaults.get(key) == expected, (
+                    f"_DEFAULTS[{key!r}] is {defaults.get(key)!r}, expected "
+                    f"{expected}, so leaving the panel alone does not reproduce "
+                    f"the previous behaviour")
+                written = f'self.{widget}.{accessor}(_DEFAULTS["{key}"])'
+            else:
+                written = f"self.{widget}.{accessor}({expected})"
+            assert _flat(written) in _flat(_PANEL_SRC), (
+                f"{widget} is never initialised to {expected} ({written} not "
+                f"found), so leaving the panel alone does not reproduce the "
+                f"previous behaviour")
 
     def test_fields_are_in_the_minkowski_group(self):
         """They must land in a Minkowski group, not the Physics one.
@@ -523,24 +570,38 @@ class TestPerformanceDialsAreReachable:
         Minkowski -- that is the gap that started this. A field that exists but
         is wired to the other algorithm looks correct and is inert.
 
-        The layout variable was renamed from `minkowski_form_layout` to
-        `minkowski_opt_layout` when the single Minkowski group was split into
-        "Nesting Settings" and "Optimizations". The check accepts either name,
-        because the property being asserted is which ALGORITHM owns the fields,
-        not which variable spells it -- and hard-coding one spelling is exactly
-        the brittleness that made this fail on a rename that changed nothing
-        about the behaviour.
+        Located by AST on the two group *names* rather than on the layout
+        variable they used to be added to, for two reasons that both bit. The
+        variable was renamed once already (`minkowski_form_layout` ->
+        `minkowski_opt_layout`) when the single Minkowski group was split, which
+        failed the check for no behavioural reason; and the pair then moved out
+        of a QFormLayout into the shared two-column grid, taking
+        `perf_form_layout` with them. The property under test is which GROUP
+        owns the fields, so the group is what is asserted on.
         """
-        flat = _flat(_PANEL_SRC)
-        candidates = [
-            name for name in ("minkowski_form_layout", "minkowski_opt_layout")
-            if f"{name}.addRow(perf_form_layout)" in flat
-        ]
-        assert candidates, (
-            "the performance fields are not added to any Minkowski form layout")
-        group = min(flat.index(f"{n}.addRow(perf_form_layout)") for n in candidates)
-        physics = flat.index("physics_form_layout = ")
-        assert group < physics, "the fields are added after the Physics layout"
+        tree = ast.parse(_PANEL_SRC)
+        owner = None
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = ast.unparse(node.func)
+            if not func.endswith("setLayout"):
+                continue
+            for arg in node.args:
+                source = _flat(ast.unparse(arg))
+                if "minkowski_step_size_input" in source:
+                    assert owner is None, (
+                        "minkowski_step_size_input is laid out in more than one "
+                        "group; it would be ambiguous which algorithm owns it")
+                    owner = func.split(".")[0]
+
+        assert owner, (
+            "minkowski_step_size_input is not laid out in any group, so the "
+            "field has no place on screen")
+        assert "physics" not in owner, (
+            f"minkowski_step_size_input is laid out in {owner}, the Physics "
+            f"group -- a Minkowski field that looks correct and is inert is "
+            f"exactly the gap this test exists for")
 
     def test_controller_passes_both_to_the_nester(self):
         """Scoped to the Minkowski `else:` branch, located by AST.
@@ -578,10 +639,18 @@ class TestPerformanceDialsAreReachable:
             "controller")
         flat = _flat(branch)
 
+        # Either accessor is accepted, and deliberately so. step_size is read
+        # through a LengthField (mm()) while rotation_workers is a QSpinBox
+        # (value()); the property under test is that the field the user moved
+        # reaches the nester, not which method name the field's type happens to
+        # expose. Pinning the spelling here would fail this test on a rename
+        # that changed nothing about the behaviour -- the same brittleness the
+        # docstring above is about.
         for key, widget in (("step_size", "minkowski_step_size_input"),
                             ("rotation_workers",
                              "minkowski_rotation_workers_input")):
-            assert f"algo_kwargs['{key}'] = self.ui.{widget}.value()" in flat, (
+            assert any(f"algo_kwargs['{key}'] = self.ui.{widget}.{accessor}()" in flat
+                       for accessor in ("value", "mm")), (
                 f"the Minkowski branch does not pass {key} from {widget}, so "
                 f"moving the field in the UI would do nothing")
 

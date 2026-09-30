@@ -34,6 +34,17 @@ class NestingTaskPanel:
         return True
 
     def cleanup(self):
-        """Resets the command's panel instance to allow it to be reopened."""
+        """Resets the command's panel instance and releases panel resources."""
+        # The panel registers a FreeCAD document observer, which FreeCAD holds
+        # as a raw pointer to a Python object. This is the one teardown path
+        # every close route goes through, so it is where that registration has
+        # to be undone -- leaving it behind means a later document switch calls
+        # into a collected object.
+        dispose = getattr(self.form, "dispose", None)
+        if dispose is not None:
+            try:
+                dispose()
+            except Exception:
+                pass
         if self._cleanup_callback:
             self._cleanup_callback()

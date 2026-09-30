@@ -8,6 +8,7 @@ import copy
 from .algorithms import nesting_strategy
 from .algorithms import physics_nester
 from .visualization_manager import VisualizationManager
+from ... import units
 
 class _MainThreadRelay(QtCore.QObject):
     """QObject that lives on the main thread.
@@ -265,31 +266,48 @@ def _calculate_efficiency(sheets, verbose=False):
     """Calculates and displays sheet packing efficiency."""
     if not sheets:
         return
-    
+
     from .layout_manager import largest_open_area
-    
+
+    # Resolved once: every figure in this report is in the same units, and
+    # doc_unit_schema falls back to the global setting when there is no active
+    # document, so a headless caller still gets a sensible answer.
+    schema = units.doc_unit_schema(FreeCAD.ActiveDocument)
+
     total_parts_area = 0
     total_sheet_area = 0
-    
+
     if verbose:
         FreeCAD.Console.PrintMessage("\n--- PACKING EFFICIENCY ---\n")
-    
+
     for i, sheet in enumerate(sheets):
         sheet_area = sheet.width * sheet.height
         parts_area = sum(part.shape.area for part in sheet.parts if hasattr(part, 'shape') and part.shape)
-        
+
         total_sheet_area += sheet_area
         total_parts_area += parts_area
-        
+
         if verbose and sheet_area > 0:
             efficiency = (parts_area / sheet_area) * 100
             largest_open = largest_open_area(sheet.parts, sheet.width, sheet.height)
-            FreeCAD.Console.PrintMessage(f"  Sheet {i+1}: {efficiency:.1f}% ({parts_area:.0f} / {sheet_area:.0f} mm²), Compactness: {largest_open:.0f} mm² largest open\n")
-    
+            # Areas are formatted in the document's units. An area is the one
+            # figure FreeCAD's own unit formatters cannot convert -- they are
+            # length formatters and return a wrong answer rather than an
+            # error -- so units.format_area goes through the schema's length
+            # unit instead.
+            FreeCAD.Console.PrintMessage(
+                f"  Sheet {i+1}: {efficiency:.1f}% "
+                f"({units.format_area(parts_area, schema)} / "
+                f"{units.format_area(sheet_area, schema)}), "
+                f"Compactness: {units.format_area(largest_open, schema)} largest open\n")
+
     if total_sheet_area > 0:
         overall_efficiency = (total_parts_area / total_sheet_area) * 100
         if verbose:
-            FreeCAD.Console.PrintMessage(f"  Overall: {overall_efficiency:.1f}% ({total_parts_area:.0f} / {total_sheet_area:.0f} mm²)\n")
+            FreeCAD.Console.PrintMessage(
+                f"  Overall: {overall_efficiency:.1f}% "
+                f"({units.format_area(total_parts_area, schema)} / "
+                f"{units.format_area(total_sheet_area, schema)})\n")
             FreeCAD.Console.PrintMessage("--------------------------\n")
         else:
             FreeCAD.Console.PrintMessage(f"Packing Efficiency: {overall_efficiency:.1f}%\n")

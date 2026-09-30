@@ -9,6 +9,7 @@ and managing CAM jobs from the nested layouts.
 import FreeCAD
 from ...constants import *
 from ...freecad_helpers import get_nested_containers, set_visibility
+from ... import units
 
 class CAMManager:
     """Manages the creation of FreeCAD CAM jobs from nested layouts."""
@@ -124,7 +125,8 @@ class CAMManager:
         if thickness_mismatches:
             FreeCAD.Console.PrintWarning(
                 f"{sheet_group.Label}: {len(thickness_mismatches)} part(s) do not match the "
-                f"{sheet_thickness}mm sheet thickness (e.g. {thickness_mismatches[0]}); "
+                f"{units.format_length(sheet_thickness, self.doc)} sheet thickness "
+                f"(e.g. {thickness_mismatches[0]}); "
                 f"the CAM model will not line up with the stock height.\n"
             )
 
@@ -253,7 +255,11 @@ class CAMManager:
                 # Recompute to finalize the job
                 self.doc.recompute()
                 
-                FreeCAD.Console.PrintMessage(f"Created CAM job '{job.Label}' for {sheet_group.Label} (stock: {sheet_width}x{sheet_height}x{sheet_thickness}mm)\n")
+                FreeCAD.Console.PrintMessage(
+                    f"Created CAM job '{job.Label}' for {sheet_group.Label} "
+                    f"(stock: {units.format_length(sheet_width, self.doc)}"
+                    f" x {units.format_length(sheet_height, self.doc)}"
+                    f" x {units.format_length(sheet_thickness, self.doc)})\n")
             else:
                 FreeCAD.Console.PrintError("Failed to create CAM job.\n")
                 

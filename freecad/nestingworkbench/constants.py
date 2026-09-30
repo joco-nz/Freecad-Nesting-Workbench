@@ -27,6 +27,7 @@ PROP_GLOBAL_ROTATION_STEPS = "GlobalRotationSteps"
 PROP_GENERATIONS = "Generations"
 PROP_POPULATION_SIZE = "PopulationSize"
 PROP_NESTING_DIRECTION = "NestingDirection"
+PROP_RANDOM_DIRECTION = "RandomDirection"
 
 # -- FreeCAD Preferences Path --
 PREFS_PATH = "User parameter:BaseApp/Preferences/NestingWorkbench"
@@ -54,6 +55,28 @@ MINKOWSKI_ROTATION_PRESETS = [360, 180, 120, 90, 45, 30, 15, 10, 5, 1]
 # to read a number.
 DIRECTION_LABELS = {0: "Down", 90: "Left", 180: "Up", 270: "Right"}
 DEFAULT_DIRECTION_DIAL = 90
+
+# Degrees the dial moves per click. 15 gives 24 positions, which is finer than
+# the four cardinals the dial used to snap to and finer than most parts'
+# symmetry warrants, while still being coarse enough to land on a repeatable
+# angle by hand. Persisted readings are dial values, so a stored 15 is 15 here
+# and not 15 degrees of bearing.
+DIRECTION_STEP_DEGREES = 15
+
+
+def dial_to_bearing(dial_value):
+    """Convert a QDial reading to the compass bearing the search actually uses.
+
+    A quarter turn plus a flip, so the two are NOT the same number and the dial
+    is not pointing where the name says. Verified against the controller's own
+    conversion: reading 0 becomes bearing 270, which resolves to ( 0, -1) Down.
+
+    Lives here because three places need it and two of them are in the GUI: the
+    dial's readout, and both of the controller's per-algorithm conversions.
+    Written out by hand in the controller twice already, which is twice the
+    chance of the two drifting apart.
+    """
+    return (270 - int(dial_value)) % 360
 
 
 # -- Behaviour Defaults --

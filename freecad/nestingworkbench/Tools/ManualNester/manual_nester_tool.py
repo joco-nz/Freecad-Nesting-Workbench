@@ -15,6 +15,7 @@ from .physics_engine import PhysicsEngine
 from .collision_resolver import CollisionResolver
 from .input_manager import InputManager
 from ...freecad_helpers import get_view_object, set_visibility
+from ... import units
 
 def _compute_physics_frame(
     working_cache,
@@ -235,7 +236,7 @@ class ManualNesterToolObserver:
         if hasattr(self.panel_manager, 'form'):
             ui = self.panel_manager.form
             # Initial sync from advanced controls
-            self.physics_engine.radius = ui.radius_spin.value()
+            self.physics_engine.radius = ui.radius_spin.mm()
             self.physics_engine.curve_exponent = [1.0, 2.0, 3.0][ui.curve_dropdown.currentIndex()]
             self.physics_engine.strength = ui.strength_spin.value()
             # Derive initial mode from radio state
@@ -246,9 +247,11 @@ class ManualNesterToolObserver:
             ui.radio_valid.toggled.connect(lambda _: self._sync_mode_from_ui(ui))
             ui.radio_autorotate.toggled.connect(lambda _: self._sync_mode_from_ui(ui))
 
-            # Advanced physics controls
-            ui.radius_spin.valueChanged.connect(
-                lambda val: setattr(self.physics_engine, 'radius', val)
+            # Advanced physics controls. The radius is unit-aware, so its
+            # value comes off the field in millimetres rather than from the
+            # widget's own (possibly rounded) display figure.
+            ui.radius_spin.widget().valueChanged.connect(
+                lambda _val: setattr(self.physics_engine, 'radius', ui.radius_spin.mm())
             )
             ui.curve_dropdown.currentIndexChanged.connect(
                 lambda idx: setattr(self.physics_engine, 'curve_exponent', [1.0, 2.0, 3.0][idx])
@@ -582,7 +585,7 @@ class ManualNesterToolObserver:
 
         # Sync to UI
         if hasattr(self.panel_manager, 'form'):
-            self.panel_manager.form.radius_spin.setValue(new_radius)
+            self.panel_manager.form.radius_spin.set_mm(new_radius)
 
         # Update the visual indicator only — do NOT call handle_move (would move the part)
         if self.selected_obj and self.physics_enabled:
@@ -857,9 +860,13 @@ class ManualNesterToolObserver:
                 )
         elif getattr(self, '_physics_logged_active_sheet', None) != dragged_sheet:
             self._physics_logged_active_sheet = dragged_sheet
+            schema = units.doc_unit_schema(
+                getattr(self.selected_obj, "Document", None)
+                or FreeCAD.ActiveDocument)
             FreeCAD.Console.PrintMessage(
                 f"[Physics] Active sheet '{sheet_label}' — {len(sheet_parts)} peers, "
-                f"drag_len={drag_delta.Length:.1f}mm, radius={self.physics_engine.radius:.0f}mm.\n"
+                f"drag_len={units.format_length(drag_delta.Length, schema)}, "
+                f"radius={units.format_length(self.physics_engine.radius, schema)}.\n"
             )
         self.collision_resolver.prime_cache(sheet_parts)
 

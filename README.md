@@ -15,19 +15,36 @@ Click the **Run Nesting** icon (or access via the Nesting menu). This opens the 
 ### 3. Configuring Options
 
 #### Sheet Settings
+Every length in the panel is shown in, and accepts, the **active document's**
+unit system — so an imperial document shows `23.62 in` where a metric one shows
+`600.00 mm`. Fields also accept whatever FreeCAD's quantity parser does, so
+`1/2 in`, `2ft 6in` and `1' 11"` all work in an imperial document. Internally
+everything stays in millimetres regardless of what is displayed.
+
 *   **Sheet Width/Height:** Dimensions of the material sheet.
 *   **Sheet Thickness:** Thickness of the material (used for 3D visualization and CAM).
 *   **Part Spacing:** Minimum distance between nested parts.
 
 #### Bounds Resolution (Advanced)
 *   **Curve Angle (Quality):** Controls how smooth curved edges are approximated. Lower angles (5-10°) give smoother curves but are slower. Higher angles (30°+) are faster but coarser.
-*   **Simplification:** Tolerance for reducing determining points on a polygon. Higher values (1.0mm+) speed up nesting by removing tiny details.
+*   **Simplify:** Tolerance for reducing determining points on a polygon. Higher values (1.0+) speed up nesting by removing tiny details.
 
 #### Minkowski Nester Settings
 *   **Packing Direction:** Choose the primary direction to gravity-pack parts (Down, Left, Up, Right).
 *   **Use Random Direction:** If checked, randomizes placement heuristics for potentially better (or worse) results.
 *   **Clear NFP Cache:** Forces recalculation of No-Fit Polygons. Useful if you suspect caching issues, but slower.
-*   **Generations / Population Size:** Settings for the Genetic Algorithm optimizer. Increase these for complex nests to find better solutions over time (default is 1 for a single pass).
+*   **Candidate Step:** Spacing between candidate positions when sampling a No-Fit Polygon. The main control over run time.
+*   **Rotation Threads:** How many candidate rotations are checked concurrently. `Auto` uses one per CPU core.
+*   **Generations / Population Size:** Settings for the Genetic Algorithm optimizer. Both default to 1, which is a single pass with no search. Crossover only begins at a population of 3 — below that the loop carries the best layout forward plus one random layout, and never combines genes. Both values are remembered between sessions.
+
+#### Helpers and Logging
+Diagnostic controls, collapsed by default to keep the panel short. The `Helpers` group holds the identifier font, label size and height, and the simulate/show-bounds/sound switches; `Logging` holds the verbose and performance switches.
+
+#### Nesting Settings
+Collapsed by default, along with `Helpers` and `Logging`. Click a group title to expand it.
+
+*   **Nesting Direction:** The direction the nester searches from. The dial steps in 15° increments; the readout below it gives the direction the run will actually use, which is not the same as the dial's angle. All four cardinals are reachable. Remembered between sessions, as is the **Use Random Direction** checkbox.
+*   **Rotation Angle:** How many orientations of each part the nester may try.
 
 #### Part Options (In the Table)
 *   **Quantity:** How many copies of this part to nest.

@@ -16,6 +16,8 @@ from .layout_manager import LayoutManager, Layout
 from .ga_coordinator import GACoordinator
 from ...freecad_helpers import recursive_delete, set_visibility
 from ...constants import *
+from ... import units
+from ...length_field import LengthField
 from .nesting_job import NestingJob
 from ... import DEFAULT_FONT
 
@@ -29,6 +31,35 @@ except ImportError:
 # it. Generous, because drawing a layout or recomputing a document is real work,
 # but finite, because an unbounded wait on a shared event is a hang.
 _DRAW_HANDOVER_TIMEOUT_S = 300.0
+
+
+class _DocumentUnitWatcher:
+    """Notifies the controller when the user switches document.
+
+    FreeCAD exposes addDocumentObserver/removeDocumentObserver and calls
+    ``slotActivateDocument`` on a duck-typed Python object -- verified, and the
+    only document event that is dependable from Python. Nothing fires for a
+    change to the active document's UnitSystem, which is why the controller
+    also re-checks the schema just before a run.
+
+    Kept as a separate object rather than a bound method on the controller
+    because the registration is a raw pointer on the C++ side: if the object
+    were collected while still registered, the next activation would call into
+    freed memory. The controller holds it as an attribute and drops the
+    registration in dispose(), which NestingTaskPanel.cleanup always reaches.
+    """
+
+    def __init__(self, on_activate):
+        self._on_activate = on_activate
+
+    def slotActivateDocument(self, doc):
+        try:
+            self._on_activate(doc)
+        except Exception as exc:
+            # Never let an exception escape into FreeCAD's C++ activation
+            # path; it would abort the document switch itself.
+            FreeCAD.Console.PrintWarning(
+                f"[NestingController] Document unit refresh failed: {exc}\n")
 
 
 class NestingWorker(QThread):
@@ -120,17 +151,114 @@ class NestingController:
         self.is_running = False
         self.cancel_requested = False
         self._saved_source_placements = []
-        
+
         self.viz_manager = VisualizationManager()
-        
+
         # Initialize default fonts
         default_font = DEFAULT_FONT
         self.ui.selected_font_path = default_font
         if hasattr(self.ui, 'font_label'):
             self.ui.font_label.setText(os.path.basename(default_font))
 
+        # Watch for document switches so the panel's length fields can follow
+        # the new document's unit system. See _DocumentUnitWatcher.
+        self._unit_watcher = _DocumentUnitWatcher(self._on_activate_document)
+        try:
+            FreeCAD.addDocumentObserver(self._unit_watcher)
+        except Exception as exc:
+            FreeCAD.Console.PrintWarning(
+                f"[NestingController] Could not watch for document changes; "
+                f"units will not follow a document switch: {exc}\n")
+            self._unit_watcher = None
+
+    def dispose(self):
+        """Unregister the document observer. Idempotent.
+
+        Called from NestingTaskPanel.cleanup. Must run while the panel is still
+        alive: FreeCAD holds the observer as a raw pointer and calls back into
+        it without consulting Python's garbage collector.
+        """
+        watcher = getattr(self, "_unit_watcher", None)
+        if watcher is None:
+            return
+        self._unit_watcher = None
+        try:
+            FreeCAD.removeDocumentObserver(watcher)
+        except Exception as exc:
+            FreeCAD.Console.PrintWarning(
+                f"[NestingController] Could not unregister the document "
+                f"observer: {exc}\n")
+
+    def _on_activate_document(self, doc):
+        """The user switched documents: follow the new one's units.
+
+        The panel is cached for the life of the command (see
+        NestingCommand._task_panel), so it outlives a switch between two open
+        documents and would otherwise keep resolving against the first one --
+        which is how shapes from one document end up nested into another.
+
+        A run already in flight is left alone. Its shapes, placements and
+        target group all belong to the document it started in, and re-pointing
+        self.doc at another one mid-run would only make that worse; the next
+        run picks the new document up.
+        """
+        if self.is_running:
+            FreeCAD.Console.PrintWarning(
+                "[NestingController] Document switched while a nest was in "
+                "flight. This run continues in the document it started in.\n")
+            return
+        # Compared by name, not identity. FreeCAD hands the observer a
+        # Document across the C++/Python boundary, which is a fresh wrapper
+        # each time -- `is` never matches, not even for the document already
+        # open. So an identity test here would miss every same-document
+        # re-activation and drop the user's shape table for nothing.
+        if getattr(doc, "Name", None) == getattr(self.doc, "Name", None):
+            return
+
+        self.doc = doc
+        # Anything the panel is holding belongs to the document we just left.
+        # FreeCAD owns those objects' lifetime, so they cannot be restored into
+        # a new document -- and worse, adding them to one would fail. Drop the
+        # references and let the panel load whatever the new document has
+        # selected.
+        self._drop_document_state()
+        self._safe_ui(self.ui.refresh_unit_display, True)
+
+    def _drop_document_state(self):
+        """Forget the shapes and layout of the document we have left."""
+        for obj in list(getattr(self.ui, "hidden_originals", ()) or ()):
+            try:
+                set_visibility(obj, True)
+            except Exception:
+                pass  # The object died with its document; nothing to restore.
+        self._saved_source_placements = []
+        self.current_job = None
+        self.ui.hidden_originals = []
+        self.ui.selected_shapes_to_process = []
+        self.ui.current_layout = None
+        try:
+            self.ui.shape_table.setRowCount(0)
+        except RuntimeError:
+            pass  # Panel closed.
+        if self.doc is not None:
+            try:
+                self.ui.status_label.setText(
+                    "Document changed. Select the shapes to nest.")
+            except RuntimeError:
+                pass
+        self._safe_ui(self.ui.update_progress, 0, 0)
+
     def execute_nesting(self):
         FreeCAD.Console.PrintMessage("\n--- NESTING START ---\n")
+
+        # Re-render the length fields against the document as it is right now.
+        # The document observer covers a document switch, but FreeCAD raises
+        # no event when the active document's UnitSystem itself changes, and
+        # this is the last point at which a stale unit can reach the run --
+        # the values read below are already millimetres, so what is actually
+        # at risk is the user reading a sheet size off the screen that is not
+        # the one about to be nested.
+        self._safe_ui(self.ui.refresh_unit_display)
 
         self._restore_source_placements()
         if self.current_job:
@@ -250,7 +378,13 @@ class NestingController:
         self._load_shapes_from_layout(layout_group)
 
     def _load_params_from_layout(self, layout_group):
-        """Extracts algorithm parameters from layout properties."""
+        """Extracts algorithm parameters from layout properties.
+
+        The length properties are App::PropertyLength, so what comes back is
+        a Quantity. float() on one of those is its millimetre figure, which is
+        the unit the fields want -- there is no schema anywhere in this path,
+        and none is needed.
+        """
         props_map = {
             PROP_SHEET_WIDTH: self.ui.sheet_width_input,
             PROP_SHEET_HEIGHT: self.ui.sheet_height_input,
@@ -262,10 +396,21 @@ class NestingController:
             PROP_POPULATION_SIZE: self.ui.minkowski_population_size_input,
             PROP_NESTING_DIRECTION: self.ui.minkowski_direction_dial,
         }
-        
+
         for prop, widget in props_map.items():
             val = getattr(layout_group, prop, None)
-            if val is not None: widget.setValue(val)
+            if val is None:
+                continue
+            if isinstance(widget, LengthField):
+                # length_mm refuses a property that is not actually a length
+                # rather than adopting whatever figure it carries -- a
+                # hand-edited document can put anything under that name, and
+                # float() on a non-Length would be a number in the wrong unit.
+                mm = units.length_mm(val)
+                if mm is not None:
+                    widget.set_mm(mm)
+            else:
+                widget.setValue(val)
             
         deflection_angle = getattr(layout_group, PROP_DEFLECTION_ANGLE, None)
         if deflection_angle is not None:
@@ -826,23 +971,29 @@ class NestingController:
         return target
 
     def _collect_ui_params(self):
+        """Snapshot the panel into the dict the run is driven from.
+
+        Every length comes out of its field as a plain millimetre float, which
+        is the contract the rest of the workbench is written against: the
+        units are a presentation concern and stop here.
+        """
         deflection_angle = self.ui.deflection_input.value()
         deflection_mm = deflection_angle / 200.0
-        
+
         settings_dict = {
-            'sheet_width': self.ui.sheet_width_input.value(),
-            'sheet_height': self.ui.sheet_height_input.value(),
-            'spacing': self.ui.part_spacing_input.value(),
-            'sheet_thickness': self.ui.sheet_thickness_input.value(),
+            'sheet_width': self.ui.sheet_width_input.mm(),
+            'sheet_height': self.ui.sheet_height_input.mm(),
+            'spacing': self.ui.part_spacing_input.mm(),
+            'sheet_thickness': self.ui.sheet_thickness_input.mm(),
             'deflection': deflection_mm,
             'deflection_angle': deflection_angle,
-            'simplification': self.ui.simplification_input.value(),
+            'simplification': self.ui.simplification_input.mm(),
             'rotation_steps': self._get_rotation_steps(),
             'add_labels': self.ui.add_labels_checkbox.isChecked(),
             'font_path': getattr(self.ui, 'selected_font_path', None),
             'show_bounds': self.ui.show_bounds_checkbox.isChecked(),
-            'label_height': self.ui.label_height_input.value(),
-            'label_size': self.ui.label_size_input.value(),
+            'label_height': self.ui.label_height_input.mm(),
+            'label_size': self.ui.label_size_input.mm(),
             'generations': self.ui.minkowski_generations_input.value(),
             'population_size': self.ui.minkowski_population_size_input.value(),
             'compactness_weight': self.ui.minkowski_compactness_input.value(),
@@ -854,8 +1005,8 @@ class NestingController:
             'use_random_direction': (self.ui.physics_random_checkbox.isChecked() if self.ui.algorithm_dropdown.currentText() == 'Physics' else self.ui.minkowski_random_checkbox.isChecked()),
             'stability_tolerance': self.ui.physics_improvement_threshold_input.value(),
             'anneal_curve': self.ui.physics_anneal_curve_type.currentText(),
-            'anneal_min_amp': self.ui.physics_anneal_min_amp.value(),
-            'anneal_max_amp': self.ui.physics_anneal_max_amp.value(),
+            'anneal_min_amp': self.ui.physics_anneal_min_amp.mm(),
+            'anneal_max_amp': self.ui.physics_anneal_max_amp.mm(),
             'anneal_rot_steps': self.ui.physics_anneal_rot_steps.value(),
             'anneal_rot_curve': self.ui.physics_anneal_rot_curve_type.currentText(),
             'anneal_rot_min': self.ui.physics_anneal_rot_min.value(),
@@ -867,7 +1018,20 @@ class NestingController:
         return settings_dict
 
     def save_settings(self, settings):
-        """Saves current UI settings to FreeCAD preferences."""
+        """Saves current UI settings to FreeCAD preferences.
+
+        Lengths are stored as millimetre floats and never as display units.
+        Preferences are not tied to a document, so an imperial session and a
+        metric one share this store; writing "23.62" in place of 600 would
+        make the two sessions overwrite each other's settings with a number
+        25.4 times apart.
+
+        Generations and Population Size are written under the same property
+        names the layout group already records them as, so a value has one name
+        wherever it is stored. Both stay at 1 unless the user set them; see
+        load_persisted_settings for the measurement behind not defaulting the
+        population higher.
+        """
         prefs = FreeCAD.ParamGet(PREFS_PATH)
         prefs.SetFloat(PROP_SHEET_WIDTH, float(settings['sheet_width']))
         prefs.SetFloat(PROP_SHEET_HEIGHT, float(settings['sheet_height']))
@@ -885,7 +1049,7 @@ class NestingController:
         mink_steps = int(360 / self.ui.rotation_angles[self.ui.minkowski_rotation_steps_slider.value()])
         prefs.SetInt("MinkowskiRotationSteps", mink_steps)
         prefs.SetFloat("MinkowskiStepSize",
-                       float(self.ui.minkowski_step_size_input.value()))
+                       float(self.ui.minkowski_step_size_input.mm()))
         prefs.SetInt("MinkowskiRotationWorkers",
                      int(self.ui.minkowski_rotation_workers_input.value()))
         
@@ -895,12 +1059,25 @@ class NestingController:
 
         prefs.SetBool(PROP_ADD_LABELS, bool(settings['add_labels']))
         prefs.SetBool(PROP_SHOW_BOUNDS, bool(settings['show_bounds']))
+        prefs.SetInt(PROP_GENERATIONS, int(settings.get('generations', 1)))
+        prefs.SetInt(PROP_POPULATION_SIZE, int(settings.get('population_size', 1)))
+        # The dial reading, not the bearing. It is what the widget holds, what
+        # _load_params_from_layout reads off a layout group, and what
+        # dial_to_bearing converts; storing the bearing here would need a
+        # second inverse conversion and would break the step, since a bearing
+        # snapped to 15 is a different reading than a reading snapped to 15.
+        prefs.SetInt(PROP_NESTING_DIRECTION,
+                     int(self.ui.minkowski_direction_dial.value()))
+        prefs.SetBool(PROP_RANDOM_DIRECTION,
+                      bool(self.ui.minkowski_random_checkbox.isChecked()))
+        prefs.SetBool("PhysicsRandomDirection",
+                      bool(self.ui.physics_random_checkbox.isChecked()))
         prefs.SetFloat(PROP_LABEL_HEIGHT, float(settings['label_height']))
         prefs.SetFloat(PROP_LABEL_SIZE, float(settings['label_size']))
         prefs.SetFloat("PhysicsStabilityTolerance", float(settings.get('stability_tolerance', 0.01)))
         prefs.SetString("PhysicsAnnealCurveType", str(settings.get('anneal_curve', "Logarithmic")))
-        prefs.SetFloat("PhysicsAnnealMinAmp", float(settings.get('anneal_min_amp', 0.1)))
-        prefs.SetFloat("PhysicsAnnealMaxAmp", float(settings.get('anneal_max_amp', 100.0)))
+        prefs.SetFloat("PhysicsAnnealMinAmp", float(self.ui.physics_anneal_min_amp.mm()))
+        prefs.SetFloat("PhysicsAnnealMaxAmp", float(self.ui.physics_anneal_max_amp.mm()))
         
         prefs.SetInt("PhysicsAnnealRotSteps", int(settings.get('anneal_rot_steps', 10)))
         prefs.SetString("PhysicsAnnealRotCurveType", str(settings.get('anneal_rot_curve', "Logarithmic")))
@@ -961,13 +1138,15 @@ class NestingController:
             if self.ui.physics_random_checkbox.isChecked():
                 algo_kwargs['physics_direction'] = None 
             else:
-                # Dial value is CCW from 6 o'clock. 
-                # 0=Down(0,-1), 90=Left(-1,0), 180=Up(0,1), 270=Right(1,0)
-                angle_deg = (270 - self.ui.physics_direction_dial.value()) % 360
+                # Dial value is CCW from 6 o'clock, and is not the compass
+                # bearing: 0=Down(0,-1), 90=Left(-1,0), 180=Up(0,1),
+                # 270=Right(1,0). dial_to_bearing owns that conversion so the
+                # panel's readout and the search direction cannot disagree.
+                angle_deg = dial_to_bearing(self.ui.physics_direction_dial.value())
                 angle_rad = math.radians(angle_deg)
                 algo_kwargs['physics_direction'] = (math.cos(angle_rad), math.sin(angle_rad))
             
-            algo_kwargs['step_size'] = self.ui.physics_step_size_input.value()
+            algo_kwargs['step_size'] = self.ui.physics_step_size_input.mm()
             algo_kwargs['max_spawn_count'] = self.ui.physics_max_spawn_input.value()
             algo_kwargs['max_nesting_steps'] = self.ui.physics_max_nesting_steps_input.value()
             algo_kwargs['anneal_steps'] = self.ui.physics_anneal_steps_input.value()
@@ -976,8 +1155,8 @@ class NestingController:
             algo_kwargs['anneal_random_shake_direction'] = self.ui.anneal_random_shake_checkbox.isChecked()
             algo_kwargs['stability_tolerance'] = ui_params.get('stability_tolerance', 0.01)
             algo_kwargs['anneal_curve'] = ui_params.get('anneal_curve', "Logarithmic")
-            algo_kwargs['anneal_min_amp'] = ui_params.get('anneal_min_amp', 0.1)
-            algo_kwargs['anneal_max_amp'] = ui_params.get('anneal_max_amp', 100.0)
+            algo_kwargs['anneal_min_amp'] = self.ui.physics_anneal_min_amp.mm()
+            algo_kwargs['anneal_max_amp'] = self.ui.physics_anneal_max_amp.mm()
             algo_kwargs['anneal_rot_steps'] = ui_params.get('anneal_rot_steps', 10)
             algo_kwargs['anneal_rot_curve'] = ui_params.get('anneal_rot_curve', "Logarithmic")
             algo_kwargs['anneal_rot_min'] = ui_params.get('anneal_rot_min', 1.0)
@@ -986,7 +1165,7 @@ class NestingController:
             if self.ui.minkowski_random_checkbox.isChecked():
                 algo_kwargs['search_direction'] = None
             else:
-                angle_deg = (270 - self.ui.minkowski_direction_dial.value()) % 360
+                angle_deg = dial_to_bearing(self.ui.minkowski_direction_dial.value())
                 angle_rad = math.radians(angle_deg)
                 algo_kwargs['search_direction'] = (math.cos(angle_rad), math.sin(angle_rad))
             
@@ -1000,7 +1179,7 @@ class NestingController:
             # through as 0 so the nester can tell "user chose auto" from
             # "nobody said anything" -- both land on the stdlib default, but
             # only one of them is a decision.
-            algo_kwargs['step_size'] = self.ui.minkowski_step_size_input.value()
+            algo_kwargs['step_size'] = self.ui.minkowski_step_size_input.mm()
             algo_kwargs['rotation_workers'] = (
                 self.ui.minkowski_rotation_workers_input.value())
 

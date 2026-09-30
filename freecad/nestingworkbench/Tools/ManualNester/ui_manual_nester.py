@@ -7,6 +7,7 @@ for the manual nester tool task panel.
 """
 
 from PySide import QtCore, QtWidgets
+from ...length_field import LengthField
 
 class ManualNesterToolUI(QtWidgets.QWidget):
     """
@@ -49,12 +50,12 @@ class ManualNesterToolUI(QtWidgets.QWidget):
         physics_layout = QtWidgets.QVBoxLayout()
 
         radius_layout = QtWidgets.QHBoxLayout()
-        radius_layout.addWidget(QtWidgets.QLabel("Influence Radius (mm):"))
-        self.radius_spin = QtWidgets.QDoubleSpinBox()
-        self.radius_spin.setRange(0, 1000)
-        self.radius_spin.setValue(200)
-        self.radius_spin.setSingleStep(10)
-        radius_layout.addWidget(self.radius_spin)
+        # No unit in the label: the field shows its own, and follows the
+        # document's unit system.
+        radius_layout.addWidget(QtWidgets.QLabel("Influence Radius:"))
+        self.radius_spin = LengthField(mm_min=0, mm_max=1000, single_step_mm=10)
+        self.radius_spin.set_mm(200)
+        radius_layout.addWidget(self.radius_spin.widget())
         physics_layout.addLayout(radius_layout)
 
         curve_layout = QtWidgets.QHBoxLayout()
