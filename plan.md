@@ -16,21 +16,34 @@ feature does not classify anything. It reads a recipe and applies it.
 
 ## Status
 
-**Steps 1-2 done. Steps 3-7 not started.**
+**Steps 1-3 done. Steps 4-7 not started.**
 
 `Tools/Cam/cam_replay.py` holds two halves:
 
 - the **recipe reader** (step 1) — no geometry, no document objects, so its
   tests run under plain pytest against stand-ins;
 - the **flattener** (step 2) — creates document objects, so it is covered by
-  both tiers: pure logic in pytest, real geometry in `freecadcmd`.
+  both tiers: pure logic in pytest, real geometry in `freecadcmd`;
+- the **job builder** (step 3) — creates a real CAM job, so the interesting
+  parts can only be checked under `freecadcmd`.
 
-- 249 pytest tests passing (29 new for step 2).
-- `tests/freecad_harness/test_replay_flatten.py`: 61 checks, 0 failures.
+- 281 pytest tests passing (32 new for step 3).
+- `tests/freecad_harness/test_replay_flatten.py`: 97 checks, 0 failures.
 - Step 2 verified on a real cylinder: surfaces stay analytic (`Cylinder` in,
   `Cylinder` out, no `BSplineSurface`), edge count and every per-edge length
   unchanged, placement is `container * child` in that order, Z normalised to
   `-thickness..0`, and the offset idempotent.
+
+One finding from step 3:
+
+- **The default stock is padded around the model.** A fresh job's stock is a
+  `StockFromBase` fitted to the geometry, which measured Z **-7.0 .. 1.0** for a
+  6 mm part — a millimetre of margin above and below. The replay stock is built
+  as the sheet exactly, **-6.0 .. 0.0**. So a user who checked their depths
+  against their own job was looking at a different Z frame from the one their
+  parts will be cut in. This is what the step 3 warning reports. It is a
+  warning rather than an error because depths are re-derived from the new stock,
+  so the cut is correct either way; only the displayed numbers differ.
 
 Two findings from step 2 that are not in the original constraint list:
 
@@ -160,6 +173,13 @@ break the implementation if ignored.
     version of `test_replay_flatten.py` reported nothing at all while failing
     silently.
 
+11. **The sheet spans `0..width`, not `-width/2..+width/2`.** The nesting sheet
+    is `Polygon([(0,0), (width,0), (width,height), (0,height)])` and
+    `Sheet.is_placement_valid` requires full containment, so parts are always
+    inside that rectangle. The replay stock must therefore be built from the
+    origin, not centred. An early version of the harness placed a part on the
+    origin and reported it as a stock bug; the harness was wrong.
+
 ## Open items
 
 - ~~**Depth properties.**~~ **Resolved.** Depths are *derived*, not authored.
@@ -202,8 +222,10 @@ Not started. Ordered so each step is independently verifiable.
    only, normalise Z so the bottom sits at `-thickness`. Returns a
    `FlattenedPart` carrying the Z shift, so a report can say which geometry
    arrived somewhere unexpected.
-3. Job builder. New job per sheet, stock box from the layout properties,
-   Z0 = top of stock.
+3. ~~Job builder.~~ **Done.** New job per sheet, stock box from the layout
+   properties, Z0 = top of stock. Returns a `ReplayJob` carrying the job's
+   **clones** — the list an operation must target — alongside the inputs, so
+   the two cannot be confused.
 4. Op replay. Two passes, tool controller remapped into the new job, `Base`
    re-pointed at all copies.
 5. Ordering. Internals before perimeters via `job.Operations.Group`.
@@ -223,6 +245,10 @@ Not started. Ordered so each step is independently verifiable.
   `tests/Test_Files/n70-intercooler-spacer-bottle-nesting.FCStd`, asserting op
   count matches source, every path non-empty, and every path spans the nested
   envelope.
+
+  It also covers step 3: that the job really clones its base, that the stock is
+  the sheet exactly, that parts land on it, and that the Z frame difference is
+  reported rather than fatal.
 
   `test_replay_flatten.py` is not yet wired into
   `tests/freecad_harness/run.sh`; it writes `.last_status_replay` and should be
@@ -245,6 +271,11 @@ Not started. Ordered so each step is independently verifiable.
   a part onto its side — not something the nester produces, and it made a
   correct placement look like a Z-normalisation failure. Both cases were wrong,
   not the module.
+- Step 3 implemented. The harness caught a third bad test case of the same kind:
+  a part was placed on the sheet origin, which the nesting side never does, and
+  the "part is not inside the sheet" check flagged it. Three test bugs across two
+  steps, all of them the check being wrong rather than the code — worth noting
+  because the checks that catch bad test data are the ones doing their job.
 - Original framing was "nest from a CAM setup, then apply the ops" (a
   classification problem). The user reframed it: the classification is already
   done by hand in the CAM workbench. Scope reduced to replay only, which

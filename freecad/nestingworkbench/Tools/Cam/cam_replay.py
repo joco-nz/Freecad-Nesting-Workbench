@@ -95,6 +95,310 @@ create objects, and is covered by the freecadcmd harness instead.
 """
 import FreeCAD
 
+# -- job creation ---------------------------------------------------------
+#
+# The job is named after the sheet it machines, so a multi-sheet nest produces
+# one clearly-labelled job per sheet rather than a single ambiguous one.
+
+JOB_NAME_PREFIX = "CAM_Replay_"
+STOCK_LABEL_PREFIX = "Stock_Replay_"
+
+# Tolerance for comparing two stock Z frames, in millimetres. Loose enough to
+# absorb the float noise a Placement round-trip introduces, tight enough that
+# a 1 mm difference -- which is what a default StockFromBase against an
+# explicit box actually produces -- is still reported.
+STOCK_FRAME_TOLERANCE = 0.01
+
+
+def read_sheet_dimensions(layout_group):
+    """Return `(width, height, thickness)` from a layout group's properties.
+
+    The dimensions live on the `Layout_*` group, not on the individual
+    `Sheet_*` groups, so the layout group is what has to be passed in. Falls
+    back to `cam_manager`'s defaults when a property is absent, so an older
+    document without them still produces a usable job rather than raising.
+
+    `height` is the layout's `SheetHeight`; the naming asymmetry between the
+    property names and the stock's own `Length`/`Width`/`Height` is the
+    layout's, not this module's.
+    """
+    from ...constants import (
+        PROP_SHEET_HEIGHT,
+        PROP_SHEET_THICKNESS,
+        PROP_SHEET_WIDTH,
+    )
+
+    defaults = (600.0, 600.0, 3.0)
+    if layout_group is None:
+        return defaults
+    values = []
+    for prop, fallback in zip(
+        (PROP_SHEET_WIDTH, PROP_SHEET_HEIGHT, PROP_SHEET_THICKNESS), defaults
+    ):
+        value = getattr(layout_group, prop, None)
+        try:
+            values.append(float(value) if value is not None else fallback)
+        except (TypeError, ValueError):
+            values.append(fallback)
+    return tuple(values)
+
+
+def sheet_origin_for(sheet_group):
+    """Return the world-space X/Y offset a sheet's parts were placed at.
+
+    Sheets are laid out side by side, so sheet 2's parts sit at a non-zero
+    world X. Each sheet's G-code should start at X0 Y0, so the origin is
+    subtracted from the parts and the stock is built at the origin -- the same
+    choice `cam_manager` makes.
+
+    Returns a zero vector when the sheet has no `Sheet_Boundary_*` child, which
+    is the case for documents that predate that structure.
+    """
+    origin = FreeCAD.Vector(0, 0, 0)
+    if sheet_group is None:
+        return origin
+    for child in getattr(sheet_group, "Group", ()):
+        if getattr(child, "Label", "").startswith("Sheet_Boundary_"):
+            placement = getattr(child, "Placement", None)
+            if placement is not None:
+                return FreeCAD.Vector(placement.Base.x, placement.Base.y, 0)
+    return origin
+
+
+def translate_to_sheet_local(parts, sheet_origin):
+    """Shift `parts` back to sheet-local coordinates, in place.
+
+    Placement-only, so the geometry itself is untouched and stays analytic.
+    The sheet origin is zero for the first sheet, so this is a no-op there.
+    """
+    if not sheet_origin:
+        return parts
+    dx, dy = -sheet_origin.x, -sheet_origin.y
+    if abs(dx) < 1e-9 and abs(dy) < 1e-9:
+        return parts
+    for part in parts:
+        placement = getattr(part, "Placement", None)
+        if placement is None:
+            continue
+        base = placement.Base
+        part.Placement = FreeCAD.Placement(
+            FreeCAD.Vector(base.x + dx, base.y + dy, base.z),
+            placement.Rotation,
+        )
+    return parts
+
+
+class ReplayJob:
+    """A new job, plus what the write half needs to target it correctly.
+
+    The important field is `clones`. `PathJob.Create` does not keep the
+    geometry it is given: it replaces each base object with a
+    `draftobjects.clone.Clone` in `job.Model.Group`. An operation's `Base` must
+    therefore point at those clones, not at the objects passed in.
+
+    Verified: three input features became `['Clone', 'Clone001', 'Clone002']`
+    labelled `Model-p1` .. `Model-p3`, and `Model.Group[0] is not parts[0]`.
+    Handing the caller its own input list back would be a quiet way to produce
+    a job whose operations reference geometry the job does not contain, so
+    `clones` is the list to use and `source_parts` is kept only for reporting.
+
+    `warnings` is a list of human-readable strings, currently the Z frame
+    comparison described on `compare_stock_frames`.
+    """
+
+    def __init__(self, job, clones, stock, sheet_group, source_parts, warnings):
+        self.job = job
+        self.clones = list(clones)
+        self.stock = stock
+        self.sheet_group = sheet_group
+        self.source_parts = list(source_parts)
+        self.warnings = list(warnings)
+
+    def __repr__(self):
+        return "<ReplayJob %s clones=%d stock=%s>" % (
+            getattr(self.job, "Label", "?"), len(self.clones),
+            getattr(self.stock, "Label", "none"),
+        )
+
+
+def describe_stock_frame(stock):
+    """Return `(z_min, z_max, height)` for a stock object, or None.
+
+    A stock with no shape -- which is possible before it is built -- yields None
+    rather than raising, so a frame comparison can be skipped.
+    """
+    shape = getattr(stock, "Shape", None)
+    if shape is None or shape.isNull():
+        return None
+    box = shape.BoundBox
+    return (box.ZMin, box.ZMax, box.ZLength)
+
+
+def compare_stock_frames(source_stock, new_stock, sheet_label=""):
+    """Warn when the source job's stock frame differs from the new one.
+
+    Returns a list of warning strings, empty when the frames agree.
+
+    This is a warning rather than an error because the consequence is subtle
+    rather than fatal. Depths are derived by the operation from the stock on
+    every recompute, so the replayed operations will cut correctly against the
+    new stock whatever the source used. What differs is what the *user saw*
+    while setting up: the depths displayed in the source job were derived
+    against the source's stock.
+
+    The mismatch is not hypothetical. A default `StockFromBase` around a 6 mm
+    part measured Z -7.0 .. 1.0 -- a millimetre of margin above and below --
+    while the nesting stock is built at exactly -6.0 .. 0.0. A user who
+    checked their depths against the source job is looking at a different
+    frame from the one their parts will be cut in.
+    """
+    warnings = []
+    source_frame = describe_stock_frame(source_stock)
+    new_frame = describe_stock_frame(new_stock)
+    prefix = ("%s: " % sheet_label) if sheet_label else ""
+
+    if new_frame is None:
+        return ["%sthe new stock has no shape, so the Z frame could not be "
+                "checked." % prefix]
+    if source_frame is None:
+        return warnings
+
+    source_zmin, source_zmax, source_height = source_frame
+    new_zmin, new_zmax, new_height = new_frame
+
+    if abs(source_height - new_height) > STOCK_FRAME_TOLERANCE:
+        warnings.append(
+            "%ssource job stock is %s mm thick but the sheet is %s mm; the "
+            "replayed operations will cut to the sheet thickness."
+            % (prefix, round(source_height, 3), round(new_height, 3))
+        )
+    if (abs(source_zmin - new_zmin) > STOCK_FRAME_TOLERANCE
+            or abs(source_zmax - new_zmax) > STOCK_FRAME_TOLERANCE):
+        warnings.append(
+            "%ssource job stock spans Z %s..%s but the replay stock spans "
+            "Z %s..%s; depths are re-derived from the stock, so the cut is "
+            "correct, but they will not match the values shown in the source "
+            "job." % (
+                prefix,
+                round(source_zmin, 3), round(source_zmax, 3),
+                round(new_zmin, 3), round(new_zmax, 3),
+            )
+        )
+    return warnings
+
+
+def create_replay_job(doc, layout_group, sheet_group, flattened_parts,
+                      source_job=None, post_processor=None, template_path=None,
+                      job_factory=None):
+    """Create a new CAM job for one sheet's flattened parts.
+
+    Returns a `ReplayJob`, or None when there is nothing to machine.
+
+    Three things happen here, and each has a reason it cannot be skipped:
+
+    1. **Parts are moved to sheet-local coordinates.** Sheets are laid out side
+       by side, so a sheet other than the first has its parts at a non-zero
+       world X. Subtracting the sheet origin means each sheet's G-code starts
+       at X0 Y0 and the stock can sit at the origin.
+
+    2. **`PathJob.Create` is called, which clones the geometry.** The clones in
+       `job.Model.Group` are what operations must reference; see `ReplayJob`.
+
+    3. **The stock is replaced with an explicit box.** The default is a
+       `StockFromBase` fitted to the model, which measured Z -7.0 .. 1.0 for a
+       6 mm part. The nesting job needs the stock to *be* the sheet:
+       `SheetWidth` x `SheetHeight` x `SheetThickness`, spanning
+       `-thickness` to 0, so Z0 is the top of the stock. This is the single
+       place the Z frame is decided, and because operation depths are derived
+       from the stock, getting it right here is what makes the depths right
+       everywhere else.
+
+    `job_factory` defaults to the App-level `Path.Main.Job.Create`, which works
+    under `freecadcmd`. A caller with a GUI can pass the GUI-level factory
+    instead, which additionally wires up a view provider; the replay does not
+    depend on which was used.
+    """
+    from Path.Main import Job as PathJob
+    from Path.Main import Stock as PathStock
+
+    parts = list(flattened_parts)
+    if not parts:
+        return None
+
+    width, height, thickness = read_sheet_dimensions(layout_group)
+    origin = sheet_origin_for(sheet_group)
+    translate_to_sheet_local(parts, origin)
+
+    factory = job_factory
+    if factory is None:
+        factory = PathJob.Create
+
+    sheet_label = getattr(sheet_group, "Label", "") or ""
+    job_name = "%s%s" % (JOB_NAME_PREFIX, sheet_label or "Sheet")
+
+    job = factory(job_name, parts, template_path)
+    if job is None:
+        return None
+    doc.recompute()
+
+    # The clones are the job's real geometry. Read them from the job rather
+    # than assuming the caller's list survived.
+    clones = list(getattr(getattr(job, "Model", None), "Group", []) or [])
+
+    if getattr(job, "Stock", None) is not None:
+        doc.removeObject(job.Stock.Name)
+
+    stock = PathStock.CreateBox(job)
+    stock.Label = "%s%s" % (STOCK_LABEL_PREFIX, sheet_label or "Sheet")
+    stock.Length = width
+    stock.Width = height
+    stock.Height = thickness
+    # Top face at Z0, bottom at -thickness, matching the Z normalisation
+    # flatten_container applied to the parts.
+    stock.Placement = FreeCAD.Placement(
+        FreeCAD.Vector(0, 0, -float(thickness)), FreeCAD.Rotation()
+    )
+    job.Stock = stock
+
+    if post_processor:
+        try:
+            job.PostProcessor = post_processor
+            job.PostProcessorOutputFile = ""
+        except Exception as exc:
+            FreeCAD.Console.PrintWarning(
+                "Could not set post processor '%s' on %s: %s\n"
+                % (post_processor, job_name, exc)
+            )
+    doc.recompute()
+
+    warnings = []
+    if source_job is not None:
+        warnings.extend(compare_stock_frames(
+            getattr(source_job, "Stock", None), stock, sheet_label
+        ))
+
+    return ReplayJob(job, clones, stock, sheet_group, parts, warnings)
+
+
+def describe_replay_job(replay):
+    """Return a human-readable summary of a `ReplayJob`.
+
+    Plain text over `FreeCAD.Console`, as with the other describe helpers.
+    """
+    lines = [
+        "Created %s with %d part(s), stock %s x %s x %s, Z0 at the top of the "
+        "stock." % (
+            getattr(replay.job, "Label", "?"), len(replay.clones),
+            getattr(replay.stock, "Length", "?"),
+            getattr(replay.stock, "Width", "?"),
+            getattr(replay.stock, "Height", "?"),
+        )
+    ]
+    for warning in replay.warnings:
+        lines.append("WARNING: %s" % warning)
+    return lines
+
+
 # -- flattening -----------------------------------------------------------
 #
 # The property a flattened part carries to identify where it came from. It is a

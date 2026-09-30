@@ -99,6 +99,135 @@ def build_nested(doc, label, cx, cy, angle, source_shape, child_rotation=None):
     return container, part
 
 
+def run_job_checks(doc, flattened, thickness):
+    """Build a real job from the flattened parts and check what comes back.
+
+    This is the step the pytest tier cannot cover, because the behaviour under
+    test is `PathJob.Create` refusing to keep the geometry it is given. It
+    replaces the input features with `draftobjects.clone.Clone` objects, and
+    the clones are what an operation's `Base` must reference. Verified: three
+    inputs became `['Clone', 'Clone001', 'Clone002']` labelled `Model-p1` ..
+    `Model-p3`, with `Model.Group[0] is not parts[0]`.
+
+    Also checked here, because both are real behaviours rather than documented
+    ones:
+
+      * the default stock is a `StockFromBase` fitted to the model, which
+        measures Z -7.0 .. 1.0 for a 6 mm part -- a millimetre of margin
+        either side. The replay stock must be the sheet exactly, -6.0 .. 0.0,
+        because operation depths are derived from the stock and this is the
+        only place the Z frame is decided;
+      * the stock frame comparison warns about that difference rather than
+        refusing to run, since the cut is still correct against the new stock.
+    """
+    from Path.Main import Job as PathJob
+
+    parts = [item.obj for _label, _container, _part, item in flattened]
+
+    # A source job with the DEFAULT stock, which is what a user who set up CAM
+    # on their own part will have.
+    src = doc.addObject("Part::Feature", "SourceBracket")
+    src.Shape = Part.makeBox(40, 25, thickness, FreeCAD.Vector(-20, -12.5, -thickness))
+    source_job = PathJob.Create("SourceJob", [src], None)
+    doc.recompute()
+    source_frame = cam_replay.describe_stock_frame(source_job.Stock)
+    check(source_frame is not None, "the source job has no stock frame")
+    if source_frame:
+        check(abs(source_frame[2] - thickness) > 0.5,
+              "expected the default stock to be padded around the model, got "
+              "Z %s..%s for a %s mm part"
+              % (source_frame[0], source_frame[1], thickness))
+
+    layout = doc.addObject("App::DocumentObjectGroup", "Layout_1")
+    for name, value in (("SheetWidth", 600.0), ("SheetHeight", 400.0),
+                        ("SheetThickness", thickness)):
+        layout.addProperty("App::PropertyLength", name, "Layout", "")
+        setattr(layout, name, value)
+    doc.recompute()
+
+    check(cam_replay.read_sheet_dimensions(layout) == (600.0, 400.0, thickness),
+          "layout dimensions did not read back")
+
+    sheet = doc.addObject("App::DocumentObjectGroup", "Sheet_1")
+
+    replay = cam_replay.create_replay_job(
+        doc, layout, sheet, parts, source_job=source_job
+    )
+    check(replay is not None, "create_replay_job returned None")
+    if replay is None:
+        return
+
+    # -- the clones are what an operation must target --
+    check(len(replay.clones) == len(parts),
+          "expected %d clones, got %d" % (len(parts), len(replay.clones)))
+    check(replay.clones != replay.source_parts,
+          "clones are the same objects as the inputs; the job did not clone")
+    for clone, original in zip(replay.clones, replay.source_parts):
+        check(clone is not original,
+              "%s: the job kept the input object instead of cloning it"
+              % original.Label)
+        check(clone.isDerivedFrom("Part::FeaturePython"),
+              "%s: clone is a %s" % (original.Label, clone.TypeId))
+        ob, nb = original.Shape.BoundBox, clone.Shape.BoundBox
+        check(abs(ob.XMin - nb.XMin) < 1e-6 and abs(ob.YMin - nb.YMin) < 1e-6,
+              "%s: clone placement differs from the original" % original.Label)
+
+    # -- the stock is the sheet, and only the sheet --
+    stock = replay.stock
+    check(stock is not None, "no stock on the replay job")
+    if stock is None:
+        return
+    check(abs(float(stock.Length) - 600.0) < 1e-6,
+          "stock Length is %s, expected 600" % stock.Length)
+    check(abs(float(stock.Width) - 400.0) < 1e-6,
+          "stock Width is %s, expected 400" % stock.Width)
+    check(abs(float(stock.Height) - thickness) < 1e-6,
+          "stock Height is %s, expected %s" % (stock.Height, thickness))
+
+    frame = cam_replay.describe_stock_frame(stock)
+    check(frame is not None, "the replay stock has no shape")
+    if frame:
+        zmin, zmax, height = frame
+        check(abs(zmin + thickness) < 1e-6,
+              "stock bottom is Z=%s, expected %s" % (zmin, -thickness))
+        check(abs(zmax) < 1e-6,
+              "stock top is Z=%s, expected 0 so Z0 is the top of the stock" % zmax)
+        check(abs(height - thickness) < 1e-6,
+              "stock is %s mm thick, expected %s" % (height, thickness))
+
+    # -- the parts sit on the stock --
+    for clone in replay.clones:
+        bb = clone.Shape.BoundBox
+        check(abs(bb.ZMin + thickness) < 1e-6,
+              "%s: bottom at Z=%s, expected %s" % (clone.Label, bb.ZMin, -thickness))
+        check(abs(bb.ZMax) < 1e-6,
+              "%s: top at Z=%s, expected 0" % (clone.Label, bb.ZMax))
+
+    # -- the Z frame difference is reported, not fatal --
+    check(len(replay.warnings) > 0,
+          "expected a warning: the source job's default stock is padded around "
+          "the model, so its Z frame differs from the replay stock")
+    check("re-derived" in "\n".join(replay.warnings),
+          "the Z frame warning does not explain that depths are re-derived")
+    check(all(w.startswith("Sheet_1") for w in replay.warnings),
+          "warnings are not attributed to the sheet: %s" % replay.warnings)
+
+    # -- and the parts are inside the stock --
+    sb = stock.Shape.BoundBox
+    for clone in replay.clones:
+        bb = clone.Shape.BoundBox
+        inside = (bb.XMin >= sb.XMin - 1e-6 and bb.XMax <= sb.XMax + 1e-6
+                  and bb.YMin >= sb.YMin - 1e-6 and bb.YMax <= sb.YMax + 1e-6)
+        check(inside,
+              "%s (X %s..%s Y %s..%s) is not inside the sheet (X %s..%s Y %s..%s)"
+              % (clone.Label, bb.XMin, bb.XMax, bb.YMin, bb.YMax,
+                 sb.XMin, sb.XMax, sb.YMin, sb.YMax))
+
+    lines = cam_replay.describe_replay_job(replay)
+    check(all(isinstance(line, str) for line in lines),
+          "describe_replay_job returned non-strings")
+
+
 def run():
     doc = FreeCAD.newDocument("replay_flatten")
 
@@ -118,11 +247,16 @@ def run():
     # up-direction rotation is baked into the master shape so parts arrive
     # Z-aligned. A child rotation about X or Y would tip a part onto its side,
     # which is not a thing the nesting side produces.
+    # Positions must be inside the sheet. The sheet is
+    # Polygon([(0,0), (width,0), (width,height), (0,height)]) and the nester
+    # requires full containment (Sheet.is_placement_valid), so a part centred
+    # on the origin would hang off the corner. An earlier version of this
+    # script did exactly that and reported it as a stock bug.
     specs = [
         # label,          cx,   cy,  angle, child yaw
-        ("Bracket_1", 0.0, 0.0, 0.0, 0.0),
-        ("Bracket_2", 60.0, 12.0, 37.0, 0.0),
-        ("Bracket_3", 0.0, 60.0, 71.0, 25.0),
+        ("Bracket_1", 30.0, 30.0, 0.0, 0.0),
+        ("Bracket_2", 90.0, 42.0, 37.0, 0.0),
+        ("Bracket_3", 30.0, 100.0, 71.0, 25.0),
     ]
 
     flattened = []
@@ -273,6 +407,8 @@ def run():
           "describe_flatten returned non-strings")
     check(any("Flattened" in line for line in lines),
           "describe_flatten did not report a part count")
+
+    run_job_checks(doc, flattened, thickness)
 
     FreeCAD.closeDocument("replay_flatten")
 
