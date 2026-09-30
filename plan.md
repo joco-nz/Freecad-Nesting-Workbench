@@ -16,11 +16,11 @@ feature does not classify anything. It reads a recipe and applies it.
 
 ## Status
 
-**Steps 1-7 done. Step 8 in progress — the fixture is being built.**
+**Steps 1-7 done. Step 8 blocked on step 9 (dressups).**
 
-The feature is complete and wired into the menu, but has only ever run
-headless against synthetic geometry small enough to reason about. Step 8 closes
-that, and the manual GUI pass follows it.
+The fixture is built and validates. It cannot be replayed yet, because the
+reader's view of a job does not survive dressups — and every operation in that
+fixture is dressed up. Step 9 is the dressup work; step 8's test follows it.
 
 `Tools/Cam/cam_replay.py` holds two halves:
 
@@ -334,8 +334,115 @@ Not started. Ordered so each step is independently verifiable.
    dialog, every sheet replayed one job per sheet. Wired into the Nesting menu
    and toolbar as `Nesting_ReplayCAMSetup`, beside `Nesting_CreateCAMJob` and
    sharing no code with it beyond `freecad_helpers`.
-8. **Mid-complexity fixture + headless replay test.** In progress — the fixture
-   is being built. See "The replay fixture" below for the full spec.
+8. **Mid-complexity fixture + headless replay test.** In progress. The fixture
+   exists and validates; the *read* half of the replay cannot yet see it,
+   because of the dressup structure investigated below. That is step 8's first
+   piece of work.
+9. **Dressup support.** Required before step 8 can pass. See "Dressups" below.
+
+## Dressups
+
+Investigated after the fixture was validated, because the fixture's job could
+not be read at all. Everything here is measured against FreeCAD 26.3's CAM
+module, and several of it contradicts advice given earlier in this work.
+
+### The structure
+
+A job's Operations list is the order of work. A dressup is *layered on* another
+object — a Path operation such as a Profile, or another dressup — and the
+stacked-on object is reached through the dressup's link, not by being listed.
+
+A dressed stack contributes **exactly one entry to the Operations list: the
+outermost dressup.** The objects underneath are not listed.
+
+Verified on FreeCAD's own `dressuptest.FCStd`, which has stacks three deep:
+
+    Operations.Group (4):
+      Profile              (no dressup)
+      LeadInOutDressup     -> Profile001
+      DressupDogbone       -> LeadInOutDressup001 -> Profile002
+      DressupPathBoundary  -> DressupDogbone001 -> LeadInOutDressup002 -> Profile003
+
+and on the replay fixture, which is seven two-object stacks:
+
+    DressupLeadInOut -> Profile,  ... six more, none of the Profiles listed
+
+### Retraction: the addOperation advice was wrong
+
+The fixture's job was reported as "no operations in Operations.Group", with the
+fix given as `job.Proxy.addOperation(doc.getObject('Profile'))` for each.
+
+**That advice was wrong and following it would have broken the job.** The
+Operations list is not supposed to contain the stacked-on object. Adding the
+Profiles produces a list where each contour appears twice, and the post-processor
+emits the list verbatim — measured at 24 cutting moves in the dressup section
+and 20 in the operation section, the same profile cut twice.
+
+The operations were never missing. They sit *underneath* the dressups, and the
+reader only looked at the Operations list. No change to the user's file is
+needed; the defect is entirely in the reader.
+
+Note for the record: a Path operation *is* added to the Operations list when it
+is created — `PathProfile.Create` on its own yields `[Profile]` — so a job
+built by adding operations and then dressing them up ends up listing both. A
+`Profile` that has a dressup on it should not be listed, and the replay will
+drop the redundant entry rather than reproduce it. That concern is to be
+written into the code where the list is built.
+
+### Why the current code fails, in four parts
+
+1. **The reader only sees list entries.** It therefore sees no operations at
+   all in a job whose operations are dressed up. On FreeCAD's own fixture:
+   1 operation, 3 unresolved dressups, 0 attached.
+2. **The writer only recreates a class literally named `ObjectDressup`.** That
+   covers 6 of 10 dressups; Array, Boundary, Tags and Dogbone are reported as
+   "could not recreate".
+3. **Dressups are held as a flat list on the operation,** so a stack two or
+   more deep has nowhere to live.
+4. **The writer adds the dressup with `addOperation(dressup, operation)`,**
+   which leaves the operation in the list — the double-cut state.
+
+### The inventory, and why it needs a table
+
+Ten dressups in four construction patterns, and no common interface:
+
+| pattern | dressups | `Create` headless? |
+|---|---|---|
+| `ObjectDressup(obj, base)` | LeadInOut, Mirror, RampEntry | no — wants a view |
+| `ObjectDressup(obj)`, no base | Dragknife, AxisMap, ZCorrect | no `Create` at all |
+| `(obj, base, job)` | Array, Boundary | yes |
+| `(obj, base)` | Tags, DogboneII | yes, with side-effects: Tags keeps the base listed, Dogbone never adds itself |
+
+Hand-rolling the constructor is not sufficient: Boundary, Dogbone, Dragknife,
+AxisMap and ZCorrect all construct but produce a **0-command path** until their
+own setup runs. So each module's own `Create` is preferred wherever it works
+headless, because it encapsulates the setup.
+
+### Decisions
+
+| question | answer |
+|---|---|
+| Which dressups must work | **LeadInOut and Dogbone** — the two in use. Others only if they come out cheaply; anything unsupported is reported, never dropped. |
+| List shape on write | **Outermost dressup only.** The stacked-on operation is created and linked, but not listed. |
+| Stack depth | **Two or more, from the start.** FreeCAD's own fixture has three and the read walk handles it for free. |
+| Where the layout comes from | The fixture's **SourceShapes** group, which holds 3 analytic `PartDesign::Body` objects (Cylinder and Plane, 2 mm). The test opens the fixture, removes the Job, and builds a CAM setup headless — LeadInOut, Dogbone, and a two-deep stack — so the recipe is built by the same code path the replay uses. |
+
+### The revised pipeline
+
+**Read.** For each entry in the Operations list, walk down through dressups to
+the Path operation at the bottom. That is one *process step*: the operation plus
+its dressups, inner to outer. List order is step order.
+
+**Write.** For each process step, in order:
+
+1. create the operation, point it at the cloned nested geometry, copy settings
+2. for each dressup inner to outer, create a new dressup layered on the
+   previous object and copy its settings
+3. add **only the outermost dressup** to the new job's Operations list — or the
+   operation itself, if the step has no dressups
+
+Step 3 is what guarantees the list shape regardless of what any dressup module
+does to the list itself, and it fixes defect 4.
 
 ## The replay fixture
 
