@@ -678,9 +678,142 @@ def run():
     run_job_checks(doc, flattened, thickness)
 
     run_replay_checks(doc)
+    run_ordering_checks(None)
 
     FreeCAD.closeDocument("replay_ops")
     FreeCAD.closeDocument("replay_flatten")
+
+
+def run_ordering_checks(doc):
+    """Nest a part inside another's hole and check the operation order.
+
+    This is the one case where the replay must NOT simply reproduce the user's
+    order. A plug sitting in a plate's hole is held by the ring of material
+    around it; cut the hole first and the plug falls out, and every operation
+    after that is cutting a loose piece.
+
+    The check builds exactly that, then asserts the plate's hole-cutting
+    operation ends up after the plug's.
+
+    It also asserts the negative: that the footprint test is specific to holes.
+    A part sitting *beside* the plate, not in it, must not read as nested --
+    which is what makes the test a real check rather than a tautology.
+    """
+    thickness = 6.0
+    doc = FreeCAD.newDocument("replay_order")
+
+    plate = doc.addObject("Part::Feature", "Plate")
+    plate_shape = Part.makeBox(80, 80, thickness,
+                               FreeCAD.Vector(-40, -40, -thickness))
+    plate_shape = plate_shape.cut(Part.makeCylinder(
+        25, thickness, FreeCAD.Vector(0, 0, -thickness)))
+    plate.Shape = plate_shape
+
+    plug = doc.addObject("Part::Feature", "Plug")
+    plug.Shape = Part.makeBox(20, 20, thickness, FreeCAD.Vector(-10, -10, -thickness))
+    doc.recompute()
+
+    # -- the footprints, and that the test is specific to holes --
+    plate_fp = cam_replay.part_footprint(plate)
+    plug_fp = cam_replay.part_footprint(plug)
+    check(plate_fp is not None, "no footprint for the plate")
+    check(plug_fp is not None, "no footprint for the plug")
+    if plate_fp is None or plug_fp is None:
+        FreeCAD.closeDocument("replay_order")
+        return
+
+    check(len(plate_fp.interiors) == 1,
+          "expected the plate to have 1 hole, got %d" % len(plate_fp.interiors))
+    check(len(plug_fp.interiors) == 0,
+          "the plug should have no holes")
+
+    # World coordinates: a shape spanning X -40..40 must keep those bounds.
+    # This is the trap that makes the naive approach wrong.
+    check(abs(plate_fp.bounds[0] + 40) < 1.0,
+          "the plate footprint is not in world coordinates: bounds %s"
+          % (tuple(round(v, 1) for v in plate_fp.bounds),))
+
+    nestings = cam_replay.find_hole_nestings([plate, plug])
+    check(nestings == [(plate, plug)],
+          "expected the plug to be found inside the plate's hole, got %d pair(s)"
+          % len(nestings))
+
+    # A part beside the plate, not in it, must not be reported as nested.
+    beside = doc.addObject("Part::Feature", "Beside")
+    beside.Shape = Part.makeBox(20, 20, thickness, FreeCAD.Vector(60, 0, -thickness))
+    doc.recompute()
+    beside_fp = cam_replay.part_footprint(beside)
+    if beside_fp is not None:
+        outside = cam_replay.find_hole_nestings([plate, beside])
+        check(outside == [],
+              "a part beside the plate was wrongly reported as nested in its hole")
+    emit("  nestings found: %d" % len(nestings))
+
+    # -- the operation order, on a real job --
+    from Path.Main import Job as PathJob
+    from Path.Op import Drilling as PathDrilling
+    from Path.Op import Profile as PathProfile
+
+    source_job = PathJob.Create("OrderJob", [plate, plug], None)
+    doc.recompute()
+    model = source_job.Model.Group
+
+    # The plate's hole, as a drilling op; the plate's outline, as a profile.
+    # Created hole-first so the source order is deliberately wrong.
+    plate_drill = PathDrilling.Create("PlateHole", None, source_job)
+    doc.recompute()
+    plate_drill.Base = [(model[0], [""])]
+    plate_drill.ToolController = source_job.Tools.Group[0]
+    doc.recompute()
+
+    plug_profile = PathProfile.Create("PlugOutline", None, source_job)
+    doc.recompute()
+    plug_profile.Base = [(model[1], [""])]
+    plug_profile.Side = "Outside"
+    plug_profile.Direction = "CW"
+    plug_profile.UseComp = True
+    plug_profile.ToolController = source_job.Tools.Group[0]
+    doc.recompute()
+
+    source_order = [o.Label for o in source_job.Operations.Group]
+    emit("  source order: %s" % source_order)
+    check(source_order.index("PlateHole") < source_order.index("PlugOutline"),
+          "the source order was expected to be wrong for this test to mean "
+          "anything, got %s" % source_order)
+
+    # Stand in for the replay: the same two operations, same ownership.
+    replayed_plate_op = plate_drill
+    replayed_plug_op = plug_profile
+    operations = [replayed_plate_op, replayed_plug_op]
+    ownership = {replayed_plate_op: plate, replayed_plug_op: plug}
+
+    ordered = cam_replay.order_operations(
+        source_job, operations, nestings, ownership)
+    new_order = [o.Label for o in ordered]
+    emit("  ordered:      %s" % new_order)
+    check(new_order.index("PlateHole") > new_order.index("PlugOutline"),
+          "the plate's hole must be cut after the plug, got %s" % new_order)
+
+    # -- and the negative: no nestings means no reordering --
+    class _Job:
+        def __init__(self, group):
+            self.Operations = type("_O", (), {"Group": list(group)})()
+
+    untouched = _Job(operations)
+    same = cam_replay.order_operations(untouched, operations, [], ownership)
+    check(same == operations,
+          "with no nestings the order must be left exactly as it was")
+    check(untouched.Operations.Group == operations,
+          "with no nestings the job's group must not be reassigned")
+
+    # -- a cycle must not hang --
+    # Each part treated as nesting inside the other: unsatisfiable.
+    both = [(plate, plug), (plug, plate)]
+    cyclic = cam_replay.order_operations(_Job(operations), operations, both, ownership)
+    check(len(cyclic) == len(operations),
+          "a cyclic constraint dropped operations")
+
+    FreeCAD.closeDocument("replay_order")
 
 
 if __name__ in ("__main__", "test_replay_flatten"):

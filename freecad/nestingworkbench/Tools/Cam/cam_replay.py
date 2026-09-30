@@ -1359,6 +1359,272 @@ def describe_replay_result(result):
     return lines
 
 
+# -- operation ordering ---------------------------------------------------
+#
+# The user's operation order for an individual part is authoritative and is
+# reproduced exactly. The one thing that has to change is the case where a part
+# is nested INSIDE another part's hole: the outer part's hole must be cut
+# *after* everything sitting inside it, or the inner part falls out while
+# still held only by the ring of material around it, and its own operations are
+# then cutting a loose piece.
+#
+# So the rule is a partial order, not a re-sort. Everything else keeps the
+# order the user chose, and the group is only touched when hole nesting
+# actually happened.
+#
+# Detecting the nesting. The nester can place a part inside another's hole --
+# the inner-fit-polygon rings are in the production candidate path
+# (minkowski_engine.get_incremental_candidates) -- but it records nothing about
+# which part went into which hole, so the relationship is recovered from the
+# finished layout: a part is inside another's hole when its footprint is
+# contained in one of that part's interior rings.
+#
+# A trap worth naming: this must NOT be done with
+# `shape_processor.get_2d_profile_from_obj`. That returns a polygon *centred
+# on the shape*, not in world coordinates. Measured: a shape spanning
+# X 100..120 yields a profile spanning -10..10. Comparing that against world
+# positions gives a confident wrong answer -- a part sitting well outside a
+# hole reads as inside it. `part_footprint` below slices the shape instead and
+# keeps world coordinates, so the two polygons are in the same frame.
+
+# Z fraction at which a footprint is taken. Mid-thickness, so a part with a
+# step or a boss on one face is still measured through its main body.
+FOOTPRINT_Z_FRACTION = 0.5
+
+
+def part_footprint(part, z_fraction=FOOTPRINT_Z_FRACTION):
+    """Return a Shapely Polygon of `part`'s footprint in WORLD coordinates.
+
+    Slices the shape at `z_fraction` of its own height and turns the resulting
+    closed wires into a polygon: the longest wire is the outer boundary, the
+    rest are holes.
+
+    Returns None when the slice yields nothing usable, or when Shapely is
+    unavailable. Callers treat None as "cannot tell" and fall back to the
+    conservative ordering rather than assuming no hole nesting.
+
+    Note this deliberately does not reuse `get_2d_profile_from_obj`, which
+    centres its output -- see the note above the function.
+    """
+    try:
+        from shapely.geometry import Polygon
+    except ImportError:
+        return None
+
+    shape = getattr(part, "Shape", None)
+    if shape is None or shape.isNull():
+        return None
+
+    box = shape.BoundBox
+    height = box.ZMax - box.ZMin
+    if height <= 1e-9:
+        return None
+    z = box.ZMin + height * float(z_fraction)
+
+    try:
+        wires = shape.slice(FreeCAD.Vector(0, 0, 1), z)
+    except Exception:
+        return None
+    if not wires:
+        return None
+
+    rings = []
+    for wire in wires:
+        try:
+            points = wire.discretize(Deflection=0.05)
+        except TypeError:
+            try:
+                points = wire.discretize(Number=64)
+            except Exception:
+                continue
+        except Exception:
+            continue
+        if points and len(points) >= 3:
+            rings.append(Polygon([(p.x, p.y) for p in points]))
+
+    if not rings:
+        return None
+    rings.sort(key=lambda p: p.area, reverse=True)
+    outer = rings[0]
+    holes = [r for r in rings[1:] if r.area > 0 and outer.contains(r)]
+    if not holes:
+        return outer
+    try:
+        return Polygon(outer.exterior.coords, [h.exterior.coords for h in holes])
+    except Exception:
+        return outer
+
+
+def find_hole_nestings(parts):
+    """Return `(outer, inner)` pairs where `inner` sits inside `outer`'s hole.
+
+    A part counts as nested in a hole when its footprint is contained in one of
+    the other part's interior rings. Containment rather than intersection,
+    because a part merely overlapping another is the normal case in a nest and
+    says nothing about ordering.
+
+    Only interior rings count. A part lying within another's *outer* boundary
+    would be overlapping material, which the nester does not produce.
+
+    Returns an empty list when Shapely is unavailable, so ordering degrades to
+    the user's own order rather than failing.
+    """
+    footprints = []
+    for part in parts:
+        footprint = part_footprint(part)
+        if footprint is not None:
+            footprints.append((part, footprint))
+
+    nestings = []
+    for outer, outer_fp in footprints:
+        if not outer_fp.interiors:
+            continue
+        for inner, inner_fp in footprints:
+            if inner is outer:
+                continue
+            for ring in outer_fp.interiors:
+                try:
+                    from shapely.geometry import Polygon
+                    if Polygon(ring.coords).contains(inner_fp):
+                        nestings.append((outer, inner))
+                        break
+                except Exception:
+                    continue
+    return nestings
+
+
+def operation_touches_hole(operation, part):
+    """Return True if `operation` would cut one of `part`'s holes.
+
+    Conservative by design: returns True when it cannot tell, including for a
+    whole-object selection where internal and external cutting are not
+    separable. An operation wrongly assumed to miss the hole would be ordered
+    before the parts it holds, which is the failure this exists to prevent, and
+    it is a silent one.
+
+    A specific sub-selection is judged by where its elements sit: an element
+    whose centre falls inside a hole ring is a hole feature.
+    """
+    base = getattr(operation, "Base", None)
+    if not base or not isinstance(base, (list, tuple)):
+        return True
+
+    geometry = None
+    subs = []
+    for item in base:
+        try:
+            geometry, subs_for_item = item
+        except (TypeError, ValueError):
+            return True
+        subs.extend(subs_for_item if isinstance(subs_for_item, (list, tuple))
+                    else [subs_for_item])
+    if geometry is None:
+        return True
+    if not subs or "" in subs:
+        return True
+
+    try:
+        from shapely.geometry import Point, Polygon
+    except ImportError:
+        return True
+
+    footprint = part_footprint(geometry)
+    if footprint is None:
+        return True
+    if not footprint.interiors:
+        # No holes to cut, so nothing can be a hole feature.
+        return False
+
+    for name in subs:
+        if not name:
+            return True
+        try:
+            element = geometry.Shape.getElement(name)
+        except Exception:
+            return True
+        try:
+            centre = element.CenterOfMass
+        except Exception:
+            return True
+        point = Point(centre.x, centre.y)
+        for ring in footprint.interiors:
+            if Polygon(ring.coords).contains(point):
+                return True
+    return False
+
+
+def order_operations(job, operations, nestings, ownership=None):
+    """Reorder `job`'s Operations.Group so hole nesting is respected.
+
+    `operations` is the replayed operations in recipe order -- the user's own
+    order. `nestings` is the `(outer, inner)` pairs from
+    `find_hole_nestings`. `ownership` maps an operation to the part it cuts,
+    needed to tell which side of a nesting it belongs to.
+
+    Returns the new order. When there are no nestings, or nothing is out of
+    order, the group is left alone entirely -- a run that does not need
+    reordering should not churn the document.
+
+    The sort is a topological sort that breaks ties by the original order, so
+    the user's sequence is preserved wherever the constraints allow it. That is
+    the whole point: the replay reproduces what the user set up, and only moves
+    what physically has to move.
+    """
+    group = getattr(getattr(job, "Operations", None), "Group", None)
+    if not group or not nestings or not operations:
+        return list(operations)
+
+    by_part = ownership or {}
+    part_of = {}
+    for operation, part in by_part.items():
+        part_of[id(operation)] = part
+
+    # Constraint: for each nesting, every hole-cutting op on `outer` must come
+    # after every op that cuts `inner`.
+    later_than = {id(op): set() for op in operations}
+    has_constraint = False
+    for outer, inner in nestings:
+        outer_ops = [op for op in operations
+                     if part_of.get(id(op)) is outer and operation_touches_hole(op, outer)]
+        inner_ops = [op for op in operations if part_of.get(id(op)) is inner]
+        if not outer_ops or not inner_ops:
+            continue
+        for op in outer_ops:
+            for other in inner_ops:
+                if id(op) != id(other):
+                    later_than[id(op)].add(id(other))
+                    has_constraint = True
+
+    if not has_constraint:
+        return list(operations)
+
+    # Stable topological sort, preferring the original order at every step.
+    order = list(operations)
+    position = {id(op): i for i, op in enumerate(order)}
+    remaining = list(order)
+    ordered = []
+    placed = set()
+    while remaining:
+        # An operation is ready when everything it must follow is already
+        # placed. Ops with no dependencies are ready, since all() of an empty
+        # set is True.
+        ready = [op for op in remaining
+                 if all(dep in placed for dep in later_than[id(op)])]
+        if not ready:
+            # A cycle: the constraints cannot all hold. Keep the user's order
+            # for the rest rather than looping, and say so.
+            ordered.extend(remaining)
+            break
+        chosen = min(ready, key=lambda op: position[id(op)])
+        ordered.append(chosen)
+        placed.add(id(chosen))
+        remaining.remove(chosen)
+
+    if group is not None and ordered != list(group):
+        job.Operations.Group = ordered
+    return ordered
+
+
 def describe_recipe(recipe):
     """Return a human-readable summary of `recipe` for the report view.
 

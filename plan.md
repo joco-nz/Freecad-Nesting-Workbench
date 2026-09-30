@@ -16,7 +16,7 @@ feature does not classify anything. It reads a recipe and applies it.
 
 ## Status
 
-**Steps 1-4 done. Steps 5-7 not started.**
+**Steps 1-5 done. Steps 6-7 not started.**
 
 `Tools/Cam/cam_replay.py` holds two halves:
 
@@ -28,8 +28,10 @@ feature does not classify anything. It reads a recipe and applies it.
   parts can only be checked under `freecadcmd`;
 - the **replay** (step 4) — recreates the user's operations and dressups.
 
-- 313 pytest tests passing (32 new for step 4).
-- `tests/freecad_harness/test_replay_flatten.py`: 125 checks, 0 failures.
+- the **ordering** (step 5) — a partial order over the replayed operations.
+
+- 331 pytest tests passing (18 new for step 5).
+- `tests/freecad_harness/test_replay_flatten.py`: 137 checks, 0 failures.
   The end-to-end replay is now exercised on a real two-part-type job: a Profile
   on the top face with a LeadInOut dressup, plus a Drilling op, replayed into a
   nest of 2 brackets and 1 spacer. The replayed Profile cuts 289.11 mm against
@@ -39,6 +41,22 @@ feature does not classify anything. It reads a recipe and applies it.
   `Cylinder` out, no `BSplineSurface`), edge count and every per-edge length
   unchanged, placement is `container * child` in that order, Z normalised to
   `-thickness..0`, and the offset idempotent.
+
+Two findings from step 5:
+
+- **`get_2d_profile_from_obj` returns a polygon *centred on the shape*, not in
+  world coordinates.** Measured: a shape spanning X 100..120 yields a profile
+  spanning -10..10. Using it for the containment test would have reported a
+  part sitting well outside a hole as being inside it — a confident wrong
+  answer. `part_footprint` slices the shape instead and keeps world
+  coordinates, so both polygons are in the same frame.
+
+- **The nester can place parts in holes but records nothing about it.** The
+  inner-fit-polygon rings are in the production candidate path
+  (`minkowski_engine.get_incremental_candidates`), so hole nesting happens, but
+  no relationship is stored on the part. The nesting is therefore recovered
+  from the finished layout, by testing whether a part's footprint is contained
+  in another part's interior ring.
 
 One finding from step 3:
 
@@ -261,7 +279,12 @@ Not started. Ordered so each step is independently verifiable.
 4. ~~Op replay.~~ **Done.** Two passes, tool controller **copied** into the new
    job with `copyTC`, `Base` re-pointed at the matching copies, every
    sub-element name resolved against the target before assignment.
-5. Ordering. Internals before perimeters via `job.Operations.Group`.
+5. ~~Ordering.~~ **Done.** The user's order is reproduced exactly. The one
+   exception is hole nesting: a part placed inside another's hole is held by
+   the ring around it, so the outer part's hole must be cut after everything
+   inside it. Implemented as a stable topological sort that only moves what
+   physically has to move, and leaves `Operations.Group` untouched when no
+   nesting occurred.
 6. Verification and reporting. Non-empty assertion per op; Z frame check as a
    **warning**.
 7. `commands/command_replay_cam.py` — command, dialog, selection validation.

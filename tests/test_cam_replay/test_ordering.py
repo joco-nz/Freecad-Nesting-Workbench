@@ -1,0 +1,258 @@
+"""Tests for the hole-nesting operation order.
+
+Background
+----------
+The user's own operation order for a part is authoritative and is reproduced
+exactly. There is one exception, and it is physical rather than editorial: when
+a part is nested *inside* another part's hole, the outer part's hole must be
+cut after everything sitting inside it. Cut the hole first and the inner part
+falls out — it is held only by the ring of material around it — and every
+operation after that point is cutting a loose piece.
+
+So the rule is a partial order, not a re-sort. Everything else keeps the order
+the user chose, and the group is not touched at all unless hole nesting
+actually happened.
+
+The detection is a trap worth knowing about. It must not be done with
+`shape_processor.get_2d_profile_from_obj`, which returns a polygon *centred on
+the shape* rather than in world coordinates: a shape spanning X 100..120 yields
+a profile spanning -10..10. Comparing that against world positions gives a
+confident wrong answer — a part sitting well outside a hole reads as inside it.
+`part_footprint` slices the shape instead and keeps world coordinates.
+"""
+import pytest
+
+from freecad.nestingworkbench.Tools.Cam import cam_replay
+from freecad.nestingworkbench.Tools.Cam.cam_replay import (
+    find_hole_nestings,
+    operation_touches_hole,
+    order_operations,
+    part_footprint,
+)
+
+
+# -- ordering -------------------------------------------------------------
+
+class _Operation:
+    def __init__(self, label, base=None):
+        self.Label = label
+        self.Base = base if base is not None else []
+
+
+class _Part:
+    def __init__(self, label, footprint=None):
+        self.Label = label
+        self._footprint = footprint
+
+
+class _Job:
+    def __init__(self, group):
+        self.Operations = type("_O", (), {"Group": list(group)})()
+
+
+def _hole_fp(outer_bounds, hole_bounds):
+    from shapely.geometry import Polygon
+    x0, y0, x1, y1 = outer_bounds
+    hx0, hy0, hx1, hy1 = hole_bounds
+    return Polygon([(x0, y0), (x1, y0), (x1, y1), (x0, y1)],
+                   [[(hx0, hy0), (hx1, hy0), (hx1, hy1), (hx0, hy1)]])
+
+
+def _plain_fp(bounds):
+    from shapely.geometry import Polygon
+    x0, y0, x1, y1 = bounds
+    return Polygon([(x0, y0), (x1, y0), (x1, y1), (x0, y1)])
+
+
+def test_reorders_so_the_hole_is_cut_after_what_it_holds(monkeypatch):
+    plate = _Part("Plate")
+    plug = _Part("Plug")
+    hole_op = _Operation("PlateHole")
+    plug_op = _Operation("PlugOutline")
+    # Whole-object selections, so both are conservatively hole-cutting.
+    monkeypatch.setattr(cam_replay, "operation_touches_hole", lambda *a: True)
+
+    nestings = [(plate, plug)]
+    ownership = {hole_op: plate, plug_op: plug}
+    ordered = order_operations(_Job([hole_op, plug_op]),
+                               [hole_op, plug_op], nestings, ownership)
+    assert [o.Label for o in ordered] == ["PlugOutline", "PlateHole"]
+
+
+def test_leaves_the_group_alone_without_nestings(monkeypatch):
+    a, b = _Operation("A"), _Operation("B")
+    job = _Job([a, b])
+    monkeypatch.setattr(cam_replay, "operation_touches_hole", lambda *a: True)
+    ordered = order_operations(job, [a, b], [], {a: _Part("x"), b: _Part("y")})
+    assert ordered == [a, b]
+    assert job.Operations.Group == [a, b]
+
+
+def test_leaves_the_group_alone_when_nothing_is_hole_cutting(monkeypatch):
+    a, b = _Operation("A"), _Operation("B")
+    job = _Job([a, b])
+    monkeypatch.setattr(cam_replay, "operation_touches_hole", lambda *a: False)
+    ordered = order_operations(job, [a, b], [(_Part("x"), _Part("y"))],
+                               {a: _Part("x"), b: _Part("y")})
+    assert ordered == [a, b]
+    assert job.Operations.Group == [a, b]
+
+
+def test_preserves_the_user_order_where_the_constraints_allow(monkeypatch):
+    """The user's sequence survives wherever nothing forces a move.
+
+    Three operations on the outer part, one on the inner. Only the two that
+    cut the hole have to move behind the inner operation; the third, which
+    does not touch the hole, keeps its place.
+    """
+    outer, inner = _Part("Outer"), _Part("Inner")
+    perimeter = _Operation("Perimeter")     # does not cut the hole
+    hole_b = _Operation("HoleB")
+    hole_c = _Operation("HoleC")
+    inner_op = _Operation("InnerCut")
+
+    monkeypatch.setattr(
+        cam_replay, "operation_touches_hole",
+        lambda op, part: op.Label in ("HoleB", "HoleC"))
+
+    operations = [perimeter, hole_b, hole_c, inner_op]
+    ownership = {perimeter: outer, hole_b: outer, hole_c: outer, inner_op: inner}
+    ordered = order_operations(_Job(operations), operations,
+                               [(outer, inner)], ownership)
+    labels = [o.Label for o in ordered]
+
+    assert labels.index("InnerCut") < labels.index("HoleB")
+    assert labels.index("InnerCut") < labels.index("HoleC")
+    # The perimeter is unconstrained, so it stays first where the user put it.
+    assert labels[0] == "Perimeter"
+
+
+def test_terminates_on_a_cycle(monkeypatch):
+    # Each part nesting inside the other is unsatisfiable; the sort must not
+    # loop and must not drop operations.
+    a, b = _Operation("A"), _Operation("B")
+    monkeypatch.setattr(cam_replay, "operation_touches_hole", lambda *a: True)
+    pa, pb = _Part("A"), _Part("B")
+    ordered = order_operations(_Job([a, b]), [a, b], [(pa, pb), (pb, pa)],
+                               {a: pa, b: pb})
+    assert len(ordered) == 2
+
+
+def test_handles_an_empty_job():
+    assert order_operations(_Job([]), [], [], {}) == []
+
+
+def test_handles_a_job_with_no_operations_group(monkeypatch):
+    # No group to reorder: returns the input rather than raising.
+    monkeypatch.setattr(cam_replay, "operation_touches_hole", lambda *a: True)
+    job = type("_J", (), {"Operations": None})()
+    a = _Operation("A")
+    assert order_operations(job, [a], [(_Part("x"), _Part("y"))], {}) == [a]
+
+
+# -- hole detection -------------------------------------------------------
+
+class TestFindHoleNestings:
+    def test_finds_a_part_inside_a_hole(self, monkeypatch):
+        plate = _Part("Plate")
+        plug = _Part("Plug")
+        monkeypatch.setattr(cam_replay, "part_footprint", lambda p, **k: {
+            "Plate": _hole_fp((-40, -40, 40, 40), (-25, -25, 25, 25)),
+            "Plug": _plain_fp((-10, -10, 10, 10)),
+        }[p.Label])
+        assert find_hole_nestings([plate, plug]) == [(plate, plug)]
+
+    def test_ignores_a_part_beside_the_hole(self, monkeypatch):
+        plate = _Part("Plate")
+        beside = _Part("Beside")
+        monkeypatch.setattr(cam_replay, "part_footprint", lambda p, **k: {
+            "Plate": _hole_fp((-40, -40, 40, 40), (-25, -25, 25, 25)),
+            # Outside the hole entirely: X 50..70.
+            "Beside": _plain_fp((50, -10, 70, 10)),
+        }[p.Label])
+        assert find_hole_nestings([plate, beside]) == []
+
+    def test_does_not_report_a_part_as_nested_in_itself(self, monkeypatch):
+        plate = _Part("Plate")
+        monkeypatch.setattr(cam_replay, "part_footprint", lambda p, **k:
+                            _hole_fp((-40, -40, 40, 40), (-25, -25, 25, 25)))
+        assert find_hole_nestings([plate]) == []
+
+    def test_a_part_with_no_holes_never_hosts(self, monkeypatch):
+        solid = _Part("Solid")
+        plug = _Part("Plug")
+        monkeypatch.setattr(cam_replay, "part_footprint", lambda p, **k: {
+            "Solid": _plain_fp((-40, -40, 40, 40)),
+            "Plug": _plain_fp((-10, -10, 10, 10)),
+        }[p.Label])
+        assert find_hole_nestings([solid, plug]) == []
+
+    def test_skips_parts_with_no_footprint(self, monkeypatch):
+        plate = _Part("Plate")
+        unknown = _Part("Unknown")
+        monkeypatch.setattr(cam_replay, "part_footprint", lambda p, **k:
+                            _hole_fp((-40, -40, 40, 40), (-25, -25, 25, 25))
+                            if p is plate else None)
+        assert find_hole_nestings([plate, unknown]) == []
+
+    def test_empty_input(self):
+        assert find_hole_nestings([]) == []
+
+
+# -- hole-cutting classification ----------------------------------------
+
+class TestOperationTouchesHole:
+    def test_a_whole_object_selection_is_conservatively_a_hole(self, monkeypatch):
+        # Internal and external cutting are not separable, and assuming it
+        # misses the hole is the silent failure this guards against.
+        part = _Part("Plate")
+        monkeypatch.setattr(cam_replay, "part_footprint", lambda p, **k: None)
+        op = _Operation("P", [(part, [""])])
+        assert operation_touches_hole(op, part) is True
+
+    def test_no_base_is_conservatively_a_hole(self, monkeypatch):
+        part = _Part("Plate")
+        monkeypatch.setattr(cam_replay, "part_footprint", lambda p, **k: None)
+        assert operation_touches_hole(_Operation("P"), part) is True
+
+    def test_a_part_with_no_holes_cannot_be_cut_in_one(self, monkeypatch):
+        part = _Part("Solid")
+        monkeypatch.setattr(cam_replay, "part_footprint", lambda p, **k:
+                            _plain_fp((-40, -40, 40, 40)))
+        op = _Operation("P", [(part, ["Face1"])])
+        assert operation_touches_hole(op, part) is False
+
+    def test_an_unresolvable_sub_element_is_conservatively_a_hole(self, monkeypatch):
+        part = _Part("Plate")
+        # A footprint WITH a hole, so the test reaches the sub-element lookup
+        # rather than short-circuiting on "this part has no holes".
+        monkeypatch.setattr(
+            cam_replay, "part_footprint", lambda p, **k:
+            _hole_fp((-40, -40, 40, 40), (-25, -25, 25, 25)))
+
+        class _Broken:
+            @property
+            def Shape(self):
+                raise Exception("no shape")
+
+        op = _Operation("P", [(_Broken(), ["Face1"])])
+        assert operation_touches_hole(op, part) is True
+
+    def test_a_sub_element_inside_a_hole_counts(self, monkeypatch):
+        part = _Part("Plate")
+        monkeypatch.setattr(
+            cam_replay, "part_footprint", lambda p, **k:
+            _hole_fp((-40, -40, 40, 40), (-25, -25, 25, 25)))
+
+        class _Element:
+            def __init__(self, x, y):
+                self.CenterOfMass = type("_C", (), {"x": x, "y": y})()
+
+        class _Geometry:
+            class Shape:
+                @staticmethod
+                def getElement(name):  # noqa: N802
+                    return _Element(0.0, 0.0)   # dead centre, inside the hole
+
+        op = _Operation("P", [(_Geometry(), ["Face7"])])
+        assert operation_touches_hole(op, part) is True
