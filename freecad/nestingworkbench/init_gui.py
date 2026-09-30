@@ -35,14 +35,22 @@ class NestingWorkbench(FreeCADGui.Workbench):
         from freecad.nestingworkbench.commands import command_manual_nester
         from freecad.nestingworkbench.commands import command_export_sheets
         from freecad.nestingworkbench.commands import command_create_cam_job
+        from freecad.nestingworkbench.commands import command_replay_cam
         from freecad.nestingworkbench.commands import command_create_silhouette
         # Create Menu (Dropdown)
+        #
+        # Replay sits next to Create CAM Job rather than inside it. They are
+        # different operations -- one builds a job from a template, the other
+        # applies the user's own CAM setup to a nest -- and keeping them as
+        # separate entries is what lets the replay stay independent of that
+        # command, which is somebody else's work.
         self.appendMenu(["Nesting"], [
             'Nesting_Run',
             'Nesting_StackSheets',
             'Nesting_ManualNester',
             'Nesting_Export',
             'Nesting_CreateCAMJob',
+            'Nesting_ReplayCAMSetup',
             'Nesting_CreateSilhouette'
         ])
         self.appendToolbar("Nesting", [
@@ -51,6 +59,7 @@ class NestingWorkbench(FreeCADGui.Workbench):
             'Nesting_ManualNester',
             'Nesting_Export',
             'Nesting_CreateCAMJob',
+            'Nesting_ReplayCAMSetup',
             'Nesting_CreateSilhouette'
         ])
 

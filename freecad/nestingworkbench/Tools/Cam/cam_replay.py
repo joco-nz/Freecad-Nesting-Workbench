@@ -1791,6 +1791,39 @@ def uncovered_targets(operation, margin=COVERAGE_MARGIN_MM):
     return uncovered
 
 
+def parts_outside_stock(clones, stock, tolerance=1e-6):
+    """Return the labels of parts that do not lie within the stock.
+
+    Not approximate, and not a warning. A part outside the stock means the
+    toolpath runs off the material, which is a scrapped part and possibly a
+    crashed tool.
+
+    This check exists because the pipeline got it wrong during development: a
+    sheet whose parts were never moved to local coordinates kept their world X
+    offsets, left the sheet, and every other check still passed. The coverage
+    check looked at whether the toolpath reached its targets and it did --
+    the targets were simply in the wrong place.
+    """
+    shape = getattr(stock, "Shape", None)
+    if shape is None or shape.isNull():
+        return []
+    bounds = shape.BoundBox
+
+    outside = []
+    for clone in clones:
+        shape = getattr(clone, "Shape", None)
+        if shape is None or shape.isNull():
+            continue
+        part = shape.BoundBox
+        inside = (part.XMin >= bounds.XMin - tolerance
+                  and part.XMax <= bounds.XMax + tolerance
+                  and part.YMin >= bounds.YMin - tolerance
+                  and part.YMax <= bounds.YMax + tolerance)
+        if not inside:
+            outside.append(getattr(clone, "Label", "?"))
+    return outside
+
+
 class Verification:
     """The outcome of checking a replayed job.
 
@@ -1815,18 +1848,30 @@ class Verification:
         )
 
 
-def verify_replay(result, extra_warnings=()):
+def verify_replay(result, extra_warnings=(), clones=None, stock=None):
     """Check a `ReplayResult` and return a `Verification`.
 
     `extra_warnings` carries things the caller already knows, such as the Z
     frame comparison from the job builder, so everything an operator needs to
-    see arrives in one place.
+    see arrives in one place. `clones` and `stock`, when given, enable the
+    containment check.
 
-    Fails on any replayed operation with no cutting motion. Warns on any
-    operation whose toolpath does not reach all the parts it targets, and on
-    any unresolved sub-element from the replay itself.
+    Fails on any replayed operation with no cutting motion, and on any part
+    that does not lie within the stock. Warns on any operation whose toolpath
+    does not reach all the parts it targets, and on any unresolved
+    sub-element from the replay itself.
     """
     verification = Verification()
+
+    if clones and stock is not None:
+        stray = parts_outside_stock(clones, stock)
+        if stray:
+            verification.failures.append(
+                "%d part(s) lie outside the stock (%s). The toolpath would run "
+                "off the material. This usually means a sheet's parts were not "
+                "moved to local coordinates -- check the sheet's origin."
+                % (len(stray), ", ".join(sorted(stray)[:5]))
+            )
 
     for operation in result.operations:
         verification.operations_checked += 1
@@ -1888,6 +1933,291 @@ def describe_verification(verification):
             "%d of %d operation(s) produced cutting motion."
             % (verification.operations_with_motion, verification.operations_checked)
         )
+    return lines
+
+
+# -- orchestration --------------------------------------------------------
+#
+# The pipeline, in one place: flatten a sheet, build a job, replay the recipe
+# into it, order the operations, verify. The command layer above this only
+# chooses options and reports.
+
+# Appended to a job's label when verification fails. The job is kept rather
+# than deleted -- you asked to be able to dig into what went wrong -- but a
+# half-built job left under a plausible name is the kind of thing someone
+# later mistakes for a working one. The label says so.
+UNVERIFIED_SUFFIX = "_UNVERIFIED"
+
+
+def is_cam_job(obj):
+    """Return True if `obj` looks like a FreeCAD CAM job.
+
+    A job is a `Path::FeaturePython` carrying an `Operations` group, a `Model`
+    group and a `Stock`. Checking for the three is more robust than checking
+    the proxy class, which differs between FreeCAD versions and between the
+    App-level and GUI-level constructors.
+    """
+    if obj is None:
+        return False
+    if not obj.isDerivedFrom("Path::Feature"):
+        return False
+    return all(hasattr(obj, attr) for attr in ("Operations", "Model", "Stock"))
+
+
+def resolve_layout_group(doc, strict=False):
+    """Return `(layout_group, warnings)` for `doc`.
+
+    Uses the shared `get_layout_group` helper, which prefers `__temp_Layout`
+    and otherwise takes the most recent `Layout_*` group. That is the
+    auto-detection the existing CAM command's selection check points at.
+
+    The ambiguity is worth surfacing rather than resolving silently. A document
+    can hold several layout groups -- the GA creates one per layout and renames
+    the winner, and `__temp_Layout` is a separate temporary -- so "the most
+    recent" is a guess whenever more than one exists. The guess is reported
+    with the candidates, because picking the wrong layout means replaying
+    somebody else's nest and calling it a success.
+
+    `strict` turns the ambiguity into a hard stop by returning None, for a
+    caller that would rather ask than guess.
+    """
+    from ...freecad_helpers import get_layout_group
+
+    warnings = []
+    candidates = [obj for obj in getattr(doc, "Objects", ())
+                  if obj.isDerivedFrom("App::DocumentObjectGroup")
+                  and obj.Label.startswith("Layout_")]
+    candidates += [obj for obj in getattr(doc, "Objects", ())
+                   if obj.isDerivedFrom("App::DocumentObjectGroup")
+                   and obj.Label.startswith("__temp_Layout")]
+
+    if len(candidates) > 1:
+        names = sorted(obj.Label for obj in candidates)
+        message = (
+            "%d layout group(s) are present in this document (%s). Using "
+            "%s. Select a specific layout if this is not the one you meant."
+            % (len(candidates), ", ".join(names),
+               "the most recent" if not strict else "none")
+        )
+        if strict:
+            return None, [message]
+        warnings.append(message)
+
+    return get_layout_group(doc), warnings
+
+
+class SheetOutcome:
+    """Everything that happened to one sheet."""
+
+    def __init__(self, sheet_group, replay_job=None, result=None,
+                 verification=None, ordering=None, errors=None):
+        self.sheet_group = sheet_group
+        self.replay_job = replay_job
+        self.result = result
+        self.verification = verification
+        self.ordering = ordering or []
+        self.errors = errors or []
+
+    @property
+    def ok(self):
+        return not self.errors and (self.verification is None or self.verification.ok)
+
+    @property
+    def sheet_label(self):
+        return getattr(self.sheet_group, "Label", "?")
+
+    def __repr__(self):
+        return "<SheetOutcome %s ok=%s>" % (self.sheet_label, self.ok)
+
+
+def replay_sheet(doc, layout_group, sheet_group, source_job, post_processor=None,
+                 template_path=None, job_factory=None):
+    """Run the whole pipeline for one sheet.
+
+    Returns a `SheetOutcome`. Nothing is deleted on failure: an operator asked
+    to be able to dig into a bad run needs the job still there to look at, and
+    the verification failure says so loudly in the report.
+
+    The order is fixed and each stage depends on the previous one:
+
+      1. read the recipe from the source job, once per run rather than per
+         sheet -- every sheet machines the same parts, so the recipe is the
+         same and the geometry is not;
+      2. flatten the sheet's nested containers;
+      3. build a job sized to the sheet;
+      4. replay the recipe into that job;
+      5. order the operations for hole nesting;
+      6. verify.
+    """
+    outcome = SheetOutcome(sheet_group)
+    if sheet_group is None:
+        outcome.errors.append("No sheet to replay.")
+        return outcome
+
+    _width, _height, thickness = read_sheet_dimensions(layout_group)
+
+    try:
+        recipe = read_recipe(source_job)
+    except Exception as exc:
+        outcome.errors.append("Could not read the recipe from %s: %s"
+                              % (getattr(source_job, "Label", "the job"), exc))
+        return outcome
+
+    if not len(recipe):
+        outcome.errors.append(
+            "%s has no operations, so there is nothing to replay."
+            % getattr(source_job, "Label", "The source job")
+        )
+        return outcome
+
+    try:
+        flattened = flatten_sheet(doc, sheet_group, thickness)
+    except Exception as exc:
+        outcome.errors.append("Could not flatten %s: %s" % (outcome.sheet_label, exc))
+        return outcome
+
+    if not len(flattened):
+        outcome.errors.append(
+            "%s yielded no parts to cut. Run nesting for this layout first."
+            % outcome.sheet_label
+        )
+        return outcome
+
+    try:
+        replay = create_replay_job(
+            doc, layout_group, sheet_group, flattened.parts,
+            source_job=source_job, post_processor=post_processor,
+            template_path=template_path, job_factory=job_factory,
+        )
+    except Exception as exc:
+        outcome.errors.append("Could not create a job for %s: %s"
+                              % (outcome.sheet_label, exc))
+        return outcome
+
+    if replay is None:
+        outcome.errors.append("Could not create a job for %s." % outcome.sheet_label)
+        return outcome
+    outcome.replay_job = replay
+
+    try:
+        result = replay_recipe(recipe, replay.job, replay.clones)
+    except Exception as exc:
+        outcome.errors.append("Could not replay into %s: %s" % (outcome.sheet_label, exc))
+        return outcome
+    outcome.result = result
+    outcome.errors.extend(result.failures)
+
+    # Ordering needs to know which part each replayed operation cuts, so each
+    # op is attributed to the part its first base entry points at.
+    try:
+        nestings = find_hole_nestings(replay.clones)
+        if nestings:
+            ownership = {}
+            for op in result.operations:
+                base = getattr(op, "Base", None)
+                if base and isinstance(base, (list, tuple)):
+                    try:
+                        ownership[op] = base[0][0]
+                    except (TypeError, IndexError):
+                        pass
+            before = [getattr(o, "Label", "?") for o in result.operations]
+            ordered = order_operations(replay.job, result.operations, nestings, ownership)
+            after = [getattr(o, "Label", "?") for o in ordered]
+            if before != after:
+                outcome.ordering.append(
+                    "%s: reordered for hole nesting, %s -> %s"
+                    % (outcome.sheet_label, " then ".join(before),
+                       " then ".join(after))
+                )
+    except Exception as exc:
+        outcome.errors.append(
+            "Could not order the operations for %s: %s" % (outcome.sheet_label, exc)
+        )
+
+    doc.recompute()
+
+    try:
+        verification = verify_replay(result, replay.warnings,
+                                    clones=replay.clones, stock=replay.stock)
+    except Exception as exc:
+        outcome.errors.append("Could not verify %s: %s" % (outcome.sheet_label, exc))
+        return outcome
+    outcome.verification = verification
+
+    if not outcome.ok:
+        _mark_unverified(replay, outcome)
+
+    return outcome
+
+
+def _mark_unverified(replay, outcome):
+    """Label a job that did not replay cleanly, and say so loudly.
+
+    Runs on *any* failure, not only a failed verification. An operation that
+    could not be replayed at all -- because its sub-element selection did not
+    survive the move to the nested geometry -- leaves a job that cuts less than
+    the source, and that is exactly as dangerous as a job whose operations
+    produce no motion. The first version of this only labelled on a
+    verification failure, and a real replay failure slipped through unlabelled.
+
+    The job is kept either way. Deleting the evidence would be the wrong
+    instinct: the point of keeping it is that the failure can be investigated.
+    """
+    job = replay.job
+    try:
+        if not job.Label.endswith(UNVERIFIED_SUFFIX):
+            job.Label = "%s%s" % (job.Label, UNVERIFIED_SUFFIX)
+    except Exception:
+        pass
+    reasons = []
+    if outcome.verification is not None and not outcome.verification.ok:
+        reasons.append("%d verification failure(s)"
+                       % len(outcome.verification.failures))
+    if outcome.errors:
+        reasons.append("%d replay error(s)" % len(outcome.errors))
+    FreeCAD.Console.PrintError(
+        "%s did not replay cleanly (%s) and is left in the document, labelled "
+        "%s, for inspection. Nothing should be posted from it.\n"
+        % (outcome.sheet_label, ", ".join(reasons) or "unknown reason",
+           getattr(job, "Label", "?"))
+    )
+
+
+def replay_layout(doc, layout_group, source_job, post_processor=None,
+                  template_path=None, job_factory=None):
+    """Replay `source_job` onto every sheet of `layout_group`.
+
+    Returns a list of `SheetOutcome`, one per sheet. A sheet that fails does
+    not stop the others: they are independent jobs and one bad sheet should not
+    hide a good one.
+    """
+    from ...freecad_helpers import get_sheet_groups
+
+    outcomes = []
+    for sheet in get_sheet_groups(layout_group):
+        outcomes.append(replay_sheet(
+            doc, layout_group, sheet, source_job,
+            post_processor=post_processor, template_path=template_path,
+            job_factory=job_factory,
+        ))
+    return outcomes
+
+
+def describe_sheet_outcome(outcome):
+    """Return a human-readable report for one `SheetOutcome`."""
+    lines = ["%s:" % outcome.sheet_label]
+    if outcome.replay_job is not None:
+        lines.extend("  " + line for line in describe_replay_job(outcome.replay_job))
+    if outcome.result is not None:
+        lines.extend("  " + line for line in describe_replay_result(outcome.result))
+    if outcome.verification is not None:
+        lines.extend("  " + line for line in describe_verification(outcome.verification))
+    for note in outcome.ordering:
+        lines.append("  %s" % note)
+    for error in outcome.errors:
+        lines.append("  FAIL: %s" % error)
+    if outcome.ok:
+        lines.append("  OK")
     return lines
 
 

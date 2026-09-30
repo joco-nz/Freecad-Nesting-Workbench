@@ -360,3 +360,66 @@ class TestDescribeVerification:
         v = Verification()
         v.failures.append("x")
         assert all(isinstance(line, str) for line in describe_verification(v))
+
+
+# -- containment ----------------------------------------------------------
+
+class TestPartsOutsideStock:
+    def test_a_part_within_the_stock_is_fine(self):
+        stock = _Target("stock", _Box(0, 0, 100, 100))
+        part = _Target("p", _Box(10, 10, 20, 20))
+        assert cam_replay.parts_outside_stock([part], stock) == []
+
+    def test_a_part_past_the_edge_is_reported(self):
+        stock = _Target("stock", _Box(0, 0, 100, 100))
+        part = _Target("p", _Box(90, 10, 130, 20))
+        assert cam_replay.parts_outside_stock([part], stock) == ["p"]
+
+    def test_reports_only_the_offenders(self):
+        stock = _Target("stock", _Box(0, 0, 100, 100))
+        inside = _Target("in", _Box(10, 10, 20, 20))
+        outside = _Target("out", _Box(200, 200, 210, 210))
+        assert cam_replay.parts_outside_stock([inside, outside], stock) == ["out"]
+
+    def test_a_part_touching_the_edge_is_inside(self):
+        stock = _Target("stock", _Box(0, 0, 100, 100))
+        part = _Target("p", _Box(0, 0, 100, 100))
+        assert cam_replay.parts_outside_stock([part], stock) == []
+
+    def test_nothing_reported_without_a_stock(self):
+        part = _Target("p", _Box(0, 0, 10, 10))
+        assert cam_replay.parts_outside_stock([part], None) == []
+
+
+class TestVerifyReplayContainment:
+    def _stock(self):
+        return _Target("stock", _Box(0, 0, 100, 100))
+
+    def test_a_part_off_the_stock_fails(self):
+        result = ReplayResult()
+        result.operations = [_Operation("P", CUTTING)]
+        stray = _Target("stray", _Box(500, 500, 510, 510))
+        verification = verify_replay(result, clones=[stray], stock=self._stock())
+        assert verification.ok is False
+        assert "outside the stock" in verification.failures[0]
+
+    def test_the_failure_suggests_the_cause(self):
+        # A part off the sheet almost always means the sheet origin was not
+        # applied, so say so rather than making the operator work it out.
+        result = ReplayResult()
+        result.operations = [_Operation("P", CUTTING)]
+        stray = _Target("stray", _Box(500, 500, 510, 510))
+        verification = verify_replay(result, clones=[stray], stock=self._stock())
+        assert "local coordinates" in verification.failures[0]
+
+    def test_a_contained_part_passes(self):
+        result = ReplayResult()
+        result.operations = [_Operation("P", CUTTING)]
+        part = _Target("p", _Box(10, 10, 20, 20))
+        verification = verify_replay(result, clones=[part], stock=self._stock())
+        assert verification.ok is True
+
+    def test_containment_is_skipped_without_clones(self):
+        result = ReplayResult()
+        result.operations = [_Operation("P", CUTTING)]
+        assert verify_replay(result).ok is True

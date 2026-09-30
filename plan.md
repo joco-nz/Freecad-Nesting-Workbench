@@ -16,7 +16,7 @@ feature does not classify anything. It reads a recipe and applies it.
 
 ## Status
 
-**Steps 1-6 done. Step 7 not started (the command itself).**
+**Steps 1-7 done. The feature is complete and wired into the menu.**
 
 `Tools/Cam/cam_replay.py` holds two halves:
 
@@ -32,8 +32,10 @@ feature does not classify anything. It reads a recipe and applies it.
 
 - the **verification** (step 6) — decides whether a bad run is visible.
 
-- 386 pytest tests passing (12 new for step 6).
-- `tests/freecad_harness/test_replay_flatten.py`: 151 checks, 0 failures.
+- 421 pytest tests passing (35 new for step 7).
+- `tests/freecad_harness/test_replay_flatten.py`: 187 checks, 0 failures.
+  The full pipeline now runs end to end over a two-sheet layout: two jobs, each
+  with its own stock at the origin, both verified.
   A healthy two-part-type replay verifies clean: 2 operations, both with
   cutting motion, 2 warnings carried through from the stock frame comparison.
   The end-to-end replay is now exercised on a real two-part-type job: a Profile
@@ -45,6 +47,22 @@ feature does not classify anything. It reads a recipe and applies it.
   `Cylinder` out, no `BSplineSurface`), edge count and every per-edge length
   unchanged, placement is `container * child` in that order, Z normalised to
   `-thickness..0`, and the offset idempotent.
+
+Two findings from step 7, both real bugs the harness caught:
+
+- **Nothing checked that the parts were on the sheet.** A sheet whose parts
+  were never moved to local coordinates kept their world X offsets, left the
+  stock, and every other check still passed — the coverage check asked whether
+  the toolpath reached its targets, and it did; the targets were simply in the
+  wrong place. `parts_outside_stock` now gates on it, with a failure message
+  that names the likely cause. A part off the sheet is a scrapped part and
+  possibly a crashed tool, so this is a failure, not a warning.
+
+- **The `_UNVERIFIED` label was only applied to verification failures.** An
+  operation that could not be replayed at all — its sub-element selection did
+  not survive the move — left a job that cuts *less* than the source, and it
+  was left unlabelled. The labelling now covers any failure, not just a
+  verification one.
 
 One finding from step 6, and it is the kind that would have shipped:
 
@@ -303,7 +321,11 @@ Not started. Ordered so each step is independently verifiable.
    motion is a failure** and stops the sheet; an operation that reaches only
    some of its targets is a **warning**, because that check compares bounding
    boxes and is approximate. Both severities decided by the user.
-7. `commands/command_replay_cam.py` — command, dialog, selection validation.
+7. ~~`commands/command_replay_cam.py`.~~ **Done.** Select a CAM job, the
+   layout is auto-detected (warning if several are present), a thin options
+   dialog, every sheet replayed one job per sheet. Wired into the Nesting menu
+   and toolbar as `Nesting_ReplayCAMSetup`, beside `Nesting_CreateCAMJob` and
+   sharing no code with it beyond `freecad_helpers`.
 
 ## Tests
 

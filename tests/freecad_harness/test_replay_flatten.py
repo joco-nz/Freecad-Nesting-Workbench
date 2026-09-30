@@ -681,6 +681,7 @@ def run():
 
     run_replay_checks(doc)
     run_ordering_checks(None)
+    run_pipeline_checks(None)
 
     FreeCAD.closeDocument("replay_ops")
     FreeCAD.closeDocument("replay_flatten")
@@ -891,6 +892,217 @@ def run_verification_checks(doc, replay, result):
     check(all(isinstance(line, str) for line in lines),
           "describe_verification returned non-strings")
     emit("\n".join("  " + line for line in lines))
+
+
+def _make_bracket(doc, thickness):
+    """A bracket with a hole. Created per document -- a document object cannot
+    be handed to a job in another document."""
+    part = doc.addObject("Part::Feature", "Bracket")
+    part.Shape = Part.makeBox(
+        40, 25, thickness, FreeCAD.Vector(-20, -12.5, -thickness)
+    ).cut(Part.makeCylinder(3, thickness, FreeCAD.Vector(-10, 0, -thickness)))
+    doc.recompute()
+    return part
+
+
+def _build_layout(doc, thickness, sheets=1):
+    """Build a layout with `sheets` sheet groups, each holding nested parts."""
+    layout = doc.addObject("App::DocumentObjectGroup", "Layout_001")
+    for name, value in (("SheetWidth", 300.0), ("SheetHeight", 200.0),
+                        ("SheetThickness", thickness)):
+        layout.addProperty("App::PropertyLength", name, "Layout", "")
+        setattr(layout, name, value)
+
+    bracket = doc.addObject("Part::Feature", "Bracket")
+    bracket.Shape = Part.makeBox(40, 25, thickness,
+                                 FreeCAD.Vector(-20, -12.5, -thickness))
+    doc.recompute()
+
+    groups = []
+    for s in range(1, sheets + 1):
+        sheet = doc.addObject("App::DocumentObjectGroup", "Sheet_%d" % s)
+        layout.addObject(sheet)
+        shapes = doc.addObject("App::DocumentObjectGroup", "Shapes_%d" % s)
+        sheet.addObject(shapes)
+        # The real nester creates a Sheet_Boundary_* plane per sheet, and its
+        # placement is the sheet's world origin. Without it the replay cannot
+        # know where to move the parts back to, which is exactly how the
+        # "parts outside the stock" failure was first found.
+        offset = 0.0 if s == 1 else 400.0
+        boundary = doc.addObject("Part::Feature", "Sheet_Boundary_%d" % s)
+        boundary.Shape = Part.makePlane(300, 200)
+        boundary.Placement = FreeCAD.Placement(
+            FreeCAD.Vector(offset, 0, 0), FreeCAD.Rotation())
+        sheet.addObject(boundary)
+        for n, (cx, cy, ang) in enumerate([(40.0, 40.0, 0.0), (140.0, 40.0, 37.0)], 1):
+            container = doc.addObject("App::Part", "nested_Bracket_%d" % n)
+            shapes.addObject(container)
+            part = doc.addObject("Part::Feature", "part_Bracket_%d" % n)
+            shape = bracket.Shape.copy()
+            shape.Placement = FreeCAD.Placement()
+            part.Shape = shape
+            container.addObject(part)
+            container.Placement = FreeCAD.Placement(
+                FreeCAD.Vector(cx + offset, cy, 0),
+                FreeCAD.Rotation(FreeCAD.Vector(0, 0, 1), ang))
+            doc.recompute()
+        groups.append(sheet)
+    return layout, groups
+
+
+def run_pipeline_checks(doc):
+    """Drive replay_layout end to end over a two-sheet layout."""
+    thickness = 6.0
+    doc = FreeCAD.newDocument("replay_pipeline")
+
+    from Path.Main import Job as PathJob
+    from Path.Op import Profile as PathProfile
+
+    bracket = doc.addObject("Part::Feature", "Bracket")
+    bracket.Shape = Part.makeBox(
+        40, 25, thickness, FreeCAD.Vector(-20, -12.5, -thickness)
+    ).cut(Part.makeCylinder(3, thickness, FreeCAD.Vector(-10, 0, -thickness)))
+    doc.recompute()
+
+    source_job = PathJob.Create("UserSetup", [bracket], None)
+    doc.recompute()
+    model = source_job.Model.Group
+    top = ["Face%d" % (i + 1) for i, f in enumerate(model[0].Shape.Faces)
+           if type(f.Surface).__name__ == "Plane"
+           and abs(f.CenterOfMass.z) < 1e-9]
+    op = PathProfile.Create("Profile", None, source_job)
+    doc.recompute()
+    op.Base = [(model[0], top)]
+    op.HandleMultipleFeatures = "Individually"
+    op.Side = "Outside"
+    op.Direction = "CW"
+    op.UseComp = True
+    op.ToolController = source_job.Tools.Group[0]
+    doc.recompute()
+    check(len(op.Path.Commands) > 5, "the source Profile produced no path")
+
+    layout, sheets = _build_layout(doc, thickness, sheets=2)
+    check(len(sheets) == 2, "expected 2 sheets, got %d" % len(sheets))
+
+    check(cam_replay.is_cam_job(source_job) is True,
+          "the source job was not recognised as a CAM job")
+
+    found, warnings = cam_replay.resolve_layout_group(doc)
+    check(found is not None, "no layout was auto-detected")
+    check(warnings == [], "a single layout should not warn, got %s" % warnings)
+
+    outcomes = cam_replay.replay_layout(doc, found, source_job)
+    check(len(outcomes) == 2,
+          "expected one outcome per sheet, got %d" % len(outcomes))
+
+    for outcome in outcomes:
+        emit(cam_replay.describe_sheet_outcome(outcome))
+        check(outcome.ok is True,
+              "%s failed: %s" % (outcome.sheet_label, outcome.errors))
+        if outcome.verification is not None:
+            check(outcome.verification.ok is True,
+                  "%s did not verify" % outcome.sheet_label)
+        if outcome.replay_job is not None:
+            job_label = outcome.replay_job.job.Label
+            check(cam_replay.UNVERIFIED_SUFFIX not in job_label,
+                  "%s was labelled UNVERIFIED despite passing" % outcome.sheet_label)
+            check(outcome.sheet_label in job_label,
+                  "job %r does not name its sheet" % job_label)
+
+    # -- each sheet got its own job, at its own origin --
+    labels = [o.replay_job.job.Label for o in outcomes if o.replay_job]
+    check(len(set(labels)) == 2, "the two sheets share a job: %s" % labels)
+
+    # Sheet 2's parts are laid out at a world X offset, and the stock is built
+    # at the origin, so sheet 2's G-code must start at X0 Y0.
+    for outcome in outcomes:
+        if outcome.replay_job is None:
+            continue
+        clones = outcome.replay_job.clones
+        check(clones, "%s produced no clones" % outcome.sheet_label)
+        for clone in clones:
+            bb = clone.Shape.BoundBox
+            check(bb.XMin >= -1.0 and bb.XMax <= 301.0,
+                  "%s: %s spans X %s..%s, outside its own sheet"
+                  % (outcome.sheet_label, clone.Label, bb.XMin, bb.XMax))
+            check(abs(bb.ZMin + thickness) < 1e-6,
+                  "%s: %s bottom at Z=%s" % (outcome.sheet_label, clone.Label, bb.ZMin))
+
+    # -- and the cut really is there --
+    for outcome in outcomes:
+        if outcome.result is None:
+            continue
+        for operation in outcome.result.operations:
+            check(cam_replay.has_cutting_motion(operation),
+                  "%s: %s has no cutting motion" % (outcome.sheet_label, operation.Label))
+            check(cam_replay.uncovered_targets(operation) == [],
+                  "%s: %s does not reach its targets"
+                  % (outcome.sheet_label, operation.Label))
+
+    # -- the containment check catches a part left off the sheet --
+    # Deliberately breaks sheet 2 by moving a part past the stock edge, then
+    # re-runs verification. This is the failure the check was added for: every
+    # other check passed while the toolpath ran off the material.
+    stray_doc = FreeCAD.newDocument("replay_stray")
+    stray_bracket = _make_bracket(stray_doc, thickness)
+    layout2, sheets2 = _build_layout(stray_doc, thickness, sheets=1)
+    stray_source = PathJob.Create("StraySource", [stray_bracket], None)
+    stray_doc.recompute()
+    stray_op = PathProfile.Create("Profile", None, stray_source)
+    stray_doc.recompute()
+    stray_op.Base = [(stray_source.Model.Group[0], ["Face1"])]
+    stray_op.Side = "Outside"
+    stray_op.Direction = "CW"
+    stray_op.UseComp = True
+    stray_doc.recompute()
+    outcomes2 = cam_replay.replay_layout(stray_doc, layout2, stray_source)
+    # Move a clone clear of the stock and re-verify.
+    job2 = outcomes2[0].replay_job
+    clone = job2.clones[0]
+    base = clone.Placement.Base
+    clone.Placement = FreeCAD.Placement(
+        FreeCAD.Vector(base.x + 5000, base.y, base.z), clone.Placement.Rotation)
+    stray_doc.recompute()
+    after = cam_replay.verify_replay(
+        outcomes2[0].result, job2.warnings, clones=job2.clones, stock=job2.stock)
+    check(after.ok is False,
+          "a part moved off the sheet did not fail verification")
+    check(any("outside the stock" in f for f in after.failures),
+          "the failure does not name the cause: %s" % after.failures)
+    check(any("local coordinates" in f for f in after.failures),
+          "the failure does not suggest a cause: %s" % after.failures)
+    FreeCAD.closeDocument("replay_stray")
+
+    # -- the UNVERIFIED label, on a real failing run --
+    fail_doc = FreeCAD.newDocument("replay_fail")
+    layout3, sheets3 = _build_layout(fail_doc, thickness, sheets=1)
+    fail_bracket = _make_bracket(fail_doc, thickness)
+    bad_source = PathJob.Create("BadSource", [fail_bracket], None)
+    fail_doc.recompute()
+    empty_op = PathProfile.Create("Profile", None, bad_source)
+    fail_doc.recompute()
+    # A base selection that resolves to nothing: the measured failure mode.
+    empty_op.Base = [(bad_source.Model.Group[0], ["Face999"])]
+    empty_op.Side = "Outside"
+    empty_op.Direction = "CW"
+    empty_op.UseComp = True
+    fail_doc.recompute()
+
+    outcomes3 = cam_replay.replay_layout(fail_doc, layout3, bad_source)
+    check(len(outcomes3) == 1, "expected one outcome, got %d" % len(outcomes3))
+    outcome3 = outcomes3[0]
+    emit("\n".join(cam_replay.describe_sheet_outcome(outcome3)))
+    check(outcome3.ok is False,
+          "an operation with no cutting motion did not fail the run")
+    job_label = outcome3.replay_job.job.Label
+    check(job_label.endswith(cam_replay.UNVERIFIED_SUFFIX),
+          "a failed job was not labelled %s: %r"
+          % (cam_replay.UNVERIFIED_SUFFIX, job_label))
+    check(fail_doc.getObject(outcome3.replay_job.job.Name) is not None,
+          "the failed job was deleted; it must be kept for inspection")
+    FreeCAD.closeDocument("replay_fail")
+
+    FreeCAD.closeDocument("replay_pipeline")
 
 
 if __name__ in ("__main__", "test_replay_flatten"):
