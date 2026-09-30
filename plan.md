@@ -501,6 +501,13 @@ Once the fixture exists:
 
 ### Test cycle cost, measured
 
+Recorded in `issues.md` as NEST-007 and NEST-008 rather than only here, since
+both are problems the workbench has independently of the replay:
+`ShapePreparer._center_3d_shape` converts analytic source geometry to
+B-splines in order to centre it, and the replay's hole-nesting detection is
+expensive as a result. Note that `issues.md` is gitignored, so those entries
+are local to this machine.
+
 The alternative to a committed layout is generating one inside the test. That
 was measured rather than assumed:
 
