@@ -34,7 +34,6 @@ Thumbs.db
 
 .opencode/plans/
 
-tests/Test_Files/n70-intercooler-spacer-bottle-nesting.FCStd
 
 # nest benchmark harness scratch status
 tests/freecad_harness/.last_status
@@ -53,6 +52,9 @@ tests/freecad_harness/.last_status_replay
 
 opencode.json
 
-issues.md
-
-tests/Test_Files/deep-nest-n70-parts-122.dxf
+# Test_Files holds working copies -- corpora being built into future samples --
+# plus the one fixture the test suite opens. The n70 .FCStd and the 5.3 MB
+# deep-nest .dxf are among the working copies and were named individually
+# before; a directory rule is less work than extending that list each time.
+tests/Test_Files/*
+!tests/Test_Files/replay-fixture-CAM-Nested.FCStd
