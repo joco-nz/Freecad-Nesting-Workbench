@@ -488,6 +488,8 @@ def run_replay_checks(doc):
     check(all(entry[0] in spacers for entry in drill_replay.Base),
           "the replayed Drilling op targets something other than the spacer")
 
+    run_verification_checks(doc, replay, result)
+
     # -- nothing is empty, and the report says so --
     report = "\n".join(cam_replay.describe_replay_result(result))
     check("All sub-element selections resolved" in report,
@@ -814,6 +816,81 @@ def run_ordering_checks(doc):
           "a cyclic constraint dropped operations")
 
     FreeCAD.closeDocument("replay_order")
+
+
+def run_verification_checks(doc, replay, result):
+    """Verify the replayed job produced real cuts, and that the checks bite.
+
+    A healthy replay must pass cleanly. Then the checks are shown to actually
+    fire when they should, because a verification that has only ever passed is
+    indistinguishable from one that never works.
+    """
+    verification = cam_replay.verify_replay(result, replay.warnings)
+
+    check(len(verification.failures) == 0,
+          "a healthy replay reported failures: %s" % verification.failures)
+    check(verification.operations_checked == len(result.operations),
+          "checked %d of %d operations"
+          % (verification.operations_checked, len(result.operations)))
+    check(verification.operations_with_motion == verification.operations_checked,
+          "%d of %d operations had no cutting motion"
+          % (verification.operations_with_motion, verification.operations_checked))
+    check(verification.ok is True, "verification.ok is False on a clean replay")
+
+    # The Z frame warning is carried through, not swallowed.
+    check(any("spans Z" in w or "thick" in w for w in verification.warnings),
+          "the stock frame warning did not reach the verification: %s"
+          % verification.warnings)
+
+    for operation in result.operations:
+        uncovered = cam_replay.uncovered_targets(operation)
+        check(uncovered == [],
+              "%s: no toolpath near %s" % (operation.Label, uncovered))
+
+    # -- the emptiness check must actually fire --
+    class _Empty:
+        Label = "EmptyOp"
+
+        class Path:
+            Commands = []
+
+    empty_result = cam_replay.ReplayResult()
+    empty_result.operations = [_Empty()]
+    empty_verification = cam_replay.verify_replay(empty_result)
+    check(empty_verification.ok is False,
+          "an operation with no path did not fail the verification")
+    check(len(empty_verification.failures) == 1,
+          "expected exactly one failure, got %s" % empty_verification.failures)
+    check("no cutting motion" in empty_verification.failures[0],
+          "the failure does not explain itself: %s" % empty_verification.failures[0])
+
+    # -- the coverage check must fire, and only warn --
+    stray = doc.addObject("Part::Feature", "Stray")
+    stray.Shape = Part.makeBox(10, 10, 6, FreeCAD.Vector(0, 0, -6))
+    doc.recompute()
+
+    good = result.operations[0]
+    saved_base = good.Base
+    try:
+        good.Base = list(saved_base) + [(stray, [""])]
+        warn_result = cam_replay.ReplayResult()
+        warn_result.operations = [good]
+        warn_verification = cam_replay.verify_replay(warn_result)
+        check(warn_verification.ok is True,
+              "partial coverage failed the verification; it must only warn")
+        check(any("Stray" in w for w in warn_verification.warnings),
+              "partial coverage did not warn about the stray part: %s"
+              % warn_verification.warnings)
+        check(any("approximate" in w for w in warn_verification.warnings),
+              "the coverage warning does not say it is approximate")
+    finally:
+        good.Base = saved_base
+        doc.recompute()
+
+    lines = cam_replay.describe_verification(verification)
+    check(all(isinstance(line, str) for line in lines),
+          "describe_verification returned non-strings")
+    emit("\n".join("  " + line for line in lines))
 
 
 if __name__ in ("__main__", "test_replay_flatten"):

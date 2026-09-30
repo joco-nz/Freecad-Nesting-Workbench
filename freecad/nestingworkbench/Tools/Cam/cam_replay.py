@@ -1625,6 +1625,272 @@ def order_operations(job, operations, nestings, ownership=None):
     return ordered
 
 
+# -- verification ---------------------------------------------------------
+#
+# The point of this step is that a replay which goes wrong should be visible.
+#
+# Everything upstream can succeed while the job still does not do what the
+# source did. The sharpest example: an operation whose base selection resolves
+# to nothing computes 3 commands and no cutting motion, and raises nothing.
+# Measured early on, on a mis-selected hole. A job like that posts, looks
+# plausible, and removes less material than intended.
+#
+# Two levels of check, deliberately different in severity.
+#
+# **An operation that cuts nothing is a failure.** Not a warning. Every
+# replayed operation exists because the user set it up on their own part, and
+# one that produces no motion is far more likely to be a broken mapping than a
+# legitimately empty feature. Blocking the sheet is the right response: a loud
+# failure that costs one run beats a quiet one that costs a customer's parts.
+#
+# **An operation that covers only some of its targets is a warning.** Deciding
+# whether a given toolpath move belongs to a given part means attributing
+# motion to geometry, and a toolpath is a sequence of points with no part
+# labels on it. The check here compares bounding boxes, which is a heuristic:
+# it will not catch a part that is cut but only partly, and it could in
+# principle be confused by a part sitting inside another's toolpath extent. It
+# is worth having because the failure it *does* catch -- an operation
+# silently covering fewer parts than it targets -- is quiet and expensive, but
+# it is a warning rather than a gate because the check itself is approximate.
+
+# A toolpath shorter than this, in mm, is treated as no motion at all. Chosen
+# as "smaller than any plausible feature on a sheet" rather than derived; the
+# emptiness test below is the real gate and this only guards the degenerate
+# case of a path that exists but goes nowhere.
+MIN_PATH_LENGTH_MM = 0.001
+
+# Extra room around a target part when testing whether the toolpath reached
+# it: the tool radius, plus room for a lead-in arc and for the tolerance of a
+# bounding-box comparison on a rotated part.
+COVERAGE_MARGIN_MM = 2.0
+
+# Rapid travel, the one G-code that never removes material. Everything else
+# that is a G-code does.
+RAPID_MOTION = "G0"
+
+# The feed motions, named for readability rather than used for the decision.
+# Kept in step with FreeCAD's own motion handling.
+CUTTING_MOTIONS = ("G1", "G2", "G3", "G73", "G76", "G81", "G82", "G83", "G84",
+                   "G85", "G86", "G87", "G88", "G89")
+
+
+def is_cutting_motion(code):
+    """Return True if a motion code removes material.
+
+    Decided by rule, not by membership of a list: a G-code that is not `G0`
+    cuts. Enumerating the cutting codes was the first version and it was wrong
+    the moment a Drilling operation was replayed -- a drilling cycle emits
+    `G81 [ F:0 R:1 X:.. Y:.. Z:-6 ]`, which is a canned cycle and does cut, but
+    is not in a list of `G1/G2/G3`. The verification then reported "produced no
+    cutting motion" for a perfectly good drilling operation.
+
+    So the rule is the reliable one and the tuple above is documentation.
+    """
+    if not code or not code.startswith("G"):
+        return False
+    return code != RAPID_MOTION
+
+
+def motion_of(command):
+    """Return the motion code of a Path command, or "" if it has none.
+
+    `str(command)` renders as `Command G1 [ X:... ]`, so the second token is
+    the motion. Parsed rather than matched on attributes, because an arc
+    carries its centre in I/J/K and its end in X/Y/Z, and both forms have to
+    be recognised as motion.
+    """
+    tokens = str(command).split()
+    if len(tokens) < 2:
+        return ""
+    return tokens[1]
+
+
+def has_cutting_motion(operation):
+    """Return True if `operation`'s toolpath contains any cutting move.
+
+    Not a command count. A path that fails to resolve produces three commands
+    -- two comment lines and a positioning G0 -- which is non-empty as a list
+    and empty as a cut. Counting commands would call that a pass.
+    """
+    path = getattr(operation, "Path", None)
+    if path is None:
+        return False
+    for command in getattr(path, "Commands", ()) or ():
+        if is_cutting_motion(motion_of(command)):
+            return True
+    return False
+
+
+def path_bounds(operation):
+    """Return `(minx, miny, maxx, maxy)` of an operation's XY moves, or None."""
+    path = getattr(operation, "Path", None)
+    if path is None:
+        return None
+    xs, ys = [], []
+    for command in getattr(path, "Commands", ()) or ():
+        x, y = getattr(command, "X", None), getattr(command, "Y", None)
+        if x is None or y is None:
+            continue
+        xs.append(float(x))
+        ys.append(float(y))
+    if not xs:
+        return None
+    return (min(xs), min(ys), max(xs), max(ys))
+
+
+def shape_bounds(obj):
+    """Return `(minx, miny, maxx, maxy)` of a document object's shape."""
+    shape = getattr(obj, "Shape", None)
+    if shape is None or shape.isNull():
+        return None
+    box = shape.BoundBox
+    return (box.XMin, box.YMin, box.XMax, box.YMax)
+
+
+def uncovered_targets(operation, margin=COVERAGE_MARGIN_MM):
+    """Return the labels of target parts the toolpath shows no sign of cutting.
+
+    Approximate, and stated as such: the toolpath is one sequence of points
+    with no part labels on it, so the only thing available is to ask whether it
+    passes anywhere near each target. A part is judged covered when the
+    toolpath's XY extent, grown by `margin`, overlaps the part's own extent.
+
+    `margin` absorbs the tool radius and a lead-in arc. A profile op cuts
+    *outside* the part, so its path sits about one tool radius beyond the
+    outline; a drilling op cuts inside it, at the hole centres. Overlap in
+    either direction catches both, which is why this is not a containment test.
+    """
+    targets = []
+    base = getattr(operation, "Base", None)
+    if base and isinstance(base, (list, tuple)):
+        for entry in base:
+            try:
+                targets.append(entry[0])
+            except (TypeError, IndexError):
+                continue
+    if not targets:
+        return []
+
+    bounds = path_bounds(operation)
+    if bounds is None:
+        return [getattr(t, "Label", "?") for t in targets]
+
+    px0, py0, px1, py1 = bounds
+    gx0, gy0 = px0 - margin, py0 - margin
+    gx1, gy1 = px1 + margin, py1 + margin
+
+    uncovered = []
+    for target in targets:
+        box = shape_bounds(target)
+        if box is None:
+            continue
+        tx0, ty0, tx1, ty1 = box
+        overlaps = (tx0 <= gx1 and tx1 >= gx0) and (ty0 <= gy1 and ty1 >= gy0)
+        if not overlaps:
+            uncovered.append(getattr(target, "Label", "?"))
+    return uncovered
+
+
+class Verification:
+    """The outcome of checking a replayed job.
+
+    `failures` are conditions that should stop the run. `warnings` are
+    conditions an operator should know about but which are approximate enough
+    not to gate on.
+    """
+
+    def __init__(self):
+        self.failures = []
+        self.warnings = []
+        self.operations_checked = 0
+        self.operations_with_motion = 0
+
+    @property
+    def ok(self):
+        return not self.failures
+
+    def __repr__(self):
+        return "<Verification %d checked, %d failure(s), %d warning(s)>" % (
+            self.operations_checked, len(self.failures), len(self.warnings)
+        )
+
+
+def verify_replay(result, extra_warnings=()):
+    """Check a `ReplayResult` and return a `Verification`.
+
+    `extra_warnings` carries things the caller already knows, such as the Z
+    frame comparison from the job builder, so everything an operator needs to
+    see arrives in one place.
+
+    Fails on any replayed operation with no cutting motion. Warns on any
+    operation whose toolpath does not reach all the parts it targets, and on
+    any unresolved sub-element from the replay itself.
+    """
+    verification = Verification()
+
+    for operation in result.operations:
+        verification.operations_checked += 1
+        label = getattr(operation, "Label", "?")
+        if has_cutting_motion(operation):
+            verification.operations_with_motion += 1
+        else:
+            n = len(getattr(getattr(operation, "Path", None), "Commands", ()) or ())
+            verification.failures.append(
+                "Operation '%s' produced no cutting motion (%d command(s), all "
+                "travel or comments). Its base selection almost certainly did "
+                "not survive the move to the nested geometry. Nothing was cut "
+                "for it." % (label, n)
+            )
+            continue
+
+        uncovered = uncovered_targets(operation)
+        if uncovered:
+            verification.warnings.append(
+                "Operation '%s' shows no toolpath near %d of %d target part(s) "
+                "(%s). This check compares bounding boxes and is approximate, "
+                "so check the toolpath before assuming the parts were skipped."
+                % (label, len(uncovered),
+                   len(operation.Base) if getattr(operation, "Base", None) else 0,
+                   ", ".join(sorted(uncovered)[:5]))
+            )
+
+    for name, note in sorted(result.subname_detail.items()):
+        if note != "ok":
+            verification.warnings.append(
+                "Sub-element %s %s." % (name, note)
+            )
+
+    verification.warnings.extend(extra_warnings)
+    return verification
+
+
+def describe_verification(verification):
+    """Return a human-readable report of a `Verification`.
+
+    Failures first, because they are the ones that stop the run.
+    """
+    lines = []
+    if verification.failures:
+        lines.append("%d failure(s):" % len(verification.failures))
+        for failure in verification.failures:
+            lines.append("  FAIL: %s" % failure)
+    if verification.warnings:
+        lines.append("%d warning(s):" % len(verification.warnings))
+        for warning in verification.warnings:
+            lines.append("  WARNING: %s" % warning)
+    if verification.ok:
+        lines.append(
+            "Verified %d operation(s), all with cutting motion."
+            % verification.operations_checked
+        )
+    if verification.operations_with_motion < verification.operations_checked:
+        lines.append(
+            "%d of %d operation(s) produced cutting motion."
+            % (verification.operations_with_motion, verification.operations_checked)
+        )
+    return lines
+
+
 def describe_recipe(recipe):
     """Return a human-readable summary of `recipe` for the report view.
 

@@ -16,7 +16,7 @@ feature does not classify anything. It reads a recipe and applies it.
 
 ## Status
 
-**Steps 1-5 done. Steps 6-7 not started.**
+**Steps 1-6 done. Step 7 not started (the command itself).**
 
 `Tools/Cam/cam_replay.py` holds two halves:
 
@@ -30,8 +30,12 @@ feature does not classify anything. It reads a recipe and applies it.
 
 - the **ordering** (step 5) — a partial order over the replayed operations.
 
-- 331 pytest tests passing (18 new for step 5).
-- `tests/freecad_harness/test_replay_flatten.py`: 137 checks, 0 failures.
+- the **verification** (step 6) — decides whether a bad run is visible.
+
+- 386 pytest tests passing (12 new for step 6).
+- `tests/freecad_harness/test_replay_flatten.py`: 151 checks, 0 failures.
+  A healthy two-part-type replay verifies clean: 2 operations, both with
+  cutting motion, 2 warnings carried through from the stock frame comparison.
   The end-to-end replay is now exercised on a real two-part-type job: a Profile
   on the top face with a LeadInOut dressup, plus a Drilling op, replayed into a
   nest of 2 brackets and 1 spacer. The replayed Profile cuts 289.11 mm against
@@ -41,6 +45,16 @@ feature does not classify anything. It reads a recipe and applies it.
   `Cylinder` out, no `BSplineSurface`), edge count and every per-edge length
   unchanged, placement is `container * child` in that order, Z normalised to
   `-thickness..0`, and the offset idempotent.
+
+One finding from step 6, and it is the kind that would have shipped:
+
+- **Canned cycles are cutting, and a list of `G1/G2/G3` missed them.** A
+  Drilling operation emits `G81 [ F:0 R:1 X:.. Y:.. Z:-6 ]` — a canned cycle
+  that removes material. The first version of the emptiness check tested
+  membership of a `G1/G2/G3` tuple, so the verification reported *"produced no
+  cutting motion"* for a perfectly good drilling operation. The rule is now
+  derived instead: a G-code that is not `G0` cuts. The tuple is kept as
+  documentation and a test asserts it cannot drift from the rule.
 
 Two findings from step 5:
 
@@ -285,8 +299,10 @@ Not started. Ordered so each step is independently verifiable.
    inside it. Implemented as a stable topological sort that only moves what
    physically has to move, and leaves `Operations.Group` untouched when no
    nesting occurred.
-6. Verification and reporting. Non-empty assertion per op; Z frame check as a
-   **warning**.
+6. ~~Verification and reporting.~~ **Done.** An operation with **no cutting
+   motion is a failure** and stops the sheet; an operation that reaches only
+   some of its targets is a **warning**, because that check compares bounding
+   boxes and is approximate. Both severities decided by the user.
 7. `commands/command_replay_cam.py` — command, dialog, selection validation.
 
 ## Tests
