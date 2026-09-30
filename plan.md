@@ -412,8 +412,22 @@ Two things it caught while being written, both in code written minutes earlier
 
 ### What the fixture must contain
 
-Labels matter — the replay matches on conventions the nester writes. Getting
-these wrong produces a fixture that looks right and exercises nothing.
+**The CAM job references the SOURCE parts, not the nested copies.** An
+operation's `Base` points at the job's Model clone, which wraps the original
+body. The layout is entirely separate, and the job can be set up on the
+starting parts alone.
+
+That is worth writing down because its absence caused a real misunderstanding
+during design: the fixture was briefly specified as though the job needed to
+know about the nest, which made the whole deliverable look much larger than it
+is. It does not.
+
+The *only* coupling between the two is a label convention: `clones_for_source`
+unwraps the source clone, reads the original's `Label`, and matches it against
+`nested_<label>_<n>`.
+
+Labels matter, then, and getting them wrong produces a fixture that looks right
+and exercises nothing.
 
 **The layout side** (what a nesting run produces):
 
@@ -436,6 +450,18 @@ with at minimum one Profile on an external boundary, one operation for an
 internal feature, and one LeadInOut dressup.
 
 ### Required content
+
+**The source body labels must match the `<type>` in the nested container
+labels.** A body labelled `Bracket` should produce `nested_Bracket_1`. The
+nester derives both from the same source label, so a nest produced by the
+workbench satisfies this automatically; it only needs checking when a layout
+is assembled by hand.
+
+It is stated as a requirement because the failure is the worst one in this
+feature: if the labels drift, `clones_for_source` matches nothing and falls
+back to *every* clone, so the operation cuts the wrong feature on parts it was
+never set up for — and nothing raises. The validator's identity cross-check
+fails on exactly this case, which is one of the main reasons it exists.
 
 - **10–12 copies of one part type.** This is the point of the fixture: it
   crosses the label-uniquification boundary.
@@ -472,6 +498,32 @@ Once the fixture exists:
   first real number from the fixture;
 - nothing in the replay depends on nester behaviour, so a nester regression
   cannot fail this test.
+
+### Test cycle cost, measured
+
+The alternative to a committed layout is generating one inside the test. That
+was measured rather than assumed:
+
+| Step | Time |
+|---|---|
+| Nesting 42 parts, single sheet, headless | **2.568 s** |
+| Replaying 16 parts (open job, flatten, build, replay, order, verify) | **0.646 s** |
+
+So generating the layout inside the test costs roughly 2.6 s per run — a
+factor of about 3 on the replay portion, not the order of magnitude it might
+have been.
+
+Committing the layout wins anyway, because its one real weakness is guarded:
+label drift is caught by the validator's identity cross-check, and by the
+replay's own behaviour (a mismatched source part falls back to every clone,
+which the cross-check reports). Paying 2.6 s per run to keep a guard that
+already exists elsewhere is not a good trade.
+
+A committed layout does carry a second, smaller risk: if the nester's output
+*convention* changes, the committed layout keeps the old shape and the replay
+test keeps passing against it. That risk is contained, because the nester's own
+tests are what would catch a convention change, and the replay depends on only
+six label conventions.
 
 ### Sequencing
 
@@ -514,6 +566,12 @@ Once the fixture exists:
   synthetic-only alternative, after measuring that `find_hole_nestings` takes
   543 ms on 40 parts and has never been run above 3. The scale question was
   the one that decided it.
+- The fixture design went A (commit source + layout + job) vs B (commit source
+  + job, generate the layout in the test) and back to A. B was argued for on the
+  grounds that a job must somehow know about the nest; it does not, which was
+  clarified and written down. A then won on measurement — B costs 2.6 s per
+  run — and on the fact that A's real weakness, label drift, is already caught
+  by the validator's identity cross-check.
 
 - Branch created from `Faster-NFP-Calc-Investigate` at `a124552`.
 - Step 1 implemented and verified against a live job. The reader is pure logic
