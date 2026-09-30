@@ -33,7 +33,10 @@ GA_STATUS="$HARNESS_DIR/.last_status_ga"
 PANEL_STATUS="$HARNESS_DIR/.last_status_panel"
 UNITS_STATUS="$HARNESS_DIR/.last_status_units"
 PYTEST_STATUS="$HARNESS_DIR/.last_status_pytest"
-rm -f "$BENCH_STATUS" "$TEST_STATUS" "$GA_STATUS" "$PANEL_STATUS" "$UNITS_STATUS" "$PYTEST_STATUS"
+REPLAY_STATUS="$HARNESS_DIR/.last_status_replay"
+DRESSUP_STATUS="$HARNESS_DIR/.last_status_dressup"
+rm -f "$BENCH_STATUS" "$TEST_STATUS" "$GA_STATUS" "$PANEL_STATUS" \
+      "$UNITS_STATUS" "$PYTEST_STATUS" "$REPLAY_STATUS" "$DRESSUP_STATUS"
 
 cd "$REPO_ROOT"
 "$FREECADCMD" "$HARNESS_DIR/nest_benchmark.py" || true
@@ -41,8 +44,16 @@ cd "$REPO_ROOT"
 "$FREECADCMD" "$HARNESS_DIR/test_ga_loop.py" || true
 "$FREECADCMD" "$HARNESS_DIR/test_panel_teardown.py" || true
 "$FREECADCMD" "$HARNESS_DIR/test_document_units.py" || true
+# The two replay checks. These need real FreeCAD objects -- analytic surfaces,
+# actual dressup proxies, an actual Operations list -- because what they guard
+# is precisely the things a stand-in cannot show: that a dressed operation is
+# absent from the list it is dressed up in, and that the post-processor emits
+# that list verbatim. Neither is expressible in pytest.
+"$FREECADCMD" "$HARNESS_DIR/test_replay_flatten.py" || true
+"$FREECADCMD" "$HARNESS_DIR/test_replay_dressups.py" || true
 
-for f in "$BENCH_STATUS" "$TEST_STATUS" "$GA_STATUS" "$PANEL_STATUS" "$UNITS_STATUS"; do
+for f in "$BENCH_STATUS" "$TEST_STATUS" "$GA_STATUS" "$PANEL_STATUS" \
+         "$UNITS_STATUS" "$REPLAY_STATUS" "$DRESSUP_STATUS"; do
     if [ ! -f "$f" ]; then
         echo "harness did not write $f -- it probably did not run" >&2
         exit 3
@@ -98,6 +109,18 @@ fi
 UNITS=$(cat "$UNITS_STATUS")
 if [ "$UNITS" -ne 0 ]; then
     echo "document-unit regression test FAILED (status $UNITS)" >&2
+    [ "$STATUS" -eq 0 ] && STATUS=1
+fi
+
+REPLAY=$(cat "$REPLAY_STATUS")
+if [ "$REPLAY" -ne 0 ]; then
+    echo "replay-flatten regression test FAILED (status $REPLAY)" >&2
+    [ "$STATUS" -eq 0 ] && STATUS=1
+fi
+
+DRESSUP=$(cat "$DRESSUP_STATUS")
+if [ "$DRESSUP" -ne 0 ]; then
+    echo "replay-dressup regression test FAILED (status $DRESSUP)" >&2
     [ "$STATUS" -eq 0 ] && STATUS=1
 fi
 

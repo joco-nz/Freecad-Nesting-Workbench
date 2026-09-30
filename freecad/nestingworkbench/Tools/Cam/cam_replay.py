@@ -525,35 +525,69 @@ def capture_properties(obj):
     return captured
 
 
-class OperationRecipe:
-    """One operation from the source job, with the dressups wrapped around it.
+class DressupSpec:
+    """One dressup in a stack, in the order it must be re-applied.
 
-    Attributes:
-        source: the original job object this was read from.
-        properties: the captured settings, replayable onto a new object.
-        dressups: list of (properties, source_dressup) in group order.
-        base_entries: the source operation's `Base` as (object, subs) pairs.
-            Retained so the write half can read the sub-element names off the
-            source operation rather than re-deriving them; these are what make
-            the replay possible at all, since a nested copy keeps identical
-            topology and therefore identical sub-element numbering.
+    `source` is the source job's dressup object, so its proxy identifies which
+    kind of dressup this is and its properties carry the user's settings.
     """
 
-    def __init__(self, source, properties, base_entries=None):
+    def __init__(self, source, properties):
         self.source = source
         self.properties = properties
-        self.dressups = []
-        self.base_entries = list(base_entries or [])
 
     @property
     def label(self):
         return getattr(self.source, "Label", "<unnamed>")
 
-    def add_dressup(self, properties, source_dressup):
-        self.dressups.append((properties, source_dressup))
+    def __repr__(self):
+        return "<DressupSpec %s>" % self.label
+
+
+class OperationRecipe:
+    """One process step: a Path operation and the dressup stack above it.
+
+    A "process step" is one entry in the job's Operations list. When an
+    operation is dressed up, the list holds the *outermost dressup*, not the
+    operation -- the operation is reached through the dressup's link instead.
+    So a step is recovered by walking down from a list entry to the operation
+    at the bottom, and the dressups collected on the way give the stack in
+    order, innermost first.
+
+    Attributes:
+        source: the operation object, found at the bottom of the stack.
+        properties: its captured settings, replayable onto a new object.
+        dressups: `DressupSpec` list, innermost first. Replay rebuilds them in
+            that order, each layered on the previous object.
+        base_entries: the operation's `Base` as (object, subs) pairs. These are
+            what make the replay possible at all, since a nested copy keeps
+            identical topology and therefore identical sub-element numbering.
+        outermost: the object the Operations list should carry for this step --
+            the top of the dressup stack, or the operation itself if bare. This
+            is what goes in the new job's Operations list; see the write half.
+    """
+
+    def __init__(self, source, properties, base_entries=None, outermost=None):
+        self.source = source
+        self.properties = properties
+        self.dressups = []
+        self.base_entries = list(base_entries or [])
+        self.outermost = outermost if outermost is not None else source
+
+    @property
+    def label(self):
+        return getattr(self.source, "Label", "<unnamed>")
+
+    def add_dressup(self, spec):
+        self.dressups.append(spec)
+
+    @property
+    def dressup_labels(self):
+        return [d.label for d in self.dressups]
 
     def __repr__(self):
-        return "<OperationRecipe %s (%d dressup(s))>" % (self.label, len(self.dressups))
+        return "<OperationRecipe %s (%d dressup(s): %s)>" % (
+            self.label, len(self.dressups), " -> ".join(self.dressup_labels) or "none")
 
 
 class Recipe:
@@ -566,16 +600,21 @@ class Recipe:
     operation it wraps. Attaching in a second pass is what makes that
     representable.
 
-    `unresolved_dressups` holds any dressup whose base operation was not in the
-    group. These are reported rather than dropped: a dressup with no operation
-    cannot be replayed, and silently losing one would produce a job that cuts
-    differently from the source with nothing to say why.
+    `unresolved_dressups` holds any dressup whose stack does not bottom out in
+    an operation. These are reported rather than dropped: a dressup with no
+    operation cannot be replayed, and silently losing one would produce a job
+    that cuts differently from the source with nothing to say why.
+
+    `normalised_entries` holds list entries that were dropped as redundant --
+    an operation listed separately from a dressup layered on it. Reproducing
+    them would cut the same contour twice; see `read_recipe`.
     """
 
     def __init__(self, job):
         self.job = job
         self.operations = []
         self.unresolved_dressups = []
+        self.normalised_entries = []
 
     def __len__(self):
         return len(self.operations)
@@ -584,27 +623,71 @@ class Recipe:
         return iter(self.operations)
 
     def __repr__(self):
-        return "<Recipe %d operation(s), %d unresolved dressup(s)>" % (
-            len(self.operations), len(self.unresolved_dressups))
+        return "<Recipe %d step(s), %d unresolved dressup(s), %d normalised>" % (
+            len(self.operations), len(self.unresolved_dressups),
+            len(self.normalised_entries))
+
+
+def walk_stack(entry):
+    """Follow `entry` down its dressup stack to the operation at the bottom.
+
+    Returns `(operation, dressups)`, or `(None, dressups)` if the walk ran off
+    the end -- a dressup with no `Base`, or a cycle, which FreeCAD's link
+    system does not prevent and a malformed file can contain.
+
+    `dressups` comes back **innermost first**, which is the order they must be
+    re-applied: you cannot build the outer one until the inner one exists.
+
+    The cycle guard matters more than it looks. `Base` is an ordinary link, so a
+    file can say dressup A sits on dressup B and B sits on A, and without the
+    `seen` set this is an infinite loop rather than an error.
+    """
+    dressups = []
+    current = entry
+    seen = {id(current)}
+    while is_dressup(current):
+        dressups.append(current)
+        base = getattr(current, "Base", None)
+        if base is None or id(base) in seen:
+            return None, list(reversed(dressups))
+        seen.add(id(base))
+        current = base
+    return current, list(reversed(dressups))
 
 
 def read_recipe(job):
     """Read `job`'s operations and dressups into a `Recipe`.
 
-    Two passes, in this order and for the reason recorded above: the first
-    collects operations, the second attaches dressups to them. A single pass
-    raises `KeyError` on a group that lists a dressup before its operation,
-    which is the ordinary case rather than an edge case.
+    The unit of reading is the **process step**: one entry in the job's
+    Operations list. That matters because a dressed operation is *not* listed.
+    The list carries the outermost dressup, and the operation underneath is
+    reached through the dressup's link rather than being an entry of its own --
+    so a reader that looks only at the list sees nothing at all in a job whose
+    operations are dressed up. On the replay fixture that was 0 operations read
+    from 7 that exist.
+
+    So the read walks. For each list entry that is a dressup, `walk_stack`
+    follows the links down to the operation and returns the stack in order.
+    That is one step. An entry that is not a dressup is a bare step, unless a
+    dressup already claimed the operation it points at.
+
+    The converse case -- an operation listed *and* a dressup layered on it --
+    happens when operations are added to a job and then dressed up, because
+    creating an operation registers it in the list. The redundant listing is
+    dropped rather than reproduced, so a replayed step cannot be cut twice.
+    The drop is recorded on `recipe.normalised_entries` rather than being
+    silent, since it means the source job and the replayed job are shaped
+    differently.
 
     `Base` entries are read from the source operation and kept on the recipe.
     They are (geometry object, sub-element list) pairs, and the sub-element
     names are the whole mechanism by which a replay can target a nested copy
     that has different placement but identical topology.
 
-    An unresolvable dressup -- one whose `Base` is not in the group, which
-    happens if the user deleted the operation but left the dressup -- is
-    recorded on `recipe.unresolved_dressups` rather than raised. It cannot be
-    replayed, and the caller decides whether that is worth warning about.
+    An unresolvable dressup -- one whose stack does not bottom out in an
+    operation -- is recorded on `recipe.unresolved_dressups` rather than
+    raised. It cannot be replayed, and the caller decides whether that is worth
+    warning about.
     """
     recipe = Recipe(job)
 
@@ -613,22 +696,52 @@ def read_recipe(job):
         return recipe
 
     by_identity = {}
-    for entry in operations_group:
-        if is_dressup(entry):
-            continue
-        properties = capture_properties(entry)
-        item = OperationRecipe(entry, properties, _read_base_entries(entry))
-        recipe.operations.append(item)
-        by_identity[id(entry)] = item
+    claimed = {}
 
     for entry in operations_group:
         if not is_dressup(entry):
             continue
-        owner = by_identity.get(id(entry.Base))
-        if owner is None:
+        operation, dressups = walk_stack(entry)
+        if operation is None:
             recipe.unresolved_dressups.append(entry)
             continue
-        owner.add_dressup(capture_properties(entry), entry)
+        claimed[id(operation)] = entry
+
+    for entry in operations_group:
+        if not is_dressup(entry):
+            # A bare operation, unless a dressup already sits on top of it.
+            if id(entry) in claimed:
+                recipe.normalised_entries.append(entry)
+                continue
+            item = OperationRecipe(entry, capture_properties(entry),
+                                   _read_base_entries(entry))
+            recipe.operations.append(item)
+            by_identity[id(entry)] = item
+            continue
+
+        operation, dressups = walk_stack(entry)
+        if operation is None:
+            continue                      # already recorded as unresolved
+
+        item = by_identity.get(id(operation))
+        if item is None:
+            item = OperationRecipe(
+                operation, capture_properties(operation),
+                _read_base_entries(operation), outermost=entry,
+            )
+            recipe.operations.append(item)
+            by_identity[id(operation)] = item
+        elif id(entry) is not id(item.outermost):
+            # Two list entries resolving to one operation: two independent
+            # dressup chains over the same cut. Replaying both would apply two
+            # sets of dressups to one operation, which is not what either chain
+            # meant. Take the first and report the second.
+            recipe.normalised_entries.append(entry)
+            continue
+
+        for source_dressup in dressups:
+            item.add_dressup(DressupSpec(source_dressup,
+                                        capture_properties(source_dressup)))
 
     return recipe
 
@@ -1116,20 +1229,194 @@ def copy_tool_controller(source_op, job, cache=None):
     return new_tc
 
 
+def _build_object_dressup(obj, base, module, job):
+    """Build a dressup whose class is literally named `ObjectDressup`.
+
+    Covers LeadInOut, Mirror and RampEntry. All three are `ObjectDressup(obj,
+    base)`: the constructor adds the properties, links `Base` and gives
+    defaults. That is all that is called.
+
+    **The constructor's own `setup(obj)` is deliberately not run**, and this is
+    the single most easily-repeated mistake in this module.
+
+    The reasoning that invites the mistake is: "I measured Boundary, Dogbone,
+    Dragknife, AxisMap and ZCorrect constructing to a 0-command path, so I must
+    be skipping a required setup." That inference is wrong, and it was made here
+    and then acted on. A dressup that produces no path from its constructor is
+    usually one that produces no path *because nothing has been assigned to it
+    yet* -- and what assigns to it is the replay, immediately afterwards, from
+    the user's captured properties.
+
+    What `setup` actually does is write **defaults**, and in LeadInOut's case
+    bind the radii to an expression:
+
+        expr = f"{baseOp.Name}.ToolController.Tool.Diameter.Value/2*1.5"
+        obj.setExpression("RadiusIn", expr)
+        obj.setExpression("RadiusOut", expr)
+
+    So calling it, then applying the captured properties, then recomputing gives
+    the tool-diameter default rather than the user's setting. Measured: a user
+    who asked for 5 mm in and 7 mm out got 3.75 mm and 3.75 mm -- the 1.5x
+    diameter for the job's 5 mm tool -- with no error reported anywhere.
+
+    A replay reproduces a *configuration*. `setup` manufactures a default one.
+    Those are different jobs, and only the first belongs here.
+    """
+    constructor = getattr(module, "ObjectDressup", None)
+    if constructor is None:
+        raise TypeError("no ObjectDressup in %s" % module.__name__)
+    constructor(obj, base)
+    return obj
+
+
+def _build_with_job_constructor(obj, base, module, job):
+    """Build Boundary or Array. Both are `Proxy(obj, base, job)`, and both
+    assign the proxy themselves.
+
+    Unlike the others, these are not called through their module's `Create`,
+    because `Create` also runs `job.Proxy.addOperation(obj, base, True)` --
+    `removeBefore=True` is correct about the base, but it is still this
+    module's job to shape the Operations list, and it does that in one place
+    at the end. See `set_operation_order`.
+    """
+    class_name = {"Path.Dressup.Boundary": "DressupPathBoundary",
+                  "Path.Dressup.Array": "DressupArray"}.get(module.__name__)
+    if class_name is None:
+        raise TypeError("%s is not a job-constructor dressup" % module.__name__)
+    constructor = getattr(module, class_name, None)
+    if constructor is None:
+        raise TypeError("no %s in %s" % (class_name, module.__name__))
+    # The constructor's return value is deliberately discarded. These proxies
+    # are written `def __init__(self, obj, ...): ...; return obj` to chain
+    # inside their own Create, but a `return` from `__init__` does not change
+    # what the class call yields -- it yields an instance of the proxy.
+    # Putting that into an `App::PropertyLinkList` raises `Type must be
+    # App.DocumentObject or None, not DressupPathBoundary`.
+    obj.Proxy = constructor(obj, base, job)
+    return obj
+
+
+def _build_dogbone(obj, base, module, job):
+    """Build a DogboneII dressup.
+
+    `DogboneII.Create(base, name)` adds nothing of its own beyond
+    `Proxy(obj, base)` -- it takes no job, and adding the dressup to the
+    Operations list is done separately, by the GUI command
+    (`Gui/DogboneII.py`: `job.Proxy.addOperation(obj, base)`) and by nothing
+    else. So a headless caller has to do both halves itself. The proxy is run
+    directly rather than through `Create` so that this function owns the
+    document object and `Create` cannot quietly make a second one under a
+    different name.
+
+    There is no `setup` step; the proxy's `execute` does the work.
+    """
+    proxy_class = getattr(module, "Proxy", None)
+    if proxy_class is None:
+        raise TypeError("no Proxy in %s" % module.__name__)
+    obj.Proxy = proxy_class(obj, base)
+    return obj
+
+
+def _build_tags(obj, base, module, job):
+    """Build a Tags dressup: `ObjectTagDressup(obj, base)`, and nothing else.
+
+    `Tags.Create` follows that with `dbo.setup(obj, True)` -- the boolean means
+    "read from the tool table". That is not run here, for the reason in
+    `_build_object_dressup`: it derives a configuration from the machine rather
+    than from the user, and the replay's job is the latter. The user's tag
+    assignments arrive as captured properties.
+
+    This is the least-verified entry in the table. Tags is the one dressup in it
+    that no available fixture exercises, so it has been reasoned about rather
+    than measured. If it turns out to need `setup`, the fix belongs here and
+    nowhere else -- and the check for it is that the replayed Tags produces a
+    toolpath containing the tagged moves, not merely that it constructs.
+    """
+    constructor = getattr(module, "ObjectTagDressup", None)
+    if constructor is None:
+        raise TypeError("no ObjectTagDressup in %s" % module.__name__)
+    constructor(obj, base)
+    return obj
+
+
+#: How to build each dressup this module can replay, keyed by the *proxy's*
+#: module name -- which is what identifies the kind, robustly, where a Label is
+#: not.
+#:
+#: A table, not a convention, because there is no convention to follow. Ten
+#: dressups in four construction patterns, and no common entry point: three
+#: take `(obj, base)`, two take `(obj, base, job)`, one is `(obj, base)` plus a
+#: `setup` that must be called or the object yields an empty path, and four
+#: take no base at all.
+#:
+#: Dragknife, AxisMap and ZCorrect are absent deliberately. They take no base,
+#: so they are not layered on an operation at all -- they configure the job
+#: (dragknife compensation, axis remapping, Z correction) and are reached
+#: through the job rather than appearing in the Operations list. They are
+#: reported as unsupported rather than silently skipped, because a user who
+#: relied on Z correction would otherwise get a job that cuts at the wrong
+#: height with nothing said about it.
+DRESSUP_BUILDERS = {
+    "Path.Dressup.Gui.LeadInOut": _build_object_dressup,
+    "Path.Dressup.Gui.Mirror": _build_object_dressup,
+    "Path.Dressup.Gui.RampEntry": _build_object_dressup,
+    "Path.Dressup.DogboneII": _build_dogbone,
+    "Path.Dressup.Boundary": _build_with_job_constructor,
+    "Path.Dressup.Array": _build_with_job_constructor,
+    "Path.Dressup.Tags": _build_tags,
+}
+
+#: Dressups known to exist but deliberately not replayable, with the reason.
+#: Reported rather than dropped -- see `DRESSUP_BUILDERS`.
+DRESSUP_UNSUPPORTED = {
+    "Path.Dressup.Gui.Dragknife": "dragknife compensation is a job setting, not "
+                                  "a dressup over an operation",
+    "Path.Dressup.Gui.AxisMap": "axis remapping is a job setting, not a "
+                                "dressup over an operation",
+    "Path.Dressup.Gui.ZCorrect": "Z correction is a job setting, not a "
+                                 "dressup over an operation",
+}
+
+
+def dressup_kind(source_dressup):
+    """Return (kind, module_name) for `source_dressup`.
+
+    `kind` is "known", "unsupported" or "unknown", which is a distinction that
+    matters to the user: "this replay does not do ZCorrect" is actionable,
+    "some dressup went wrong" is not.
+    """
+    proxy = getattr(source_dressup, "Proxy", None)
+    if proxy is None:
+        return "unknown", None
+    module_name = type(proxy).__module__
+    if module_name in DRESSUP_BUILDERS:
+        return "known", module_name
+    if module_name in DRESSUP_UNSUPPORTED:
+        return "unsupported", module_name
+    return "unknown", module_name
+
+
 def create_dressup_in(source_dressup, base_op, job, label_suffix="_replay"):
     """Create a copy of `source_dressup` wrapping `base_op`, in `job`.
 
-    `Path.Dressup.Gui.LeadInOut.Create` is not used: it touches a ViewProvider
-    and raises `AttributeError: 'NoneType' object has no attribute 'Object'`
-    under `freecadcmd`, which is where the tests run. Constructing
-    `ObjectDressup` and registering with `job.Proxy.addOperation` works
-    headless and produces the same object -- confirmed, and the resulting
-    dressup picked up the lead-in and added a command over its base operation.
+    Returns the new object, or None if it could not be built. The reason is
+    reported by `dressup_kind` before this is called, so None means a genuine
+    failure rather than an unknown dressup type.
 
-    Returns the new object, or None if the dressup's constructor is not one
-    this module can drive. The constructor is taken from the source
-    dressup's proxy module for the same reason operations are: so a Boundary or
-    Dogbone dressup replays as readily as a LeadInOut.
+    **This does not add the dressup to the job's Operations list.** The list is
+    the replay's to shape, because the rule is uniform and none of the
+    dressup modules can be relied on to follow it: `addOperation(dressup, base)`
+    inserts the dressup *before* the base and, with `removeBefore` unset, leaves
+    the base in the list too. Two entries, one contour, cut twice -- measured at
+    24 cutting moves in the dressup's section and 20 in the base's. Only
+    `set_operation_order` writes the list, and only the outermost goes in.
+
+    `Path.Dressup.Gui.LeadInOut.Create` is not called: it ends in
+    `ViewProviderDressup(obj.ViewObject)` and `setEdit`, and with no ViewProvider
+    under `freecadcmd` that raises `AttributeError: 'NoneType' object has no
+    attribute 'Object'`. `FREECAD_TESTING` short-circuits part of it in recent
+    builds but not reliably enough to depend on. The table does the same work
+    without the view.
 
     The document comes from the job rather than being passed in. There is no
     reason to hand this function a document that might not be the one holding
@@ -1138,32 +1425,80 @@ def create_dressup_in(source_dressup, base_op, job, label_suffix="_replay"):
     """
     import importlib
 
-    proxy = getattr(source_dressup, "Proxy", None)
-    if proxy is None or base_op is None:
+    if base_op is None:
         return None
+    kind, module_name = dressup_kind(source_dressup)
+    if kind != "known":
+        return None
+
     doc = getattr(job, "Document", None) or FreeCAD.ActiveDocument
     if doc is None:
         return None
     try:
-        module = importlib.import_module(type(proxy).__module__)
+        module = importlib.import_module(module_name)
     except ImportError:
         return None
-    constructor = getattr(module, "ObjectDressup", None)
-    if constructor is None:
-        return None
 
-    name = "%s%s" % (getattr(source_dressup, "Label", "Dressup"), label_suffix)
+    label = getattr(source_dressup, "Label", "Dressup")
+    name = "%s%s" % (label, label_suffix)
     try:
-        new_obj = doc.addObject("Path::FeaturePython", name)
-        constructor(new_obj, base_op)
-        job.Proxy.addOperation(new_obj, base_op)
+        obj = doc.addObject("Path::FeaturePython", name)
+        DRESSUP_BUILDERS[module_name](obj, base_op, module, job)
+        if getattr(obj, "Proxy", None) is None:
+            raise RuntimeError("constructor left the object without a proxy")
     except Exception as exc:
         FreeCAD.Console.PrintWarning(
-            "Could not recreate dressup '%s': %s\n"
-            % (getattr(source_dressup, "Label", "?"), exc)
+            "Could not recreate dressup '%s' (%s): %s\n"
+            % (label, module_name, exc)
         )
+        try:
+            doc.removeObject(name)
+        except Exception:
+            pass
         return None
-    return new_obj
+    return obj
+
+
+def set_operation_order(job, entries):
+    """Replace the job's Operations list with `entries`, in that order.
+
+    **The one place this module writes `Operations.Group`**, and it replaces
+    rather than appends because two things upstream put entries there that must
+    not survive.
+
+    First, the operation factories self-register. `Path.Op.Profile.Create(name,
+    None, job)` on its own leaves `[Profile]` in the list -- creating an
+    operation is what puts it there. So after pass one the list holds every
+    base operation, including the ones that are about to be dressed up.
+
+    Second, `addOperation(dressup, base)` inserts the dressup *before* the base
+    and, with `removeBefore` unset, leaves the base in the list too. `Array` and
+    `Boundary` pass `removeBefore=True` and get this right; `LeadInOut`,
+    `Tags` and `Mirror` do not.
+
+    Either way the result is the same: two list entries for one contour, and
+    the post-processor emits the list verbatim. Measured on a lead-in profile,
+    24 cutting moves in the dressup's section and 20 in the base's -- the same
+    profile cut twice.
+
+    So the rule is enforced here rather than trusted to each module: **a
+    process step contributes exactly one entry, the outermost dressup if the
+    operation is dressed up, or the operation itself if bare.** The operation
+    underneath a dressup is still created and still linked -- it has to be, the
+    dressup needs it to work from -- it is simply not a step in its own right.
+
+    If a source job does list an operation separately from a dressup layered on
+    it, this drops the redundant entry rather than reproducing it. That is a
+    deliberate difference between the source job's shape and the replayed one's,
+    recorded on `Recipe.normalised_entries`, and it is the conservative
+    direction to be wrong in.
+    """
+    group = getattr(getattr(job, "Operations", None), "Group", None)
+    if group is None:
+        return False
+    kept = [entry for entry in entries if entry is not None]
+    job.Operations.Group = kept
+    return True
 
 
 class ReplayResult:
@@ -1184,14 +1519,43 @@ class ReplayResult:
         self.failures = []
         self.warnings = []
         self.subname_detail = {}
+        self.unsupported_dressups = []
 
     def __len__(self):
         return len(self.operations)
 
     def __repr__(self):
-        return "<ReplayResult %d op(s), %d dressup(s), %d failure(s)>" % (
-            len(self.operations), len(self.dressups), len(self.failures)
+        return "<ReplayResult %d op(s), %d dressup(s), %d failure(s), "\
+               "%d unsupported>" % (
+            len(self.operations), len(self.dressups), len(self.failures),
+            len(self.unsupported_dressups)
         )
+
+
+def expression_bound(obj):
+    """Return the set of property paths on `obj` that carry an expression.
+
+    FreeCAD exposes these through `ExpressionEngine` as (path, expression)
+    pairs. An expression is not a value: it recomputes, and it wins over
+    anything assigned to the property.
+
+    That matters here because a dressup constructor can install one. LeadInOut's
+    `setup` binds `RadiusIn` and `RadiusOut` to the tool diameter, and a replay
+    that ran it produced 1.5x the tool radius in place of the user's setting,
+    silently. Comparing the source's bindings against the replayed object's is
+    how that gets caught rather than discovered on the machine.
+    """
+    try:
+        engine = obj.ExpressionEngine
+    except Exception:
+        return set()
+    paths = set()
+    for entry in engine or ():
+        try:
+            paths.add(entry[0])
+        except (TypeError, IndexError):
+            continue
+    return paths
 
 
 def apply_properties(target, properties, skip=(), remap=None):
@@ -1312,28 +1676,82 @@ def replay_recipe(recipe, job, clones, tool_cache=None):
         result.operations.append(new_op)
         made[id(item.source)] = new_op
 
-    # -- pass two: dressups, now that their bases exist --
+    # -- pass two: the dressup stacks, innermost dressup first --
+    #
+    # A stack is rebuilt in one go, dressup on dressup, because the outer one
+    # needs the inner one to exist before it can be layered on. The operation
+    # at the bottom is the first layer's base; each subsequent dressup takes the
+    # previous object. `recipe` stores a stack innermost-first, which is
+    # already the build order.
+    #
+    # Only the outermost goes in the list, and the list is written once at the
+    # end. See `set_operation_order` for why, and the note on the double cut
+    # in `create_dressup_in`.
+    ordered = []
     for item in recipe:
-        for _props, source_dressup in item.dressups:
-            base = made.get(id(source_dressup.Base))
-            if base is None:
-                result.failures.append(
-                    "Dressup '%s' wraps an operation that was not replayed; it "
-                    "cannot be replayed either."
-                    % getattr(source_dressup, "Label", "?")
+        new_op = made.get(id(item.source))
+        if new_op is None:
+            # Pass one already recorded why. Anything left in the stack cannot
+            # be built on nothing.
+            continue
+
+        layer = new_op
+        outermost = new_op
+        built_any = False
+        for spec in item.dressups:
+            kind, module_name = dressup_kind(spec.source)
+            if kind == "unsupported":
+                result.unsupported_dressups.append(
+                    (module_name or "?", spec.label, DRESSUP_UNSUPPORTED[module_name])
                 )
                 continue
-            new_dressup = create_dressup_in(source_dressup, base, job)
+            if kind == "unknown":
+                result.failures.append(
+                    "Dressup '%s' is of a kind this replay does not recognise "
+                    "(proxy %s), so it was not applied."
+                    % (spec.label, module_name or "none")
+                )
+                continue
+
+            new_dressup = create_dressup_in(spec.source, layer, job)
             if new_dressup is None:
                 result.failures.append(
                     "Could not recreate dressup '%s'."
-                    % getattr(source_dressup, "Label", "?")
+                    % spec.label
                 )
                 continue
-            apply_properties(new_dressup, _props, skip=("Base",))
+            apply_properties(new_dressup, spec.properties, skip=("Base",))
+
+            # A constructor that installed an expression the source did not have
+            # is now recomputing over the value just applied, and the user's
+            # setting will be replaced on the next recompute. Caught here rather
+            # than on the machine -- see `expression_bound`.
+            stray = expression_bound(new_dressup) - expression_bound(spec.source)
+            if stray:
+                result.warnings.append(
+                    "Dressup '%s' recomputes %s from an expression, which will "
+                    "override the value carried over from the source job. The "
+                    "replayed job will not cut the same as the source."
+                    % (spec.label, ", ".join(sorted(stray)))
+                )
+
             result.dressups.append(new_dressup)
+            layer = new_dressup
+            outermost = new_dressup
+            built_any = True
+
+        if built_any or not item.dressups:
+            ordered.append(outermost)
+
+    # One write, in recipe order. See `set_operation_order`.
+    set_operation_order(job, ordered)
 
     for warning in result.failures:
+        FreeCAD.Console.PrintWarning("%s\n" % warning)
+    for _kind, label, _reason in result.unsupported_dressups:
+        FreeCAD.Console.PrintWarning(
+            "Dressup '%s' was not replayed; see the summary.\n" % label)
+    for warning in result.warnings:
         FreeCAD.Console.PrintWarning("%s\n" % warning)
     return result
 
@@ -1349,6 +1767,12 @@ def describe_replay_result(result):
         "Replayed %d operation(s) and %d dressup(s)."
         % (len(result.operations), len(result.dressups))
     ]
+    for kind, label, reason in result.unsupported_dressups:
+        lines.append(
+            "WARNING: dressup '%s' (%s) was not replayed -- %s. Its operation "
+            "was replayed bare, so this cut has no dressup applied."
+            % (label, kind, reason)
+        )
     partial = {n: d for n, d in result.subname_detail.items() if d != "ok"}
     for name, note in sorted(partial.items()):
         lines.append("WARNING: sub-element %s %s." % (name, note))
@@ -1905,6 +2329,7 @@ def verify_replay(result, extra_warnings=(), clones=None, stock=None):
                 "Sub-element %s %s." % (name, note)
             )
 
+    verification.warnings.extend(result.warnings)
     verification.warnings.extend(extra_warnings)
     return verification
 
@@ -2236,12 +2661,10 @@ def describe_recipe(recipe):
     if not recipe.operations:
         lines.append("No operations found in %s." % getattr(recipe.job, "Label", "the job"))
     for index, item in enumerate(recipe.operations, start=1):
-        dressup_names = ", ".join(
-            getattr(src, "Label", "?") for _props, src in item.dressups
-        )
+        dressup_names = " -> ".join(item.dressup_labels)
         parts = ["%d. %s" % (index, item.label)]
         if dressup_names:
-            parts.append("[dressups: %s]" % dressup_names)
+            parts.append("[%s]" % dressup_names)
         if item.base_entries:
             parts.append("[base: %d %s]" % (
                 len(item.base_entries),
@@ -2250,8 +2673,13 @@ def describe_recipe(recipe):
         lines.append("  ".join(parts))
     for dressup in recipe.unresolved_dressups:
         lines.append(
-            "WARNING: dressup '%s' wraps an operation that is not in the job's "
-            "operations group; it cannot be replayed."
-            % getattr(dressup, "Label", "?")
+            "WARNING: dressup '%s' does not wrap an operation; it cannot be "
+            "replayed." % getattr(dressup, "Label", "?")
+        )
+    for entry in getattr(recipe, "normalised_entries", []):
+        lines.append(
+            "  '%s' is listed separately from a dressup layered on it; replayed "
+            "as part of that dressup's step, so it is not cut twice."
+            % getattr(entry, "Label", "?")
         )
     return lines

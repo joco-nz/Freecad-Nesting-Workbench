@@ -256,36 +256,113 @@ class TestReadRecipe:
         recipe = read_recipe(_FakeJob([a, b, c]))
         assert [op.label for op in recipe] == ["A", "B", "C"]
 
-    def test_attaches_dressup_to_its_operation(self):
-        a = _FakeOp("Profile")
-        dressup = _FakeDressup("DressupLeadInOut", base=a)
-        recipe = read_recipe(_FakeJob([a, dressup]))
+    def test_reads_a_step_from_a_dressup_alone(self):
+        # The shape of a real job. A dressed operation is NOT listed; the
+        # outermost dressup is, and the operation is reached through the link.
+        # A reader that looks only at the list sees nothing at all here -- which
+        # is what it did: 0 operations read from a 7-operation fixture.
+        op = _FakeOp("Profile")
+        dressup = _FakeDressup("DressupLeadInOut", base=op)
+        recipe = read_recipe(_FakeJob([dressup]))
+        assert [item.label for item in recipe] == ["Profile"]
+        assert recipe.operations[0].dressup_labels == ["DressupLeadInOut"]
+        assert recipe.operations[0].dressups[0].source is dressup
+
+    def test_a_step_read_from_a_dressup_carries_the_operations_base(self):
+        # The whole mechanism depends on this: the sub-element names come off
+        # the operation at the bottom of the stack.
+        geo = _Geometry()
+        op = _FakeOp("Profile", base=[(geo, ["Edge4", "Edge7"])])
+        recipe = read_recipe(_FakeJob([_FakeDressup("Lead", base=op)]))
+        entries = recipe.operations[0].base_entries
+        assert len(entries) == 1 and entries[0][0] is geo
+        assert entries[0][1] == ["Edge4", "Edge7"]
+
+    def test_a_two_deep_stack_reads_innermost_first(self):
+        # Build order and read order are both innermost-first. FreeCAD's own
+        # dressuptest.FCStd has a three-deep one.
+        op = _FakeOp("Profile")
+        lead = _FakeDressup("LeadInOut", base=op)
+        bone = _FakeDressup("Dogbone", base=lead)
+        recipe = read_recipe(_FakeJob([bone]))
+        assert recipe.operations[0].dressup_labels == ["LeadInOut", "Dogbone"]
+
+    def test_a_three_deep_stack_reads_innermost_first(self):
+        op = _FakeOp("Profile")
+        lead = _FakeDressup("LeadInOut", base=op)
+        bone = _FakeDressup("Dogbone", base=lead)
+        bound = _FakeDressup("Boundary", base=bone)
+        recipe = read_recipe(_FakeJob([bound]))
+        assert recipe.operations[0].dressup_labels == [
+            "LeadInOut", "Dogbone", "Boundary"]
+
+    def test_steps_keep_group_order_across_bare_and_dressed(self):
+        recipe = read_recipe(_FakeJob([
+            _FakeOp("Drilling"),
+            _FakeDressup("Lead", base=_FakeOp("ProfileA")),
+            _FakeOp("Drilling001"),
+        ]))
+        assert [item.label for item in recipe] == [
+            "Drilling", "ProfileA", "Drilling001"]
+
+    def test_a_redundant_operation_listing_is_dropped_not_reproduced(self):
+        # Creating an operation registers it in the list, so a job built by
+        # adding operations and then dressing them up lists both. Replaying
+        # both would cut the same contour twice.
+        op = _FakeOp("Profile")
+        dressup = _FakeDressup("Lead", base=op)
+        recipe = read_recipe(_FakeJob([op, dressup]))
         assert len(recipe) == 1
-        assert len(recipe.operations[0].dressups) == 1
-        assert recipe.operations[0].dressups[0][1] is dressup
+        assert recipe.normalised_entries == [op]
 
-    def test_attaches_when_dressup_precedes_its_operation(self):
-        # The real observed order. A single-pass reader raises KeyError here.
-        a = _FakeOp("Profile")
-        dressup = _FakeDressup("DressupLeadInOut", base=a)
-        recipe = read_recipe(_FakeJob([dressup, a, _FakeOp("Drilling")]))
-        assert [op.label for op in recipe] == ["Profile", "Drilling"]
-        assert len(recipe.operations[0].dressups) == 1
+    def test_the_dropped_listing_takes_the_dressups_position(self):
+        # Order is the job's process order, and a drop must not move a step.
+        op = _FakeOp("Profile")
+        recipe = read_recipe(_FakeJob([
+            _FakeOp("Drilling"), op, _FakeDressup("Lead", base=op)]))
+        assert [item.label for item in recipe] == ["Drilling", "Profile"]
 
-    def test_multiple_dressups_attach_to_one_operation(self):
-        a = _FakeOp("Profile")
-        d1 = _FakeDressup("Lead", base=a)
-        d2 = _FakeDressup("Boundary", base=a)
-        recipe = read_recipe(_FakeJob([d1, a, d2]))
-        assert len(recipe.operations) == 1
-        assert len(recipe.operations[0].dressups) == 2
+    def test_a_dressup_over_an_unlisted_operation_is_not_unresolved(self):
+        # An operation missing from the list is the NORMAL case, not a fault.
+        # Reporting it as unresolvable is what made the fixture look empty.
+        op = _FakeOp("DeletedOp")
+        recipe = read_recipe(_FakeJob([_FakeDressup("Orphan", base=op)]))
+        assert recipe.unresolved_dressups == []
+        assert [item.label for item in recipe] == ["DeletedOp"]
 
-    def test_records_rather_than_raises_on_unresolvable_dressup(self):
-        orphan = _FakeDressup("Orphan", base=_FakeOp("DeletedOp"))
+    def test_two_dressups_on_one_operation_take_the_first_and_report(self):
+        # Neither chain says it wraps the other, so there is no stack to read.
+        # Applying both to one operation is not what either meant.
+        op = _FakeOp("Profile")
+        d1 = _FakeDressup("Lead", base=op)
+        d2 = _FakeDressup("Boundary", base=op)
+        recipe = read_recipe(_FakeJob([d1, d2]))
+        assert len(recipe) == 1
+        assert recipe.operations[0].dressup_labels == ["Lead"]
+        assert recipe.normalised_entries == [d2]
+
+    def test_an_unset_base_makes_a_dressup_indistinguishable_from_an_operation(self):
+        # A documented limitation, pinned rather than left to be rediscovered.
+        # `is_dressup` tells a dressup from an operation by the TYPE of Base --
+        # a single link versus a link-sub-list. With Base unset there is nothing
+        # to tell by, and the object reads as a bare operation.
+        #
+        # In a real file this cannot arise: every dressup proxy adds Base as a
+        # required property, so an unset Base is a half-built object rather than
+        # a saved one.
+        orphan = _FakeDressup("Orphan", base=None)
         recipe = read_recipe(_FakeJob([_FakeOp("Profile"), orphan]))
-        assert len(recipe) == 1
-        assert len(recipe.unresolved_dressups) == 1
-        assert recipe.unresolved_dressups[0] is orphan
+        assert [item.label for item in recipe] == ["Profile", "Orphan"]
+        assert recipe.unresolved_dressups == []
+
+    def test_a_cyclic_stack_is_unresolved_rather_than_looping_forever(self):
+        # Base is an ordinary link, so a file can say A wraps B and B wraps A.
+        a = _FakeDressup("A", base=None)
+        b = _FakeDressup("B", base=a)
+        a.Base = b
+        recipe = read_recipe(_FakeJob([a]))
+        assert recipe.unresolved_dressups == [a]
+        assert len(recipe) == 0
 
     def test_preserves_base_entries(self):
         geo = _Geometry()
@@ -346,16 +423,30 @@ class TestDescribeRecipe:
         assert "1. Profile" in text
         assert "base: 1 entry" in text
 
-    def test_lists_dressups(self):
-        a = _FakeOp("Profile")
-        recipe = read_recipe(_FakeJob([a, _FakeDressup("LeadInOut", base=a)]))
+    def test_lists_a_dressup_stack_innermost_first(self):
+        op = _FakeOp("Profile")
+        lead = _FakeDressup("LeadInOut", base=op)
+        recipe = read_recipe(_FakeJob([_FakeDressup("Dogbone", base=lead)]))
         text = "\n".join(describe_recipe(recipe))
-        assert "dressups: LeadInOut" in text
+        assert "1. Profile" in text
+        assert "[LeadInOut -> Dogbone]" in text
 
     def test_warns_about_unresolved_dressup(self):
-        orphan = _FakeDressup("Orphan", base=_FakeOp("DeletedOp"))
-        recipe = read_recipe(_FakeJob([orphan]))
+        # Reachable only via a cycle; see the unset-Base note in TestReadRecipe.
+        a = _FakeDressup("A", base=None)
+        b = _FakeDressup("B", base=a)
+        a.Base = b
+        recipe = read_recipe(_FakeJob([a]))
         assert "WARNING" in "\n".join(describe_recipe(recipe))
+
+    def test_says_a_redundant_listing_was_dropped(self):
+        # The replayed job is shaped differently from the source, and the user
+        # should be able to see that it was deliberate.
+        op = _FakeOp("Profile")
+        recipe = read_recipe(_FakeJob([op, _FakeDressup("Lead", base=op)]))
+        text = "\n".join(describe_recipe(recipe))
+        assert "not cut twice" in text
+        assert "Profile" in text
 
     def test_reports_an_empty_job_without_raising(self):
         text = "\n".join(describe_recipe(read_recipe(_FakeJob([]))))
