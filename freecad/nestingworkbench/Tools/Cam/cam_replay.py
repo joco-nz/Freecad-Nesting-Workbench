@@ -57,16 +57,60 @@ Constraints this module exists to respect
    Label twice yields `Bracket` and `Bracket001`, even with the
    `DuplicateLabels` preference set to 0. So the hazard is over-matching, not
    collision, and the fix is to carry an explicit identity rather than to
-   search for labels.
+   search for labels. Every flattened part therefore carries `SourceObject` and
+   `SourceContainer` links.
+
+5. **A container placement is invisible to CAM.**
+   An operation whose `Base` points at a child inside an `App::Part` produced a
+   toolpath at the child's *local* coordinates -- `[-22.5, 22.5]` where world
+   placement put it at `~[118, 160]`. Nested parts cannot be referenced where
+   they sit, so they have to be flattened to top-level objects first. This is
+   what `flatten_sheet` is for.
+
+6. **`transformGeometry` destroys the geometry the toolpath is cut from.**
+   It converts analytic surfaces to B-splines: a `Cylinder` face came back as a
+   `BSplineSurface` with area 314.1593 -> 315.0023. Lead-in and lead-out arc
+   maths run against the real surface, so a splined cylinder means the toolpath
+   follows an approximation. `flatten_container` assigns a `Placement` instead,
+   which leaves a `Cylinder` a `Cylinder` -- and, because the topology is left
+   untouched, keeps the sub-element names an operation's `Base` refers to
+   pointing at the same features. A nested copy has identical topology to its
+   source: same edge count, same per-edge length and curve type.
+
+7. **Depths are derived, not authored.** An operation recomputes
+   `StartDepth`/`FinalDepth` from the stock box and the geometry on every
+   recompute, so setting them has no lasting effect and capturing them is
+   harmless. The consequence is that the Z frame is enforced by the stock
+   rather than carried from the user's part, which makes it a single place to
+   get right.
 
 Scope
 -----
-This module is the read half only. It touches no geometry and creates no
-document objects, which is what makes it testable under plain pytest with
-stand-in objects -- the classification, the property capture and the ordering
-are all pure logic over shapes the caller supplies.
+Two halves, and the line between them is where a document gets written.
+
+The recipe reader (`read_recipe` and what it calls) touches no geometry and
+creates no objects, which is what makes it testable under plain pytest with
+stand-in objects. The flattener (`flatten_sheet` and what it calls) does
+create objects, and is covered by the freecadcmd harness instead.
 """
 import FreeCAD
+
+# -- flattening -----------------------------------------------------------
+#
+# The property a flattened part carries to identify where it came from. It is a
+# link rather than a label because label lookups cannot be trusted: see the
+# module docstring, constraint 4. One link per flattened part is enough to match
+# it to the source operation in the write half without any string comparison.
+
+PROP_SOURCE_OBJECT = "SourceObject"
+PROP_SOURCE_CONTAINER = "SourceContainer"
+PROP_NESTED_LABEL = "NestedLabel"
+
+# The child of a `nested_*` container holding the geometry to cut. The same
+# prefix `cam_manager` keys on, so the two halves of the workbench agree on
+# which object in a container is the part.
+PART_LABEL_PREFIX = "part_"
+
 
 # Properties that describe an object's identity or its computed result rather
 # than the settings a user chose, and so must not be copied to a new operation.
@@ -303,6 +347,249 @@ def _read_base_entries(operation):
             continue
         entries.append((geometry, list(subs) if isinstance(subs, (list, tuple)) else [subs]))
     return entries
+
+
+class FlattenResult:
+    """The outcome of flattening one sheet's nested containers.
+
+    Attributes:
+        parts: the flattened `Part::Feature` objects, in container order.
+        skipped: (container, reason) pairs for containers that yielded nothing.
+            Reported rather than raised: one unusable container should not cost
+            the whole sheet, but it does mean fewer parts get cut, and the
+            operator needs to know which.
+        z_shifts: (object, offset) for each part whose Z was moved, kept so a
+            caller can report parts that arrived somewhere unexpected.
+    """
+
+    def __init__(self):
+        self.parts = []
+        self.skipped = []
+        self.z_shifts = []
+
+    def __len__(self):
+        return len(self.parts)
+
+    def __iter__(self):
+        return iter(self.parts)
+
+    def __repr__(self):
+        return "<FlattenResult %d part(s), %d skipped>" % (len(self.parts), len(self.skipped))
+
+
+def find_part_in_container(container):
+    """Return the `part_*` child of a `nested_*` container, or None.
+
+    Matching is on the label prefix, which is the convention the nesting side
+    writes (`shape_preparer` creates `part_<id>`) and the convention
+    `cam_manager` already reads. The prefix carries an underscore precisely so
+    it cannot match a sibling such as `boundary_*` or `label_*`.
+    """
+    for child in getattr(container, "Group", ()):
+        if getattr(child, "Label", "").startswith(PART_LABEL_PREFIX):
+            return child
+    return None
+
+
+def combined_placement(container, part):
+    """Return the world placement of `part` as nested inside `container`.
+
+    A nested part carries its position twice: the container holds the placement
+    the nester chose (position and rotation on the sheet), and the child holds
+    the up-direction rotation applied when the master shape was built. The
+    world transform is the product, `container.Placement * part.Placement`, in
+    that order.
+
+    Order matters and is not commutative. A probe with a container at
+    `(60, 0, 0)` rotated 37 degrees and an identity child produced
+    `Pos=(60, 0, 0) Yaw=37`; with the multiplication reversed the position
+    would be rotated by the child's own rotation instead.
+    """
+    container_placement = getattr(container, "Placement", None) or FreeCAD.Placement()
+    part_placement = getattr(part, "Placement", None) or FreeCAD.Placement()
+    return container_placement.multiply(part_placement)
+
+
+def z_offset_for_thickness(shape, sheet_thickness):
+    """Return the Z translation that puts a shape's bottom at `-thickness`.
+
+    The convention `cam_manager` already uses: stock spans `-thickness` to `0`,
+    parts sit on the stock with their own bottom at `-thickness`, so Z0 is the
+    top of the stock. Reimplemented rather than imported, because this feature
+    is deliberately standalone.
+
+    The formula is `-thickness - shape.BoundBox.ZMin`, which is idempotent: a
+    part already at `ZMin == -thickness` gets an offset of exactly 0. Measured
+    across three starting positions for a 6 mm part:
+
+        ZMin  0.0 -> offset -6.0 -> -6.0 .. 0.0
+        ZMin -6.0 -> offset  0.0 -> -6.0 .. 0.0
+        ZMin  2.0 -> offset -8.0 -> -6.0 .. 0.0
+
+    So it is safe to apply unconditionally, including to geometry that has
+    already been normalised by a previous run.
+    """
+    if sheet_thickness is None:
+        return 0.0
+    return -float(sheet_thickness) - float(shape.BoundBox.ZMin)
+
+
+class FlattenedPart:
+    """One container flattened, with the Z shift that was applied.
+
+    Returned rather than a bare object so the Z shift travels with the part. A
+    caller reporting on a run needs to know which geometry arrived somewhere
+    unexpected, and that information is lost the moment a function returns
+    sometimes-a-tuple-sometimes-an-object.
+    """
+
+    def __init__(self, obj, container, z_offset):
+        self.obj = obj
+        self.container = container
+        self.z_offset = z_offset
+
+    def __repr__(self):
+        return "<FlattenedPart %s z_offset=%.3f>" % (
+            getattr(self.obj, "Label", "?"), self.z_offset)
+
+
+def flatten_container(doc, container, sheet_thickness, group=None, name_prefix="CAMPart"):
+    """Flatten one `nested_*` container into a single top-level `Part::Feature`.
+
+    Returns a `FlattenedPart`, or None if the container holds no `part_*` child
+    or the child has a null shape.
+
+    The transform is applied as a `Placement`, never via `transformGeometry`.
+    This is the single most important choice in the module and it is not a
+    style preference. `transformGeometry` converts analytic surfaces into
+    B-splines: a `Cylinder` face came back as a `BSplineSurface`, with face area
+    shifted 314.1593 -> 315.0023. The lead-in and lead-out arc maths run
+    against the real geometry, so a splined cylinder means the toolpath follows
+    an approximation of the surface the user drew. A `Placement` leaves a
+    `Cylinder` a `Cylinder`.
+
+    It is also what makes the replay addressable at all. Operations reference
+    geometry by sub-element name (`Face1`, `Edge7`), so the topology has to
+    survive flattening. A nested copy has identical topology to its source --
+    same edge count, same per-edge length and curve type -- so the source
+    operation's sub-element names address the same features on every copy.
+
+    Three properties are attached so the write half can match a flattened part
+    back to its source without comparing labels:
+    `SourceObject` (the part's own original), `SourceContainer` (the container
+    it came from) and `NestedLabel`.
+    """
+    part = find_part_in_container(container)
+    if part is None:
+        return None
+
+    shape = getattr(part, "Shape", None)
+    if shape is None or shape.isNull():
+        return None
+
+    # Copy, then strip the child's placement before applying the combined one.
+    # Assigning to a Placement leaves the underlying geometry untouched, which
+    # is the whole point -- see the docstring above.
+    flattened = shape.copy()
+    flattened.Placement = FreeCAD.Placement()
+    flattened.Placement = combined_placement(container, part)
+
+    offset = z_offset_for_thickness(flattened, sheet_thickness)
+    if offset:
+        placement = flattened.Placement
+        base = placement.Base
+        flattened.Placement = FreeCAD.Placement(
+            FreeCAD.Vector(base.x, base.y, base.z + offset),
+            placement.Rotation,
+        )
+
+    obj = doc.addObject("Part::Feature", "%s_%s" % (name_prefix, len(doc.Objects)))
+    obj.Shape = flattened
+    if group is not None:
+        group.addObject(obj)
+
+    _add_link_property(obj, PROP_SOURCE_OBJECT, part,
+                       "The nested part this geometry was flattened from")
+    _add_link_property(obj, PROP_SOURCE_CONTAINER, container,
+                       "The nested_* container this geometry came from")
+    if not hasattr(obj, PROP_NESTED_LABEL):
+        obj.addProperty("App::PropertyString", PROP_NESTED_LABEL, "CAM Replay",
+                        "Label of the nested container, for reporting")
+    setattr(obj, PROP_NESTED_LABEL, getattr(container, "Label", ""))
+
+    return FlattenedPart(obj, container, offset)
+
+
+def _add_link_property(obj, name, value, doc_string):
+    """Add a cross-scope link property to `obj` if it is not already present.
+
+    `App::PropertyXLink`, not `App::PropertyLink`. A plain Link to an object
+    that lives inside an `App::Part` container is out of that container's
+    scope, and FreeCAD says so on every recompute:
+
+        Part::Feature: CAMPart_12 links are out of scope.
+        Out of scope links to: part_Bracket_1
+
+    Measured: the identical link as an XLink produced no warning, whether it
+    pointed at the child or at the container. XLink exists for exactly this --
+    a link whose target is not a sibling or a child -- and since a flattened
+    part deliberately sits outside the layout while pointing back into it, this
+    is the correct property type rather than a way of muting a message.
+
+    Linking to the child and to the container are both fine; the module records
+    both, because the write half needs the part and a report needs the
+    container.
+    """
+    if not hasattr(obj, name):
+        obj.addProperty("App::PropertyXLink", name, "CAM Replay", doc_string)
+    setattr(obj, name, value)
+
+
+def flatten_sheet(doc, sheet_group, sheet_thickness, group=None):
+    """Flatten every `nested_*` container under `sheet_group`.
+
+    Containers are found with the shared `get_nested_containers` helper rather
+    than by walking the group here, so the replay and the existing CAM job
+    creation agree on where nested parts live.
+
+    A container that yields no part is recorded in `result.skipped` and the rest
+    of the sheet continues. A null shape or a missing `part_*` child is a
+    document-state problem the operator should see, not something to raise on
+    and abandon the sheet for.
+    """
+    from ...freecad_helpers import get_nested_containers
+
+    result = FlattenResult()
+    for container in get_nested_containers(sheet_group):
+        flattened = flatten_container(doc, container, sheet_thickness, group=group)
+        if flattened is None:
+            result.skipped.append((container, "no part_* child, or its shape is null"))
+            continue
+        result.parts.append(flattened.obj)
+        if flattened.z_offset:
+            result.z_shifts.append((flattened.obj, flattened.z_offset))
+    return result
+
+
+def describe_flatten(result):
+    """Return a human-readable summary of a `FlattenResult`.
+
+    Plain text over `FreeCAD.Console` for the same reason as
+    `describe_recipe`: it reaches the Report view when a GUI is up and still
+    works under `freecadcmd`.
+    """
+    lines = ["Flattened %d part(s)." % len(result.parts)]
+    for obj, offset in result.z_shifts:
+        lines.append(
+            "  %s: Z shifted by %.3f mm to sit on the stock"
+            % (getattr(obj, "Label", "?"), offset)
+        )
+    for container, reason in result.skipped:
+        lines.append(
+            "WARNING: %s was skipped (%s); it will not be cut."
+            % (getattr(container, "Label", "?"), reason)
+        )
+    return lines
 
 
 def describe_recipe(recipe):

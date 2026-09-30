@@ -16,19 +16,35 @@ feature does not classify anything. It reads a recipe and applies it.
 
 ## Status
 
-**Step 1 done. Steps 2-7 not started.**
+**Steps 1-2 done. Steps 3-7 not started.**
 
-`Tools/Cam/cam_replay.py` exists: the recipe reader, and nothing else. It
-touches no geometry and creates no document objects, which is what makes it
-testable under plain pytest against stand-in objects.
+`Tools/Cam/cam_replay.py` holds two halves:
 
-- 34 new tests, 220 in the suite, all passing.
-- Verified against a live job: a Profile with a LeadInOut dressup and a Drilling
-  read back in group order, 39/36/17 properties captured, dressup attached to
-  its operation despite being listed first, sub-element names preserved, and
-  `resolve_source_object` unwrapping the model clone back to the original.
+- the **recipe reader** (step 1) — no geometry, no document objects, so its
+  tests run under plain pytest against stand-ins;
+- the **flattener** (step 2) — creates document objects, so it is covered by
+  both tiers: pure logic in pytest, real geometry in `freecadcmd`.
 
-One probe finding folded in below: depths are derived, not authored.
+- 249 pytest tests passing (29 new for step 2).
+- `tests/freecad_harness/test_replay_flatten.py`: 61 checks, 0 failures.
+- Step 2 verified on a real cylinder: surfaces stay analytic (`Cylinder` in,
+  `Cylinder` out, no `BSplineSurface`), edge count and every per-edge length
+  unchanged, placement is `container * child` in that order, Z normalised to
+  `-thickness..0`, and the offset idempotent.
+
+Two findings from step 2 that are not in the original constraint list:
+
+- **`App::PropertyLink` into an `App::Part` is out of scope.** A top-level
+  feature linking to something inside a container made FreeCAD warn on every
+  recompute (`CAMPart_12 links are out of scope. Out of scope links to:
+  part_Bracket_1`). Switched to `App::PropertyXLink`, which is the type that
+  means cross-scope. Pinned by a test, and confirmed to bite by injecting the
+  regression.
+- **A part tilted off Z cannot have its top at Z=0.** True by construction and
+  left that way: forcing it would shear the geometry rather than place it. The
+  nester only rotates about Z, so it does not arise.
+
+The depth question is resolved — see Open items.
 
 Every design decision below was verified against the real FreeCAD 26.3 CAM
 module through `freecad_env/usr/bin/freecadcmd`, not inferred from reading the
@@ -134,6 +150,16 @@ break the implementation if ignored.
    `ObjectDressup(obj, base_op)` plus `job.Proxy.addOperation()` instead —
    confirmed working headless.
 
+9. **A link into an `App::Part` from outside it is out of scope.** FreeCAD
+   warns on every recompute. Use `App::PropertyXLink` for the `SourceObject`
+   and `SourceContainer` links, not `App::PropertyLink`.
+
+10. **Harness output needs `FreeCAD.Console`, not `print()`.** Once a document
+    exists, `FreeCAD.Console` captures plain `print()`, so check output
+    vanishes while the status file is still written correctly. The first
+    version of `test_replay_flatten.py` reported nothing at all while failing
+    silently.
+
 ## Open items
 
 - ~~**Depth properties.**~~ **Resolved.** Depths are *derived*, not authored.
@@ -171,9 +197,11 @@ Not started. Ordered so each step is independently verifiable.
 1. ~~`Tools/Cam/cam_replay.py` — recipe reader.~~ **Done.** Classify ops vs
    dressups by property type; capture the property dict; resolve the
    dressup→base dependency.
-2. Geometry flattener. Walk `nested_*` containers via `get_nested_containers`,
-   emit top-level `Part::Feature` with `Placement` only, normalise Z so the
-   bottom sits at `-thickness`.
+2. ~~Geometry flattener.~~ **Done.** Walk `nested_*` containers via
+   `get_nested_containers`, emit top-level `Part::Feature` with `Placement`
+   only, normalise Z so the bottom sits at `-thickness`. Returns a
+   `FlattenedPart` carrying the Z shift, so a report can say which geometry
+   arrived somewhere unexpected.
 3. Job builder. New job per sheet, stock box from the layout properties,
    Z0 = top of stock.
 4. Op replay. Two passes, tool controller remapped into the new job, `Base`
@@ -186,11 +214,19 @@ Not started. Ordered so each step is independently verifiable.
 ## Tests
 
 - **Tier 1 (pytest)** — recipe classification, property-capture exclusions,
-  ordering pass, and a regression test for the label prefix over-match.
-- **Tier 2 (`freecadcmd`)** — full replay against
-  `tests/Test_Files/n70-intercooler-spacer-bottle-nesting.FCStd`: op count
-  matches source, every path non-empty, every path spans the nested envelope,
-  geometry still analytic. Uses the headless dressup construction path.
+  ordering pass, a regression test for the label prefix over-match, and
+  flattening's pure logic. 249 tests.
+- **Tier 2 (`freecadcmd`)** — `test_replay_flatten.py` covers what a stand-in
+  cannot: that geometry survives flattening, topology is intact, placement
+  order is honoured, Z normalisation is exact and idempotent, and the link
+  types are in scope. Still to come: the full replay against
+  `tests/Test_Files/n70-intercooler-spacer-bottle-nesting.FCStd`, asserting op
+  count matches source, every path non-empty, and every path spans the nested
+  envelope.
+
+  `test_replay_flatten.py` is not yet wired into
+  `tests/freecad_harness/run.sh`; it writes `.last_status_replay` and should be
+  added when the replay harness grows.
 
 ## Change log
 
@@ -202,6 +238,13 @@ Not started. Ordered so each step is independently verifiable.
   by the op from the stock box, not authored. The Z frame is therefore enforced
   in step 3 (the stock) rather than carried from the user's part, which narrows
   what the step 6 warning has to check.
+- Step 2 implemented. Two test bugs found and fixed before the checks were
+  trusted: the multiplication-order check passed vacuously with an identity
+  child (and could not distinguish a Y-rotation of a point already on the Y
+  axis), and one test case used a 90-degree Y rotation on the child, which tips
+  a part onto its side — not something the nester produces, and it made a
+  correct placement look like a Z-normalisation failure. Both cases were wrong,
+  not the module.
 - Original framing was "nest from a CAM setup, then apply the ops" (a
   classification problem). The user reframed it: the classification is already
   done by hand in the CAM workbench. Scope reduced to replay only, which
