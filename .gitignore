@@ -51,3 +51,7 @@ tests/freecad_harness/.last_status_bench_cache
 tests/freecad_harness/.last_status_bench_cache
 
 opencode.json
+
+issues.md
+
+tests/Test_Files/deep-nest-n70-parts-122.dxf
