@@ -896,6 +896,469 @@ def describe_flatten(result):
     return lines
 
 
+# -- operation replay ----------------------------------------------------
+#
+# The part that actually cuts. Everything up to here has been preparation.
+
+# Sub-element names are passed through from the source operation rather than
+# re-resolved, and this is a deliberate choice with a real cost.
+#
+# It works because a flattened copy has identical topology to its source: the
+# flattening is a Placement, which leaves the geometry untouched, so the same
+# edge count, the same per-edge length and curve type, and therefore the same
+# `Face1`/`Edge7` numbering. Verified by resolving a source operation's
+# sub-names against a flattened copy and against one rotated 37 degrees --
+# 1/1 resolved, and the resolved face was still the same physical top face.
+#
+# The cost is that nothing checks the names still mean what they meant. If the
+# topology ever diverges -- a part rebuilt by a different FreeCAD version, a
+# source edited after nesting -- a valid-looking name would silently address
+# the wrong feature, and the result would be plausible G-code cutting the
+# wrong thing. So every sub-name is resolved against each clone before the
+# operation is assigned, and a name that does not resolve aborts that
+# operation rather than being dropped. A loud failure is the only acceptable
+# outcome for "cut the wrong feature".
+
+# Properties an operation must not have copied from the source, beyond the
+# generic NON_REPLAYABLE_PROPERTIES set. `ToolController` is in that set
+# already for the recipe reader, but it is listed here for the same reason it
+# is not: the write half has to remap it, so the reader kept it deliberately
+# and this comment records that the two halves agree.
+
+
+def resolve_subnames(subs, shape):
+    """Return the sub-element names in `subs` that exist on `shape`.
+
+    FreeCAD's `getElement` raises on an unknown name, so this is the only way
+    to find out whether a source operation's selection still means anything
+    after flattening. Names are returned in their original order and
+    duplicates are preserved, because a selection listing the same edge twice
+    is the user's business rather than this function's.
+    """
+    resolved = []
+    for name in subs:
+        if not name:
+            # The empty string means "the whole object", which every shape has.
+            resolved.append(name)
+            continue
+        try:
+            shape.getElement(name)
+        except Exception:
+            continue
+        resolved.append(name)
+    return resolved
+
+
+def check_subnames_against_clones(subs, clones):
+    """Return `(clones_missing, detail)` for sub-names that fail on any clone.
+
+    `clones_missing` is the set of names that resolved nowhere. `detail` is a
+    per-name account of what resolved where, for the report.
+
+    A name resolving on some clones and not others is the alarming case: the
+    operation would cut a different feature on different parts of the same
+    nest. It is reported separately from a name that resolves on none.
+    """
+    missing = set()
+    detail = {}
+    for name in subs:
+        if not name:
+            detail[name] = "whole object"
+            continue
+        hits = 0
+        for clone in clones:
+            shape = getattr(clone, "Shape", None)
+            if shape is None:
+                continue
+            try:
+                shape.getElement(name)
+            except Exception:
+                continue
+            hits += 1
+        if hits == 0:
+            missing.add(name)
+            detail[name] = "resolved on 0 of %d" % len(clones)
+        elif hits < len(clones):
+            detail[name] = "resolved on %d of %d" % (hits, len(clones))
+        else:
+            detail[name] = "ok"
+    return missing, detail
+
+
+def clones_for_source(clones, source_geometry):
+    """Return the job clones that correspond to `source_geometry`.
+
+    Returns every clone when the match cannot be narrowed, which is the safe
+    direction: an operation that applies to a few too many parts is visible in
+    the toolpath, whereas one that applies to too few silently cuts less than
+    the source.
+
+    Narrowing happens when the source geometry and the clones name the same
+    part type. The chain back from a job clone to a part is long:
+
+        Model-Bracket (source job's clone)
+          -> Bracket                       (Objects[0], the user's original)
+        Clone (replay job's clone)
+          -> CAMPart_12                    (Objects[0], the flattened part)
+          -> part_Bracket_1                (SourceObject)
+          -> nested_Bracket_1              (SourceContainer)
+
+    so the part type is recovered from `NestedLabel` as
+    `nested_<type>_<n>` and compared against the source's label. That is a
+    format extraction, not a document search: it is not the `findObjects`
+    prefix match that makes `nested_Bracket_1` also return `nested_Bracket_10`
+    and `nested_Bracket_11`.
+    """
+    # Unwrap first. An operation's Base points at the *source job's* clone,
+    # labelled `Model-Bracket`, not at the user's `Bracket` -- so comparing
+    # that label against `nested_Bracket_1` matches nothing and every
+    # operation falls back to targeting every clone. Verified: with the
+    # unwrap missing, a 2-bracket 1-spacer nest matched 3 of 3 for both.
+    original = resolve_source_object(source_geometry) or source_geometry
+    source_label = getattr(original, "Label", "")
+    if not source_label:
+        return list(clones)
+
+    matched = []
+    for clone in clones:
+        original = getattr(clone, "Objects", None)
+        flattened = original[0] if original else None
+        if flattened is None:
+            continue
+        nested = getattr(flattened, PROP_NESTED_LABEL, "")
+        if not nested:
+            continue
+        parts = nested.split("_")
+        if len(parts) >= 3 and "_".join(parts[1:-1]) == source_label:
+            matched.append(clone)
+
+    return matched if matched else list(clones)
+
+
+def create_operation_in(source_op, job, label_suffix="_replay"):
+    """Create a new operation of the same kind as `source_op`, in `job`.
+
+    The operation type is recovered from the source operation's proxy module
+    rather than hardcoded, which is what keeps the replay working for Pocket,
+    Slot, Engrave and anything else the user built. `type(source_op.Proxy)` is
+    the proxy *class*, which has no `Create`; its module does. Verified with
+    `Path.Op.Profile` and `Path.Op.Drilling`.
+
+    Returns the new object, or None if its module offers no `Create` -- which
+    would mean a scripted operation this module does not know how to rebuild,
+    and is worth reporting rather than guessing at.
+    """
+    import importlib
+
+    proxy = getattr(source_op, "Proxy", None)
+    if proxy is None:
+        return None
+    module_name = type(proxy).__module__
+    try:
+        module = importlib.import_module(module_name)
+    except ImportError:
+        return None
+    factory = getattr(module, "Create", None)
+    if factory is None:
+        return None
+
+    name = "%s%s" % (getattr(source_op, "Label", "Op"), label_suffix)
+    try:
+        new_op = factory(name, None, job)
+    except TypeError:
+        # Not every Create takes a job. Drilling's does; a third-party
+        # operation's may not.
+        try:
+            new_op = factory(name)
+        except Exception:
+            return None
+    except Exception:
+        return None
+    return new_op
+
+
+def copy_tool_controller(source_op, job, cache=None):
+    """Return a tool controller in `job` equivalent to `source_op`'s.
+
+    Returns None when the source operation has no tool controller, which is
+    legitimate -- some operations are not tool-dependent.
+
+    The controller is **copied** into the new job with
+    `Path.Tool.Controller.copyTC`, not linked across. A cross-job link does
+    work; verified, an operation in job B accepted job A's controller with no
+    error. But it leaves the new job depending on the source job surviving,
+    so deleting the source job breaks the replay. `copyTC` makes the new job
+    self-contained, which is the point of creating a new job at all.
+
+    `cache` maps a source controller to its copy, so ten operations sharing
+    one 5 mm endmill produce one copied controller rather than ten.
+    """
+    from Path.Tool import Controller as PathToolController
+
+    source_tc = getattr(source_op, "ToolController", None)
+    if source_tc is None:
+        return None
+
+    if cache is not None and id(source_tc) in cache:
+        return cache[id(source_tc)]
+
+    try:
+        new_tc = PathToolController.copyTC(source_tc, job)
+    except Exception as exc:
+        FreeCAD.Console.PrintWarning(
+            "Could not copy tool controller '%s': %s\n"
+            % (getattr(source_tc, "Label", "?"), exc)
+        )
+        return None
+
+    if cache is not None:
+        cache[id(source_tc)] = new_tc
+    return new_tc
+
+
+def create_dressup_in(source_dressup, base_op, job, label_suffix="_replay"):
+    """Create a copy of `source_dressup` wrapping `base_op`, in `job`.
+
+    `Path.Dressup.Gui.LeadInOut.Create` is not used: it touches a ViewProvider
+    and raises `AttributeError: 'NoneType' object has no attribute 'Object'`
+    under `freecadcmd`, which is where the tests run. Constructing
+    `ObjectDressup` and registering with `job.Proxy.addOperation` works
+    headless and produces the same object -- confirmed, and the resulting
+    dressup picked up the lead-in and added a command over its base operation.
+
+    Returns the new object, or None if the dressup's constructor is not one
+    this module can drive. The constructor is taken from the source
+    dressup's proxy module for the same reason operations are: so a Boundary or
+    Dogbone dressup replays as readily as a LeadInOut.
+
+    The document comes from the job rather than being passed in. There is no
+    reason to hand this function a document that might not be the one holding
+    the job, and doing so once produced `AttributeError: 'NoneType' object has
+    no attribute 'addObject'` -- a dressup that silently failed to be created.
+    """
+    import importlib
+
+    proxy = getattr(source_dressup, "Proxy", None)
+    if proxy is None or base_op is None:
+        return None
+    doc = getattr(job, "Document", None) or FreeCAD.ActiveDocument
+    if doc is None:
+        return None
+    try:
+        module = importlib.import_module(type(proxy).__module__)
+    except ImportError:
+        return None
+    constructor = getattr(module, "ObjectDressup", None)
+    if constructor is None:
+        return None
+
+    name = "%s%s" % (getattr(source_dressup, "Label", "Dressup"), label_suffix)
+    try:
+        new_obj = doc.addObject("Path::FeaturePython", name)
+        constructor(new_obj, base_op)
+        job.Proxy.addOperation(new_obj, base_op)
+    except Exception as exc:
+        FreeCAD.Console.PrintWarning(
+            "Could not recreate dressup '%s': %s\n"
+            % (getattr(source_dressup, "Label", "?"), exc)
+        )
+        return None
+    return new_obj
+
+
+class ReplayResult:
+    """The outcome of replaying a recipe into a job.
+
+    `operations` are the new base operations, in replay order. `dressups` are
+    the new dressup objects, keyed by nothing in particular -- they are
+    reported, not looked up.
+
+    `failures` holds human-readable strings for anything that could not be
+    replayed. A replay that silently dropped an operation would produce a job
+    that cuts less than the source, and nothing would say so.
+    """
+
+    def __init__(self):
+        self.operations = []
+        self.dressups = []
+        self.failures = []
+        self.warnings = []
+        self.subname_detail = {}
+
+    def __len__(self):
+        return len(self.operations)
+
+    def __repr__(self):
+        return "<ReplayResult %d op(s), %d dressup(s), %d failure(s)>" % (
+            len(self.operations), len(self.dressups), len(self.failures)
+        )
+
+
+def apply_properties(target, properties, skip=(), remap=None):
+    """Assign captured properties onto `target`.
+
+    Properties in `skip` are left alone. `remap` maps a property name to a
+    replacement value, which is how `ToolController` is pointed at the new
+    job's copy rather than the source job's.
+
+    A property that refuses to be assigned is collected and returned rather
+    than raised on. One read-only or type-incompatible property on one
+    operation should not cost the whole replay, but the caller has to hear
+    about it.
+    """
+    applied, skipped = [], []
+    for name, value in properties.items():
+        if name in skip:
+            skipped.append(name)
+            continue
+        if remap and name in remap:
+            value = remap[name]
+            if value is None:
+                skipped.append(name)
+                continue
+        try:
+            setattr(target, name, value)
+            applied.append(name)
+        except Exception:
+            skipped.append(name)
+    return applied, skipped
+
+
+def replay_recipe(recipe, job, clones, tool_cache=None):
+    """Recreate `recipe`'s operations in `job`, targeting `clones`.
+
+    Two passes, in that order, and the order is not a preference.
+    `Operations.Group` was observed on a live job as
+    `['DressupLeadInOut', 'Profile', 'Drilling']` -- the dressup ahead of the
+    operation it wraps. A single pass raises `KeyError` when the dressup cannot
+    find its base. The first version of the probe did exactly that.
+
+    `clones` must be the job's model clones, not the objects passed to
+    `PathJob.Create`. See `ReplayJob`.
+
+    Every source operation that cannot be recreated lands in
+    `result.failures` with a reason. Nothing is dropped quietly.
+    """
+    result = ReplayResult()
+    if tool_cache is None:
+        tool_cache = {}
+
+    made = {}
+
+    # -- pass one: base operations --
+    for item in recipe:
+        if is_dressup(item.source):
+            continue
+        new_op = create_operation_in(item.source, job)
+        if new_op is None:
+            result.failures.append(
+                "Could not recreate operation '%s'; its type does not expose a "
+                "Create function this module can drive." % item.label
+            )
+            continue
+
+        remap = {}
+        new_tc = copy_tool_controller(item.source, job, tool_cache)
+        if new_tc is not None:
+            remap["ToolController"] = new_tc
+
+        applied, skipped = apply_properties(
+            new_op, item.properties, remap=remap or None
+        )
+
+        # Re-point at the clones, keeping the source's sub-element selection.
+        #
+        # Each source entry becomes one entry per *matching* clone. Expanding
+        # every selection to every clone would be wrong as soon as one
+        # operation spans two part types: a selection of Face1 on a Bracket and
+        # Face5 on a Spacer would put Face5 on the brackets.
+        base_value = []
+        for geometry, subs in item.base_entries:
+            targets = clones_for_source(clones, geometry) if clones else []
+            if not targets:
+                result.failures.append(
+                    "Operation '%s' has base geometry but the job has no "
+                    "clones to point it at." % item.label
+                )
+                continue
+            if not subs or "" in subs:
+                base_value.extend((clone, [""]) for clone in targets)
+                continue
+            missing, detail = check_subnames_against_clones(subs, targets)
+            for name, note in detail.items():
+                if name:
+                    result.subname_detail[name] = note
+            if missing:
+                result.failures.append(
+                    "Operation '%s' selects %s, which %s. Not replayed, because "
+                    "it would cut a different feature than intended."
+                    % (item.label, ", ".join(sorted(missing)),
+                       "does not exist on the nested geometry"
+                       if len(missing) == len(subs) else
+                       "resolves on only some of the nested parts")
+                )
+                continue
+            base_value.extend((clone, subs) for clone in targets)
+
+        if base_value:
+            try:
+                new_op.Base = base_value
+            except Exception as exc:
+                result.failures.append(
+                    "Could not set Base on '%s': %s" % (item.label, exc)
+                )
+                continue
+
+        result.operations.append(new_op)
+        made[id(item.source)] = new_op
+
+    # -- pass two: dressups, now that their bases exist --
+    for item in recipe:
+        for _props, source_dressup in item.dressups:
+            base = made.get(id(source_dressup.Base))
+            if base is None:
+                result.failures.append(
+                    "Dressup '%s' wraps an operation that was not replayed; it "
+                    "cannot be replayed either."
+                    % getattr(source_dressup, "Label", "?")
+                )
+                continue
+            new_dressup = create_dressup_in(source_dressup, base, job)
+            if new_dressup is None:
+                result.failures.append(
+                    "Could not recreate dressup '%s'."
+                    % getattr(source_dressup, "Label", "?")
+                )
+                continue
+            apply_properties(new_dressup, _props, skip=("Base",))
+            result.dressups.append(new_dressup)
+
+    for warning in result.failures:
+        FreeCAD.Console.PrintWarning("%s\n" % warning)
+    return result
+
+
+def describe_replay_result(result):
+    """Return a human-readable summary of a `ReplayResult`.
+
+    Reports the sub-element check explicitly, because it is the check that
+    stands between a plausible-looking job and one that cuts the wrong
+    feature.
+    """
+    lines = [
+        "Replayed %d operation(s) and %d dressup(s)."
+        % (len(result.operations), len(result.dressups))
+    ]
+    partial = {n: d for n, d in result.subname_detail.items() if d != "ok"}
+    for name, note in sorted(partial.items()):
+        lines.append("WARNING: sub-element %s %s." % (name, note))
+    for failure in result.failures:
+        lines.append("WARNING: %s" % failure)
+    if not result.failures and not partial:
+        lines.append("All sub-element selections resolved on every nested part.")
+    return lines
+
+
 def describe_recipe(recipe):
     """Return a human-readable summary of `recipe` for the report view.
 

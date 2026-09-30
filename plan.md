@@ -16,7 +16,7 @@ feature does not classify anything. It reads a recipe and applies it.
 
 ## Status
 
-**Steps 1-3 done. Steps 4-7 not started.**
+**Steps 1-4 done. Steps 5-7 not started.**
 
 `Tools/Cam/cam_replay.py` holds two halves:
 
@@ -25,10 +25,16 @@ feature does not classify anything. It reads a recipe and applies it.
 - the **flattener** (step 2) — creates document objects, so it is covered by
   both tiers: pure logic in pytest, real geometry in `freecadcmd`;
 - the **job builder** (step 3) — creates a real CAM job, so the interesting
-  parts can only be checked under `freecadcmd`.
+  parts can only be checked under `freecadcmd`;
+- the **replay** (step 4) — recreates the user's operations and dressups.
 
-- 281 pytest tests passing (32 new for step 3).
-- `tests/freecad_harness/test_replay_flatten.py`: 97 checks, 0 failures.
+- 313 pytest tests passing (32 new for step 4).
+- `tests/freecad_harness/test_replay_flatten.py`: 125 checks, 0 failures.
+  The end-to-end replay is now exercised on a real two-part-type job: a Profile
+  on the top face with a LeadInOut dressup, plus a Drilling op, replayed into a
+  nest of 2 brackets and 1 spacer. The replayed Profile cuts 289.11 mm against
+  a 288.87 mm expectation (2 × the source's 144.43 mm), so the toolpath is
+  geometrically the same cut, just moved.
 - Step 2 verified on a real cylinder: surfaces stay analytic (`Cylinder` in,
   `Cylinder` out, no `BSplineSurface`), edge count and every per-edge length
   unchanged, placement is `container * child` in that order, Z normalised to
@@ -173,7 +179,33 @@ break the implementation if ignored.
     version of `test_replay_flatten.py` reported nothing at all while failing
     silently.
 
-11. **The sheet spans `0..width`, not `-width/2..+width/2`.** The nesting sheet
+11. **A cross-job tool controller link is accepted silently.** An operation in
+    job B takes job A's `ToolController` with no error, and the toolpath is
+    correct. But the new job then depends on the source job surviving. The
+    replay copies it with `Path.Tool.Controller.copyTC` instead, cached so ten
+    operations sharing one endmill produce one copy.
+
+12. **A sub-element name that no longer resolves must abort its operation, not
+    be dropped.** Source sub-names are passed through verbatim, which is sound
+    because a `Placement` leaves topology untouched and a nested copy has
+    identical topology. But nothing *guarantees* the names still mean what they
+    meant, and a valid-looking name addressing the wrong feature produces
+    plausible G-code cutting the wrong thing. Every name is resolved against
+    each target first; a failure aborts that operation and says so.
+
+13. **Part-type identity is recovered from the nested label, and that is a soft
+    spot.** `clones_for_source` parses `nested_<type>_<n>` and compares `<type>`
+    against the source part's label. It works because the nester derives both
+    from the same source label. It breaks if the two are not derived from the
+    same label — which is what happened in the harness when an earlier check
+    had already taken the name `Bracket`, so FreeCAD uniquified the source to
+    `Bracket001` while the nested labels still said `Bracket`. A robust fix is
+    a real `App::PropertyLink` from the master container to the source object,
+    which would mean touching `shape_preparer.py`; not done, since this feature
+    is deliberately standalone. Until then, a mismatch falls back to *every*
+    clone, which over-cuts visibly rather than under-cutting silently.
+
+14. **The sheet spans `0..width`, not `-width/2..+width/2`.** The nesting sheet
     is `Polygon([(0,0), (width,0), (width,height), (0,height)])` and
     `Sheet.is_placement_valid` requires full containment, so parts are always
     inside that rectangle. The replay stock must therefore be built from the
@@ -226,8 +258,9 @@ Not started. Ordered so each step is independently verifiable.
    properties, Z0 = top of stock. Returns a `ReplayJob` carrying the job's
    **clones** — the list an operation must target — alongside the inputs, so
    the two cannot be confused.
-4. Op replay. Two passes, tool controller remapped into the new job, `Base`
-   re-pointed at all copies.
+4. ~~Op replay.~~ **Done.** Two passes, tool controller **copied** into the new
+   job with `copyTC`, `Base` re-pointed at the matching copies, every
+   sub-element name resolved against the target before assignment.
 5. Ordering. Internals before perimeters via `job.Operations.Group`.
 6. Verification and reporting. Non-empty assertion per op; Z frame check as a
    **warning**.
@@ -271,6 +304,16 @@ Not started. Ordered so each step is independently verifiable.
   a part onto its side — not something the nester produces, and it made a
   correct placement look like a Z-normalisation failure. Both cases were wrong,
   not the module.
+- Step 4 implemented. Two more harness bugs, and one real code bug:
+  the identity matching compared the *source job clone's* label
+  (`Model-Bracket`) against `nested_Bracket_1` instead of unwrapping to the
+  original first, so nothing matched and every operation silently fell back to
+  targeting every clone — the Drilling op cut 11 commands across all three
+  parts instead of 7 on the one spacer. Also: the replay harness shared a
+  document with the flatten checks, so FreeCAD uniquified a label underneath
+  it; and the path-length faithfulness check counted G0 rapids, measuring the
+  distance between parts rather than what was cut (343.73 mm for a 288.87 mm
+  cut).
 - Step 3 implemented. The harness caught a third bad test case of the same kind:
   a part was placed on the sheet origin, which the nesting side never does, and
   the "part is not inside the sheet" check flagged it. Three test bugs across two

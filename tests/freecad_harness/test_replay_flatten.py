@@ -228,6 +228,273 @@ def run_job_checks(doc, flattened, thickness):
           "describe_replay_job returned non-strings")
 
 
+def run_replay_checks(doc):
+    """Replay a real recipe into a real job and check the toolpaths.
+
+    Takes its own document. Sharing one with the flatten checks made FreeCAD
+    uniquify the source part to `Bracket001` while the hand-written nested
+    labels still said `Bracket`, and the identity matching then correctly found
+    no match -- which looked like a code bug and was a fixture bug.
+
+    This is the step the whole feature exists for, and it is the first place
+    the read half and the write half meet, so it is worth checking end to end
+    rather than in pieces.
+
+    The source job is built the way a user would build one: a Profile on the
+    top face with a LeadInOut dressup, and a Drilling op for the hole. Two
+    part types, so the identity matching in `clones_for_source` is exercised
+    as well as the general case.
+    """
+    from Path.Main import Job as PathJob
+    from Path.Op import Profile as PathProfile
+    from Path.Op import Drilling as PathDrilling
+    from Path.Dressup.Gui.LeadInOut import ObjectDressup
+
+    doc = FreeCAD.newDocument("replay_ops")
+    thickness = 6.0
+
+    def make_source(name, cx, cy, w, h, hr):
+        obj = doc.addObject("Part::Feature", name)
+        shape = Part.makeBox(w, h, thickness, FreeCAD.Vector(-w / 2, -h / 2, -thickness))
+        shape = shape.cut(Part.makeCylinder(
+            hr, thickness, FreeCAD.Vector(cx - w / 4, cy, -thickness)))
+        obj.Shape = shape
+        return obj
+
+    # -- the user's source job, on two different part types --
+    bracket = make_source("Bracket", 0, 0, 40, 25, 3)
+    spacer = make_source("Spacer", 0, 0, 30, 30, 2)
+    source_job = PathJob.Create("UserJob", [bracket, spacer], None)
+    doc.recompute()
+    model = source_job.Model.Group
+
+    def top_faces(target):
+        return ["Face%d" % (i + 1) for i, f in enumerate(target.Shape.Faces)
+                if type(f.Surface).__name__ == "Plane"
+                and abs(f.CenterOfMass.z) < 1e-9]
+
+    prof = PathProfile.Create("Profile", None, source_job)
+    doc.recompute()
+    prof.Base = [(model[0], top_faces(model[0]))]
+    prof.HandleMultipleFeatures = "Individually"
+    prof.Side = "Outside"
+    prof.Direction = "CW"
+    prof.UseComp = True
+    prof.ToolController = source_job.Tools.Group[0]
+    doc.recompute()
+
+    drill = PathDrilling.Create("Drilling", None, source_job)
+    doc.recompute()
+    drill.Base = [(model[1], [""])]
+    drill.ToolController = source_job.Tools.Group[0]
+    doc.recompute()
+
+    dressup = doc.addObject("Path::FeaturePython", "DressupLeadInOut")
+    ObjectDressup(dressup, prof)
+    source_job.Proxy.addOperation(dressup, prof)
+    dressup.LeadIn = True
+    dressup.LeadOut = True
+    dressup.StyleIn = "Arc"
+    dressup.StyleOut = "Line"
+    dressup.RadiusIn = 5
+    dressup.RadiusOut = 7
+    dressup.AngleIn = 90
+    dressup.AngleOut = 45
+    doc.recompute()
+
+    emit("source Operations.Group: %s" % [o.Label for o in source_job.Operations.Group])
+    check(len(prof.Path.Commands) > 5, "the source Profile produced no path")
+    check(len(drill.Path.Commands) > 2, "the source Drilling produced no path")
+
+    # -- a nest of both part types --
+    # Shapes_1 must be a child of the Sheet group: get_nested_containers looks
+    # for a Shapes_* subgroup inside the sheet, not beside it.
+    sheet = doc.addObject("App::DocumentObjectGroup", "Sheet_1")
+    shapes = doc.addObject("App::DocumentObjectGroup", "Shapes_1")
+    sheet.addObject(shapes)
+
+    def nest(label, source_shape, cx, cy, angle):
+        # Named the way the nester names them: nested_<source label>_<n>. The
+        # source label is read back rather than assumed, because FreeCAD may
+        # have uniquified it.
+        label = "%s_%d" % (getattr(label, "Label", "Part"), nest.counter)
+        nest.counter += 1
+        container = doc.addObject("App::Part", "nested_" + label)
+        shapes.addObject(container)
+        part = doc.addObject("Part::Feature", "part_" + label)
+        shape = source_shape.copy()
+        shape.Placement = FreeCAD.Placement()
+        part.Shape = shape
+        container.addObject(part)
+        container.Placement = FreeCAD.Placement(
+            FreeCAD.Vector(cx, cy, 0), FreeCAD.Rotation(FreeCAD.Vector(0, 0, 1), angle))
+        doc.recompute()
+        return container, part
+
+    nest.counter = 1
+    nest(bracket, bracket.Shape, 40.0, 40.0, 0.0)
+    nest(bracket, bracket.Shape, 140.0, 40.0, 37.0)
+    nest(spacer, spacer.Shape, 40.0, 120.0, 25.0)
+    doc.recompute()
+
+    layout = doc.addObject("App::DocumentObjectGroup", "Layout_1")
+    for name, value in (("SheetWidth", 300.0), ("SheetHeight", 200.0),
+                        ("SheetThickness", thickness)):
+        layout.addProperty("App::PropertyLength", name, "Layout", "")
+        setattr(layout, name, value)
+    doc.recompute()
+
+    flattened = cam_replay.flatten_sheet(doc, sheet, thickness)
+    check(len(flattened) == 3,
+          "expected 3 flattened parts, got %d" % len(flattened))
+    if len(flattened) != 3:
+        return
+
+    replay = cam_replay.create_replay_job(
+        doc, layout, sheet, flattened.parts, source_job=source_job)
+    check(replay is not None, "create_replay_job returned None")
+    if replay is None:
+        return
+
+    recipe = cam_replay.read_recipe(source_job)
+    check(len(recipe) == 2,
+          "expected 2 operations in the recipe, got %d" % len(recipe))
+    check(len(recipe.unresolved_dressups) == 0,
+          "the recipe left %d dressup unresolved" % len(recipe.unresolved_dressups))
+
+    result = cam_replay.replay_recipe(recipe, replay.job, replay.clones)
+    doc.recompute()
+
+    emit("replayed: %r" % result)
+    check(len(result.failures) == 0,
+          "replay reported failures: %s" % result.failures)
+    check(len(result.operations) == 2,
+          "expected 2 replayed operations, got %d" % len(result.operations))
+    check(len(result.dressups) == 1,
+          "expected 1 replayed dressup, got %d" % len(result.dressups))
+    if len(result.failures) or len(result.operations) != 2:
+        return
+
+    # -- every replayed operation produced a real toolpath --
+    for new_op in result.operations:
+        check(new_op.Path is not None and len(new_op.Path.Commands) > 5,
+              "%s: replayed path is empty (%s commands)"
+              % (new_op.Label, len(new_op.Path.Commands) if new_op.Path else 0))
+
+    # -- the dressup picked up its lead-in --
+    dress = result.dressups[0]
+    base = dress.Base
+    check(dress.StyleIn == "Arc" and dress.StyleOut == "Line",
+          "dressup styles did not carry over: %s / %s" % (dress.StyleIn, dress.StyleOut))
+    check(abs(float(dress.RadiusIn) - 5.0) < 1e-6 and abs(float(dress.RadiusOut) - 7.0) < 1e-6,
+          "dressup radii did not carry over: %s / %s" % (dress.RadiusIn, dress.RadiusOut))
+    check(len(dress.Path.Commands) >= len(base.Path.Commands),
+          "the dressup produced fewer commands than the op it wraps (%d < %d)"
+          % (len(dress.Path.Commands), len(base.Path.Commands)))
+
+    # -- the tool was copied, not linked across --
+    for new_op in result.operations:
+        tc = getattr(new_op, "ToolController", None)
+        check(tc is not None, "%s has no tool controller after replay" % new_op.Label)
+        if tc is not None:
+            check(tc in replay.job.Tools.Group,
+                  "%s: the tool controller is not in the replay job's tool table"
+                  % new_op.Label)
+            check(all(tc is not source_job.Tools.Group[0]
+                      for _ in [0]),
+                  "%s: the replayed op still points at the SOURCE job's tool"
+                  % new_op.Label)
+
+    # -- the identity matching kept the part types apart --
+    # Asked for the whole clone list, not one clone at a time: the fallback for
+    # an unmatched source is "every clone", so asking about a single clone
+    # always answers yes and matches nothing. An earlier version of this check
+    # did that and reported 3 Brackets in a nest of 2.
+    brackets = cam_replay.clones_for_source(replay.clones, model[0])
+    spacers = cam_replay.clones_for_source(replay.clones, model[1])
+    check(len(brackets) == 2,
+          "expected 2 clones to match Bracket, got %d" % len(brackets))
+    check(len(spacers) == 1,
+          "expected 1 clone to match Spacer, got %d" % len(spacers))
+
+    profile_op = [o for o in result.operations if "Profile" in o.Label][0]
+    profile_targets = {id(entry[0]) for entry in profile_op.Base}
+    bracket_ids = {id(c) for c in brackets}
+    check(profile_targets == bracket_ids,
+          "the Profile should target only the Bracket clones: %d targets, "
+          "%d brackets" % (len(profile_targets), len(bracket_ids)))
+
+    # -- the toolpaths cover the nested parts --
+    for new_op in result.operations:
+        xs = [c.X for c in new_op.Path.Commands if getattr(c, "X", None) is not None]
+        if not xs:
+            continue
+        targets = {id(entry[0]) for entry in new_op.Base}
+        boxes = [replay.clones.index(t).__class__ for t in targets if t in replay.clones]
+        emit("  %-24s ncmds=%-4d X %s..%s" % (
+            new_op.Label, len(new_op.Path.Commands),
+            round(min(xs), 2), round(max(xs), 2)))
+        check(max(xs) > 20, "%s: the toolpath does not reach past the first part"
+              % new_op.Label)
+
+    # -- the replayed cut is the SAME cut, just moved --
+    #
+    # Present-and-non-empty is a weak claim. This compares the actual motion:
+    # the source Profile's path length must equal the replayed Profile's, since
+    # the nested copies are the same part at the same scale. If the replay
+    # silently cut a different feature, the lengths would differ.
+    def path_length(op, cutting_only=True):
+        """Length of a toolpath in mm.
+
+        Counts cutting moves (G1/G2/G3) by default. Including G0 rapids
+        measures the distance *between* parts, which scales with how the nest
+        is laid out rather than with what was cut -- the first version of this
+        check included them and reported 343.73 mm for a path that cuts
+        288.87 mm.
+        """
+        total = 0.0
+        last = None
+        for cmd in op.Path.Commands:
+            text = str(cmd)
+            motion = text.split()[1] if len(text.split()) > 1 else ""
+            if cutting_only and motion not in ("G1", "G2", "G3"):
+                if motion.startswith("G0"):
+                    last = None
+                continue
+            x, y = getattr(cmd, "X", None), getattr(cmd, "Y", None)
+            if x is None or y is None:
+                last = None
+                continue
+            if last is not None:
+                total += ((x - last[0]) ** 2 + (y - last[1]) ** 2) ** 0.5
+            last = (x, y)
+        return total
+
+    profile_replay = [o for o in result.operations if "Profile" in o.Label][0]
+    source_len = path_length(prof)
+    replay_len = path_length(profile_replay)
+    n_bracket_targets = sum(1 for entry in profile_replay.Base
+                            if entry[0] in brackets)
+    emit("  profile path length: source %.2f mm, replay %.2f mm over %d part(s)"
+         % (source_len, replay_len, n_bracket_targets))
+    check(abs(replay_len - source_len * n_bracket_targets) < 1.0,
+          "replayed profile path is %.2f mm; %d brackets of a %.2f mm source "
+          "path would be %.2f mm"
+          % (replay_len, n_bracket_targets, source_len,
+             source_len * n_bracket_targets))
+
+    # -- and the drill only ever touched the spacer --
+    drill_replay = [o for o in result.operations if "Drilling" in o.Label][0]
+    check(all(entry[0] in spacers for entry in drill_replay.Base),
+          "the replayed Drilling op targets something other than the spacer")
+
+    # -- nothing is empty, and the report says so --
+    report = "\n".join(cam_replay.describe_replay_result(result))
+    check("All sub-element selections resolved" in report,
+          "the report does not state that the sub-element check passed: %s" % report)
+    emit(report)
+
+
 def run():
     doc = FreeCAD.newDocument("replay_flatten")
 
@@ -410,6 +677,9 @@ def run():
 
     run_job_checks(doc, flattened, thickness)
 
+    run_replay_checks(doc)
+
+    FreeCAD.closeDocument("replay_ops")
     FreeCAD.closeDocument("replay_flatten")
 
 
