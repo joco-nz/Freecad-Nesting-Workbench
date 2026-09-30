@@ -16,7 +16,11 @@ feature does not classify anything. It reads a recipe and applies it.
 
 ## Status
 
-**Steps 1-7 done. The feature is complete and wired into the menu.**
+**Steps 1-7 done. Step 8 in progress — the fixture is being built.**
+
+The feature is complete and wired into the menu, but has only ever run
+headless against synthetic geometry small enough to reason about. Step 8 closes
+that, and the manual GUI pass follows it.
 
 `Tools/Cam/cam_replay.py` holds two halves:
 
@@ -34,8 +38,12 @@ feature does not classify anything. It reads a recipe and applies it.
 
 - 421 pytest tests passing (35 new for step 7).
 - `tests/freecad_harness/test_replay_flatten.py`: 187 checks, 0 failures.
-  The full pipeline now runs end to end over a two-sheet layout: two jobs, each
-  with its own stock at the origin, both verified.
+  The full pipeline runs end to end over a two-sheet layout: two jobs, each with
+  its own stock at the origin, both verified.
+
+Every part in every one of those checks is a `Part::Feature` built from
+primitives, and none of them has more than three parts of a type. That is what
+step 8 exists to change.
   A healthy two-part-type replay verifies clean: 2 operations, both with
   cutting motion, 2 warnings carried through from the stock frame comparison.
   The end-to-end replay is now exercised on a real two-part-type job: a Profile
@@ -326,6 +334,124 @@ Not started. Ordered so each step is independently verifiable.
    dialog, every sheet replayed one job per sheet. Wired into the Nesting menu
    and toolbar as `Nesting_ReplayCAMSetup`, beside `Nesting_CreateCAMJob` and
    sharing no code with it beyond `freecad_helpers`.
+8. **Mid-complexity fixture + headless replay test.** In progress — the fixture
+   is being built. See "The replay fixture" below for the full spec.
+
+## The replay fixture
+
+A committed `.FCStd` that exercises the replay at a size and a realism the
+synthetic in-script fixtures do not reach.
+
+### Why, specifically
+
+Four gaps, each of which the current fixtures cannot reach:
+
+1. **Scale.** `find_hole_nestings` measured **543 ms on 40 parts** (40 x
+   `part_footprint` at 15.1 ms each, plus an O(n^2) containment loop over the
+   parts that have holes), and it has never run above 3 parts. At n70's 122
+   parts that is roughly 2 s *per sheet*, unmeasured.
+2. **Part labels at quantity > 10.** `clones_for_source` recovers the part type
+   by splitting `nested_<type>_<n>` on `_` and rejoining the middle. A type
+   containing an underscore is verified. The interaction with FreeCAD's label
+   uniquification at quantity 10+ is **not** — and that is precisely where
+   `findObjects(Label=...)` over-matched, and precisely where n70 lives. This
+   is the soft spot already recorded as constraint 13.
+3. **Non-circular internal features.** Every internal feature in the current
+   harness is a circle. A slot or rectangular pocket is a different ring count,
+   a different sub-element set, and a different containment result.
+4. **`PartDesign::Body` geometry.** Every synthetic part so far is a
+   `Part::Feature` built from primitives. A Body is sketch-based, has different
+   topology, and carries an `App::Origin` the nester has to skip
+   (`SKIP_TYPEIDS` exists for that).
+
+### Decisions
+
+| Question | Answer |
+|---|---|
+| Committed `.FCStd` or generated at test time? | **Committed `.FCStd`.** Fast, deterministic, decoupled from nester changes, and openable in a GUI — which is the one untested part of the feature. |
+| Primitives or sketch-based geometry? | **Sketch-based** (`PartDesign::Body`). Closer to what actually gets nested. |
+| How many parts? | **~40.** Enough to cross the 10-per-type boundary; nowhere near n70. |
+
+Rejected: hand-building the layout, because it drifts from what a real run
+emits. Re-running the nester on every test invocation, because it couples the
+replay test to nester regressions — confusing when the two features are
+independent. Generating once and committing gives authenticity without either
+cost.
+
+Note `tests/Test_Files/` currently has **no tracked files at all**: both the
+n70 `.FCStd` and its 5.3 MB `.dxf` are gitignored, so nothing in the repo is
+openable in a GUI today.
+
+### What the fixture must contain
+
+Labels matter — the replay matches on conventions the nester writes. Getting
+these wrong produces a fixture that looks right and exercises nothing.
+
+**The layout side** (what a nesting run produces):
+
+    Layout_001                    App::DocumentObjectGroup
+      SheetWidth / SheetHeight / SheetThickness   (App::PropertyLength)
+      Sheet_1                     App::DocumentObjectGroup
+        Sheet_Boundary_1          Part::Feature, a plane, placed at the sheet origin
+        Shapes_1                  App::DocumentObjectGroup
+          nested_<Type>_1         App::Part, Placement = nest position + Z rotation
+            part_<Type>_1         Part::Feature, geometry centred, own Placement
+      Sheet_2 ...                 as above
+
+`Sheet_Boundary_N` is **required**, not optional. `sheet_origin_for` reads the
+sheet's world origin from it, and without it the parts are never moved to local
+coordinates — which is the failure that produced the "parts outside the stock"
+check in step 6.
+
+**The CAM side** (the recipe to replay): a Job referencing the source bodies,
+with at minimum one Profile on an external boundary, one operation for an
+internal feature, and one LeadInOut dressup.
+
+### Required content
+
+- **10–12 copies of one part type.** This is the point of the fixture: it
+  crosses the label-uniquification boundary.
+- **A part type whose label contains an underscore** (e.g. `L_Shape`), to
+  combine the underscore case with quantity 10+.
+- **At least one part with a non-circular internal feature** — a slot or a
+  rectangular pocket. Closes gap 3.
+- **At least one part with a fillet or chamfer.** Closes gap 4 partly, and
+  changes edge counts, so it tests sub-element resolution against something
+  that is not a primitive.
+- **At least one part with a hole large enough to nest a smaller part inside**,
+  so hole-nesting ordering is exercised by the fixture rather than only by the
+  synthetic check.
+- **Two sheets**, so the one-job-per-sheet path is covered at scale. The current
+  synthetic test does this with 2 parts per sheet; the fixture should do it
+  with a realistic mix.
+- **Parts at distinct rotations.** The nester only rotates about Z, so the
+  rotations should be spread rather than all zero.
+
+### What the test will assert
+
+Once the fixture exists:
+
+- every replayed operation produces cutting motion;
+- every sub-element name resolves on every nested part;
+- every part lies within its sheet's stock;
+- each sheet produced its own job, at its own origin, with the stock sized from
+  the layout properties;
+- the replayed toolpaths cover the nested envelope — compared by path length
+  against the source, not merely by non-emptiness;
+- hole nesting is detected, and the operation order changed accordingly;
+- **a wall-clock budget for the replay stage**, so `find_hole_nestings` at
+  scale is measured rather than assumed. The budget itself is TBD, pending the
+  first real number from the fixture;
+- nothing in the replay depends on nester behaviour, so a nester regression
+  cannot fail this test.
+
+### Sequencing
+
+1. Fixture built and committed.
+2. Headless test written and run — shakes out scale and topology.
+3. **Only then** the manual GUI pass, which will then be testing only the GUI
+   layer rather than also turning up structural problems.
+
 
 ## Tests
 
@@ -348,7 +474,18 @@ Not started. Ordered so each step is independently verifiable.
   `tests/freecad_harness/run.sh`; it writes `.last_status_replay` and should be
   added when the replay harness grows.
 
+- **Tier 3 (fixture)** — the committed `.FCStd` described under "The replay
+  fixture". This is the only tier that uses real sketch-based geometry, a
+  realistic part count, or committed binary input, and the only one whose
+  result is openable by hand in a GUI. Nothing in tiers 1 and 2 can reach
+  those, which is the whole reason it exists.
+
 ## Change log
+
+- Step 8 opened. A mid-complexity committed fixture was agreed over the
+  synthetic-only alternative, after measuring that `find_hole_nestings` takes
+  543 ms on 40 parts and has never been run above 3. The scale question was
+  the one that decided it.
 
 - Branch created from `Faster-NFP-Calc-Investigate` at `a124552`.
 - Step 1 implemented and verified against a live job. The reader is pure logic
