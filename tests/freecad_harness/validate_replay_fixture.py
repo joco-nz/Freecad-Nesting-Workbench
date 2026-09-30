@@ -448,6 +448,54 @@ def _c_stub(container):
     return type("_S", (), {"Objects": [container], "Label": container.Label})()
 
 
+def _diagnose_no_operations(doc, job, recipe):
+    """Say WHY a job has no operations, when the reason is diagnosable.
+
+    "No operations" on its own sends the reader hunting. The common cause is
+    specific and easy to fix: the operations exist in the document, each dressup
+    points at one, but they were never added to `Operations.Group` -- which is
+    what actually defines a job's process order. Adding a dressup puts the
+    *dressup* in the group, so it is easy to end up with a group of dressups
+    and no operations, each pointing at something real that nothing lists.
+
+    Checked rather than asserted, because the opposite case -- no operations
+    anywhere -- is a genuinely different problem with a different fix.
+    """
+    by_label = {o.Label: o for o in doc.Objects}
+
+    dressup_bases = {}
+    for dressup in recipe.unresolved_dressups:
+        base = getattr(dressup, "Base", None)
+        if base is not None:
+            dressup_bases[getattr(base, "Label", "?")] = dressup.Label
+
+    in_group = {getattr(o, "Label", "?")
+                for o in (getattr(job.Operations, "Group", []) or [])}
+    present = sorted(label for label in dressup_bases if label in by_label)
+
+    if present:
+        fail("The job has no operations in Operations.Group, but %d operation "
+             "object(s) exist in this document and are wrapped by a dressup."
+             % len(present),
+             "The operations are not in the job's process order, so the replay "
+             "has nothing to read.\n"
+             "  present but unlisted: %s\n"
+             "  Operations.Group currently holds: %s\n"
+             "\n"
+             "Fix: add each operation to the job, e.g.\n"
+             "  job.Proxy.addOperation(doc.getObject('%s'))\n"
+             "and put the dressups after the operation they wrap. In the CAM "
+             "workbench, creating the operation first and then dressing it up "
+             "produces the right order."
+             % (", ".join(present), sorted(in_group) or "nothing",
+                present[0]))
+    else:
+        fail("The job has no operations, and none are wrapped by a dressup "
+             "either.",
+             "Found %d dressup(s) whose base is missing. The job needs at "
+             "least one operation to replay." % len(recipe.unresolved_dressups))
+
+
 def validate_job(doc, wanted_name=None, all_containers=()):
     """Check the CAM job and inventory the recipe. Returns the job, or None."""
     heading("CAM JOB")
@@ -480,7 +528,7 @@ def validate_job(doc, wanted_name=None, all_containers=()):
 
     recipe = cam_replay.read_recipe(job)
     if not len(recipe):
-        fail("The job has no operations, so there is nothing to replay.")
+        _diagnose_no_operations(doc, job, recipe)
         return job
     if recipe.unresolved_dressups:
         warn("%d dressup(s) could not be attached: %s"
