@@ -453,6 +453,103 @@ its dressups, inner to outer. List order is step order.
 Step 3 is what guarantees the list shape regardless of what any dressup module
 does to the list itself, and it fixes defect 4.
 
+## What the GUI run found
+
+The first manual run of the command, on the tracked fixture. It is the only
+thing in this work that no automated tier could have found, and the reason is
+worth recording before the details: **a ViewProvider does not exist under
+`freecadcmd`**, so every test tier here passes with or without the defect below.
+
+### 1. The tree renders flat — and it is a ViewProvider, not the document
+
+Measured on the replayed job:
+
+    CAM_Replay_Sheet_1  (Path::FeaturePython)   InList = []
+    Operations = 'Operations001'  InList=['CAM_Replay_Sheet_1']
+    Operations.Group = [DressupLeadInOut_replay, ... x7]
+      DressupLeadInOut_replay  Base -> 'Profile_replay'
+          Profile_replay       InList = ['DressupLeadInOut_replay']   claimed once
+
+So the new job **was** created, sits at document root as the source job does,
+its Operations group is claimed by it, and every dressup's `Base` points at its
+own replayed operation with a single claim. The document structure is right.
+
+What is missing is one level down: each dressup has no children and its base
+operation appears at the document root. The cause is
+`ViewProviderDressup.claimChildren()`, which returns `[self.obj.Base]`
+(`Path/Dressup/Gui/LeadInOut.py:812`). Every dressup kind has one. The replay
+sets no ViewProvider, so `claimChildren()` returns nothing.
+
+The fixture's own `GuiDocument.xml` records the difference:
+
+    DressupLeadInOut   ViewProvider Proxy = Path.Dressup.Gui.LeadInOut.ViewProviderDressup
+    Profile            ViewProvider Proxy = Path.Op.Gui.Base.ViewProvider
+
+**Not cosmetic.** `setEdit` lives on the same ViewProvider, so double-clicking
+a replayed operation or dressup does not open its task dialog. The replayed job
+is read-only in the GUI.
+
+Import availability is uneven and measured, which is why this needs a table and
+a fallback rather than one rule:
+
+| module | imports headless | has `ViewProviderDressup` |
+|---|---|---|
+| `Gui.LeadInOut` | yes | yes |
+| `Gui.DogboneII` | yes | yes |
+| `Gui.Mirror`, `Gui.RampEntry` | yes | yes |
+| `Gui.Array` | yes | **no** — differently named |
+| `Gui.Boundary` | **no** — `ImportError` | — |
+| `Path.Op.Gui.Base` | **no** — `FreeCADGui.addCommand` | — |
+
+### 2. The Machine is lost, and the dialog was inventing the post
+
+    SOURCE   PostProcessor=''   Machine='Origarmi Plasma'
+    REPLAY   PostProcessor=''   Machine=''            <- lost
+
+The `Machine` never made it across, and nothing warned: it is in neither
+`NON_REPLAYABLE_PROPERTIES` nor anything else the replay touches. FreeCAD
+derives the post processor from the machine, so this is the property that
+matters.
+
+On top of that the options dialog offered `monokrom_plasma`, which the job then
+refused:
+
+    Could not set post processor 'monokrom_plasma' on CAM_Replay_Sheet_1
+
+Two different lists. `PathJob` builds its `PostProcessor` enumeration from
+`allEnabledLegacyPostProcessors()` (`Path/Main/Job.py:522`); the dialog filled
+itself from `allEnabledPostProcessors()`. `monokrom_plasma` is in the first and
+not the second, as is `generic_plasma`.
+
+**The dialog is being removed rather than corrected.** Both its choices — the
+template and the post processor — are answered by the source job, and a second
+answer to a question the user has already answered can only disagree with it.
+
+### 3. The replayed job carries an unused default tool
+
+`Tools001` holds both `TC: 5mm Endmill` (from `PathJob.Create`) and
+`TC: Plasma, 40A, 1.2mm kerf001` (the copy). `Controller.Create: Created
+toolbit with ID:` is `copyTC` working, not an error.
+
+### 4. Forty-eight flattened parts at document root
+
+`flatten_sheet` is called with no `group`, so every `CAMPart_*` lands at root.
+The parameter already exists.
+
+### The five items, in the order they will be done
+
+| # | Item | Why this order |
+|---|---|---|
+| 1 | Set ViewProviders on replayed dressups and operations | The only functionally broken item. Guarded on `ViewObject`; headless never runs it. |
+| 2 | Copy `Machine` / `PostProcessor` from the source job; delete the options dialog | Small, and it is silent data loss rather than a visible warning. |
+| 3 | Drop tool controllers nothing references | Tidiness, no behaviour change. |
+| 4 | Flattened parts into a per-sheet sibling group | Tidiness, parameter already exists. |
+| 5 | Name the job from the source: `<Source>_Replay_<Sheet>` | A one-liner that touches the label `UNVERIFIED` and a harness check both depend on, so last. |
+
+Item 1 cannot be verified by any automated tier. The only check is a manual run
+in the GUI, and that is worth stating rather than letting a green gate imply
+otherwise.
+
 ## The replay fixture
 
 A committed `.FCStd` that exercises the replay at a size and a realism the
@@ -707,6 +804,42 @@ six label conventions.
   realistic part count, or committed binary input, and the only one whose
   result is openable by hand in a GUI. Nothing in tiers 1 and 2 can reach
   those, which is the whole reason it exists.
+
+## Change log
+
+- The first manual GUI run, and the four things it found. The document structure
+  was correct throughout -- the new job existed, its Operations group was
+  claimed by it, every dressup's Base pointed at its own replayed operation,
+  and each operation was claimed exactly once. What was missing was a
+  ViewProvider, which is what makes CAM nest an operation under its dressup and
+  what carries `setEdit`, so the tree rendered flat and the job was read-only.
+  **No test in this repository can see that**: a ViewProvider does not exist
+  under `freecadcmd`, so every tier passes with or without it. The only guard
+  available is a consistency check between the two hand-written tables, which
+  is what was added, and the verification is a person opening the result.
+- The Machine was being lost outright -- `'Origarmi Plasma'` in the source, `''`
+  in the replay -- and nothing warned, because it is in neither
+  `NON_REPLAYABLE_PROPERTIES` nor anything else the replay touched. FreeCAD
+  derives the post processor from it, so that is the property that matters. It
+  is copied now, and checked in the validator against the real fixture.
+- The options dialog is deleted rather than corrected. Both its answers were
+  already in the selected job, and it was actively wrong: it listed post
+  processors from `allEnabledPostProcessors()` while FreeCAD's own Job builds
+  its enum from `allEnabledLegacyPostProcessors()`, so it offered
+  `monokrom_plasma` -- which the new job then refused.
+- Dropping the unused tool controller took four attempts and the reason is worth
+  recording, because each attempt looked correct. `PathJob.Create` leaves a
+  default endmill in every new job, and a tool bit is not one object: the
+  controller links a `Part::FeaturePython` wrapper, which wraps a
+  `PartDesign::Body`, which carries an `Attributes`. FreeCAD will not remove
+  the chain in one call, and the order matters -- `Tools.removeObject` drops
+  the controller from the group but leaves it in the document still claiming
+  its bit, so the bit's own body survives and lands at the document root
+  looking like unrelated debris. Removing outside-in, re-checking rather than
+  assuming a depth, is what works.
+- Forty-eight flattened parts per sheet were landing at the document root;
+  `flatten_sheet` already took a `group` and nobody passed one.
+- 439 pytest, 187 flatten, 78 dressup, 39 identity. Gate exit 0.
 
 ## Change log
 

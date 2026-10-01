@@ -101,6 +101,200 @@ import FreeCAD
 # one clearly-labelled job per sheet rather than a single ambiguous one.
 
 JOB_NAME_PREFIX = "CAM_Replay_"
+
+#: Job properties that describe the *setup* rather than the geometry, and are
+#: therefore copied from the source job rather than created fresh.
+#:
+#: `Machine` is the one that matters. FreeCAD derives the post processor from
+#: it, so a job that has lost its Machine has lost the answer to "what
+#: post-processor does this need?" even when its own `PostProcessor` is empty
+#: and consistent. Measured on the tracked fixture:
+#:
+#:     source   PostProcessor=''   Machine='Origarmi Plasma'
+#:     replayed PostProcessor=''   Machine=''
+#:
+#: and nothing warned, because `Machine` is in neither
+#: `NON_REPLAYABLE_PROPERTIES` nor anything else the replay touched.
+JOB_SETUP_PROPERTIES = (
+    "Machine",
+    "PostProcessor",
+    "PostProcessorArgs",
+    "PostProcessorOutputFile",
+)
+
+
+def replay_job_name(source_job, sheet_label):
+    """Return the name for a replayed job.
+
+    `<source>_Replay_<sheet>`, so the tree shows which job a replayed one came
+    from. The sheet label has to stay in the name: `_UNVERIFIED` is appended to
+    it on failure, and the harness asserts the job names its sheet, so anything
+    that drops the sheet from the label breaks both.
+    """
+    source = getattr(source_job, "Label", "") if source_job is not None else ""
+    source = source or "CAM"
+    if sheet_label:
+        return "%s_Replay_%s" % (source, sheet_label)
+    return "%s_Replay" % source
+
+
+def prune_unused_tool_controllers(job):
+    """Remove tool controllers in `job` that no operation references.
+
+    `PathJob.Create` gives a new job a default `TC: 5mm Endmill`, and the
+    replay then copies the user's own controller in alongside it. Nothing
+    references the endmill, and it is not merely untidy: the job's SetupSheet
+    resolves the active tool from the controllers present, so a replayed job
+    offered a machine head the operations never use.
+
+    Only a controller that nothing references is removed, and only when at
+    least one controller *is* referenced -- so a replay that failed before any
+    operation got a tool cannot end up with no tools at all.
+
+    Returns the labels removed, for the report.
+    """
+    tools = getattr(job, "Tools", None)
+    group = list(getattr(tools, "Group", None) or [])
+    if len(group) < 2:
+        return []
+
+    used = set()
+    for obj in _job_objects(job):
+        controller = getattr(obj, "ToolController", None)
+        if controller is not None:
+            used.add(id(controller))
+
+    if not used:
+        return []
+
+    removed = []
+    doc = getattr(job, "Document", None)
+    for controller in group:
+        if id(controller) in used:
+            continue
+        # `Tools` is a group, and a group's own removal recurses into what it
+        # holds. That matters because a tool bit is not one object: a
+        # controller links a Part::FeaturePython wrapper, which wraps a
+        # PartDesign::Body, which carries an Attributes object. Walking that
+        # chain by hand was tried and is wrong in a way that is easy to miss --
+        # removing the controller leaves the wrapper claimed by nothing, and
+        # every layer then sits at the document root looking like unrelated
+        # debris. Measured, in order: the wrapper, then the Body, then
+        # Attributes, each appearing only after the one before it was pruned.
+        try:
+            tools.removeObject(controller)
+        except Exception:
+            try:
+                group.remove(controller)
+            except Exception:
+                continue
+        # FreeCAD will not do this in one call, and the order matters more than
+        # it looks. Measured:
+        #
+        #   Tools.removeObject(controller)  drops it from the group but leaves
+        #                                     the object in the document, still
+        #                                     claiming its tool bit;
+        #   doc.removeObject(bit)           is refused-ish while the bit is still
+        #                                     claimed, and the bit's own body
+        #                                     then survives.
+        #
+        # So: the controller goes first, then its bit, then whatever the bit
+        # orphaned, until nothing more is left claiming. The chain depth is
+        # discovered rather than assumed, because it is FreeCAD's shape and it
+        # differs between tool bits.
+        _remove_with_orphans(doc, controller)
+        removed.append(getattr(controller, "Label", "?"))
+    return removed
+
+
+def _remove_with_orphans(doc, obj, _depth=0):
+    """Remove `obj` from the document, then anything left claiming nothing.
+
+    A tool bit is not one object: the controller links a
+    `Part::FeaturePython` wrapper, which wraps a `PartDesign::Body`, which
+    carries an `Attributes` object. Removing the controller leaves the wrapper
+    at the document root, and removing that leaves the Body, and each one
+    arrives at the root in turn looking like unrelated debris. The only safe
+    order is outside-in, and the only reliable way to get the order right is to
+    re-check rather than assume a depth.
+    """
+    if doc is None or obj is None:
+        return
+    try:
+        links = [o for o in obj.OutList
+                 if o is not None and hasattr(o, "Name")]
+    except Exception:
+        links = []
+    try:
+        doc.removeObject(obj.Name)
+    except Exception:
+        return
+    if _depth > 8:                       # a cycle would otherwise spin
+        return
+    for child in links:
+        try:
+            if child.InList:
+                continue
+        except Exception:
+            continue
+        _remove_with_orphans(doc, child, _depth + 1)
+
+
+def _job_objects(job):
+    """Every object in `job` worth checking for a job-local link.
+
+    The Operations group and, through it, the operations underneath any
+    dressups. Not the whole document: a link from something the replay did not
+    create is not the replay's business, and the document holds the source job
+    and the layout too.
+    """
+    seen = set()
+    pending = [job]
+    group = getattr(getattr(job, "Operations", None), "Group", None) or []
+    pending.extend(group)
+    model = getattr(getattr(job, "Model", None), "Group", None) or []
+    pending.extend(model)
+    out = []
+    while pending:
+        obj = pending.pop()
+        if obj is None or id(obj) in seen:
+            continue
+        seen.add(id(obj))
+        out.append(obj)
+        base = getattr(obj, "Base", None)
+        if base is not None and not isinstance(base, (list, tuple)):
+            pending.append(base)
+    return out
+
+
+def copy_job_setup(source_job, job):
+    """Copy the source job's machine and post-processor setup onto `job`.
+
+    The replay reproduces a configuration, so the machine and post-processor
+    come from the job being replayed rather than from a dialog asking again.
+    Asking again can only produce a second answer to a question already
+    answered, and it will sometimes be a wrong one: FreeCAD's own Job builds its
+    `PostProcessor` enumeration from `allEnabledLegacyPostProcessors()` while
+    `allEnabledPostProcessors()` is the more obvious-looking call, and the
+    difference includes `monokrom_plasma` and `generic_plasma`. Choosing from
+    the wrong list yields a value the job then refuses.
+
+    `post_processor` overrides, for a caller that has a reason. Nothing in this
+    repository passes one.
+    """
+    copied = []
+    if source_job is None:
+        return copied
+    for name in JOB_SETUP_PROPERTIES:
+        if not hasattr(job, name) or not hasattr(source_job, name):
+            continue
+        try:
+            setattr(job, name, getattr(source_job, name))
+            copied.append(name)
+        except Exception as exc:
+            FreeCAD.Console.PrintWarning(
+                "Could not copy %s from the source job: %s\n" % (name, exc))
+    return copied
 STOCK_LABEL_PREFIX = "Stock_Replay_"
 
 # Tolerance for comparing two stock Z frames, in millimetres. Loose enough to
@@ -334,7 +528,7 @@ def create_replay_job(doc, layout_group, sheet_group, flattened_parts,
         factory = PathJob.Create
 
     sheet_label = getattr(sheet_group, "Label", "") or ""
-    job_name = "%s%s" % (JOB_NAME_PREFIX, sheet_label or "Sheet")
+    job_name = replay_job_name(source_job, sheet_label)
 
     job = factory(job_name, parts, template_path)
     if job is None:
@@ -369,6 +563,8 @@ def create_replay_job(doc, layout_group, sheet_group, flattened_parts,
                 "Could not set post processor '%s' on %s: %s\n"
                 % (post_processor, job_name, exc)
             )
+    else:
+        copy_job_setup(source_job, job)
     doc.recompute()
 
     warnings = []
@@ -1148,6 +1344,133 @@ def clones_for_source(clones, source_geometry):
     return matched if matched else list(clones)
 
 
+# -- view providers --------------------------------------------------------
+#
+# **This is what makes the replayed job look and behave like a CAM job, and no
+# automated tier here can check it.** A ViewProvider does not exist under
+# `freecadcmd`, so every check in this repository passes with or without the
+# code below. The only verification is opening the result in the GUI.
+#
+# What breaks without it, from a real manual run:
+#
+#   * the tree renders flat. CAM's nesting is
+#     `ViewProviderDressup.claimChildren()` returning `[self.obj.Base]`
+#     (`Path/Dressup/Gui/LeadInOut.py:812`), so with no ViewProvider the base
+#     operation has no parent and FreeCAD puts it at the document root. The
+#     document is correct throughout -- measured: the job exists, its Operations
+#     group is claimed by it, every dressup's Base points at its own replayed
+#     operation, and each operation is claimed exactly once. Only the display
+#     and the claim are missing.
+#   * the job is read-only. `setEdit` lives on the same object, so
+#     double-clicking a replayed operation or dressup does not open its task
+#     dialog.
+#
+# The class names are not consistent, which is why this is a table: four kinds
+# use `ViewProviderDressup`, and the other three each have their own name.
+# Measured headless, and the availability is uneven:
+#
+#   Path.Dressup.Gui.LeadInOut / DogboneII / Mirror / RampEntry   import, have it
+#   Path.Dressup.Gui.Array       imports, class is DressupArrayViewProvider
+#   Path.Dressup.Gui.Boundary    ImportError -- "Cannot load Gui module in
+#                                console application"
+#   Path.Op.Gui.Base             AttributeError -- FreeCADGui.addCommand
+#
+# So every lookup is guarded and every one has a fallback, and none of it runs
+# headless at all.
+
+#: proxy module -> (Gui module, ViewProvider class)
+DRESSUP_VIEWPROVIDERS = {
+    "Path.Dressup.Gui.LeadInOut": ("Path.Dressup.Gui.LeadInOut",
+                                   "ViewProviderDressup"),
+    "Path.Dressup.Gui.Mirror": ("Path.Dressup.Gui.Mirror", "ViewProviderDressup"),
+    "Path.Dressup.Gui.RampEntry": ("Path.Dressup.Gui.RampEntry",
+                                   "ViewProviderDressup"),
+    "Path.Dressup.DogboneII": ("Path.Dressup.Gui.DogboneII", "ViewProviderDressup"),
+    "Path.Dressup.Array": ("Path.Dressup.Gui.Array", "DressupArrayViewProvider"),
+    "Path.Dressup.Boundary": ("Path.Dressup.Gui.Boundary",
+                              "DressupPathBoundaryViewProvider"),
+    "Path.Dressup.Tags": ("Path.Dressup.Gui.Tags", "PathDressupTagViewProvider"),
+}
+
+#: Operations all share one. `Path/Op/Gui/` has no per-operation module for
+#: Profile, and the fixture's own `GuiDocument.xml` records
+#: `Path.Op.Gui.Base.ViewProvider` for every operation in it.
+OPERATION_VIEWPROVIDER = ("Path.Op.Gui.Base", "ViewProvider")
+
+
+def _view_provider_class(gui_module, class_name):
+    """Import `gui_module` and return a ViewProvider class from it.
+
+    Falls back to any class in the module whose name mentions a view provider,
+    which is what carries this through when FreeCAD renames one. Returns None
+    rather than raising: a missing icon is a cosmetic loss, and a missing
+    `claimChildren` is a structural one -- but neither is worth aborting a
+    replay for, and the alternative is a job that cannot be opened.
+    """
+    import importlib
+    try:
+        module = importlib.import_module(gui_module)
+    except Exception as exc:
+        FreeCAD.Console.PrintWarning(
+            "No view provider for %s: %s: %s\n"
+            % (gui_module, type(exc).__name__, exc))
+        return None
+    found = getattr(module, class_name, None)
+    if found is not None:
+        return found
+    for name in dir(module):
+        if "ViewProvider" not in name:
+            continue
+        candidate = getattr(module, name)
+        if isinstance(candidate, type):
+            return candidate
+    return None
+
+
+def set_view_provider(obj, proxy_module=None, is_dressup=None):
+    """Attach the right ViewProvider to `obj`. Returns True if one was set.
+
+    A no-op returning False when there is no GUI, which is the normal case in
+    every test in this repository. Not an error and not worth a warning: a
+    ViewProvider has no meaning without a view.
+    """
+    view = getattr(obj, "ViewObject", None)
+    if view is None:
+        return False
+
+    if is_dressup is None:
+        is_dressup = is_dressup_object(obj)
+    entry = DRESSUP_VIEWPROVIDERS.get(proxy_module) if is_dressup \
+        else OPERATION_VIEWPROVIDER
+    if entry is None:
+        return False
+
+    provider = _view_provider_class(entry[0], entry[1])
+    if provider is None:
+        return False
+    try:
+        view.Proxy = provider(view)
+    except Exception as exc:
+        FreeCAD.Console.PrintWarning(
+            "Could not attach a view provider to %s: %s\n"
+            % (getattr(obj, "Label", "?"), exc))
+        return False
+    return True
+
+
+def is_dressup_object(obj):
+    """True if `obj` is a dressup, decided by its proxy module.
+
+    Not `is_dressup`, which decides by the *type* of `Base` and so is a
+    statement about the replay's data model. This asks what kind of thing it is,
+    which is the question a ViewProvider lookup is asking.
+    """
+    proxy = getattr(obj, "Proxy", None)
+    if proxy is None:
+        return False
+    return type(proxy).__module__.startswith("Path.Dressup")
+
+
 def create_operation_in(source_op, job, label_suffix="_replay"):
     """Create a new operation of the same kind as `source_op`, in `job`.
 
@@ -1187,6 +1510,8 @@ def create_operation_in(source_op, job, label_suffix="_replay"):
             return None
     except Exception:
         return None
+    # So the result is editable and carries the right icon. No-op headless.
+    set_view_provider(new_op, module_name, is_dressup=False)
     return new_op
 
 
@@ -1446,6 +1771,10 @@ def create_dressup_in(source_dressup, base_op, job, label_suffix="_replay"):
         DRESSUP_BUILDERS[module_name](obj, base_op, module, job)
         if getattr(obj, "Proxy", None) is None:
             raise RuntimeError("constructor left the object without a proxy")
+        # So `claimChildren()` nests the base operation under this dressup, and
+        # double-click opens its task dialog. No-op headless; see the block
+        # above for why nothing automated here can see it either way.
+        set_view_provider(obj, module_name, is_dressup=True)
     except Exception as exc:
         FreeCAD.Console.PrintWarning(
             "Could not recreate dressup '%s' (%s): %s\n"
@@ -2567,8 +2896,26 @@ def replay_sheet(doc, layout_group, sheet_group, source_job, post_processor=None
         )
         return outcome
 
+    # The flattened parts go in a group of their own, as a sibling of the job.
+    # Not inside the job: its Model holds the clones, and mixing the flattened
+    # geometry in there is not the shape a CAM job has. Without a group they
+    # land at the document root -- forty-eight of them, per sheet, which buries
+    # everything else in the tree.
+    job_name = replay_job_name(source_job,
+                               getattr(sheet_group, "Label", "") or "")
     try:
-        flattened = flatten_sheet(doc, sheet_group, thickness)
+        parts_group = doc.addObject(
+            "App::DocumentObjectGroup", "%s_parts" % job_name)
+        parts_group.Label = "%s_parts" % job_name
+        doc.recompute()
+    except Exception as exc:
+        parts_group = None
+        FreeCAD.Console.PrintWarning(
+            "Could not create a group for %s's flattened parts: %s\n"
+            % (outcome.sheet_label, exc))
+
+    try:
+        flattened = flatten_sheet(doc, sheet_group, thickness, group=parts_group)
     except Exception as exc:
         outcome.errors.append("Could not flatten %s: %s" % (outcome.sheet_label, exc))
         return outcome
@@ -2603,6 +2950,21 @@ def replay_sheet(doc, layout_group, sheet_group, source_job, post_processor=None
         return outcome
     outcome.result = result
     outcome.errors.extend(result.failures)
+
+    # `PathJob.Create` leaves a default tool controller in every new job, and
+    # the replay copies the user's own in beside it. Drop the one nothing uses,
+    # so the job offers the tool its operations actually cut with.
+    try:
+        removed_tools = prune_unused_tool_controllers(replay.job)
+        if removed_tools:
+            doc.recompute()
+            FreeCAD.Console.PrintMessage(
+                "Removed unused tool controller(s) from %s: %s\n"
+                % (replay.job.Label, ", ".join(removed_tools)))
+    except Exception as exc:
+        FreeCAD.Console.PrintWarning(
+            "Could not tidy the tool table on %s: %s\n"
+            % (replay.job.Label, exc))
 
     # Ordering needs to know which part each replayed operation cuts, so each
     # op is attributed to the part its first base entry points at.

@@ -462,3 +462,49 @@ class TestDescribeRecipe:
         # Must stay renderable in the Report view without a GUI.
         recipe = read_recipe(_FakeJob([_FakeOp("Profile")]))
         assert all(isinstance(line, str) for line in describe_recipe(recipe))
+
+
+class TestDressupTablesAgree:
+    """The constructor table and the ViewProvider table must cover the same set.
+
+    Both are keyed by proxy module and both are hand-written, which means a
+    dressup added to one and not the other is the easy mistake. The consequence
+    is quiet and only visible in a GUI: the dressup builds and cuts, and its
+    base operation appears at the document root because nothing claims it.
+    That is exactly the defect a manual run found and no test in this repository
+    can see, because a ViewProvider does not exist under `freecadcmd`.
+
+    So this is the only guard available on the one part of the table that the
+    harness structurally cannot check.
+    """
+    def test_every_replayable_dressup_has_a_view_provider(self):
+        missing = [m for m in cam_replay.DRESSUP_BUILDERS
+                   if m not in cam_replay.DRESSUP_VIEWPROVIDERS]
+        assert missing == [], (
+            "dressups replayable but with no ViewProvider entry: %s. They will "
+            "build and cut, but the tree will not nest their base operation "
+            "under them and double-click will not open their dialog." % missing)
+
+    def test_no_view_provider_without_a_constructor(self):
+        extra = [m for m in cam_replay.DRESSUP_VIEWPROVIDERS
+                 if m not in cam_replay.DRESSUP_BUILDERS]
+        assert extra == [], (
+            "ViewProvider entries for dressups this module does not build: %s"
+            % extra)
+
+    def test_unsupported_dressups_are_not_claimed_as_replayable(self):
+        # A dressup reported as unsupported must not also have a builder, or
+        # the two tables disagree about whether it replays.
+        overlap = [m for m in cam_replay.DRESSUP_UNSUPPORTED
+                   if m in cam_replay.DRESSUP_BUILDERS]
+        assert overlap == [], overlap
+
+    def test_set_view_provider_is_a_no_op_without_a_view(self):
+        # The headless path, and the one every test in this repository takes.
+        # It must return False rather than raise, or the harness breaks.
+        obj = type("_O", (), {
+            "ViewObject": None,
+            "Label": "x",
+            "Proxy": None,
+        })()
+        assert cam_replay.set_view_provider(obj) is False

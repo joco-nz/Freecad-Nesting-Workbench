@@ -942,6 +942,63 @@ def check_identity_against_replay(outcome, identity_by_operation):
                      % (expected, len(targets)))
 
 
+def check_job_setup_was_copied(outcome, source_job, replayed_job):
+    """The replayed job's machine and tool table must match the source's.
+
+    Two silent losses, both found by a manual run rather than a test, because
+    both produce a job that looks complete:
+
+      * **`Machine` was not copied at all.** `'Origarmi Plasma'` in the source,
+        `''` in the replay. FreeCAD derives the post processor from the
+        machine, so the job had lost the answer to "what post does this need?"
+        even though its own `PostProcessor` was empty and consistent. Nothing
+        warned: `Machine` is in neither `NON_REPLAYABLE_PROPERTIES` nor
+        anything else the replay touched.
+      * **the default tool stayed in the table.** `PathJob.Create` gives every
+        new job a `TC: 5mm Endmill` and the replay copies the user's own in
+        beside it, so the job's SetupSheet offered a machine head none of its
+        operations cut with.
+
+    Both are invisible in the toolpath. The machine loss surfaces at post
+    time; the tool table at whatever consumes the SetupSheet.
+    """
+    label = outcome.sheet_label
+    for name in cam_replay.JOB_SETUP_PROPERTIES:
+        want = getattr(source_job, name, None)
+        got = getattr(replayed_job, name, None)
+        if want is None or got is None:
+            continue
+        if str(want) != str(got):
+            fail("%s: the replayed job's %s is %r, the source job's is %r"
+                 % (label, name, got, want),
+                 "Machine and post-processor setup is copied from the job you "
+                 "selected, so a replayed job needs none of its own. If this "
+                 "is wrong the output is wrong: FreeCAD derives the post "
+                 "processor from Machine, so a job that has lost it has lost "
+                 "the post as well.")
+
+    tools = getattr(replayed_job, "Tools", None)
+    group = list(getattr(tools, "Group", None) or [])
+    if len(group) > 1:
+        used = set()
+        for entry in group:
+            for obj in cam_replay._job_objects(replayed_job):
+                controller = getattr(obj, "ToolController", None)
+                if controller is not None:
+                    used.add(id(controller))
+        unused = [t.Label for t in group if id(t) not in used]
+        fail("%s: the replayed job has %d tool controllers and %d of them "
+             "nothing uses: %s"
+             % (label, len(group), len(unused), unused),
+             "PathJob.Create gives a new job a default tool, and the replay "
+             "copies yours in beside it. The SetupSheet resolves the active "
+             "tool from the controllers present, so a job carrying a tool "
+             "none of its operations use is offering a machine head it will "
+             "not cut with.")
+    elif group:
+        ok("%s: one tool controller, as in the source" % label)
+
+
 def dry_run(doc, layout, job, identity_by_operation=()):
     """Actually run the replay, and report what it did."""
     heading("REPLAY DRY RUN")
@@ -980,6 +1037,8 @@ def dry_run(doc, layout, job, identity_by_operation=()):
                          % (outcome.sheet_label, operation.Label))
             if identity_by_operation:
                 check_identity_against_replay(outcome, identity_by_operation)
+            # `job` here is the SOURCE job; the replayed one is on the outcome.
+            check_job_setup_was_copied(outcome, job, outcome.replay_job.job)
 
     emit("")
     emit("  replay wall clock: %.0f ms" % (1000 * elapsed))

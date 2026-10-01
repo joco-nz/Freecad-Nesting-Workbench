@@ -41,6 +41,7 @@ from freecad.nestingworkbench.Tools.Cam.cam_replay import (
     describe_replay_job,
     describe_stock_frame,
     read_sheet_dimensions,
+    replay_job_name,
     sheet_origin_for,
     translate_to_sheet_local,
 )
@@ -317,3 +318,37 @@ class TestDescribeReplayJob:
         job = type("_J", (), {"Label": "J"})()
         replay = ReplayJob(job, [], _Stock(-6.0, 0.0), None, [], [])
         assert all(isinstance(line, str) for line in describe_replay_job(replay))
+
+
+class TestReplayJobName:
+    """The name is how the tree says which job a replayed one came from."""
+
+    class _Job:
+        def __init__(self, label):
+            self.Label = label
+
+    def test_names_the_source_and_the_sheet(self):
+        assert replay_job_name(self._Job("Job"), "Sheet_1") == "Job_Replay_Sheet_1"
+
+    def test_keeps_the_sheet_label_in_the_name(self):
+        # Two things depend on this. `_UNVERIFIED` is appended to the label on
+        # failure, and the harness asserts the job names its sheet -- a name
+        # that drops the sheet breaks both.
+        for sheet in ("Sheet_1", "Sheet_2", "Sheet_10"):
+            assert sheet in replay_job_name(self._Job("Job"), sheet)
+
+    def test_falls_back_when_there_is_no_source(self):
+        assert replay_job_name(None, "Sheet_1") == "CAM_Replay_Sheet_1"
+
+    def test_falls_back_when_the_source_has_no_label(self):
+        assert replay_job_name(self._Job(""), "Sheet_1") == "CAM_Replay_Sheet_1"
+
+    def test_handles_a_missing_sheet_label(self):
+        assert replay_job_name(self._Job("Job"), "") == "Job_Replay"
+
+    def test_two_jobs_stay_distinguishable(self):
+        # The point of naming from the source: replaying two different jobs
+        # onto the same sheet must not produce the same name.
+        a = replay_job_name(self._Job("Job"), "Sheet_1")
+        b = replay_job_name(self._Job("OtherJob"), "Sheet_1")
+        assert a != b
