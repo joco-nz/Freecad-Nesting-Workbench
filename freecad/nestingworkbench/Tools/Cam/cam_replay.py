@@ -535,6 +535,14 @@ def create_replay_job(doc, layout_group, sheet_group, flattened_parts,
         return None
     doc.recompute()
 
+    # The model-level `PathJob.Create` is the one that works headless, so it
+    # does not attach a view. `Main/Gui/Job.py`'s `Create` does that as a
+    # separate step, and the replay has to do it too or the job comes out with
+    # the generic icon, no task panel on double-click, and no group extension --
+    # which is what "the job does not have Operations, SetupSheet or Tools
+    # under it" looks like from the tree.
+    set_job_view_provider(job)
+
     # The clones are the job's real geometry. Read them from the job rather
     # than assuming the caller's list survived.
     clones = list(getattr(getattr(job, "Model", None), "Group", []) or [])
@@ -1392,29 +1400,24 @@ DRESSUP_VIEWPROVIDERS = {
     "Path.Dressup.Tags": ("Path.Dressup.Gui.Tags", "PathDressupTagViewProvider"),
 }
 
-#: Operations all share one. `Path/Op/Gui/` has no per-operation module for
-#: Profile, and the fixture's own `GuiDocument.xml` records
-#: `Path.Op.Gui.Base.ViewProvider` for every operation in it.
-OPERATION_VIEWPROVIDER = ("Path.Op.Gui.Base", "ViewProvider")
+#: Operations do NOT share one view provider class with a fixed signature --
+#: see `OPERATION_GUI_MODULE` below for why each needs its own resources. What
+#: is shared is the base class every one of them derives from.
+
+import importlib
 
 
 def _view_provider_class(gui_module, class_name):
     """Import `gui_module` and return a ViewProvider class from it.
 
     Falls back to any class in the module whose name mentions a view provider,
-    which is what carries this through when FreeCAD renames one. Returns None
-    rather than raising: a missing icon is a cosmetic loss, and a missing
-    `claimChildren` is a structural one -- but neither is worth aborting a
-    replay for, and the alternative is a job that cannot be opened.
+    which is what carries this through when FreeCAD renames one. **Raises**
+    rather than returning None: a missing view provider is a real defect, and a
+    caller that cannot see it has no way to report one. The version this
+    replaced returned None and warned, and a warning nobody reads is how a whole
+    manual round went by believing the operations were covered.
     """
-    import importlib
-    try:
-        module = importlib.import_module(gui_module)
-    except Exception as exc:
-        FreeCAD.Console.PrintWarning(
-            "No view provider for %s: %s: %s\n"
-            % (gui_module, type(exc).__name__, exc))
-        return None
+    module = importlib.import_module(gui_module)
     found = getattr(module, class_name, None)
     if found is not None:
         return found
@@ -1424,36 +1427,146 @@ def _view_provider_class(gui_module, class_name):
         candidate = getattr(module, name)
         if isinstance(candidate, type):
             return candidate
-    return None
+    raise LookupError("no view provider class in %s" % gui_module)
 
 
-def set_view_provider(obj, proxy_module=None, is_dressup=None):
-    """Attach the right ViewProvider to `obj`. Returns True if one was set.
+#: An operation's view provider needs a `CommandResources` object, and the only
+#: thing that carries one is the command its Gui module registers at import:
+#:
+#:     Path.Op.Gui.Profile.Command.res   ->   ViewProvider(vobj, res)
+#:
+#: `res` supplies the icon, the operation name and the task-page class. This
+#: is the mistake that cost a whole manual round: the view provider is
+#: constructed with TWO arguments, and calling it with one raises a TypeError
+#: that a `try` around the whole thing swallows. The operation then has no view
+#: provider at all -- wrong icon, and double-click does nothing -- and nothing
+#: anywhere says so, because the swallow reported success.
+OPERATION_GUI_MODULE = "Path.Op.Gui.%s"
 
-    A no-op returning False when there is no GUI, which is the normal case in
-    every test in this repository. Not an error and not worth a warning: a
-    ViewProvider has no meaning without a view.
+#: The job's own view provider, and the extension that makes it a group in the
+#: tree. Without the extension the job's Operations, Model, Tools, Stock and
+#: SetupSheet nest by ordinary link claims rather than as a CAM job's contents,
+#: which is what "the job does not have them under it" looks like.
+#: `Main/Gui/Job.py:2060`.
+JOB_VIEWPROVIDER = ("Path.Main.Gui.Job", "ViewProvider")
+JOB_GROUP_EXTENSION = "Gui::ViewProviderGroupExtensionPython"
+
+
+def _attach_view_provider(obj, provider, failures):
+    """Attach `provider(view)` to `obj`'s view. Returns True if set.
+
+    `failures` collects what went wrong. This function does not swallow
+    anything: a view provider that fails to attach is why a replayed job comes
+    out with the wrong icon and no double-click, and the first version of this
+    code hid exactly that behind a bare `except` and a `return False` -- which
+    cost a whole manual test round, because a swallowed failure is
+    indistinguishable from success.
+
+    `provider` takes the view and whatever else it needs, so the two-argument
+    operation case is a lambda rather than a special case here.
     """
+    if failures is None:
+        failures = []
+    view = getattr(obj, "ViewObject", None)
+    if view is None:
+        return False                # headless; a view provider is meaningless
+    label = getattr(obj, "Label", "?")
+    try:
+        view.Proxy = provider(view)
+    except Exception as exc:
+        failures.append("%s: %s: %s" % (label, type(exc).__name__, exc))
+        return False
+    return True
+
+
+def set_view_provider(obj, proxy_module=None, is_dressup=None, failures=None):
+    """Attach the right ViewProvider to a replayed operation or dressup.
+
+    Returns True if one was set. A no-op returning False when there is no GUI,
+    which is the normal case in every test in this repository.
+
+    `failures` is appended to rather than warned about, so the caller can put
+    the whole set in one place in the sheet report.
+    """
+    if failures is None:
+        failures = []
     view = getattr(obj, "ViewObject", None)
     if view is None:
         return False
 
     if is_dressup is None:
         is_dressup = is_dressup_object(obj)
-    entry = DRESSUP_VIEWPROVIDERS.get(proxy_module) if is_dressup \
-        else OPERATION_VIEWPROVIDER
-    if entry is None:
-        return False
 
-    provider = _view_provider_class(entry[0], entry[1])
-    if provider is None:
+    if is_dressup:
+        entry = DRESSUP_VIEWPROVIDERS.get(proxy_module)
+        if entry is None:
+            failures.append(
+                "%s: no view provider entry for %r, so its base operation "
+                "will not nest under it in the tree"
+                % (getattr(obj, "Label", "?"), proxy_module))
+            return False
+        gui_module, class_name = entry
+        try:
+            provider = _view_provider_class(gui_module, class_name)
+        except Exception as exc:
+            failures.append("%s: %s: %s" % (getattr(obj, "Label", "?"),
+                                            type(exc).__name__, exc))
+            return False
+        return _attach_view_provider(obj, provider, failures)
+
+    # An operation: the provider needs the resources its Gui module registered.
+    name = (proxy_module or "").rsplit(".", 1)[-1]
+    label = getattr(obj, "Label", "?")
+    try:
+        gui = importlib.import_module(OPERATION_GUI_MODULE % name)
+        base = importlib.import_module("Path.Op.Gui.Base")
+    except Exception as exc:
+        failures.append("%s: no Gui module for %r: %s: %s"
+                        % (label, proxy_module, type(exc).__name__, exc))
+        return False
+    resources = getattr(getattr(gui, "Command", None), "res", None)
+    if resources is None:
+        failures.append(
+            "%s: %r registered no command resources, so it has no icon and no "
+            "task page" % (label, gui.__name__))
+        return False
+    if not _attach_view_provider(
+            obj, lambda v: base.ViewProvider(v, resources), failures):
+        return False
+    # Matches `Op/Gui/Base.py` `Create`, which also makes the operation
+    # visible; without it a freshly built operation is hidden in the tree.
+    try:
+        view.Visibility = True
+    except Exception:
+        pass
+    return True
+
+
+def set_job_view_provider(job, failures=None):
+    """Attach the job's own view provider, and make it a group in the tree.
+
+    `Main/Gui/Job.py`'s `Create` does exactly these two things after calling the
+    model-level `PathJob.Create`. The replay calls the model-level one, because
+    that is the one that works headless, and so it has to do the view half
+    itself.
+
+    Without the group extension the job's Operations, Model, Tools, Stock and
+    SetupSheet still appear beneath it -- FreeCAD nests by link claim -- but it
+    is not a CAM job in the tree: it has the generic icon, it is not editable,
+    and it does not present itself the way a job does.
+    """
+    if failures is None:
+        failures = []
+    view = getattr(job, "ViewObject", None)
+    if view is None:
         return False
     try:
-        view.Proxy = provider(view)
+        module = importlib.import_module(JOB_VIEWPROVIDER[0])
+        view.Proxy = module.ViewProvider(view)
+        view.addExtension(JOB_GROUP_EXTENSION)
     except Exception as exc:
-        FreeCAD.Console.PrintWarning(
-            "Could not attach a view provider to %s: %s\n"
-            % (getattr(obj, "Label", "?"), exc))
+        failures.append("%s: %s: %s" % (getattr(job, "Label", "job"),
+                                        type(exc).__name__, exc))
         return False
     return True
 
@@ -1471,7 +1584,8 @@ def is_dressup_object(obj):
     return type(proxy).__module__.startswith("Path.Dressup")
 
 
-def create_operation_in(source_op, job, label_suffix="_replay"):
+def create_operation_in(source_op, job, label_suffix="_replay",
+                        view_failures=None):
     """Create a new operation of the same kind as `source_op`, in `job`.
 
     The operation type is recovered from the source operation's proxy module
@@ -1511,7 +1625,8 @@ def create_operation_in(source_op, job, label_suffix="_replay"):
     except Exception:
         return None
     # So the result is editable and carries the right icon. No-op headless.
-    set_view_provider(new_op, module_name, is_dressup=False)
+    set_view_provider(new_op, module_name, is_dressup=False,
+                     failures=view_failures)
     return new_op
 
 
@@ -1721,7 +1836,8 @@ def dressup_kind(source_dressup):
     return "unknown", module_name
 
 
-def create_dressup_in(source_dressup, base_op, job, label_suffix="_replay"):
+def create_dressup_in(source_dressup, base_op, job, label_suffix="_replay",
+                     view_failures=None):
     """Create a copy of `source_dressup` wrapping `base_op`, in `job`.
 
     Returns the new object, or None if it could not be built. The reason is
@@ -1774,7 +1890,8 @@ def create_dressup_in(source_dressup, base_op, job, label_suffix="_replay"):
         # So `claimChildren()` nests the base operation under this dressup, and
         # double-click opens its task dialog. No-op headless; see the block
         # above for why nothing automated here can see it either way.
-        set_view_provider(obj, module_name, is_dressup=True)
+        set_view_provider(obj, module_name, is_dressup=True,
+                         failures=view_failures)
     except Exception as exc:
         FreeCAD.Console.PrintWarning(
             "Could not recreate dressup '%s' (%s): %s\n"
@@ -1973,7 +2090,8 @@ def apply_properties(target, properties, skip=(), remap=None):
     return applied, skipped
 
 
-def replay_recipe(recipe, job, clones, tool_cache=None):
+def replay_recipe(recipe, job, clones, tool_cache=None,
+                  view_failures=None):
     """Recreate `recipe`'s operations in `job`, targeting `clones`.
 
     Two passes, in that order, and the order is not a preference.
@@ -1991,6 +2109,9 @@ def replay_recipe(recipe, job, clones, tool_cache=None):
     result = ReplayResult()
     if tool_cache is None:
         tool_cache = {}
+    if view_failures is None:
+        view_failures = []
+    result.view_provider_failures = view_failures
 
     made = {}
 
@@ -1998,7 +2119,8 @@ def replay_recipe(recipe, job, clones, tool_cache=None):
     for item in recipe:
         if is_dressup(item.source):
             continue
-        new_op = create_operation_in(item.source, job)
+        new_op = create_operation_in(item.source, job,
+                                      view_failures=view_failures)
         if new_op is None:
             result.failures.append(
                 "Could not recreate operation '%s'; its type does not expose a "
@@ -2098,7 +2220,8 @@ def replay_recipe(recipe, job, clones, tool_cache=None):
                 )
                 continue
 
-            new_dressup = create_dressup_in(spec.source, layer, job)
+            new_dressup = create_dressup_in(spec.source, layer, job,
+                                            view_failures=view_failures)
             if new_dressup is None:
                 result.failures.append(
                     "Could not recreate dressup '%s'."
@@ -2950,6 +3073,10 @@ def replay_sheet(doc, layout_group, sheet_group, source_job, post_processor=None
         return outcome
     outcome.result = result
     outcome.errors.extend(result.failures)
+    for note in result.view_provider_failures:
+        FreeCAD.Console.PrintWarning(
+            "View provider: %s. The replayed job will look and behave "
+            "partly like a plain object.\n" % note)
 
     # `PathJob.Create` leaves a default tool controller in every new job, and
     # the replay copies the user's own in beside it. Drop the one nothing uses,
