@@ -80,15 +80,19 @@ else
     echo "note: pytest not available, skipped the pure-Python suite" >&2
 fi
 
-case "$STATUS" in
-    0) echo "harness: PASS" ;;
-    1) echo "harness: GATE FAILED" >&2 ;;
-    2) echo "harness: USAGE ERROR" >&2 ;;
-    *) echo "harness: ERROR (status $STATUS)" >&2 ;;
-esac
-
-# The regression test is a separate concern from the perf gate: report both,
-# and fail if either did.
+# Every check below folds into $STATUS, and the verdict is printed last, once
+# $STATUS is final. It used to be printed first, which meant a red gate read
+#
+#     harness: PASS
+#     replay-flatten regression test FAILED (status 1)
+#
+# -- a verdict of PASS immediately above the line explaining it. The exit code
+# was always correct, so this never failed a build; it just made a failing run
+# read like a passing one to anyone skimming, which is the exact moment a gate
+# is worth having.
+#
+# The perf gate is a separate concern from the regression tests: both are
+# reported, and the run fails if either did.
 if [ "$TESTS" -ne 0 ]; then
     echo "master-promotion regression test FAILED (status $TESTS)" >&2
     [ "$STATUS" -eq 0 ] && STATUS=1
@@ -129,5 +133,12 @@ if [ "$PYTEST_RC" -ne 0 ]; then
     echo "pytest suite FAILED (status $PYTEST_RC)" >&2
     [ "$STATUS" -eq 0 ] && STATUS=1
 fi
+
+case "$STATUS" in
+    0) echo "harness: PASS" ;;
+    1) echo "harness: GATE FAILED" >&2 ;;
+    2) echo "harness: USAGE ERROR" >&2 ;;
+    *) echo "harness: ERROR (status $STATUS)" >&2 ;;
+esac
 
 exit "$STATUS"
