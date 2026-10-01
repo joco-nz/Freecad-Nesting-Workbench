@@ -807,6 +807,32 @@ six label conventions.
 
 ## Change log
 
+- Job settings are now copied wholesale rather than by name. The hand-picked
+  list of four lost `OrderOutputBy`, which is the order the post processor
+  emits operations in: the source said `Operation` -- the job's process order --
+  and the replay said `Fixture`. Everything else the list did copy looked
+  correct only because the two jobs happened to agree on the defaults, which is
+  what a named list always looks like until it does not.
+  `JOB_PROPERTIES_NOT_COPIED` is the skip list instead: the replayed job's own
+  structure, computed values, identity, presentation.
+- **That skip list decides both what is copied and what the validator
+  compares**, so a name added to it stops being copied and stops being checked
+  in the same move. Demonstrated by adding `OrderOutputBy` back to it: the
+  validator reported **0 failures** -- neither copied nor verified, which is the
+  defect the list exists to prevent. The list is now pinned by a test with its
+  full contents written out, and a second test asserts it excludes nothing a
+  user would set. This is the third time in this work a check has been defined
+  in terms of the thing it checks; the first two were the identity cross-check
+  and the swallowed view-provider exception.
+- Measured every job property on the fixture, source against replay. The
+  remaining differences are the intended ones: the job's own Model, Operations,
+  SetupSheet, Stock, Tools and Proxy; `Label`, which is set deliberately;
+  `CycleTime` and `Path`, which are computed; and `Visibility`, deliberately
+  not copied so the user can see what was made.
+- 444 pytest, 187 flatten, 78 dressup, 39 identity. Gate exit 0.
+
+## Change log
+
 - The first manual GUI run, and the four things it found. The document structure
   was correct throughout -- the new job existed, its Operations group was
   claimed by it, every dressup's Base pointed at its own replayed operation,

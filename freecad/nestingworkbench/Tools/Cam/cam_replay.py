@@ -115,12 +115,52 @@ JOB_NAME_PREFIX = "CAM_Replay_"
 #:
 #: and nothing warned, because `Machine` is in neither
 #: `NON_REPLAYABLE_PROPERTIES` nor anything else the replay touched.
-JOB_SETUP_PROPERTIES = (
-    "Machine",
-    "PostProcessor",
-    "PostProcessorArgs",
-    "PostProcessorOutputFile",
-)
+#: Job properties the replay does NOT copy, and why.
+#:
+#: A hand-picked list of what to copy is the same mistake as a hand-picked list
+#: of dressups: it will be incomplete, and nothing notices. The first version of
+#: this named four properties and lost `OrderOutputBy`, which is the order the
+#: post processor emits operations in -- the source said `Operation` (the job's
+#: process order) and the replay said `Fixture`. Everything else it did copy
+#: looked right only because the two jobs happened to agree on the defaults.
+#:
+#: So the rule is inverted: copy every job property, and skip these.
+#:
+#:   * the replayed job's own structure. It has its own Model, Operations,
+#:     SetupSheet, Stock and Tools, built for this sheet; the source's point at
+#:     the source geometry, and copying them would rewire the new job to the old
+#:     one's parts.
+#:
+#:   * computed or derived values. `CycleTime` is a measurement, `Path` is an
+#:     accumulated toolpath, `LastPostProcess*` records a post that has not
+#:     happened. Copying any of them states something untrue about the new job.
+#:
+#:   * identity. `Label` is set deliberately from the source and the sheet, and
+#:     `Proxy` is the job's own brain.
+#:
+#:   * presentation. `Visibility` is deliberately NOT copied: the source job is
+#:     usually hidden, and the point of the replayed one is that the user can
+#:     see what was made.
+JOB_PROPERTIES_NOT_COPIED = frozenset((
+    "Group", "Model", "Operations", "SetupSheet", "Stock", "Tools",
+    "Proxy",
+    "CycleTime", "Path", "LastPostProcessDate", "LastPostProcessOutput",
+    "Label", "Label2", "ExpressionEngine",
+    "Visibility", "_ElementMapVersion", "_GroupTouched",
+))
+
+
+def job_settings_to_copy(source_job, job):
+    """Return the property names worth carrying from `source_job` to `job`.
+
+    Every property both objects have, minus `JOB_PROPERTIES_NOT_COPIED`. Sorted,
+    so a report over it is stable.
+    """
+    if source_job is None:
+        return []
+    names = set(getattr(source_job, "PropertiesList", ()) or ())
+    names &= set(getattr(job, "PropertiesList", ()) or ())
+    return sorted(names - JOB_PROPERTIES_NOT_COPIED)
 
 
 def replay_job_name(source_job, sheet_label):
@@ -268,33 +308,33 @@ def _job_objects(job):
 
 
 def copy_job_setup(source_job, job):
-    """Copy the source job's machine and post-processor setup onto `job`.
+    """Copy the source job's settings onto `job`, and report what moved.
 
-    The replay reproduces a configuration, so the machine and post-processor
-    come from the job being replayed rather than from a dialog asking again.
-    Asking again can only produce a second answer to a question already
-    answered, and it will sometimes be a wrong one: FreeCAD's own Job builds its
-    `PostProcessor` enumeration from `allEnabledLegacyPostProcessors()` while
+    The replay reproduces a configuration, so the settings come from the job
+    being replayed rather than from a dialog asking again. Asking again can
+    only produce a second answer to a question already answered, and it will
+    sometimes be a wrong one: FreeCAD's own Job builds its `PostProcessor`
+    enumeration from `allEnabledLegacyPostProcessors()` while
     `allEnabledPostProcessors()` is the more obvious-looking call, and the
     difference includes `monokrom_plasma` and `generic_plasma`. Choosing from
     the wrong list yields a value the job then refuses.
 
-    `post_processor` overrides, for a caller that has a reason. Nothing in this
-    repository passes one.
+    Every property is attempted, minus `JOB_PROPERTIES_NOT_COPIED`, rather than
+    a named few. A property that fails to copy is reported rather than skipped,
+    because a job that quietly kept a default where the source had a setting
+    produces different G-code and says nothing about it.
     """
-    copied = []
-    if source_job is None:
-        return copied
-    for name in JOB_SETUP_PROPERTIES:
-        if not hasattr(job, name) or not hasattr(source_job, name):
-            continue
+    copied, failed = [], []
+    for name in job_settings_to_copy(source_job, job):
         try:
             setattr(job, name, getattr(source_job, name))
             copied.append(name)
         except Exception as exc:
+            failed.append("%s (%s: %s)" % (name, type(exc).__name__, exc))
             FreeCAD.Console.PrintWarning(
                 "Could not copy %s from the source job: %s\n" % (name, exc))
-    return copied
+    return copied, failed
+
 STOCK_LABEL_PREFIX = "Stock_Replay_"
 
 # Tolerance for comparing two stock Z frames, in millimetres. Loose enough to
@@ -572,7 +612,11 @@ def create_replay_job(doc, layout_group, sheet_group, flattened_parts,
                 % (post_processor, job_name, exc)
             )
     else:
-        copy_job_setup(source_job, job)
+        _copied, job_setup_failures = copy_job_setup(source_job, job)
+        for note in job_setup_failures:
+            FreeCAD.Console.PrintWarning(
+                "%s kept its own value for %s; the replayed job will not "
+                "match the source there.\n" % (job_name, note))
     doc.recompute()
 
     warnings = []

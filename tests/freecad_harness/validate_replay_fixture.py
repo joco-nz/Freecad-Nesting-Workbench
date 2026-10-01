@@ -963,19 +963,18 @@ def check_job_setup_was_copied(outcome, source_job, replayed_job):
     time; the tool table at whatever consumes the SetupSheet.
     """
     label = outcome.sheet_label
-    for name in cam_replay.JOB_SETUP_PROPERTIES:
+    for name in cam_replay.job_settings_to_copy(source_job, replayed_job):
         want = getattr(source_job, name, None)
         got = getattr(replayed_job, name, None)
-        if want is None or got is None:
+        if str(want) == str(got):
             continue
-        if str(want) != str(got):
-            fail("%s: the replayed job's %s is %r, the source job's is %r"
-                 % (label, name, got, want),
-                 "Machine and post-processor setup is copied from the job you "
-                 "selected, so a replayed job needs none of its own. If this "
-                 "is wrong the output is wrong: FreeCAD derives the post "
-                 "processor from Machine, so a job that has lost it has lost "
-                 "the post as well.")
+        fail("%s: the replayed job's %s is %r, the source job's is %r"
+             % (label, name, got, want),
+             "Every job setting is copied from the job you selected, so a "
+             "replayed job needs none of its own. A difference here is a "
+             "different job, not a different name for the same one: "
+             "OrderOutputBy decides the order operations are emitted in, and "
+             "Machine decides which post processor FreeCAD reaches for.")
 
     tools = getattr(replayed_job, "Tools", None)
     group = list(getattr(tools, "Group", None) or [])

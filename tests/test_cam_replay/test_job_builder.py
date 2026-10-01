@@ -352,3 +352,70 @@ class TestReplayJobName:
         a = replay_job_name(self._Job("Job"), "Sheet_1")
         b = replay_job_name(self._Job("OtherJob"), "Sheet_1")
         assert a != b
+
+
+class TestJobPropertiesNotCopied:
+    """The list of job properties the replay skips is pinned, exactly.
+
+    It has to be. That list decides both what is copied AND what the validator
+    compares, so a name added to it stops being copied and stops being checked
+    in the same move, and nothing notices. Demonstrated: adding `OrderOutputBy`
+    to it and re-running the validator produced **0 failures** -- the property
+    was neither copied nor verified, which is precisely the defect that list
+    exists to prevent.
+
+    So the list is short, every entry is defensible on its own terms, and this
+    test fails if one is added without that argument being made here.
+    """
+
+    EXPECTED = {
+        # the replayed job's own structure -- it has its own, built for this
+        # sheet, and the source's point at the source geometry
+        "Group", "Model", "Operations", "SetupSheet", "Stock", "Tools",
+        # identity
+        "Proxy", "Label", "Label2",
+        # computed or derived: copying these would state something untrue
+        "CycleTime", "Path", "LastPostProcessDate", "LastPostProcessOutput",
+        # bookkeeping and presentation
+        "ExpressionEngine", "Visibility",
+        "_ElementMapVersion", "_GroupTouched",
+    }
+
+    def test_the_list_is_exactly_what_is_agreed(self):
+        assert set(cam_replay.JOB_PROPERTIES_NOT_COPIED) == self.EXPECTED, (
+            "JOB_PROPERTIES_NOT_COPIED changed. It decides what is copied AND "
+            "what the validator compares, so a name added here is silently "
+            "uncopied and unverified. If that is intended, add it to EXPECTED "
+            "here with the reason.")
+
+    def test_it_excludes_structure_computed_and_identity(self):
+        excluded = cam_replay.JOB_PROPERTIES_NOT_COPIED
+        for name in ("Model", "Operations", "Stock", "Tools", "SetupSheet"):
+            assert name in excluded, name
+        for name in ("CycleTime", "Path", "Label", "Proxy"):
+            assert name in excluded, name
+
+    def test_it_does_not_exclude_anything_a_user_would_set(self):
+        # The properties FreeCAD groups under Output and WCS, all of which a
+        # user sets and all of which change the output.
+        excluded = cam_replay.JOB_PROPERTIES_NOT_COPIED
+        for name in ("Machine", "PostProcessor", "PostProcessorArgs",
+                     "PostProcessorOutputFile", "PostProcessorPropertyOverrides",
+                     "SplitOutput", "Fixtures", "OrderOutputBy", "JobType",
+                     "Description", "GeometryTolerance"):
+            assert name not in excluded, (
+                "%s is a user setting and must be copied" % name)
+
+    def test_settings_to_copy_covers_everything_else(self):
+        class _Job:
+            PropertiesList = ["Machine", "OrderOutputBy", "Model", "CycleTime",
+                             "Label", "Fixtures"]
+
+        names = cam_replay.job_settings_to_copy(_Job(), _Job())
+        assert names == ["Fixtures", "Machine", "OrderOutputBy"]
+
+    def test_settings_to_copy_is_empty_without_a_source(self):
+        class _Job:
+            PropertiesList = ["Machine"]
+
+        assert cam_replay.job_settings_to_copy(None, _Job()) == []
