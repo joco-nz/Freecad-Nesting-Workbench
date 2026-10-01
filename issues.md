@@ -360,3 +360,57 @@ so each section is still ~287 ms and the estimate is 3 x 287 ms, not 48 x 287.
 
 Not recorded as a limitation, because a 16x reduction looks available and has
 simply not been built.
+
+## NEST-009 — a replayed Boundary dressup clips against the SOURCE job's stock
+
+Found by extending `test_replay_dressups.py` to a three-deep stack
+(LeadInOut -> Dogbone -> Boundary), the shape FreeCAD's own `dressuptest.FCStd`
+uses. It is a defect, not a limitation, and it is **not fixed** — the two
+obvious fixes are both wrong, which is why it is written down rather than
+patched.
+
+**What is wrong.** Boundary's `Stock` is an `App::PropertyLink` to a solid, and
+`capture_properties` takes it verbatim. The replayed Boundary therefore clips
+against the *source job's* stock: fitted to the source part, in the source Z
+frame, at the source part's position. Measured:
+
+    source Boundary:       11 cuts, Stock -> the user's own stock solid
+    replayed Boundary:     11 cuts, Stock -> still the source job's object
+
+A cross-job link resolves, so nothing raises and the job looks fine.
+
+**Why it is easy to miss.** On the first sheet the parts are at the origin and
+the source stock is fitted to a part that is also near the origin, so the two
+nearly coincide. The replay is wrong and looks right. On any later sheet the
+parts have been moved to sheet-local coordinates and the boundary is still
+where the first sheet's part was.
+
+**Fix 1, tried and rejected: repoint `Stock` at the replay job's own stock.**
+This looks right — the sheet *is* the boundary, and decision 3 already makes
+the job's stock the sheet. It is worse. The sheet stock spans `-thickness .. 0`
+and the contour is cut at z 0, so the cut edge lies exactly on the stock's top
+face and `PathBoundary`'s `edge.common(shape)` degenerates. Measured on the
+three-deep step: **30 cutting moves before, 0 after.** The Boundary goes from
+cutting to cutting nothing.
+
+**Fix 2, not tried: copy the user's stock into the sheet's frame.** `doc.
+copyObject` plus a translation by the sheet origin. Preserves the user's
+boundary, which is the point of a replay, and avoids the degeneracy because a
+`CreateFromBase` stock spans z -3..1 with the cut strictly inside. Costs a copy
+per sheet and needs the sheet origin, which the replay already has.
+
+**Current state: reported, not fixed.** `unmapped_job_links` finds any job-local
+link the replay carried across without remapping, and the sheet outcome carries
+a warning naming the replayed dressup, the property and the object.
+`test_replay_dressups.py` asserts the warning is emitted, which is the
+mitigation — a Boundary dressup is **not safe to post from a replayed job**
+until this is resolved, and the assertion is what stops the mitigation being
+quietly deleted. `DRESSUP_JOB_LINKS` is the empty map that would hold the fix.
+
+**Also worth knowing, found while setting the test up.** Boundary clips with
+`edge.common(shape)`, and an edge commoned with a planar *face* in 3D returns
+nothing: 0 cutting moves against a 400x200 face, 11 against a 400x200 box. The
+property is documented as "Solid object", so a face is user error, but it fails
+by producing an empty path rather than an error. And `Inside=True` against the
+constructor's own `CreateFromBase` stock clips the contour away entirely,
+because that stock is barely larger than the part.

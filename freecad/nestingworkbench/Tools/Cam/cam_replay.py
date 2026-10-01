@@ -1558,6 +1558,62 @@ def expression_bound(obj):
     return paths
 
 
+#: Dressup properties that are links into the SOURCE job, mapped to where they
+#: belong in the replayed job.
+#:
+#: `capture_properties` takes every `App::Property*` verbatim, including links.
+#: That is right for values and wrong for links: a link carried across jobs
+#: resolves -- FreeCAD does not object -- and the replayed object then depends
+#: on the source job surviving, which is the same reason `copy_tool_controller`
+#: copies rather than links.
+#:
+#: `ToolController` is handled separately, on the operations, by remapping onto
+#: the copied controller.
+#:
+#: **`Stock` is deliberately NOT in this map, and is the one open question.**
+#: It is Boundary's -- the solid the dressup clips against -- and carried
+#: verbatim it clips against the SOURCE job's stock: fitted to the source part,
+#: in the source Z frame, at the source part's position. That is wrong on any
+#: sheet but the first, where parts are at the origin, and on the first it
+#: nearly coincides with the right answer, which is what makes it easy to miss.
+#:
+#: The obvious fix is wrong. Repointing `Stock` at the replay job's own stock
+#: looks right -- the sheet IS the boundary, and decision 3 already makes the
+#: job's stock the sheet -- but the sheet stock spans `-thickness .. 0` while
+#: the contour is cut at z 0, so the cut edge lies exactly on the stock's top
+#: face and `edge.common(shape)` degenerates. Measured: 30 cutting moves
+#: before, 0 after.
+#:
+#: So the state is that the link is wrong and REPORTED, not silently wrong and
+#: not silently patched. Resolving it means choosing between copying the
+#: user's stock into the sheet's frame and giving Boundary a boundary that is
+#: not the stock at all. Neither is mechanical. See issues.md.
+DRESSUP_JOB_LINKS = {}
+
+
+def unmapped_job_links(dressup, properties):
+    """Return captured job-local link properties that the replay did not remap.
+
+    `Base` is deliberately excluded: the replay owns it, having just built it.
+    Everything else that is a link carried across from the source job is a
+    candidate for having been repointed and was not.
+    """
+    found = []
+    for name in properties:
+        if name in DRESSUP_JOB_LINKS or name == "Base":
+            continue
+        try:
+            type_id = dressup.getTypeIdOfProperty(name)
+        except Exception:
+            continue
+        if not type_id.startswith("App::PropertyLink"):
+            continue
+        value = getattr(dressup, name, None)
+        if value is not None and hasattr(value, "Name"):
+            found.append((name, value))
+    return found
+
+
 def apply_properties(target, properties, skip=(), remap=None):
     """Assign captured properties onto `target`.
 
@@ -1721,6 +1777,22 @@ def replay_recipe(recipe, job, clones, tool_cache=None):
                 )
                 continue
             apply_properties(new_dressup, spec.properties, skip=("Base",))
+
+            # A link carried across from the source job resolves, so nothing
+            # raises; the replayed dressup just points at an object in another
+            # job. Say so rather than leaving it to be found on a second sheet.
+            for link_name, target in unmapped_job_links(new_dressup,
+                                                        spec.properties):
+                # Named by the REPLAYED label, not the source's: the reader is
+                # looking at the job that was just created, and the source job
+                # may not even be open.
+                result.warnings.append(
+                    "%s.%s still points at %r, which belongs to the source "
+                    "job. It will be evaluated there, not on this sheet. Check "
+                    "it before posting."
+                    % (new_dressup.Label, link_name,
+                       getattr(target, "Label", "?"))
+                )
 
             # A constructor that installed an expression the source did not have
             # is now recomputing over the value just applied, and the user's

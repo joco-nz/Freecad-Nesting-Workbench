@@ -16,11 +16,25 @@ feature does not classify anything. It reads a recipe and applies it.
 
 ## Status
 
-**Steps 1-7 done. Step 8 blocked on step 9 (dressups).**
+**Steps 1-7 and 9 done. Step 8's fixture and its tests are in place.**
 
-The fixture is built and validates. It cannot be replayed yet, because the
-reader's view of a job does not survive dressups — and every operation in that
-fixture is dressed up. Step 9 is the dressup work; step 8's test follows it.
+The dressup work (step 9) is complete: the reader walks a dressup stack to the
+operation underneath, the write half rebuilds the chain and lists only the
+outermost dressup, and both are covered under `freecadcmd` against real dressup
+modules. Step 8's fixture validates and replays end to end — 7 operations, 7
+dressups, 48 parts, all verified.
+
+The four harness checks, all wired into `run.sh`:
+
+- `test_replay_flatten.py`: 187 checks — geometry and topology survive
+  flattening, and the full pipeline runs.
+- `test_replay_dressups.py`: 60 checks — a CAM setup built headless from the
+  fixture's `SourceShapes`, with a bare operation, a LeadInOut, a Dogbone and a
+  two-deep stack.
+- `test_replay_identity.py`: 39 checks — proves the identity cross-check can
+  fail. Not wired in: it asserts a fixture is wrong, so a gate would report a
+  broken build over a deliberately broken fixture.
+- 429 pytest.
 
 `Tools/Cam/cam_replay.py` holds two halves:
 
@@ -31,19 +45,11 @@ fixture is dressed up. Step 9 is the dressup work; step 8's test follows it.
 - the **job builder** (step 3) — creates a real CAM job, so the interesting
   parts can only be checked under `freecadcmd`;
 - the **replay** (step 4) — recreates the user's operations and dressups.
-
 - the **ordering** (step 5) — a partial order over the replayed operations.
-
 - the **verification** (step 6) — decides whether a bad run is visible.
-
-- 421 pytest tests passing (35 new for step 7).
-- `tests/freecad_harness/test_replay_flatten.py`: 187 checks, 0 failures.
-  The full pipeline runs end to end over a two-sheet layout: two jobs, each with
-  its own stock at the origin, both verified.
-
-Every part in every one of those checks is a `Part::Feature` built from
-primitives, and none of them has more than three parts of a type. That is what
-step 8 exists to change.
+- the **dressup table** (step 9) — ten dressups in four construction patterns
+  and no common entry point, so a table rather than a convention: seven
+  replayable, three job-level settings reported as unsupported.
   A healthy two-part-type replay verifies clean: 2 operations, both with
   cutting motion, 2 warnings carried through from the stock frame comparison.
   The end-to-end replay is now exercised on a real two-part-type job: a Profile
@@ -334,11 +340,14 @@ Not started. Ordered so each step is independently verifiable.
    dialog, every sheet replayed one job per sheet. Wired into the Nesting menu
    and toolbar as `Nesting_ReplayCAMSetup`, beside `Nesting_CreateCAMJob` and
    sharing no code with it beyond `freecad_helpers`.
-8. **Mid-complexity fixture + headless replay test.** In progress. The fixture
-   exists and validates; the *read* half of the replay cannot yet see it,
-   because of the dressup structure investigated below. That is step 8's first
-   piece of work.
-9. **Dressup support.** Required before step 8 can pass. See "Dressups" below.
+8. ~~**Mid-complexity fixture + headless replay test.**~~ **Done.** The fixture
+   is committed and validates; `test_replay_dressups.py` and
+   `test_replay_identity.py` drive it. What remains untested is the GUI: the
+   command has never been run by hand.
+9. ~~**Dressup support.**~~ **Done.** See "Dressups" below. This was the
+   blocker: every operation in the fixture is dressed up, and the reader only
+   looked at the Operations list, where a dressed operation deliberately does
+   not appear.
 
 ## Dressups
 
@@ -485,9 +494,9 @@ replay test to nester regressions — confusing when the two features are
 independent. Generating once and committing gives authenticity without either
 cost.
 
-Note `tests/Test_Files/` currently has **no tracked files at all**: both the
-n70 `.FCStd` and its 5.3 MB `.dxf` are gitignored, so nothing in the repo is
-openable in a GUI today.
+Note `tests/Test_Files/` holds exactly one tracked file, this fixture. The n70
+`.FCStd` and its 5.3 MB `.dxf` remain gitignored, so this is the only geometry
+in the repo that can be opened in a GUI.
 
 ### Validating the fixture before the test is written
 
@@ -502,12 +511,13 @@ confusing structural failure. Structure checks are followed by a dry run of the
 whole pipeline, reporting per-sheet outcome, operation count, sub-element
 resolution, containment and wall clock.
 
-Verified against both cases: the n70 file (correctly reported as *source
-geometry only*), and a purpose-built valid fixture, which it passes with
-**0 failures**. A diagnostic that can only fail is not a diagnostic.
+It passes the tracked fixture with **0 failures**, and still fails a file with
+no layout. Neither of those is the interesting evidence, though: a diagnostic
+that only ever sees a good file has not been tested.
 
-Two things it caught while being written, both in code written minutes earlier
-— which is the argument for having it:
+**What it actually caught, and why that is the argument for it.** All four were
+in code written minutes or days earlier, and in three cases the diagnostic was
+itself the thing at fault:
 
   * a throwaway fixture generator placed parts at x=20 with a half-width of 30,
     so they started at x=-10. The dry run's containment check reported them
@@ -515,7 +525,31 @@ Two things it caught while being written, both in code written minutes earlier
     generator was wrong, not the replay;
   * the validator's own containment assertion was hardcoded to X 0..300 and
     reported four parts "outside the stock" that were plainly inside a 400 mm
-    sheet. It now measures against the actual stock object.
+    sheet. It now measures against the actual stock object;
+  * **the identity cross-check could not fail.** It called
+    `clones_for_source([stub], geometry)` per container, and that function
+    returns *every* clone when it cannot narrow — a deliberate safety property,
+    and correct for the replay. With a one-element stub it could never narrow,
+    so it always returned that element, which is truthy, so the `or` never
+    reached the real label match. The predicate was constant `True`. On the
+    tracked fixture every operation reported 48 nested parts where the truth is
+    23, 23 and 2, under a comment claiming it was "the one place the replay can
+    be confidently wrong without anything raising". The replay was always
+    right; the check never ran. Replaced with a naming cross-check plus a
+    post-dry-run check against the real clones, and proved able to fail by
+    nulling a nested part's shape — 13 clones to 12, named count 5 to 4;
+  * **its advice for an empty recipe was the opposite of correct.** It
+    prescribed `job.Proxy.addOperation` on each operation it found, which puts
+    every dressed contour in the job twice. It fired on exactly the case it was
+    wrong about, because the reader could not see dressed operations — a
+    symptom of the reader's blindness, treated as a fault in the file.
+
+The pattern is consistent enough to be worth stating: three of the four were
+found by the *reporting* disagreeing with another number in the same output,
+and two of those were only visible because a second number was printed next to
+them. `test_replay_identity.py` exists to keep that property — it builds an
+honest job, then a mismatched one, and asserts both that the honest one passes
+and that the mismatch is visible.
 
 ### What the fixture must contain
 
@@ -675,6 +709,21 @@ six label conventions.
   those, which is the whole reason it exists.
 
 ## Change log
+
+- Steps 8 and 9 closed. The fixture replays end to end: 7 operations, 7
+  dressups, 48 nested parts, all verified. The read walk, the dressup table and
+  the single-writer `set_operation_order` came out of discovering that a
+  dressed operation is absent from the Operations list by design.
+- Three defects found and fixed, all by the validator's own reporting
+  disagreeing with another number beside it: the identity cross-check was
+  constant `True`; its advice for an empty recipe prescribed the double-cut;
+  and its assumptions block stated the wrong Operations shape, which is where
+  the detour started. See "Validating the fixture" for the full account.
+- A dressup constructor's `setup(obj)` is deliberately never called. It writes
+  defaults, and LeadInOut's binds `RadiusIn`/`RadiusOut` to an expression off
+  the tool diameter, so a replay that ran it produced 1.5x the tool radius
+  instead of the user's setting — 3.75 mm for a 5 mm tool, silently, with
+  every structural check still passing.
 
 - Step 8 opened. A mid-complexity committed fixture was agreed over the
   synthetic-only alternative, after measuring that `find_hole_nestings` takes

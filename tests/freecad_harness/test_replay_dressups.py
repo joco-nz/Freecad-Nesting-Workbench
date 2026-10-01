@@ -142,18 +142,33 @@ def top_faces(feature):
             and abs(f.CenterOfMass.z) < 1e-9]
 
 
+#: Sheet size, and the stock box the Boundary dressup is given. They must
+#: agree, or the boundary clips against a sheet that is not the one the parts
+#: were nested onto.
+SHEET_W = 900.0
+SHEET_H = 420.0
+
+
 # -- the source CAM setup ------------------------------------------------
 
 def build_source_job(doc, shapes):
     """Build a CAM job whose operations are dressed up, headless.
 
-    Deliberately covers four shapes of step, because each one used to break the
+    Deliberately covers five shapes of step, because each one used to break the
     read or the write:
 
       * a bare operation -- nothing to get wrong;
       * a Profile under one LeadInOut, the user's everyday case;
       * a Profile under a Dogbone, the other dressup in use;
-      * a two-deep stack, Dogbone over LeadInOut over Profile.
+      * a two-deep stack, Dogbone over LeadInOut over Profile;
+      * a three-deep stack, Boundary over Dogbone over LeadInOut over Profile.
+
+    Three deep is not hypothetical. FreeCAD's own `dressuptest.FCStd` has
+    exactly that shape -- LeadInOut -> Dogbone -> Boundary over one operation --
+    and it is the deepest the read walk has been shown to handle on a file the
+    user did not build. It is also the shape that exercises the most of the
+    write: three constructors, each layering on the object the previous one
+    produced, and three links to get right.
 
     The list is written by `set_operation_order`, which is the point: a job
     whose operations are all dressed up has an Operations list containing no
@@ -205,18 +220,52 @@ def build_source_job(doc, shapes):
             built.AngleIn = 90
             built.AngleOut = 90
             return obj
-        from Path.Dressup.DogboneII import Proxy as Dogbone
-        from Path.Dressup.DogboneII import Style as DogboneStyle
-        obj = doc.addObject("Path::FeaturePython", "DressupDogbone")
-        obj.Proxy = Dogbone(obj, base)
-        # `Side` and `Style` are the properties that exist. There is no
-        # BoneLength: the length comes from the tool and the algorithm, which is
-        # why the enumeration below is `Incision`, not a number.
-        obj.Style = DogboneStyle.Dogbone
-        return obj
+        if kind == "Dogbone":
+            from Path.Dressup.DogboneII import Proxy as Dogbone
+            from Path.Dressup.DogboneII import Style as DogboneStyle
+            obj = doc.addObject("Path::FeaturePython", "DressupDogbone")
+            obj.Proxy = Dogbone(obj, base)
+            # `Side` and `Style` are the properties that exist. There is no
+            # BoneLength: the length comes from the tool and the algorithm.
+            obj.Style = DogboneStyle.Dogbone
+            return obj
+        if kind == "Boundary":
+            # `DressupPathBoundary(obj, base, job)` -- the job-taking
+            # constructor. Boundary clips the path to a solid, so unlike the
+            # other two it genuinely needs the job, and it is the one that
+            # would notice if the replay's stock were wrong.
+            #
+            # Two things it needs that the constructor does not supply usefully:
+            #
+            #   * a STOCK solid. The constructor fits one to the base geometry,
+            #     which is barely larger than the part, so `Inside=True` clips
+            #     the contour away and the path comes back empty. A user points
+            #     this at their sheet; here that is a box the size of the
+            #     layout.
+            #   * a SOLID, not a face. `PathBoundary` clips with
+            #     `edge.common(shape)`, and an edge commoned with a planar face
+            #     in 3D returns nothing -- measured 0 cutting moves against a
+            #     400x200 face and 11 against a 400x200 box.
+            #
+            # Its properties are Stock, Inside, RetractThreshold,
+            # RestMachiningPass and Offset. There is no FinalDepth: the depth
+            # comes from the operation it wraps, which is already set.
+            from Path.Dressup.Boundary import DressupPathBoundary
+            obj = doc.addObject("Path::FeaturePython", "DressupPathBoundary")
+            obj.Proxy = DressupPathBoundary(obj, base, job)
+            stock = doc.addObject("Part::Feature", "SheetStock")
+            stock.Shape = Part.makeBox(SHEET_W, SHEET_H, 4,
+                                       FreeCAD.Vector(-SHEET_W / 2.0,
+                                                      -SHEET_H / 2.0, -2))
+            doc.recompute()
+            obj.Stock = stock
+            obj.Inside = True
+            obj.Offset = 0.0
+            return obj
+        raise ValueError("unknown dressup kind %r" % kind)
 
-    # shapes[0] bare, shapes[1] LeadInOut, shapes[2] Dogbone, and if there is a
-    # fourth, the two-deep stack.
+    # shapes[0] bare, shapes[1] LeadInOut, shapes[2] Dogbone, shapes[3] two deep
+    # and shapes[4] three deep.
     if len(steps) > 1:
         steps[1][1].append(dressup(None, steps[1][0], "LeadInOut"))
     if len(steps) > 2:
@@ -225,6 +274,12 @@ def build_source_job(doc, shapes):
         lead = dressup(None, steps[3][0], "LeadInOut")
         steps[3][1].append(lead)
         steps[3][1].append(dressup(None, lead, "Dogbone"))
+    if len(steps) > 4:
+        lead = dressup(None, steps[4][0], "LeadInOut")
+        bone = dressup(None, lead, "Dogbone")
+        steps[4][1].append(lead)
+        steps[4][1].append(bone)
+        steps[4][1].append(dressup(None, bone, "Boundary"))
 
     doc.recompute()
 
@@ -276,20 +331,26 @@ def chain_kinds(entry):
 def build_layout(doc, shapes, thickness, sheets=1):
     """A layout whose nested parts are the same shapes the source job used.
 
-    Two parts of each type per sheet, which is what makes the clone expansion
-    observable: one source operation has to end up cutting several nested
-    copies.
+    Several parts of each type per sheet, which is what makes the clone
+    expansion observable: one source operation has to end up cutting several
+    nested copies.
     """
     layout = doc.addObject("App::DocumentObjectGroup", "Layout_002")
-    for name, value in (("SheetWidth", 700.0), ("SheetHeight", 300.0),
+    for name, value in (("SheetWidth", SHEET_W), ("SheetHeight", SHEET_H),
                         ("SheetThickness", thickness)):
         layout.addProperty("App::PropertyLength", name, "Layout", "")
         setattr(layout, name, value)
 
+    # Sized so the largest part -- the 120x50 ClampPlate carrying the
+    # three-deep stack -- fits at every grid position and at every angle, at
+    # the largest radius from its centre. The containment check in
+    # verify_replay is a real check, not decoration: an earlier grid that was
+    # sized for 100 mm parts put the ClampPlate's corner outside the stock and
+    # failed the sheet, which read at first like a replay fault and was not one.
     grid = []
     for row in range(2):
         for column in range(4):
-            grid.append((60.0 + column * 160.0, 70.0 + row * 140.0,
+            grid.append((100.0 + column * 210.0, 100.0 + row * 200.0,
                          (column * 23 + row * 11) % 90))
 
     groups = []
@@ -298,9 +359,9 @@ def build_layout(doc, shapes, thickness, sheets=1):
         layout.addObject(sheet)
         shapes_group = doc.addObject("App::DocumentObjectGroup", "Shapes_%d" % s)
         sheet.addObject(shapes_group)
-        offset = 0.0 if s == 1 else 800.0
+        offset = 0.0 if s == 1 else 1200.0
         boundary = doc.addObject("Part::Feature", "Sheet_Boundary_%d" % s)
-        boundary.Shape = Part.makePlane(700, 300)
+        boundary.Shape = Part.makePlane(SHEET_W, SHEET_H)
         boundary.Placement = FreeCAD.Placement(
             FreeCAD.Vector(offset, 0, 0), FreeCAD.Rotation())
         sheet.addObject(boundary)
@@ -358,7 +419,7 @@ def check_read(job, steps):
     return recipe
 
 
-def check_write(recipe, outcomes, steps):
+def check_write(recipe, outcomes, steps, source_job):
     """The write half, on the jobs `replay_layout` produced."""
     emit("\n-- write --")
     source_kinds = [chain_kinds(dressups[-1] if dressups else op)
@@ -397,6 +458,70 @@ def check_write(recipe, outcomes, steps):
                           % (label, entry.Label, other.Label))
 
         check_settings_survived(outcomes, recipe, steps)
+        check_source_links_are_reported(outcomes, source_job, steps)
+
+
+def check_source_links_are_reported(outcomes, source_job, steps):
+    """A dressup link into the SOURCE job must be REPORTED, not carried quietly.
+
+    The rule: a replayed object may not hold a link into the job it was copied
+    from. `ToolController` is handled -- captured only so the write half knows a
+    tool was chosen, then remapped onto the new job's copy by
+    `copy_tool_controller`. Every other job-local link has to be dealt with the
+    same way.
+
+    Boundary's `Stock` is the one that is not, and it is **known wrong rather
+    than fixed**: carried verbatim it clips against the source job's stock, and
+    repointing it at the replay job's stock is worse (see
+    `DRESSUP_JOB_LINKS` for the measurement). So the contract this asserts is
+    that the replay says so -- a warning naming the property and the object --
+    rather than producing a job that looks fine and cuts to the wrong boundary.
+
+    The consequence, which is the point of the assertion: the Boundary dressup
+    is NOT safe to post from a replayed job until that is resolved. The
+    warning is the mitigation, and this check is what stops the mitigation
+    being quietly removed.
+    """
+    source_held = {id(o) for o in source_job.OutListRecursive}
+    for entry in source_job.Operations.Group:
+        source_held.add(id(entry))
+        if cam_replay.is_dressup(entry):
+            operation, _dressups = cam_replay.walk_stack(entry)
+            if operation is not None:
+                source_held.add(id(operation))
+
+    examined = 0
+    reported = 0
+    for outcome in outcomes:
+        if outcome.replay_job is None or outcome.result is None:
+            continue
+        for dressup in outcome.result.dressups:
+            for name in dressup.PropertiesList:
+                if not dressup.getTypeIdOfProperty(name).startswith(
+                        "App::PropertyLink"):
+                    continue
+                if name in ("Base", "ToolController"):
+                    continue
+                value = getattr(dressup, name, None)
+                if value is None or not hasattr(value, "Name"):
+                    continue
+                examined += 1
+                if id(value) in source_held:
+                    # Still pointing into the source job. That is the open
+                    # question, and it must be visible.
+                    text = "\n".join(outcome.result.warnings)
+                    check(dressup.Label in text and name in text,
+                          "%s: replayed %s.%s points into the source job and "
+                          "nothing warned about it" % (outcome.sheet_label,
+                                                       dressup.Label, name))
+                    reported += 1
+    check(examined > 0,
+          "no job-local link was found on any replayed dressup, so this check "
+          "examined nothing -- the Boundary branch stopped being built")
+    check(reported > 0,
+          "no job-local link into the source job was found, so the warning path "
+          "is untested. If Boundary's Stock is ever fixed, this assertion is "
+          "the one to revisit.")
 
 
 def check_settings_survived(outcomes, recipe, steps):
@@ -469,6 +594,14 @@ def run():
     shapes.append(("WidePlate", box_part(doc, "WidePlate", 30.0, 100.0,
                                          thickness,
                                          ((0.0, -25.0, 4.0), (0.0, 25.0, 4.0)))))
+    # A fifth part, carrying the three-deep stack. It needs two holes far enough
+    # apart that the Boundary dressup has something to clip against, and it is
+    # the widest of them so the boundary actually bites rather than passing the
+    # whole contour through untouched -- a Boundary that clips nothing replays
+    # fine and tests nothing.
+    shapes.append(("ClampPlate", box_part(doc, "ClampPlate", 120.0, 50.0,
+                                          thickness,
+                                          ((-40.0, 0.0, 5.0), (40.0, 0.0, 5.0)))))
     doc.recompute()
 
     job, steps = build_source_job(doc, shapes)
@@ -512,7 +645,7 @@ def run():
     # the bug it enables is observable. Comparing before this would pass with
     # the bug present.
     doc.recompute()
-    check_write(recipe, outcomes, steps)
+    check_write(recipe, outcomes, steps, job)
 
     # The clone expansion is the other half of the feature, and it is only
     # observable if a source operation actually landed on several copies.
