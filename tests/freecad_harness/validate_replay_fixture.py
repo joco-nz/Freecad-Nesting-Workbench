@@ -429,23 +429,30 @@ def survey_holes(sheets_with_containers):
 
 # -- the CAM job ----------------------------------------------------------
 
-def _matches(container, source_label):
-    """True if `container`'s label encodes `source_label` as its part type.
+def _nested_type(container):
+    """Return the part type encoded in `container`'s label, or None.
 
-    The same parse `clones_for_source` does: the middle of `nested_<type>_<n>`.
+    The middle of `nested_<type>_<n>` -- the same parse `clones_for_source`
+    performs, and deliberately not `findObjects(Label=...)`, which is a prefix
+    match and so would return `nested_Bracket_1` for `nested_Bracket_10`.
     """
     pieces = container.Label.split("_")
     if len(pieces) < 3:
-        return False
-    return "_".join(pieces[1:-1]) == source_label
+        return None
+    return "_".join(pieces[1:-1])
 
 
-def _c_stub(container):
-    """A stand-in for clones_for_source, which wants job clones.
+def _containers_for_type(containers, source_label):
+    """Containers whose label claims to be copies of `source_label`.
 
-    Only the label is consulted here, so the raw container is enough.
+    This is a claim made by the layout's naming, not a result. What the replay
+    actually does is decided by `clones_for_source` against real job clones,
+    which is checked in `check_identity_against_replay` once the dry run has
+    produced them. The two are kept apart deliberately -- see the note on that
+    function for what happens when they are confused.
     """
-    return type("_S", (), {"Objects": [container], "Label": container.Label})()
+    return [c for c in containers
+            if _nested_type(c) is not None and _nested_type(c) == source_label]
 
 
 def _diagnose_no_operations(doc, job, recipe):
@@ -506,7 +513,7 @@ def validate_job(doc, wanted_name=None, all_containers=()):
              "The replay reads Operations.Group from a job the user selects. "
              "is_cam_job() wants a Path::Feature carrying Operations, Model "
              "and Stock.")
-        return None
+        return None, []
 
     for job in jobs:
         emit("  found job %r (%s)" % (job.Label, job.TypeId))
@@ -516,7 +523,7 @@ def validate_job(doc, wanted_name=None, all_containers=()):
         if not matching:
             fail("No job named %r. Candidates: %s"
                  % (wanted_name, [j.Label for j in jobs]))
-            return None
+            return None, []
         job = matching[0]
     else:
         job = jobs[0]
@@ -529,11 +536,14 @@ def validate_job(doc, wanted_name=None, all_containers=()):
     recipe = cam_replay.read_recipe(job)
     if not len(recipe):
         _diagnose_no_operations(doc, job, recipe)
-        return job
+        return job, []
     if recipe.unresolved_dressups:
-        warn("%d dressup(s) could not be attached: %s"
+        warn("%d dressup(s) did not resolve to an operation: %s"
              % (len(recipe.unresolved_dressups),
-                [getattr(d, "Label", "?") for d in recipe.unresolved_dressups]))
+                [getattr(d, "Label", "?") for d in recipe.unresolved_dressups]),
+             "A dressup whose stack does not bottom out in an operation cannot "
+             "be replayed. Check the Base link, and note that Base is a single "
+             "link, not a link-sub-list.")
 
     emit("  Operations.Group, in order:")
     group = getattr(job.Operations, "Group", []) or []
@@ -567,23 +577,71 @@ def validate_job(doc, wanted_name=None, all_containers=()):
     # clones_for_source falls back to "every clone", so the operation would cut
     # the wrong feature on parts it was never meant to touch, and every
     # downstream check would pass.
-    emit("  identity cross-check (operation -> source part -> nested parts):")
+    #
+    # What is reported here is a NAMING claim: this many containers are called
+    # nested_<this part>_<n>. It is the cheapest thing available without running
+    # the replay, and it is what the structure-only mode can honestly say.
+    #
+    # It used to report something else and wrong. This called
+    # `clones_for_source([stub], geometry)` per container, and that function
+    # returns *every* clone when it cannot narrow -- a deliberate safety
+    # property, documented at length, and correct for the replay. Called with a
+    # one-element stub it can never narrow, so it always returned that one
+    # element, which is truthy, so the `or` short-circuited and the real label
+    # match was never consulted. Every operation reported the total part count:
+    # 48 for all 7 on the tracked fixture, where the truth is 23, 23 and 2.
+    #
+    # The check that matters therefore never ran, in a file whose comment
+    # claimed it was the one that mattered most. What the replay really does is
+    # checked separately, in check_identity_against_replay.
+    emit("  identity cross-check (operation -> source part -> nested parts "
+         "by name):")
+    identity_by_operation = []
     for item in recipe:
         for geometry, _subs in item.base_entries:
             original = cam_replay.resolve_source_object(geometry) or geometry
             label = getattr(original, "Label", "?")
-            containers = [c for c in all_containers
-                          if cam_replay.clones_for_source([_c_stub(c)], geometry)
-                          or _matches(c, label)]
+            containers = _containers_for_type(all_containers, label)
+            identity_by_operation.append((item, label, len(containers)))
             if containers:
-                emit("    %-22s -> %r -> %d nested part(s)"
+                emit("    %-22s -> %r -> %d nested part(s) by name"
                      % (item.label, label, len(containers)))
             else:
                 fail("Operation %r references source part %r, which has no "
-                     "matching nested part." % (item.label, label),
-                     "The replay would fall back to targeting every clone, "
-                     "cutting a feature on parts it was not set up for. The "
-                     "nested label must be nested_<that part's label>_<n>.")
+                     "nested part named for it." % (item.label, label),
+                     "No container is labelled nested_%s_<n>. The replay would "
+                     "fall back to targeting every clone, cutting a feature on "
+                     "parts it was not set up for -- visibly, in the toolpath, "
+                     "rather than as an error.\n"
+                     "The nested label must be nested_<that part's label>_<n>."
+                     % label)
+    if all_containers and not identity_by_operation:
+        warn("No operation carries a Base, so identity cannot be checked.",
+             "Operations that select the whole object still replay; they just "
+             "cannot be cross-checked against the nested naming.")
+
+    if recipe.normalised_entries:
+        note("%d list entr(ies) normalised away: %s"
+             % (len(recipe.normalised_entries),
+                [getattr(e, "Label", "?") for e in recipe.normalised_entries]))
+        emit("  (an operation listed separately from a dressup layered on it is "
+             "read as part of that dressup's step, so it is not cut twice -- "
+             "this is normal, and is what the CAM workbench produces)")
+
+    for item in recipe:
+        stack = item.dressup_labels
+        if stack:
+            emit("    %-22s dressup stack: %s" % (item.label, " -> ".join(stack)))
+        for spec in item.dressups:
+            kind, module = cam_replay.dressup_kind(spec.source)
+            if kind == "known":
+                verdict = "replayable"
+            elif kind == "unsupported":
+                verdict = "NOT replayed -- %s" % \
+                    cam_replay.DRESSUP_UNSUPPORTED.get(module, "no reason given")
+            else:
+                verdict = "unrecognised proxy %r" % (module,)
+            emit("      %-22s %-12s %s" % (spec.label, kind, verdict))
 
     tools = getattr(job, "Tools", None)
     if tools is not None and getattr(tools, "Group", None):
@@ -592,12 +650,109 @@ def validate_job(doc, wanted_name=None, all_containers=()):
     else:
         warn("The job has no tool controller, so operations replay without a tool.")
 
-    return job
+    return job, identity_by_operation
 
 
 # -- dry run --------------------------------------------------------------
 
-def dry_run(doc, layout, job):
+def check_identity_against_replay(outcome, identity_by_operation):
+    """Check what the replay ACTUALLY targeted, against the real job clones.
+
+    This is the check the naming cross-check cannot be, and the one that matters.
+
+    `clones_for_source` is given a real list of clones here, not a per-container
+    stub, so its "return everything rather than guess narrow" fallback is
+    visible instead of hidden: when it fires, the match count equals the total
+    clone count, and that is the case worth failing on, because it means the
+    operation is about to cut a feature on every part on the sheet.
+
+    The expected count comes from the naming cross-check, so the two are
+    independent: naming says how many containers *claim* to be this part, and
+    this says how many clones the replay *chose*.
+    """
+    replay = outcome.replay_job
+    total = len(replay.clones)
+    if not total:
+        return
+
+    # What the naming cross-check expected, keyed by the SOURCE operation's
+    # label. The replay appends `_replay` to each label, so the pairing strips
+    # that; it is a name, not a position, because position assumes an ordering
+    # the two lists need not share.
+    expected_by_label = {}
+    for item, label, expected in identity_by_operation:
+        expected_by_label.setdefault(item.label, (label, expected))
+
+    emit("")
+    emit("    identity, as the replay resolved it (%d clone(s) on the sheet):"
+         % total)
+    for operation in outcome.result.operations:
+        name = operation.Label
+        if name.endswith("_replay"):
+            name = name[:-len("_replay")]
+        source = expected_by_label.get(name)
+        targets = list(getattr(operation, "Base", None) or [])
+        nested_kinds = set()
+        for pair in targets:
+            geometry = pair[0] if isinstance(pair, (list, tuple)) else pair
+            original = getattr(geometry, "Objects", None)
+            flattened = original[0] if original else None
+            nested = getattr(flattened, cam_replay.PROP_NESTED_LABEL, "")
+            if nested:
+                pieces = nested.split("_")
+                if len(pieces) >= 3:
+                    nested_kinds.add("_".join(pieces[1:-1]))
+        emit("      %-22s targets %2d of %d clone(s), nested types: %s"
+             % (operation.Label, len(targets), total,
+                ", ".join(sorted(nested_kinds)) or "(none)"))
+
+        if len(targets) == total and total > 1:
+            if len(nested_kinds) > 1 or not nested_kinds:
+                fail("%s: %s targets ALL %d nested parts."
+                     % (outcome.sheet_label, operation.Label, total),
+                     "clones_for_source could not narrow this operation to the "
+                     "part type it was set up on, and fell back to every clone. "
+                     "The toolpath would cut this feature on parts it was never "
+                     "meant for. Check that the operation's source part is named "
+                     "the same way its nested containers are "
+                     "(nested_<part label>_<n>).")
+            else:
+                note("%s: %s targets all %d parts, which is correct -- there is "
+                     "only one part type on this sheet." %
+                     (outcome.sheet_label, operation.Label, total))
+        elif not targets:
+            note("%s: %s ended up on no nested part at all." %
+                 (outcome.sheet_label, operation.Label))
+        elif source is not None:
+            # Naming and reality disagree. The naming cross-check counted the
+            # containers that CLAIM to be this part type; this counts the clones
+            # the replay actually built. They should match, and when they do not,
+            # something between the two lost parts -- a container skipped during
+            # flattening, a null shape, a part the flattener could not seat.
+            #
+            # What this deliberately does NOT catch, because nothing can: an
+            # operation whose Base has been re-pointed at the wrong source part.
+            # Both checks read the operation's current geometry, so a re-pointed
+            # operation is consistently wrong in both places and the two agree.
+            # The replay is faithful to its input, and the document does not
+            # record what the input was meant to be. The report above is what
+            # makes that visible -- a human compares the part type against the
+            # source parts -- but no automated check can assert the intent.
+            _expected_label, expected = source
+            if expected and len(targets) != expected:
+                fail("%s: %s targets %d clone(s), but %r has %d nested part(s) "
+                     "by name."
+                     % (outcome.sheet_label, operation.Label, len(targets),
+                        _expected_label, expected),
+                     "The layout names %d container(s) for this part type and "
+                     "the replay built %d clone(s) for it. Something dropped "
+                     "parts in between -- check for containers with no part_* "
+                     "child or a null shape, which flatten_container records in "
+                     "result.skipped."
+                     % (expected, len(targets)))
+
+
+def dry_run(doc, layout, job, identity_by_operation=()):
     """Actually run the replay, and report what it did."""
     heading("REPLAY DRY RUN")
     if layout is None or job is None:
@@ -633,6 +788,8 @@ def dry_run(doc, layout, job):
                 if not cam_replay.has_cutting_motion(operation):
                     fail("%s: %s has no cutting motion"
                          % (outcome.sheet_label, operation.Label))
+            if identity_by_operation:
+                check_identity_against_replay(outcome, identity_by_operation)
 
     emit("")
     emit("  replay wall clock: %.0f ms" % (1000 * elapsed))
@@ -677,11 +834,19 @@ def main(path):
 
     all_containers = [c for _sheet, containers in sheets_with_containers
                       for c in containers]
-    job = validate_job(doc, os.environ.get("REPLAY_FIXTURE_JOB") or None,
-                       all_containers)
+    job, identity_by_operation = validate_job(
+        doc, os.environ.get("REPLAY_FIXTURE_JOB") or None, all_containers)
 
     if not os.environ.get("REPLAY_FIXTURE_NOREPLAY"):
-        dry_run(doc, layout, job)
+        dry_run(doc, layout, job, identity_by_operation)
+    elif identity_by_operation:
+        heading("IDENTITY, AS THE REPLAY WOULD RESOLVE IT")
+        warn("Skipped: the dry run is what produces the job clones.",
+             "The naming cross-check above reports how many containers claim to "
+             "be each operation's part type. Whether clones_for_source then "
+             "narrows to them -- or falls back to every clone, and cuts the "
+             "feature on parts it was never set up for -- is only observable "
+             "with a real clone list, so it needs the dry run.")
 
     heading("SUMMARY")
     emit("  %d failure(s), %d warning(s), %d note(s)"
