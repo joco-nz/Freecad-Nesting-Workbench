@@ -500,3 +500,50 @@ still alive does not work either way: `part.Document` still answers for a
 removed object, so a `source_parts` trim on that basis kept all 48 dead
 references; and `part.Name` raises `Cannot access attribute 'Name' of deleted
 object`. Only asking the document for its live object names works.
+
+## NEST-011 — two toolbar buttons had the same icon
+
+`command_create_cam_job.py` and `command_replay_cam.py` both declared
+`Nesting_CNC_Icon.svg`, and the two commands are adjacent in both the menu and
+the toolbar (`init_gui.py:52-53`). Six distinct icons for seven commands.
+
+The obvious fix — give it a distinct picture — turns out to have a house style
+to match, and that style is stricter than it looks. The six existing icons are
+**1448 rectangles and nothing else**: one `<path>` per colour, every shape an
+axis-aligned `M x y h w v h h -w z` on a 48x48 grid. No curves, no strokes, no
+gradients, no transforms, no `<g>`. So it is a fully specified format and can be
+generated rather than hand-placed.
+
+**Fixed** with `Resources/icons/Nesting_Replay_Icon.svg` — a replay ring around a
+2x2 nest, one part of which is the source. 230 rectangles, 7 colours, 3549 bytes,
+in the same format as the file it sits beside.
+
+Three measurements shaped it, and none of them were what I would have guessed:
+
+* **The stroke weight is the house style, not a preference.** The existing icons
+  outline at 2 units. A first pass at 4 units read as a blob next to them.
+  Related: FreeCAD renders a 48-unit grid at `width="64"` down to the toolbar,
+  so at a 16px toolbar one unit is a third of a device pixel and a 2-unit
+  stroke is already one device pixel. Nothing thinner can survive.
+* **Silhouette decides legibility, not detail.** Rendered at 16/24/32/48: the
+  fist and the stacked boards survive, the CNC icon does not. So the first
+  candidates -- one part, arrow, three copies -- were dropped or simplified
+  rather than refined. Two designs were cut entirely: a fan of dots, and a
+  thick diagonal "cut path" that read as glare.
+* **The palette came from CAM, as asked.** Tango, from the 125 icons in
+  `~/dev/FreeCAD/src/Mod/CAM/Gui/Resources/icons`: `#fff110`/`#cf7008` for the
+  material, `#8ae234`/`#73d216`/`#4e9a06` for a cut result, `#2e3436` for
+  structure, `#ffffff` for the highlight. Every one is present in at least two
+  of those 125 -- `#8f5902` in two, `#8ae234` in 37. A first pass used an
+  invented `#8f5005`, which appears in no CAM icon and was replaced.
+
+Eight candidates were generated and previewed at six sizes before one was
+chosen; the generator is not in the repo, since the icons are assets and
+regenerating them is not something the build does.
+
+**Verified** by round trip: each SVG is parsed back with the same parser used on
+the six existing icons, re-rendered, and compared cell by cell -- 0 differing
+cells, and only `M`/`h`/`v`/`z` commands present. That check earned its keep
+immediately by reporting all eight as MISMATCH when the fault was in the
+validator. What it cannot check is FreeCAD's Qt renderer, which antialiases, so
+the real toolbar will look softer than the nearest-neighbour previews.

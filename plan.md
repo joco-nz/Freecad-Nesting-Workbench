@@ -1007,3 +1007,14 @@ six label conventions.
   was the job's ViewProvider group extension claiming `Part::Feature` objects
   where it had always claimed `Part::FeaturePython` Clones. It renders, the job
   tree nests as before, and the operations cut.
+
+## Change log
+
+- **NEST-011 closed.** `Nesting_ReplayCAMSetup` shared `Nesting_CNC_Icon.svg`
+  with `Nesting_CreateCAMJob`, and the two are adjacent in both the menu and the
+  toolbar — six icons for seven commands. Now `Resources/icons/Nesting_Replay_Icon.svg`,
+  a replay ring around a 2x2 nest with one part as the source.
+  Style A as chosen: pixel-art on the 48-unit grid in the house format, Tango
+  palette taken from the CAM workbench's own 125 icons. Eight candidates were
+  generated and previewed at 96/64/48/32/24/16px before this one was chosen.
+  See issues.md for the three measurements that shaped it.

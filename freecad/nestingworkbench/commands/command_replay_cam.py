@@ -55,7 +55,23 @@ class ReplayCAMSetupCommand:
 
     def GetResources(self):
         return {
-            "Pixmap": "Nesting_CNC_Icon.svg",
+            # Its own icon, not the CNC one. The two commands sit next to each
+            # other in both the menu and the toolbar, and sharing
+            # `Nesting_CNC_Icon.svg` made them indistinguishable at a glance.
+            #
+            # `Nesting_Replay_Icon` is a replay ring around a 2x2 nest of parts,
+            # one of them the source. It follows the house spec exactly -- a 48
+            # unit grid, axis-aligned rectangles only, one `<path>` per colour,
+            # no curves or strokes -- and its palette is Tango taken from the
+            # CAM workbench's own icons rather than the bespoke ramps the other
+            # six use: #ffffff, #fff110, #cf7008, #8f5902, #8ae234, #73d216,
+            # #4e9a06, #2e3436. Each is present in at least two of the 125
+            # icons in FreeCAD's `src/Mod/CAM/Gui/Resources/icons`.
+            #
+            # It survives 16px, which matters because FreeCAD scales a 48-unit
+            # grid down to the toolbar and a 2-unit stroke is already one
+            # device pixel there.
+            "Pixmap": "Nesting_Replay_Icon.svg",
             "MenuText": "Replay CAM Setup onto Nesting",
             "ToolTip": (
                 "Apply the operations and dressups from the selected CAM job "
