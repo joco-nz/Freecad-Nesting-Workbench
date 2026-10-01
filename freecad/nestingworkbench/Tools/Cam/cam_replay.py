@@ -1583,6 +1583,40 @@ def set_view_provider(obj, proxy_module=None, is_dressup=None, failures=None):
         view.Visibility = True
     except Exception:
         pass
+    # And turn off "cancel deletes me", which `__init__` turns ON.
+    #
+    # `ViewProvider.__init__` sets `deleteOnReject = True`: during the initial
+    # edit session, a Cancel means "abandon creating this operation".
+    # `setEdit` copies that flag into the TaskPanel and only afterwards resets
+    # it, so the panel holds True and `TaskPanel.reject()` runs
+    # `removeObject(self.obj.Name)`.
+    #
+    # Correct for an operation the GUI is creating, and wrong here: this
+    # operation already exists. There is no creation session to abandon, so
+    # Cancel must just close the dialog -- measured on a replayed Profile, where
+    # it deleted the Profile.
+    #
+    # A job loaded from a file does not have this problem, and the saved state
+    # shows why. The proxy persisted for a Profile is
+    #
+    #     {"OpName", "OpIcon", "OpPageModule", "OpPageClass"}
+    #
+    # -- `deleteOnReject` is not in it, so a restored proxy is built without
+    # `__init__` and simply does not have the attribute. That is why
+    # `deleteObjectsOnReject()` guards with `hasattr`. A replayed operation is
+    # the one case where the flag exists and is True, because the replay
+    # constructs its view provider rather than restoring it.
+    #
+    # Dressups are unaffected: none of `Dressup/Gui/*.py` has the flag, which
+    # is why a dressup dialog cancels cleanly and an operation dialog did not.
+    clear = getattr(view.Proxy, "setDeleteObjectsOnReject", None)
+    if callable(clear):
+        try:
+            clear(False)
+        except Exception as exc:
+            failures.append("%s: could not clear delete-on-cancel (%s: %s)"
+                            % (label, type(exc).__name__, exc))
+            return False
     return True
 
 
@@ -3110,6 +3144,27 @@ def replay_sheet(doc, layout_group, sheet_group, source_job, post_processor=None
         return outcome
     outcome.replay_job = replay
 
+    # The flattened parts STAY, and this is a measured decision rather than an
+    # oversight.
+    #
+    # It is tempting: `PathJob.Create` has put a clone of each into
+    # `job.Model.Group`, every step after this one works from `replay.clones`,
+    # and 48 objects in the document is a lot of clutter. So they were removed
+    # -- and 5 of 7 operations lost their toolpath, because a
+    # `draftobjects.clone.Clone` is a LINK, not a copy. Its `Objects` property
+    # points back at the flattened part, and the clone re-evaluates from it.
+    # Remove the source and the clone is a dead reference with a stale cached
+    # shape, which some operations can still read and most cannot:
+    #
+    #     Profile_replay      402 cmd  184 cuts
+    #     Profile001_replay     0 cmd    0 cuts   <- the job now cuts less
+    #     Profile002_replay  532 cmd  283 cuts
+    #     Profile003..006_replay  0 cmd   0 cuts
+    #
+    # They stay, in a group of their own, which is the tidying that is
+    # actually available. Making them genuinely disposable would mean baking the
+    # clone shapes into independent `Part::Feature` objects, which is a change
+    # to how the job's geometry is built and is not taken here.
     try:
         result = replay_recipe(recipe, replay.job, replay.clones)
     except Exception as exc:

@@ -508,3 +508,106 @@ class TestDressupTablesAgree:
             "Proxy": None,
         })()
         assert cam_replay.set_view_provider(obj) is False
+
+
+class TestOperationViewProviderIsNotDisposable:
+    """A replayed operation must not delete itself when Cancel is pressed.
+
+    `Path.Op.Gui.Base.ViewProvider.__init__` sets `deleteOnReject = True`,
+    meaning "during the initial edit session, Cancel means abandon creating
+    this". `setEdit` copies that flag into the TaskPanel and only afterwards
+    resets it, so the panel holds True and `TaskPanel.reject()` runs
+    `removeObject(self.obj.Name)`.
+
+    Correct for an operation the GUI is creating. Wrong for a replayed one,
+    which already exists -- there is no creation session to abandon. Found by
+    a manual run: Cancel on a replayed Profile deleted the Profile.
+
+    A job loaded from a file does not have the problem, and the saved state says
+    why. The proxy persisted for a Profile is
+    `{"OpName", "OpIcon", "OpPageModule", "OpPageClass"}` -- no
+    `deleteOnReject` -- so a restored proxy is built without `__init__` and
+    never has the attribute. That is also why `deleteObjectsOnReject()` guards
+    with `hasattr`. A replayed operation is the one case where the flag exists
+    and is True, because the replay constructs its view provider rather than
+    restoring it.
+
+    The real fix is a call the harness cannot observe -- there is no ViewObject
+    under `freecadcmd` -- so what is checked here is that the call is made, and
+    made with False.
+    """
+    class _View:
+        def __init__(self, proxy):
+            self.Proxy = proxy
+            self.Visibility = None
+
+    class _Recorder:
+        """Stands in for `Path.Op.Gui.Base.ViewProvider`."""
+
+        def __init__(self, view):
+            self.view = view
+            self.delete_on_reject = True
+            self.cleared = []
+
+        def setDeleteObjectsOnReject(self, state=False):
+            self.cleared.append(state)
+            self.delete_on_reject = state
+            return state
+
+    def test_the_flag_is_cleared_when_the_attach_succeeds(self):
+        # Attach a stub provider successfully, then confirm the flag is off.
+        # Done by patching the module lookup rather than the GUI, so the whole
+        # path runs under plain pytest.
+        recorder = self._Recorder(None)
+        view = self._View(recorder)
+        obj = type("_Op", (), {"ViewObject": view, "Label": "Profile_replay",
+                               "Proxy": None})()
+        failures = []
+
+        class _FakeBase:
+            ViewProvider = staticmethod(
+                lambda v, res: recorder)
+
+        class _FakeGui:
+            class Command:
+                res = object()
+
+        import sys
+        real_import = __import__("importlib").import_module
+
+        def fake_import(name, *a, **k):
+            if name == "Path.Op.Gui.Nonexistent":
+                return _FakeGui
+            if name == "Path.Op.Gui.Base":
+                return _FakeBase
+            return real_import(name, *a, **k)
+
+        import importlib
+        original = importlib.import_module
+        importlib.import_module = fake_import
+        try:
+            ok = cam_replay.set_view_provider(
+                obj, "Path.Op.Nonexistent", is_dressup=False,
+                failures=failures)
+        finally:
+            importlib.import_module = original
+
+        assert ok is True, failures
+        assert recorder.cleared == [False], (
+            "the replayed operation was left with delete-on-cancel set, so "
+            "pressing Cancel in its dialog deletes it")
+        assert recorder.delete_on_reject is False
+
+    def test_a_provider_without_the_method_is_not_an_error(self):
+        # Dressup view providers have no deleteOnReject, and a FreeCAD that
+        # drops the method must not break the replay.
+        class _Bare:
+            def __init__(self, view):
+                pass
+
+        view = self._View(_Bare(None))
+        obj = type("_O", (), {"ViewObject": view, "Label": "x",
+                              "Proxy": None})()
+        failures = []
+        assert cam_replay._attach_view_provider(obj, _Bare, failures) is True
+        assert failures == []

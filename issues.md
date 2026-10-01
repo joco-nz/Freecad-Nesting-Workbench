@@ -414,3 +414,48 @@ property is documented as "Solid object", so a face is user error, but it fails
 by producing an empty path rather than an error. And `Inside=True` against the
 constructor's own `CreateFromBase` stock clips the contour away entirely,
 because that stock is barely larger than the part.
+
+## NEST-010 — the flattened parts cannot be removed: the job's clones are links
+
+Raised as "the parts group can go once copies are made into the Model folder".
+Tried, measured, and reverted.
+
+**A `draftobjects.clone.Clone` is a link, not a copy.** Its `Objects`
+property points back at the object it was cloned from, and the clone
+re-evaluates from it. `PathJob.Create` replaces the geometry passed to it with
+these clones, so the replayed job's `Model` holds 48 objects that each depend
+on a flattened part still being in the document.
+
+Removing the flattened parts and their group leaves the document tidier and the
+job wrong. Measured on the tracked fixture, 48 parts removed:
+
+    Profile_replay        402 cmd  184 cuts
+    Profile001_replay       0 cmd    0 cuts   <- the job now cuts less
+    Profile002_replay     532 cmd  283 cuts
+    Profile003..006_replay   0 cmd    0 cuts
+
+Five of seven operations lost their toolpath. The clones still hold a cached
+shape, so two operations happen to read it and the rest cannot resolve their
+sub-element selections against it:
+
+    Sub-element Edge100 resolved on 2 of 48
+
+So the verification did its job: the sheet was labelled `_UNVERIFIED` rather
+than passing with a silently shorter toolpath.
+
+**Kept as-is:** the flattened parts stay, in a group of their own. That group is
+the tidying actually available — 48 objects in one place rather than loose at
+the document root.
+
+**If they are ever to go**, the change is to make the clones independent: bake
+each clone's shape into a plain `Part::Feature` before handing it to the job, so
+the job's geometry does not reference anything the replay created and then
+discarded. That is a change to how the job's `Model` is built, not a cleanup,
+and it has a cost — baked geometry does not follow the source part if the user
+edits it, which is the thing a Clone is for.
+
+**Two dead ends recorded so they are not retried.** Asking whether a part is
+still alive does not work either way: `part.Document` still answers for a
+removed object, so a `source_parts` trim on that basis kept all 48 dead
+references; and `part.Name` raises `Cannot access attribute 'Name' of deleted
+object`. Only asking the document for its live object names works.

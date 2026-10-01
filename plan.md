@@ -807,6 +807,31 @@ six label conventions.
 
 ## Change log
 
+- **Cancel on a replayed operation deleted it.** `Path.Op.Gui.Base.
+  ViewProvider.__init__` sets `deleteOnReject = True` -- during the *initial
+  edit session*, Cancel means abandon creating this. `setEdit` copies the flag
+  into the TaskPanel and only afterwards resets it, so the panel holds True and
+  `TaskPanel.reject()` runs `removeObject`. Correct for an operation the GUI is
+  creating; wrong for one that already exists, which is what the replay builds.
+  A job loaded from a file is unaffected, and the saved state says why: the
+  proxy persisted for a Profile is `{"OpName", "OpIcon", "OpPageModule",
+  "OpPageClass"}` -- no `deleteOnReject` -- so a restored proxy is built
+  without `__init__` and never has the attribute, which is why
+  `deleteObjectsOnReject()` guards with `hasattr`. A replayed operation is the
+  one case where the flag exists and is set, because the replay constructs its
+  view provider rather than restoring it. Dressups have no such flag at all,
+  which is why their dialog always cancelled cleanly.
+- **The flattened parts cannot be removed, and the clones are the reason.** See
+  NEST-010. A `draftobjects.clone.Clone` is a link, not a copy: it points back
+  at the part it was cloned from and re-evaluates from it. Removing the 48
+  flattened parts left the job cutting on 2 of 7 operations instead of 7 of 7,
+  and the verification caught it and labelled the sheet `_UNVERIFIED`. They
+  stay, in a group of their own, which is the tidying that is actually
+  available.
+- 446 pytest, 187 flatten, 78 dressup, 39 identity. Gate exit 0.
+
+## Change log
+
 - Job settings are now copied wholesale rather than by name. The hand-picked
   list of four lost `OrderOutputBy`, which is the order the post processor
   emits operations in: the source said `Operation` -- the job's process order --
