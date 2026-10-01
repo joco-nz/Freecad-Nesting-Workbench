@@ -456,51 +456,197 @@ def _containers_for_type(containers, source_label):
 
 
 def _diagnose_no_operations(doc, job, recipe):
-    """Say WHY a job has no operations, when the reason is diagnosable.
+    """Say WHY a job yields no process steps, and what to do about each cause.
 
-    "No operations" on its own sends the reader hunting. The common cause is
-    specific and easy to fix: the operations exist in the document, each dressup
-    points at one, but they were never added to `Operations.Group` -- which is
-    what actually defines a job's process order. Adding a dressup puts the
-    *dressup* in the group, so it is easy to end up with a group of dressups
-    and no operations, each pointing at something real that nothing lists.
+    "No operations" on its own sends the reader hunting, so the causes are
+    separated rather than asserted -- they have different fixes, and one of them
+    is the opposite of the others.
 
-    Checked rather than asserted, because the opposite case -- no operations
-    anywhere -- is a genuinely different problem with a different fix.
+    **The rule this encodes, because getting it backwards is the expensive
+    mistake:**
+
+        A process step contributes ONE entry to Operations.Group. If the
+        operation is dressed up, that entry is the OUTERMOST DRESSUP. The
+        operation underneath is created and linked, and is NOT listed.
+
+    So a job whose Operations list holds a column of dressups and no operations
+    is **correct**. It looks broken and is not. Listing the operations as well
+    puts every contour in the job twice, and the post-processor emits the list
+    verbatim -- measured at 24 cutting moves in the dressup's section and 20 in
+    the operation's, the same profile cut twice.
+
+    An earlier version of this function gave the opposite advice, telling the
+    reader to run `job.Proxy.addOperation` on each operation it found. Following
+    that advice breaks the job. It is written out here so it cannot be
+    re-derived: if you are here because you think the list is missing
+    operations, check whether those operations are wrapped by a dressup that IS
+    listed. If so, there is nothing to fix.
     """
-    by_label = {o.Label: o for o in doc.Objects}
+    group = list(getattr(getattr(job, "Operations", None), "Group", None) or [])
+    in_group = [getattr(o, "Label", "?") for o in group]
 
-    dressup_bases = {}
-    for dressup in recipe.unresolved_dressups:
-        base = getattr(dressup, "Base", None)
-        if base is not None:
-            dressup_bases[getattr(base, "Label", "?")] = dressup.Label
+    # Operations in the document that are not listed, and not underneath a
+    # listed dressup -- the genuinely-missing case, where addOperation is right.
+    listed_ids = {id(o) for o in group}
+    listed_dressups = [o for o in group if cam_replay.is_dressup(o)]
+    reachable = set()
+    for dressup in listed_dressups:
+        operation, _dressups = cam_replay.walk_stack(dressup)
+        if operation is not None:
+            reachable.add(id(operation))
 
-    in_group = {getattr(o, "Label", "?")
-                for o in (getattr(job.Operations, "Group", []) or [])}
-    present = sorted(label for label in dressup_bases if label in by_label)
+    operations_in_doc = []
+    for obj in doc.Objects:
+        proxy = getattr(obj, "Proxy", None)
+        if proxy is None:
+            continue
+        module = type(proxy).__module__
+        if module.startswith("Path.Op") and not module.startswith("Path.Dressup"):
+            operations_in_doc.append(obj)
 
-    if present:
-        fail("The job has no operations in Operations.Group, but %d operation "
-             "object(s) exist in this document and are wrapped by a dressup."
-             % len(present),
-             "The operations are not in the job's process order, so the replay "
-             "has nothing to read.\n"
-             "  present but unlisted: %s\n"
-             "  Operations.Group currently holds: %s\n"
+    unlisted = [o for o in operations_in_doc
+                if id(o) not in listed_ids and id(o) not in reachable]
+    wrapped_and_listed = [o for o in operations_in_doc
+                          if id(o) in reachable and id(o) not in listed_ids]
+
+    if not group:
+        fail("The job's Operations list is empty, so it has no process steps.",
+             "The replay reads one step per entry in Operations.Group.\n"
+             "  Operations.Group currently holds: nothing\n"
+             "  operations in this document: %s\n"
              "\n"
-             "Fix: add each operation to the job, e.g.\n"
+             "If the document holds no operation objects either, the job was "
+             "never set up -- create one in the CAM workbench and it will "
+             "appear in the list.\n"
+             "If it does hold them, they were created without being added: "
+             "job.Proxy.addOperation(obj). That is the one case where adding "
+             "an operation to the list is the fix."
+             % (", ".join(getattr(o, "Label", "?") for o in operations_in_doc)
+                or "none"))
+        return
+
+    if recipe.unresolved_dressups:
+        # Reachable only via a cycle or a dangling link. A dressup whose Base
+        # points at a missing object, or at another dressup that points back.
+        fail("%d dressup(s) in the list do not resolve to an operation, and "
+             "nothing else in the list does either."
+             % len(recipe.unresolved_dressups),
+             "  unresolvable: %s\n"
+             "  Operations.Group: %s\n"
+             "\n"
+             "A dressup's Base is a single link to the object it layers on -- "
+             "a Path operation, or another dressup. A chain resolves by "
+             "following those links down to an operation. It does not when the "
+             "link points at a missing object, or when two dressups point at "
+             "each other.\n"
+             "The fix is to repair the Base links, NOT to add the underlying "
+             "operations to the list: a dressed operation must not be listed, "
+             "because the dressup on it is already the list entry. Adding it "
+             "would cut every one of those contours twice.\n"
+             "  operations found in the document, none of them listed: %s"
+             % (", ".join(getattr(d, "Label", "?")
+                          for d in recipe.unresolved_dressups),
+                ", ".join(in_group),
+                ", ".join(getattr(o, "Label", "?") for o in unlisted) or "none"))
+        return
+
+    if unlisted:
+        fail("%d operation object(s) in this document are in neither the "
+             "Operations list nor underneath a listed dressup."
+             % len(unlisted),
+             "  unlisted: %s\n"
+             "  Operations.Group: %s\n"
+             "\n"
+             "These exist but are not steps of the job, so the replay will "
+             "not cut them. If they are meant to be cut, add each to the job:\n"
              "  job.Proxy.addOperation(doc.getObject('%s'))\n"
-             "and put the dressups after the operation they wrap. In the CAM "
-             "workbench, creating the operation first and then dressing it up "
-             "produces the right order."
-             % (", ".join(present), sorted(in_group) or "nothing",
-                present[0]))
-    else:
-        fail("The job has no operations, and none are wrapped by a dressup "
-             "either.",
-             "Found %d dressup(s) whose base is missing. The job needs at "
-             "least one operation to replay." % len(recipe.unresolved_dressups))
+             "That is the correct fix HERE, and only here: an operation with no "
+             "dressup on it should be listed. An operation that IS dressed up "
+             "should not -- see the rule in this function's docstring."
+             % (", ".join(getattr(o, "Label", "?") for o in unlisted),
+                ", ".join(in_group),
+                getattr(unlisted[0], "Label", "?")))
+        return
+
+    if wrapped_and_listed:
+        # Cannot happen -- walk_stack and the recipe read the same links -- but
+        # if it ever does, the two disagree about what is listed, and that
+        # should be visible rather than quietly ignored.
+        note("%d operation(s) sit underneath a listed dressup, which is the "
+             "correct shape." % len(wrapped_and_listed))
+        for operation in wrapped_and_listed:
+            emit("    %-22s is wrapped by a listed dressup, so it is not "
+                 "listed itself (correct)" % getattr(operation, "Label", "?"))
+        return
+
+    fail("The job's Operations list has %d entr(ies) but no operation could be "
+         "read from any of them." % len(group),
+         "  Operations.Group: %s\n"
+         "\n"
+         "This should not be reachable -- the reader resolves each entry down "
+         "its dressup links. If it is reporting this, the reader and this "
+         "validator disagree about the structure, which is a bug worth "
+         "reporting rather than a fixture to fix."
+         % ", ".join(in_group))
+
+
+def _report_unlisted_operations(doc, job):
+    """Report operation objects that are in neither the list nor under a dressup.
+
+    The complement of the rule in `_diagnose_no_operations`. That function
+    handles a job with no readable steps; this handles a job that reads fine but
+    is quietly missing work.
+
+    Worth separating from the above because the two give opposite advice, and
+    only one of them is right:
+
+      * an operation with a dressup on it must NOT be listed -- the dressup is
+        the list entry, and listing both cuts the contour twice;
+      * an operation with nothing on it, that is not listed, is not part of the
+        job at all, and `job.Proxy.addOperation` is the fix.
+
+    Getting the second wrong in the direction of the first loses a cut silently.
+    """
+    group = list(getattr(getattr(job, "Operations", None), "Group", None) or [])
+    listed_ids = {id(o) for o in group}
+    reachable = set()
+    for entry in group:
+        if not cam_replay.is_dressup(entry):
+            continue
+        operation, _dressups = cam_replay.walk_stack(entry)
+        if operation is not None:
+            reachable.add(id(operation))
+
+    unlisted = []
+    for obj in doc.Objects:
+        proxy = getattr(obj, "Proxy", None)
+        if proxy is None:
+            continue
+        if not type(proxy).__module__.startswith("Path.Op"):
+            continue
+        if id(obj) in listed_ids or id(obj) in reachable:
+            continue
+        unlisted.append(obj)
+
+    if not unlisted:
+        return
+    labels = [getattr(o, "Label", "?") for o in unlisted]
+    fail("%d operation object(s) are in neither the Operations list nor "
+         "underneath a listed dressup: %s" % (len(unlisted), labels),
+         "  Operations.Group: %s\n"
+         "\n"
+         "The replay reads one step per list entry, so these are not steps of "
+         "the job and will not be cut. Nothing downstream raises -- the job "
+         "builds, verifies, and cuts everything else, so the symptom is a part "
+         "arriving with a feature missing and no error saying why.\n"
+         "  Fix: add each to the job.\n"
+         "    job.Proxy.addOperation(doc.getObject('%s'))\n"
+         "  That is correct HERE because nothing is dressed on top of them. If "
+         "one of these IS dressed up, and the dressup is already listed, then "
+         "it is correct as it stands -- a dressed operation is reached through "
+         "the dressup and must not be listed itself, or it is cut twice."
+         % (", ".join(getattr(o, "Label", "?") for o in group) or "nothing",
+            labels[0]))
 
 
 def validate_job(doc, wanted_name=None, all_containers=()):
@@ -544,6 +690,18 @@ def validate_job(doc, wanted_name=None, all_containers=()):
              "A dressup whose stack does not bottom out in an operation cannot "
              "be replayed. Check the Base link, and note that Base is a single "
              "link, not a link-sub-list.")
+
+    # An operation that exists but is in neither the list nor underneath a
+    # listed dressup. The recipe reads every step, so it never reports zero for
+    # this and the diagnosis above never fires -- which would leave the one case
+    # where `addOperation` IS the correct fix unreachable, having just been
+    # written carefully.
+    #
+    # It is a failure and not a note, because the replay will silently not cut
+    # it. Nothing downstream raises: the job builds, verifies, and cuts every
+    # other operation, so a part comes off the machine with a feature missing
+    # and nothing anywhere says why.
+    _report_unlisted_operations(doc, job)
 
     emit("  Operations.Group, in order:")
     group = getattr(job.Operations, "Group", []) or []
