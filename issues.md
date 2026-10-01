@@ -545,5 +545,10 @@ regenerating them is not something the build does.
 the six existing icons, re-rendered, and compared cell by cell -- 0 differing
 cells, and only `M`/`h`/`v`/`z` commands present. That check earned its keep
 immediately by reporting all eight as MISMATCH when the fault was in the
-validator. What it cannot check is FreeCAD's Qt renderer, which antialiases, so
-the real toolbar will look softer than the nearest-neighbour previews.
+validator.
+
+**Verified in the GUI** by manual run, in both the enabled and disabled states.
+That was the part no check here could reach: FreeCAD's Qt renderer antialiases,
+so the real toolbar looks softer than the nearest-neighbour previews, and a
+disabled command desaturates the icon, which is worth knowing about for a
+palette carrying a saturated green and yellow. Both read correctly.

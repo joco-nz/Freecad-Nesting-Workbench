@@ -1018,3 +1018,6 @@ six label conventions.
   palette taken from the CAM workbench's own 125 icons. Eight candidates were
   generated and previewed at 96/64/48/32/24/16px before this one was chosen.
   See issues.md for the three measurements that shaped it.
+- Icon confirmed in the GUI in both enabled and disabled states. The disabled
+  case was the one worth checking: FreeCAD desaturates a disabled command's
+  icon, and this palette carries a saturated Tango green and yellow.
