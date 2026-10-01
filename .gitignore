@@ -50,6 +50,7 @@ tests/freecad_harness/.last_status_bench_cache
 tests/freecad_harness/.last_status_bench_cache
 tests/freecad_harness/.last_status_replay
 tests/freecad_harness/.last_status_dressup
+tests/freecad_harness/.last_status_identity
 
 opencode.json
 
