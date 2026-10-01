@@ -39,6 +39,7 @@ from freecad.nestingworkbench.Tools.Cam.cam_replay import (
     create_dressup_in,
     create_operation_in,
     describe_replay_result,
+    nested_label_of,
     resolve_subnames,
 )
 
@@ -64,6 +65,21 @@ class _Clone:
 
 
 class _Flat:
+    def __init__(self, nested_label):
+        self.Label = "CAMPart"
+        if nested_label is not None:
+            setattr(self, cam_replay.PROP_NESTED_LABEL, nested_label)
+
+
+class _Part:
+    """A plain `Part::Feature` in the job's Model -- a flattened part itself.
+
+    Deliberately has no `Objects` attribute at all, because a real
+    `Part::Feature` does not either. This is what
+    `adopt_flattened_parts_as_model` leaves in the Model in place of the Clones
+    `PathJob.Create` made.
+    """
+
     def __init__(self, nested_label):
         self.Label = "CAMPart"
         if nested_label is not None:
@@ -185,6 +201,76 @@ class TestClonesForSource:
 
     def test_never_returns_none(self):
         assert clones_for_source([], _Original("Bracket")) == []
+
+
+class TestNestedLabelOf:
+    """Reading the Model's identity, whichever kind of object is in there.
+
+    `clones_for_source` used to walk `Clone -> Objects[0] -> NestedLabel` and
+    nothing else. When the Model holds the flattened parts themselves that path
+    is empty, so nothing matched, so the function returned every entry, so every
+    operation targeted all 48 parts regardless of type -- and 5 of 7 stopped
+    cutting because their sub-element names resolved on only 23 of 48. Measured
+    on the committed fixture, not inferred.
+    """
+
+    def test_reads_the_label_off_the_object_itself(self):
+        assert nested_label_of(_Part("nested_Bracket_1")) == "nested_Bracket_1"
+
+    def test_falls_back_to_the_clone_path(self):
+        clone = _Target("c1", [], nested_label="nested_Bracket_1")
+        assert nested_label_of(clone) == "nested_Bracket_1"
+
+    def test_owns_the_label_in_preference_to_the_link(self):
+        # If an entry somehow carries both, its own label is the one that
+        # describes it. Getting this backwards would narrow on a stale link.
+        entry = _Target("c1", [], nested_label="nested_Stale_1")
+        setattr(entry, cam_replay.PROP_NESTED_LABEL, "nested_Real_1")
+        assert nested_label_of(entry) == "nested_Real_1"
+
+    def test_empty_for_an_object_with_neither(self):
+        assert nested_label_of(_Part(None)) == ""
+
+    def test_empty_for_a_link_whose_target_is_unlabelled(self):
+        assert nested_label_of(_Clone("Clone", flattened=_Flat(None))) == ""
+
+    def test_survives_an_object_with_no_objects_property(self):
+        # A `Part::Feature` really does not have one, so `getattr` with a
+        # default is the whole of the defensiveness needed.
+        assert nested_label_of(object()) == ""
+
+
+class TestModelIdentitySurvivesTheSwap:
+    """`clones_for_source` against a Model that holds the flattened parts."""
+
+    def _model(self):
+        return [_Part("nested_Bracket_1"), _Part("nested_Bracket_2"),
+                _Part("nested_Spacer_1"), _Part("nested_Spacer_2")]
+
+    def test_narrows_to_the_matching_part_type(self):
+        model = self._model()
+        brackets = model[:2]
+        spacers = model[2:]
+        assert clones_for_source(model, _Original("Bracket")) == brackets
+        assert clones_for_source(model, _Original("Spacer")) == spacers
+
+    def test_does_not_silently_match_everything(self):
+        # The regression that matters. Returning all four here is the failure
+        # that made the swapped job cut less, and it looked fine -- no
+        # exception, no warning, just a short toolpath.
+        model = self._model()
+        assert len(clones_for_source(model, _Original("Bracket"))) < len(model)
+
+    def test_works_across_a_mix_of_clones_and_parts(self):
+        # Not what the replay produces today, but it must not be the thing that
+        # breaks first if the job is hand-edited.
+        model = [_Target("c1", [], nested_label="nested_Bracket_1"),
+                 _Part("nested_Bracket_2"), _Part("nested_Spacer_1")]
+        assert clones_for_source(model, _Original("Bracket")) == model[:2]
+
+    def test_falls_back_to_all_when_nothing_matches(self):
+        model = self._model()
+        assert clones_for_source(model, _Original("Widget")) == model
 
 
 # -- property application -------------------------------------------------

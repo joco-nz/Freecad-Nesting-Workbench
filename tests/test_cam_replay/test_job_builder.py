@@ -37,6 +37,7 @@ from freecad.nestingworkbench.Tools.Cam import cam_replay
 from freecad.nestingworkbench.Tools.Cam.cam_replay import (
     STOCK_FRAME_TOLERANCE,
     ReplayJob,
+    adopt_flattened_parts_as_model,
     compare_stock_frames,
     describe_replay_job,
     describe_stock_frame,
@@ -215,33 +216,117 @@ class TestTranslateToSheetLocal:
 
 # -- the clone trap -------------------------------------------------------
 
-class TestCloneTrapIsVisible:
+class TestModelGroupIsTheListThatMatters:
     """The failure this guards against cannot be reproduced with stand-ins,
-    since there is no real PathJob to clone anything. What is pinned here is
-    the shape of the contract: the caller gets the job's own model group, and
-    the input list is kept separately so the two cannot be confused.
+    since there is no real PathJob to decide what lands in the Model. What is
+    pinned here is the shape of the contract: the caller gets the job's own
+    Model group, and the input list is not retained, so nothing downstream can
+    build an operation's `Base` against geometry the job does not contain.
+
+    The old version of this asserted the opposite -- that `clones` and
+    `source_parts` were kept as two different lists, because
+    `PathJob.Create` replaced the inputs with Clones and they genuinely were
+    two sets of objects. `adopt_flattened_parts_as_model` now puts the inputs in
+    the Model and drops the Clones, so they are one set again, and keeping the
+    second name would only be a way to be wrong twice.
     """
 
-    def _replay(self, clones, source):
-        job = type("_J", (), {"Label": "CAM_Replay_Sheet_1", "Model": None})()
-        job.Model = type("_M", (), {"Group": clones})()
-        return ReplayJob(job, clones, None, None, source, [])
+    def _replay(self, model_group):
+        job = type("_J", (), {"Label": "CAM_Replay_Sheet_1"})()
+        job.Model = type("_M", (), {"Group": model_group})()
+        return ReplayJob(job, list(job.Model.Group), None, None, [])
 
-    def test_exposes_clones_not_the_input_list(self):
-        clones = [object(), object()]
-        replay = self._replay(clones, [object(), object(), object()])
-        assert replay.clones == clones
-        assert len(replay.source_parts) == 3
+    def test_exposes_exactly_the_model_group(self):
+        model = [object(), object(), object()]
+        assert self._replay(model).clones == model
 
-    def test_clones_are_copied_so_later_mutation_cannot_change_them(self):
-        clones = [object(), object()]
-        replay = self._replay(clones, [])
-        clones.append(object())
+    def test_model_entries_are_copied_so_later_mutation_cannot_change_them(self):
+        model = [object(), object()]
+        replay = self._replay(model)
+        model.append(object())
         assert len(replay.clones) == 2
 
+    def test_does_not_keep_a_second_reference_to_the_same_objects(self):
+        model = [object(), object()]
+        replay = self._replay(model)
+        assert not hasattr(replay, "source_parts")
+
     def test_carries_warnings(self):
-        replay = ReplayJob(None, [], None, None, [], ["something"])
+        replay = ReplayJob(None, [], None, None, ["something"])
         assert replay.warnings == ["something"]
+
+
+class TestAdoptFlattenedPartsAsModel:
+    """The swap, on the terms it has to hold to.
+
+    The harness tier measures the real thing against a real job; what it cannot
+    do cheaply is the refusal paths, and a refusal that half-works is the
+    outcome worth being paranoid about -- a job with some Clones and some parts
+    is worse than one with all Clones, because the Clones then point at
+    objects that are themselves in the Model.
+    """
+
+    class _Doc:
+        def __init__(self):
+            self.removed = []
+
+        def removeObject(self, name):
+            self.removed.append(name)
+
+        def recompute(self):
+            pass
+
+    class _Model:
+        def __init__(self, group):
+            self.Group = list(group)
+            self.added = []
+            self.removed = []
+
+        def removeObject(self, obj):
+            self.removed.append(obj)
+            self.Group.remove(obj)
+
+        def addObject(self, obj):
+            self.added.append(obj)
+            self.Group.append(obj)
+
+    def _clone(self, target, label):
+        clone = type("_C", (), {"Label": label, "Objects": [target],
+                                "Name": label})()
+        return clone
+
+    def test_does_nothing_when_there_is_no_model(self):
+        job = type("_J", (), {"Model": None})()
+        assert adopt_flattened_parts_as_model(self._Doc(), job, [object()])[0] == 0
+
+    def test_does_nothing_when_given_no_parts(self):
+        job = type("_J", (), {"Model": self._Model([])})()
+        assert adopt_flattened_parts_as_model(self._Doc(), job, [])[0] == 0
+
+    def test_refuses_when_a_model_entry_is_not_a_clone(self):
+        # A custom `job_factory` whose Model is not clones of our parts.
+        part = object()
+        job = type("_J", (), {"Model": self._Model([part])})()
+        count, why = adopt_flattened_parts_as_model(self._Doc(), job, [part])
+        assert count == 0
+        assert "not a clone" in why
+
+    def test_refuses_when_the_clone_points_at_something_else(self):
+        # The dangerous variant: a Model mixing a clone of ours with one of
+        # something else's. Swapping the first and leaving the second would
+        # leave a job pointing outward from itself.
+        mine, theirs, foreign = object(), object(), object()
+        model = self._Model([self._clone(mine, "Clone"),
+                             self._clone(foreign, "Clone001")])
+        job = type("_J", (), {"Model": model})()
+        assert adopt_flattened_parts_as_model(self._Doc(), job, [mine, theirs])[0] == 0
+        assert model.added == []
+
+    def test_explains_a_refusal_instead_of_failing_silently(self):
+        job = type("_J", (), {"Model": self._Model([object()])})()
+        count, why = adopt_flattened_parts_as_model(self._Doc(), job, [object()])
+        assert count == 0
+        assert why
 
 
 # -- stock frame ----------------------------------------------------------
@@ -303,7 +388,7 @@ class TestDescribeReplayJob:
         job = type("_J", (), {"Label": "CAM_Replay_Sheet_1"})()
         stock = _Stock(-6.0, 0.0, label="Stock_Replay_Sheet_1")
         stock.Length, stock.Width, stock.Height = 600.0, 400.0, 6.0
-        replay = ReplayJob(job, [1, 2], stock, None, [1, 2], [])
+        replay = ReplayJob(job, [1, 2], stock, None, [])
         text = "\n".join(describe_replay_job(replay))
         assert "2 part(s)" in text
         assert "600.0 x 400.0 x 6.0" in text
@@ -311,12 +396,12 @@ class TestDescribeReplayJob:
     def test_surfaces_warnings(self):
         job = type("_J", (), {"Label": "J"})()
         stock = _Stock(-6.0, 0.0)
-        replay = ReplayJob(job, [], stock, None, [], ["frames differ"])
+        replay = ReplayJob(job, [], stock, None, ["frames differ"])
         assert "WARNING: frames differ" in "\n".join(describe_replay_job(replay))
 
     def test_lines_are_plain_text(self):
         job = type("_J", (), {"Label": "J"})()
-        replay = ReplayJob(job, [], _Stock(-6.0, 0.0), None, [], [])
+        replay = ReplayJob(job, [], _Stock(-6.0, 0.0), None, [])
         assert all(isinstance(line, str) for line in describe_replay_job(replay))
 
 

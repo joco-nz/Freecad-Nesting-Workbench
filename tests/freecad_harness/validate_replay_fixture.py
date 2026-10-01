@@ -874,8 +874,8 @@ def check_identity_against_replay(outcome, identity_by_operation):
         expected_by_label.setdefault(item.label, (label, expected))
 
     emit("")
-    emit("    identity, as the replay resolved it (%d clone(s) on the sheet):"
-         % total)
+    emit("    identity, as the replay resolved it (%d model entry/entries on "
+         "the sheet):" % total)
     for operation in outcome.result.operations:
         name = operation.Label
         if name.endswith("_replay"):
@@ -885,14 +885,13 @@ def check_identity_against_replay(outcome, identity_by_operation):
         nested_kinds = set()
         for pair in targets:
             geometry = pair[0] if isinstance(pair, (list, tuple)) else pair
-            original = getattr(geometry, "Objects", None)
-            flattened = original[0] if original else None
-            nested = getattr(flattened, cam_replay.PROP_NESTED_LABEL, "")
+            nested = cam_replay.nested_label_of(geometry)
             if nested:
                 pieces = nested.split("_")
                 if len(pieces) >= 3:
                     nested_kinds.add("_".join(pieces[1:-1]))
-        emit("      %-22s targets %2d of %d clone(s), nested types: %s"
+        emit("      %-22s targets %2d of %d model entry/entries, nested "
+             "types: %s"
              % (operation.Label, len(targets), total,
                 ", ".join(sorted(nested_kinds)) or "(none)"))
 
@@ -901,7 +900,8 @@ def check_identity_against_replay(outcome, identity_by_operation):
                 fail("%s: %s targets ALL %d nested parts."
                      % (outcome.sheet_label, operation.Label, total),
                      "clones_for_source could not narrow this operation to the "
-                     "part type it was set up on, and fell back to every clone. "
+                     "part type it was set up on, and fell back to every model "
+                      "entry. "
                      "The toolpath would cut this feature on parts it was never "
                      "meant for. Check that the operation's source part is named "
                      "the same way its nested containers are "

@@ -959,3 +959,40 @@ six label conventions.
 - The user's initial four-scenario taxonomy (holes merged into one op, etc.)
   remains sound but is no longer something this feature computes. It is
   inherited from whatever the user set up on the source job.
+
+## Change log
+
+- **NEST-010 resolved.** The flattened parts are now the job's geometry, and
+  the Clones `PathJob.Create` wraps around them are dropped. This came from the
+  user asking why flattening was followed by a second set of copies, which was
+  the right question: the second set is not needed. CAM reads a shape and
+  resolves sub-element names against it; a `draftobjects.clone.Clone` arrives
+  by reference, which buys nothing and forces the parts to outlive the job.
+  `adopt_flattened_parts_as_model` promotes the originals and removes the
+  Clones, refusing rather than half-doing it if the Model is not Clones of our
+  own parts (a custom `job_factory`).
+- The earlier conclusion on NEST-010 — that the parts would have to be *baked*,
+  trading away the link to the source — was measuring the symptom instead of
+  the cause. The cost I wrote down as unavoidable, baked geometry not following
+  the source part, was not a cost of baking at all: the geometry is a snapshot
+  taken at replay time and always was, with or without the Clone.
+- The swap immediately reproduced NEST-010 from the other side.
+  `clones_for_source` read `NestedLabel` through `clone.Objects[0]`, so a plain
+  `Part::Feature` matched nothing, the function returned every entry, and 5 of 7
+  operations stopped cutting. `nested_label_of` now reads the label off the
+  entry and falls back to the link. Worth recording because the two failures are
+  the same bug — the replay depending on something outside its own Model — and
+  only the second one was found by a measurement.
+- The staging group is now temporary. The parts are built into a `<job>_parts`
+  group only so they are not loose at the document root while the job is being
+  created; it is removed once they have been adopted. Document root is back to
+  four objects, and 713 objects became 712.
+- `ReplayJob.source_parts` removed. `clones` and `source_parts` described one
+  set of objects as two names, which is exactly the confusion the Clone forced;
+  with the Clone gone the second name was a way to be wrong twice.
+- The harness now saves, closes, reopens and then deletes the layout. Every
+  previous check inspected a job in the session that built it, and the whole
+  claim here is a claim about a file on disk. Measured on the fixture: 7/7
+  operations with cutting motion after reload, and 7/7 after the layout is
+  gone, 263 objects. Confirmed load-bearing — disabling the swap produces 18
+  harness failures rather than none.

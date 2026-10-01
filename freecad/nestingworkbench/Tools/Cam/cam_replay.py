@@ -41,7 +41,8 @@ Constraints this module exists to respect
    attachment as it went raised `KeyError`. Hence `Recipe` attaches in a second
    pass, and `read_recipe` reports an unresolvable dressup rather than losing it.
 
-3. **Model entries are clones, and the clone hides custom properties.**
+3. **The source job's Model entries are clones, and the clone hides custom
+   properties.**
    `PathJob.Create` replaces base geometry with `draftobjects.clone.Clone`
    objects, and a custom property added to the original (`MyMeta`) is *not*
    visible on the clone. So the geometry the operations reference is the clone,
@@ -49,6 +50,13 @@ Constraints this module exists to respect
    recorded: `Base` targets the clone, and `SourceObject` is recovered from
    `clone.Objects[0]` so the write half can match nested copies by something
    more reliable than a label.
+
+   The replay job does not repeat that. `adopt_flattened_parts_as_model` puts
+   the flattened parts into the Model and drops the Clones `PathJob.Create`
+   wrapped around them, so a replayed job's geometry is a plain
+   `Part::Feature` with nothing behind it and no custom properties to hide. The
+   `SourceObject` / `SourceContainer` links survive on it, which is what the
+   write half reads; `nested_label_of` reads them from either kind of entry.
 
 4. **Labels cannot be trusted for lookups, though they cannot collide.**
    `findObjects(Label="nested_Bracket_1")` returns `_1`, `_10` *and* `_11` --
@@ -425,31 +433,33 @@ def translate_to_sheet_local(parts, sheet_origin):
 class ReplayJob:
     """A new job, plus what the write half needs to target it correctly.
 
-    The important field is `clones`. `PathJob.Create` does not keep the
-    geometry it is given: it replaces each base object with a
-    `draftobjects.clone.Clone` in `job.Model.Group`. An operation's `Base` must
-    therefore point at those clones, not at the objects passed in.
+    The important field is `clones` -- the objects an operation's `Base` must
+    point at. It is read back out of `job.Model.Group` rather than taken from
+    the caller's list, because `PathJob.Create` decides what actually ends up in
+    the Model: given three features it produced `['Clone', 'Clone001',
+    'Clone002']` labelled `Model-p1` .. `Model-p3`, with
+    `Model.Group[0] is not parts[0]`. Building an operation against the input
+    list instead would quietly produce a job whose geometry it does not contain.
 
-    Verified: three input features became `['Clone', 'Clone001', 'Clone002']`
-    labelled `Model-p1` .. `Model-p3`, and `Model.Group[0] is not parts[0]`.
-    Handing the caller its own input list back would be a quiet way to produce
-    a job whose operations reference geometry the job does not contain, so
-    `clones` is the list to use and `source_parts` is kept only for reporting.
+    `adopt_flattened_parts_as_model` then puts the flattened parts themselves
+    there and drops those Clones, so in practice `clones` and the caller's
+    `parts` are the same objects. The field kept the name because it is the
+    list everything downstream targets; the caller's own list is not kept, so
+    that nothing can target it by accident.
 
     `warnings` is a list of human-readable strings, currently the Z frame
     comparison described on `compare_stock_frames`.
     """
 
-    def __init__(self, job, clones, stock, sheet_group, source_parts, warnings):
+    def __init__(self, job, clones, stock, sheet_group, warnings):
         self.job = job
         self.clones = list(clones)
         self.stock = stock
         self.sheet_group = sheet_group
-        self.source_parts = list(source_parts)
         self.warnings = list(warnings)
 
     def __repr__(self):
-        return "<ReplayJob %s clones=%d stock=%s>" % (
+        return "<ReplayJob %s model=%d stock=%s>" % (
             getattr(self.job, "Label", "?"), len(self.clones),
             getattr(self.stock, "Label", "none"),
         )
@@ -521,6 +531,66 @@ def compare_stock_frames(source_stock, new_stock, sheet_label=""):
     return warnings
 
 
+def adopt_flattened_parts_as_model(doc, job, parts):
+    """Put `parts` into `job.Model.Group` in place of the Clones over them.
+
+    `PathJob.Create` does not keep the geometry it is handed: it wraps each
+    item in a `draftobjects.clone.Clone` and puts *those* in the Model, leaving
+    the originals as unreferenced strays. A Clone is a link, so the flattened
+    parts then have to outlive the job -- which is why they could not be
+    removed, and why a per-sheet 48-object group sat in the document.
+
+    But the Clone buys nothing. CAM reads a shape and resolves sub-element
+    names against it; it does not care that the shape arrived by reference.
+    Measured: a plain `Part::Feature` in `Model.Group`, with a Profile over it,
+    produces 17 commands and 10 cutting moves, and survives with nothing behind
+    it.
+
+    So the originals are promoted into the Model and the Clones are dropped.
+    That removes a whole set of objects, a whole group, and the link that made
+    the originals untouchable.
+
+    Refuses rather than half-does. If any Model entry is not a Clone pointing
+    at one of `parts`, nothing is swapped and the job is left exactly as
+    `PathJob.Create` built it -- a job with working Clones is untidy, a job with
+    half of them replaced is broken.
+    """
+    clones = list(getattr(getattr(job, "Model", None), "Group", None) or [])
+    if not clones or not parts:
+        return 0, "no model entries to swap"
+
+    wanted = {id(p) for p in parts}
+    pairs = []
+    for clone in clones:
+        upstream = getattr(clone, "Objects", None)
+        if not upstream or id(upstream[0]) not in wanted:
+            return 0, ("model entry %r is not a clone of a flattened part"
+                       % getattr(clone, "Label", "?"))
+        pairs.append((clone, upstream[0]))
+
+    model = job.Model
+    for clone, part in pairs:
+        try:
+            model.removeObject(clone)
+        except Exception:
+            pass
+        for group in [g for g in part.InList
+                      if getattr(g, "TypeId", "") == "App::DocumentObjectGroup"]:
+            try:
+                group.removeObject(part)
+            except Exception:
+                pass
+        model.addObject(part)
+    doc.recompute()
+    for clone, _part in pairs:
+        try:
+            doc.removeObject(clone.Name)
+        except Exception:
+            pass
+    doc.recompute()
+    return len(pairs), ""
+
+
 def create_replay_job(doc, layout_group, sheet_group, flattened_parts,
                       source_job=None, post_processor=None, template_path=None,
                       job_factory=None):
@@ -583,8 +653,21 @@ def create_replay_job(doc, layout_group, sheet_group, flattened_parts,
     # under it" looks like from the tree.
     set_job_view_provider(job)
 
-    # The clones are the job's real geometry. Read them from the job rather
-    # than assuming the caller's list survived.
+    # The flattened parts become the job's geometry directly, and the Clones
+    # `PathJob.Create` wrapped around them are dropped. A Model of plain
+    # `Part::Feature` objects needs nothing behind it, so the parts stop being a
+    # build artefact that has to be kept alive for the job's sake. See
+    # `adopt_flattened_parts_as_model` for why the Clone is not worth the link
+    # it forces.
+    adopted, _why_not = adopt_flattened_parts_as_model(doc, job, parts)
+    if adopted:
+        FreeCAD.Console.PrintMessage(
+            "Used the %d flattened part(s) directly as the job's geometry "
+            "rather than clones of them.\n" % adopted)
+
+    # The Model is the job's real geometry. Read it back from the job rather
+    # than assuming the caller's list survived -- after the swap it is the
+    # parts themselves, not clones of them.
     clones = list(getattr(getattr(job, "Model", None), "Group", []) or [])
 
     if getattr(job, "Stock", None) is not None:
@@ -625,7 +708,7 @@ def create_replay_job(doc, layout_group, sheet_group, flattened_parts,
             getattr(source_job, "Stock", None), stock, sheet_label
         ))
 
-    return ReplayJob(job, clones, stock, sheet_group, parts, warnings)
+    return ReplayJob(job, clones, stock, sheet_group, warnings)
 
 
 def describe_replay_job(replay):
@@ -1347,9 +1430,9 @@ def check_subnames_against_clones(subs, clones):
 
 
 def clones_for_source(clones, source_geometry):
-    """Return the job clones that correspond to `source_geometry`.
+    """Return the job's Model entries that correspond to `source_geometry`.
 
-    Returns every clone when the match cannot be narrowed, which is the safe
+    Returns every entry when the match cannot be narrowed, which is the safe
     direction: an operation that applies to a few too many parts is visible in
     the toolpath, whereas one that applies to too few silently cuts less than
     the source.
@@ -1359,8 +1442,7 @@ def clones_for_source(clones, source_geometry):
 
         Model-Bracket (source job's clone)
           -> Bracket                       (Objects[0], the user's original)
-        Clone (replay job's clone)
-          -> CAMPart_12                    (Objects[0], the flattened part)
+        CAMPart_12 (the replay job's Model entry -- the flattened part itself)
           -> part_Bracket_1                (SourceObject)
           -> nested_Bracket_1              (SourceContainer)
 
@@ -1369,11 +1451,17 @@ def clones_for_source(clones, source_geometry):
     format extraction, not a document search: it is not the `findObjects`
     prefix match that makes `nested_Bracket_1` also return `nested_Bracket_10`
     and `nested_Bracket_11`.
+
+    `nested_label_of` reads that label from either kind of Model entry -- the
+    flattened part itself, or the Clone `PathJob.Create` would have made over
+    it. That fallback is not decoration: reading only the Clone path left the
+    lookup matching nothing, so every operation fell back to targeting every
+    part and five of seven stopped cutting.
     """
     # Unwrap first. An operation's Base points at the *source job's* clone,
     # labelled `Model-Bracket`, not at the user's `Bracket` -- so comparing
     # that label against `nested_Bracket_1` matches nothing and every
-    # operation falls back to targeting every clone. Verified: with the
+    # operation falls back to targeting every entry. Verified: with the
     # unwrap missing, a 2-bracket 1-spacer nest matched 3 of 3 for both.
     original = resolve_source_object(source_geometry) or source_geometry
     source_label = getattr(original, "Label", "")
@@ -1382,11 +1470,7 @@ def clones_for_source(clones, source_geometry):
 
     matched = []
     for clone in clones:
-        original = getattr(clone, "Objects", None)
-        flattened = original[0] if original else None
-        if flattened is None:
-            continue
-        nested = getattr(flattened, PROP_NESTED_LABEL, "")
+        nested = nested_label_of(clone)
         if not nested:
             continue
         parts = nested.split("_")
@@ -1394,6 +1478,37 @@ def clones_for_source(clones, source_geometry):
             matched.append(clone)
 
     return matched if matched else list(clones)
+
+
+def nested_label_of(model_entry):
+    """Return `model_entry`'s `NestedLabel`, or "" if it has none.
+
+    Two kinds of thing live in a job's Model, and the difference matters here.
+
+    A **`draftobjects.clone.Clone`** -- what `PathJob.Create` makes out of
+    whatever you hand it -- carries the label one hop away, on whatever it was
+    cloned from:
+
+        Clone  ->  Objects[0]  ->  NestedLabel
+
+    A **plain `Part::Feature`**, which is what the replay now puts there so the
+    job's geometry needs nothing behind it, carries it itself:
+
+        Part::Feature  ->  NestedLabel
+
+    Reading only the Clone path silently stopped matching the moment the Model
+    held anything else, and the failure is the quiet kind: nothing matched, so
+    this returned every entry, so every operation targeted all 48 parts
+    regardless of type, and 5 of 7 stopped cutting because their sub-element
+    names resolved on only 23 of 48. Measured, not inferred.
+    """
+    nested = getattr(model_entry, PROP_NESTED_LABEL, "")
+    if nested:
+        return nested
+    upstream = getattr(model_entry, "Objects", None)
+    if upstream:
+        return getattr(upstream[0], PROP_NESTED_LABEL, "")
+    return ""
 
 
 # -- view providers --------------------------------------------------------
@@ -3097,11 +3212,11 @@ def replay_sheet(doc, layout_group, sheet_group, source_job, post_processor=None
         )
         return outcome
 
-    # The flattened parts go in a group of their own, as a sibling of the job.
-    # Not inside the job: its Model holds the clones, and mixing the flattened
-    # geometry in there is not the shape a CAM job has. Without a group they
-    # land at the document root -- forty-eight of them, per sheet, which buries
-    # everything else in the tree.
+    # Staging. The flattened parts are built here and end up in the job's Model,
+    # so this group is temporary: they only need somewhere to sit while the job
+    # is created, which is the moment the user would otherwise see forty-eight
+    # objects at the document root per sheet. It is dropped again once they have
+    # been adopted -- see `adopt_flattened_parts_as_model`.
     job_name = replay_job_name(source_job,
                                getattr(sheet_group, "Label", "") or "")
     try:
@@ -3144,27 +3259,22 @@ def replay_sheet(doc, layout_group, sheet_group, source_job, post_processor=None
         return outcome
     outcome.replay_job = replay
 
-    # The flattened parts STAY, and this is a measured decision rather than an
-    # oversight.
+    # The staging group is empty now: `adopt_flattened_parts_as_model` moved its
+    # members into the job's Model and took them out. Remove it rather than
+    # leave an empty `<job>_parts` at the document root per sheet.
     #
-    # It is tempting: `PathJob.Create` has put a clone of each into
-    # `job.Model.Group`, every step after this one works from `replay.clones`,
-    # and 48 objects in the document is a lot of clutter. So they were removed
-    # -- and 5 of 7 operations lost their toolpath, because a
-    # `draftobjects.clone.Clone` is a LINK, not a copy. Its `Objects` property
-    # points back at the flattened part, and the clone re-evaluates from it.
-    # Remove the source and the clone is a dead reference with a stale cached
-    # shape, which some operations can still read and most cannot:
-    #
-    #     Profile_replay      402 cmd  184 cuts
-    #     Profile001_replay     0 cmd    0 cuts   <- the job now cuts less
-    #     Profile002_replay  532 cmd  283 cuts
-    #     Profile003..006_replay  0 cmd   0 cuts
-    #
-    # They stay, in a group of their own, which is the tidying that is
-    # actually available. Making them genuinely disposable would mean baking the
-    # clone shapes into independent `Part::Feature` objects, which is a change
-    # to how the job's geometry is built and is not taken here.
+    # If the swap was refused -- a custom `job_factory` whose Model is not clones
+    # of our parts -- the group still holds them and the check below leaves it
+    # alone, which is the right outcome: those parts are still what the
+    # Clones point at.
+    if parts_group is not None and not len(getattr(parts_group, "Group", []) or []):
+        try:
+            doc.removeObject(parts_group.Name)
+        except Exception as exc:
+            FreeCAD.Console.PrintWarning(
+                "Could not remove the now-empty staging group for %s: %s\n"
+                % (outcome.sheet_label, exc))
+
     try:
         result = replay_recipe(recipe, replay.job, replay.clones)
     except Exception as exc:

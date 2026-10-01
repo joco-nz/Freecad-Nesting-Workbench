@@ -415,7 +415,9 @@ by producing an empty path rather than an error. And `Inside=True` against the
 constructor's own `CreateFromBase` stock clips the contour away entirely,
 because that stock is barely larger than the part.
 
-## NEST-010 — the flattened parts cannot be removed: the job's clones are links
+## NEST-010 — the flattened parts could not be removed: the job's clones were links
+
+**RESOLVED.** The link was the whole problem, and it was removable.
 
 Raised as "the parts group can go once copies are made into the Model folder".
 Tried, measured, and reverted.
@@ -443,9 +445,9 @@ sub-element selections against it:
 So the verification did its job: the sheet was labelled `_UNVERIFIED` rather
 than passing with a silently shorter toolpath.
 
-**Kept as-is:** the flattened parts stay, in a group of their own. That group is
-the tidying actually available — 48 objects in one place rather than loose at
-the document root.
+**Kept as-is, for now:** the flattened parts stay, in a group of their own. That
+group is the tidying actually available — 48 objects in one place rather than
+loose at the document root.
 
 **If they are ever to go**, the change is to make the clones independent: bake
 each clone's shape into a plain `Part::Feature` before handing it to the job, so
@@ -453,6 +455,45 @@ the job's geometry does not reference anything the replay created and then
 discarded. That is a change to how the job's `Model` is built, not a cleanup,
 and it has a cost — baked geometry does not follow the source part if the user
 edits it, which is the thing a Clone is for.
+
+**How it was actually resolved.** The baking was never necessary, because the
+Clone was not buying anything. CAM reads a shape and resolves sub-element names
+against it; it does not care that the shape arrived by reference.
+`adopt_flattened_parts_as_model` promotes the flattened parts into the Model and
+drops the Clones, so there is no link to keep alive and no group to hold the
+parts for as long as the job exists.
+
+Measured on the tracked fixture, 48 parts:
+
+    Used the 48 flattened part(s) directly as the job's geometry.
+    Model now: 48 entries, type Part::Feature, linking out to []
+    Verified 7 operation(s), all with cutting motion.  0 failures, 0 warnings
+    Document root: 4 objects.  713 -> 712, the empty staging group gone too.
+
+And the claim the fix rests on, against a file on disk rather than a live
+session — save, close, reopen:
+
+    after reload:    7/7 operations with cutting motion
+    layout deleted:  7/7 operations with cutting motion, 263 objects
+
+The layout is genuinely not load-bearing any more. The job is a snapshot of the
+nest as it was when the command ran, and it always was — what changed is that
+the snapshot now lives in the job instead of in a sibling group that had to be
+kept for the job's sake.
+
+Two things it cost, both measured rather than assumed:
+
+* `clones_for_source` read `NestedLabel` via `clone.Objects[0]`, a Clone-only
+  path. Given a plain `Part::Feature` it matched nothing, returned every entry,
+  and 5 of 7 operations stopped cutting — the same failure mode as the original
+  NEST-010, reached from the other direction. Fixed by `nested_label_of`, which
+  reads the label off the entry itself and falls back to the link. Pinned by
+  `TestNestedLabelOf` and `TestModelIdentitySurvivesTheSwap`, and visible in the
+  fixture validator, which now reports `nested types: TopStrap` where it
+  reported `(none)`.
+* `ReplayJob` no longer needs `source_parts`. The two names described one set of
+  objects and are now one list, so the second was removed rather than kept as a
+  way to be wrong twice.
 
 **Two dead ends recorded so they are not retried.** Asking whether a part is
 still alive does not work either way: `part.Document` still answers for a

@@ -103,11 +103,17 @@ def run_job_checks(doc, flattened, thickness):
     """Build a real job from the flattened parts and check what comes back.
 
     This is the step the pytest tier cannot cover, because the behaviour under
-    test is `PathJob.Create` refusing to keep the geometry it is given. It
-    replaces the input features with `draftobjects.clone.Clone` objects, and
-    the clones are what an operation's `Base` must reference. Verified: three
-    inputs became `['Clone', 'Clone001', 'Clone002']` labelled `Model-p1` ..
-    `Model-p3`, with `Model.Group[0] is not parts[0]`.
+    test is `PathJob.Create`'s treatment of the geometry it is given: it does
+    not keep it, but replaces each input with a `draftobjects.clone.Clone`.
+    Verified: three inputs became `['Clone', 'Clone001', 'Clone002']` labelled
+    `Model-p1` .. `Model-p3`, with `Model.Group[0] is not parts[0]`.
+
+    The replay undoes that. It promotes the flattened parts into the Model and
+    drops the Clones, because a Clone is a link and a link means the geometry
+    has to outlive the job -- which is why the parts could never be removed and
+    every sheet left a 48-object group behind. A plain `Part::Feature` in the
+    Model needs nothing behind it. Measured on the committed fixture: 7 of 7
+    operations with cutting motion, 0 failures, 0 warnings.
 
     Also checked here, because both are real behaviours rather than documented
     ones:
@@ -157,20 +163,37 @@ def run_job_checks(doc, flattened, thickness):
     if replay is None:
         return
 
-    # -- the clones are what an operation must target --
+    # -- the flattened parts ARE the job's geometry, with nothing behind them --
+    #
+    # This replaced a check that the job *cloned* its input. It did clone it:
+    # `PathJob.Create` wraps whatever it is given in a `draftobjects.clone.Clone`
+    # and puts those in the Model, keeping the originals as strays. The Clone
+    # bought nothing and cost a link -- the flattened parts had to outlive the
+    # job, so they could never be removed, so every sheet left an empty-looking
+    # 48-object group at the document root. `adopt_flattened_parts_as_model`
+    # promotes the originals and drops the Clones.
     check(len(replay.clones) == len(parts),
-          "expected %d clones, got %d" % (len(parts), len(replay.clones)))
-    check(replay.clones != replay.source_parts,
-          "clones are the same objects as the inputs; the job did not clone")
-    for clone, original in zip(replay.clones, replay.source_parts):
-        check(clone is not original,
-              "%s: the job kept the input object instead of cloning it"
+          "expected %d model entries, got %d" % (len(parts), len(replay.clones)))
+    check({id(e) for e in replay.clones} == {id(p) for p in parts},
+          "the job's model entries are not the flattened parts themselves; "
+          "something is still wrapping the geometry")
+    for entry, original in zip(replay.clones, parts):
+        check(entry is original,
+              "%s: the Model holds a copy rather than the flattened part"
               % original.Label)
-        check(clone.isDerivedFrom("Part::FeaturePython"),
-              "%s: clone is a %s" % (original.Label, clone.TypeId))
-        ob, nb = original.Shape.BoundBox, clone.Shape.BoundBox
-        check(abs(ob.XMin - nb.XMin) < 1e-6 and abs(ob.YMin - nb.YMin) < 1e-6,
-              "%s: clone placement differs from the original" % original.Label)
+        check(entry.TypeId == "Part::Feature",
+              "%s: model entry is a %s, expected a plain Part::Feature"
+              % (original.Label, entry.TypeId))
+        # A Clone re-evaluates from `Objects[0]`. If that came back, the swap
+        # silently failed and the job is once again depending on something
+        # outside its own Model.
+        check(not (getattr(entry, "Objects", None) or []),
+              "%s: model entry still links to %s"
+              % (original.Label,
+                 [o.Label for o in (getattr(entry, "Objects", None) or [])]))
+        check(entry.Name in [o.Name for o in replay.job.Model.Group],
+              "%s: model entry is not actually in the job's Model group"
+              % original.Label)
 
     # -- the stock is the sheet, and only the sheet --
     stock = replay.stock
@@ -1102,7 +1125,96 @@ def run_pipeline_checks(doc):
           "the failed job was deleted; it must be kept for inspection")
     FreeCAD.closeDocument("replay_fail")
 
-    FreeCAD.closeDocument("replay_pipeline")
+    # Closes the document itself.
+    _round_trip_checks(doc, outcomes, thickness)
+
+
+def _round_trip_checks(doc, outcomes, thickness):
+    """Save, reopen, and delete the layout. The three things never checked.
+
+    Everything above inspects a job in the session that built it. A job can
+    pass all of that and still be useless: what the user opens tomorrow is a
+    file on disk. And the whole reason for the swap -- that a Model of plain
+    `Part::Feature` objects needs nothing behind it -- is a claim about a
+    document, not about a live session, so it has to be checked against one.
+
+    Measured on the committed fixture before this was written: after reload the
+    job kept all 7 operations with cutting motion, and after deleting the whole
+    layout it still cut 7 of 7, with 713 objects in the document reduced to 263.
+    """
+    import tempfile
+    tmp = os.path.join(tempfile.gettempdir(), "replay_roundtrip.FCStd")
+    if os.path.exists(tmp):
+        os.remove(tmp)
+
+    # Names, not object references. Anything held from a closed document is
+    # unusable -- even its `Name` raises -- so everything the checks below need
+    # is read out now, while the document is still open.
+    expected = [(o.replay_job.job.Name, o.replay_job.job.Label,
+                 len(o.replay_job.clones)) for o in outcomes if o.replay_job]
+    check(len(expected) == len(outcomes),
+          "only %d of %d outcomes carried a job into the round trip"
+          % (len(expected), len(outcomes)))
+
+    doc.saveAs(tmp)
+    FreeCAD.closeDocument(doc.Name)
+
+    reopened = FreeCAD.openDocument(tmp)
+    try:
+        for name, label, model_count in expected:
+            job = reopened.getObject(name)
+            check(job is not None, "%s did not survive the save" % label)
+            if job is None:
+                continue
+            check(job.Label == label,
+                  "%s came back as %r" % (label, job.Label))
+            check(len(job.Model.Group) == model_count,
+                  "%s came back with %d model entries, expected %d"
+                  % (label, len(job.Model.Group), model_count))
+            for entry in job.Model.Group:
+                check(entry.TypeId == "Part::Feature",
+                      "%s: a model entry came back as a %s"
+                      % (label, entry.TypeId))
+                check(not (getattr(entry, "Objects", None) or []),
+                      "%s: a model entry came back still linking to %s"
+                      % (label,
+                         [o.Label for o in (getattr(entry, "Objects", None) or [])]))
+                bb = entry.Shape.BoundBox
+                check(abs(bb.ZMin + thickness) < 1e-6,
+                      "%s: %s came back with its bottom at Z=%s"
+                      % (label, entry.Label, bb.ZMin))
+            for operation in job.Operations.Group:
+                check(cam_replay.has_cutting_motion(operation),
+                      "%s: %s came back with no cutting motion"
+                      % (label, operation.Label))
+
+        # And the point of the whole exercise: the layout is not load-bearing.
+        for group in [o for o in reopened.Objects
+                      if o.TypeId == "App::DocumentObjectGroup"
+                      and o.Label.startswith("Layout")]:
+            for child in list(getattr(group, "Group", []) or []):
+                for part in list(getattr(child, "Group", []) or []):
+                    for leaf in list(getattr(part, "Group", []) or []):
+                        part.removeObject(leaf)
+                        reopened.removeObject(leaf.Name)
+                    child.removeObject(part)
+                    reopened.removeObject(part.Name)
+                group.removeObject(child)
+                reopened.removeObject(child.Name)
+            reopened.removeObject(group.Name)
+        reopened.recompute()
+
+        for name, label, _model_count in expected:
+            job = reopened.getObject(name)
+            cutting = sum(1 for o in job.Operations.Group
+                          if cam_replay.has_cutting_motion(o))
+            check(cutting == len(job.Operations.Group),
+                  "%s: %d of %d operations cut after the layout was deleted"
+                  % (label, cutting, len(job.Operations.Group)))
+    finally:
+        FreeCAD.closeDocument(reopened.Name)
+        if os.path.exists(tmp):
+            os.remove(tmp)
 
 
 if __name__ in ("__main__", "test_replay_flatten"):
