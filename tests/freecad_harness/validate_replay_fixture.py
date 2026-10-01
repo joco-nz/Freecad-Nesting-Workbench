@@ -103,6 +103,12 @@ def print_assumptions():
     Printed first on purpose. A misunderstanding about what the file is meant
     to contain should be visible immediately, rather than showing up later as
     a confusing structural failure.
+
+    That reasoning has been earned. This block used to say the Operations list
+    holds "the operations and dressups", which is the wrong shape, and that one
+    wrong sentence is where a long detour started: a correct job -- seven
+    LeadInOut dressups and no Profiles listed -- read as a job whose operations
+    were missing, and the fix that followed would have broken the file.
     """
     heading("WHAT THIS VALIDATOR ASSUMES")
     emit(
@@ -119,21 +125,40 @@ def print_assumptions():
         "                             containers, each holding a part_*\n"
         "                             Part::Feature with the geometry\n"
         "\n"
-        "  3. A CAM JOB whose Operations.Group holds the operations and\n"
-        "     dressups set up on the source bodies. That is the recipe. It\n"
+        "  3. A CAM JOB set up on the source bodies. That is the recipe. It\n"
         "     references the SOURCE geometry, not the nested copies.\n"
         "\n"
         "  Then: the user selects the job, the replay finds the layout\n"
         "  automatically, and applies the recipe to EVERY sheet.\n"
         "\n"
-        "  Note the distinction in 1 and 2, because it is easy to get wrong and\n"
-        "  the existing n70 fixture gets it wrong: that file holds three\n"
-        "  PartDesign bodies and NOTHING else -- no layout, no sheets, no nested\n"
-        "  parts. It is an INPUT to the nester, not a nesting result, so it\n"
-        "  cannot drive a replay on its own. A replay fixture needs all three."
+        "  On 1 and 2: keep them distinct. Plenty of real files are SOURCE\n"
+        "  GEOMETRY ONLY -- bodies and sketches, no layout, no sheets, no nested\n"
+        "  parts. Those are an INPUT to the nester, not a nesting result, and\n"
+        "  they cannot drive a replay on their own. A replay fixture needs all\n"
+        "  three parts. This validator says which one it is looking at rather\n"
+        "  than assuming, but it is the most common reason a good file is not a\n"
+        "  replay fixture."
     )
     emit("")
     emit("  If that is not what you built, stop here and say so.")
+    emit("")
+    emit("  ON THE OPERATIONS LIST, because it is the part people get wrong:")
+    emit("")
+    emit("    A process step contributes ONE entry to Operations.Group.")
+    emit("")
+    emit("      - An operation with nothing dressed on it is listed directly.")
+    emit("      - An operation with a dressup on it is NOT listed. Its entry")
+    emit("        is the OUTERMOST DRESSUP, and the operation underneath is")
+    emit("        reached through that dressup's link.")
+    emit("")
+    emit("    So a list holding a column of dressups and no operations is")
+    emit("    CORRECT. It looks broken and is not. The post-processor emits")
+    emit("    the list verbatim, so listing a dressed operation as well as its")
+    emit("    dressup puts the same contour in the job twice -- measured at 24")
+    emit("    cutting moves in the dressup's section and 20 in the operation's.")
+    emit("")
+    emit("    Stacks two and three deep are ordinary: LeadInOut -> Dogbone ->")
+    emit("    Boundary over one operation is one step and one list entry.")
 
 
 # -- structure ------------------------------------------------------------
@@ -147,9 +172,12 @@ def validate_layout(doc):
         warn(warning)
 
     if layout is None:
-        # Distinguish "wrong kind of file" from "incomplete file", because the
-        # n70 fixture is a perfectly good nester input and a useless replay
-        # fixture, and conflating those sends people looking in the wrong place.
+        # Distinguish "wrong kind of file" from "incomplete file", because a
+        # file of source geometry is a perfectly good nester input and a
+        # useless replay fixture, and conflating those sends people looking in
+        # the wrong place. The category is worth naming; any particular file is
+        # not, since this validator is handed whatever it is handed and a named
+        # exemplar reads as though that file is the one failing.
         bodies = [o for o in doc.Objects
                   if o.TypeId in ("PartDesign::Body", "Part::Feature",
                                   "Part::Part2DObject")]
@@ -159,11 +187,13 @@ def validate_layout(doc):
             fail("No layout group, but this document holds %d source object(s)."
                  % len(bodies),
                  "It looks like SOURCE GEOMETRY only -- an input to the\n"
-                 "nester, not a nesting result. The n70 fixture is exactly\n"
-                 "this: three PartDesign bodies and nothing else. To drive a\n"
-                 "replay you also need a Layout_* group with Sheet_N groups,\n"
-                 "Sheet_Boundary_N planes and nested_* containers. Run the\n"
-                 "nester on this geometry and save the result alongside it.")
+                 "nester, not a nesting result: nothing that looks like a\n"
+                 "layout, a sheet, or a nested part.\n"
+                 "That is a perfectly good nester input and cannot drive a\n"
+                 "replay on its own. To drive a replay you also need a\n"
+                 "Layout_* group with Sheet_N groups, Sheet_Boundary_N planes\n"
+                 "and nested_* containers. Run the nester on this geometry and\n"
+                 "save the result alongside it.")
         else:
             fail("No layout group found.",
                  "Expected an App::DocumentObjectGroup whose Label starts "
@@ -250,8 +280,9 @@ def survey_source(doc):
     """Report the source geometry the CAM job is set up on.
 
     Reported unconditionally, including for a file that turns out to hold
-    source geometry only. A source-only document is the n70 fixture's shape,
-    and telling it what it *does* contain is more use than "no layout found".
+    source geometry only. Such a file is a good nester input and a useless
+    replay fixture, and telling it what it *does* contain is more use than "no
+    layout found".
     """
     heading("SOURCE GEOMETRY")
     # A CAM tool bit is itself a PartDesign::Body, so filter by name: a tool
@@ -359,7 +390,8 @@ def survey_holes(sheets_with_containers):
     """Report which parts have holes, and whether any could host a nested part.
 
     This is the expensive part -- part_footprint is ~15 ms per part -- and it is
-    reported with timing because its cost at n70's scale is currently assumed
+    reported with timing because its cost at production scale (~120 parts) is
+    currently assumed
     rather than known.
     """
     heading("INTERNAL FEATURES")
