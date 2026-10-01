@@ -996,3 +996,14 @@ six label conventions.
   operations with cutting motion after reload, and 7/7 after the layout is
   gone, 263 objects. Confirmed load-bearing — disabling the swap produces 18
   harness failures rather than none.
+
+## Change log
+
+- Second manual GUI run, after `d71e08d`. Confirmed working. This was the one
+  thing no automated tier could have caught, for the same reason as the first
+  run: **a ViewProvider does not exist under `freecadcmd`**, so every check of
+  the swap — that the job's Model holds the flattened parts directly rather than
+  Clones — was testing the document, never the tree. The specific GUI-only risk
+  was the job's ViewProvider group extension claiming `Part::Feature` objects
+  where it had always claimed `Part::FeaturePython` Clones. It renders, the job
+  tree nests as before, and the operations cut.
