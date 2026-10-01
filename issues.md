@@ -552,3 +552,57 @@ That was the part no check here could reach: FreeCAD's Qt renderer antialiases,
 so the real toolbar looks softer than the nearest-neighbour previews, and a
 disabled command desaturates the icon, which is worth knowing about for a
 palette carrying a saturated green and yellow. Both read correctly.
+
+## NEST-012 — the replay takes 43 seconds, and 42 of them are the ordering step
+
+Raised as "the command has no progress feedback while it works". Investigating
+that found a much better answer.
+
+`validate_replay_fixture` has timed `replay_layout` since early on: **43 s** for
+one sheet of 48 parts with 7 operations. Because it loops over sheets, a
+three-sheet nest is over two minutes of frozen UI.
+
+**98% of it is one stage.** Measured with the `Progress` seam added for this
+investigation (below), and independently by wrapping the suspect calls:
+
+    Reading the source CAM setup               1 event     0.01s
+    Flattening nested parts                   50 events     0.00s
+    Building the replay job                    1 event     0.41s
+    Replaying the recipe                      15 events     0.01s
+    Ordering and tidying the tool table        1 event    43.00s
+    Verifying the result                       2 events     0.05s
+
+And within that stage, by wrapping `find_hole_nestings`, `order_operations` and
+`verify_replay` and subtracting the named calls from the span:
+
+    find_hole_nestings                                 7.44s
+    order_operations                                  11.65s
+    doc.recompute() between them                      23.33s
+                                                    ----------
+                                                     42.42s of 43.50s
+
+**Nothing that costs time changes anything a user would notice.** The reorder
+does not move a toolpath: reordering `Operations.Group` cannot alter what any
+operation cuts, and the 23.33 s recompute exists only because those two calls
+touched the document. So the ordering stage buys correctness that is already
+there and pays for it with a full recompute of every operation's toolpath.
+
+**Two measurement mistakes worth recording, because both produced confident
+wrong answers.**
+
+* Attributing elapsed time by *per-stage* timestamp rather than by the previous
+  event gave the first event of each stage the whole elapsed run. That put
+  43 of the 44 seconds on "Verifying the result", and verification costs
+  **0.05 s**. Measured directly: `parts_outside_stock` 0.01 s, `.Path` reads
+  0.00 s, `uncovered_targets` 0.03 s.
+* The guess before either measurement -- that the cost was toolpath generation
+  or flattening -- was also wrong. Both are under half a second.
+
+`Document.recompute` is read-only on the `App.Document` type and cannot be
+wrapped, so the recompute's cost is obtained by subtraction rather than
+directly. `App.Document` is immutable; an instance attribute cannot be set.
+
+**Not yet fixed.** A progress bar built on this seam would report six stages in
+half a second and then sit on one stage for 43, which is reporting a symptom.
+The work worth doing is in `find_hole_nestings` and in not recomputing when
+`order_operations` changed nothing.

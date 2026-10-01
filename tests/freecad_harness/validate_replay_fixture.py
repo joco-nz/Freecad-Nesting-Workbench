@@ -1005,9 +1005,32 @@ def dry_run(doc, layout, job, identity_by_operation=()):
         warn("Skipped: no layout or no job.")
         return
 
+    # A recorder, so the progress seam is exercised against the real fixture
+    # rather than only against the stand-ins in the pytest tier. It also earns
+    # its keep as a timing instrument: attributing elapsed time per stage is
+    # what located the 43-second cost described in issues.md, and the first
+    # version of that attribution keyed on the stage name instead of on the
+    # previous event, which put the whole run on whichever stage came last.
+    events = []
+    deltas = []
+    run_start = time.perf_counter()
+    previous = [run_start]
+
+    def record_progress(stage, current, total, message=None):
+        # The previous timestamp is held separately from `deltas`. An earlier
+        # version did `event_times[-1][0]`, which indexes into a float and
+        # raises -- and the reporter then went silent for the rest of the run,
+        # exactly as designed, leaving only the two events before the failure
+        # and a warning that was easy to misread as "the seam is dead".
+        now = time.perf_counter()
+        events.append((stage, current, total, message))
+        deltas.append(now - previous[0])
+        previous[0] = now
+
     start = time.perf_counter()
     try:
-        outcomes = cam_replay.replay_layout(doc, layout, job)
+        outcomes = cam_replay.replay_layout(doc, layout, job,
+                                            progress_callback=record_progress)
     except Exception as exc:
         import traceback
         traceback.print_exc()
@@ -1041,6 +1064,72 @@ def dry_run(doc, layout, job, identity_by_operation=()):
 
     emit("")
     emit("  replay wall clock: %.0f ms" % (1000 * elapsed))
+
+    _report_progress(events, deltas, elapsed)
+
+
+def _report_progress(events, deltas, elapsed):
+    """Check the progress seam fired, and where the wall clock went.
+
+    The per-stage table is not decoration. It is the instrument that found
+    where the 43 seconds were, and it is the thing to look at before deciding
+    whether a progress bar is the right answer to a slow command.
+    """
+    if not events:
+        fail("replay_layout emitted no progress events; the seam is dead")
+        return
+
+    stages = []
+    for stage, _current, _total, _message in events:
+        if not stages or stages[-1] != stage:
+            stages.append(stage)
+
+    expected = ["Reading the source CAM setup", "Flattening nested parts",
+                "Building the replay job", "Replaying the recipe",
+                "Ordering and tidying the tool table", "Verifying the result"]
+    if stages != expected:
+        fail("progress stages are not the pipeline's stages",
+             "expected %r, got %r" % (expected, stages))
+
+    # The sheet label prefixes every message, so a multi-sheet run can be told
+    # apart. This fixture has one sheet, so that is all that is checkable here.
+    prefixes = {message.split(" ")[0] for _s, _c, _t, message in events
+                if message}
+    if len(prefixes) != 1:
+        fail("progress messages carry more than one sheet prefix: %r"
+             % sorted(prefixes))
+
+    ok("%d progress event(s) over %d stage(s)" % (len(events), len(stages)))
+
+    # Per-stage seconds, measured between consecutive events and attributed to
+    # the stage that was running. `total` is the true elapsed, so the column
+    # adds up.
+    per_stage = []
+    prev_stage = None
+    for (stage, _c, _t, _m), secs in zip(events, deltas):
+        if prev_stage is not None and stage != prev_stage:
+            per_stage[-1][1] += secs
+        if not per_stage or per_stage[-1][0] != stage:
+            per_stage.append([stage, 0.0])
+        prev_stage = stage
+    if per_stage:
+        per_stage[-1][1] += deltas[-1]
+
+    emit("")
+    emit("    %-36s %7s %10s" % ("stage", "events", "seconds"))
+    for stage, secs in per_stage:
+        n = sum(1 for e in events if e[0] == stage)
+        emit("    %-36s %7d %9.2fs" % (stage, n, secs))
+    accounted = sum(s for _n, s in per_stage)
+    emit("    %-36s %7s %9.2fs  (measured %.2fs)"
+         % ("SUM", "", accounted, elapsed))
+
+    slowest = max(per_stage, key=lambda row: row[1])
+    if slowest[1] > 0.5 * elapsed and slowest[1] > 1.0:
+        note("%.0f%% of the run is in one stage: %s (%.1fs of %.1fs). A "
+             "progress bar can only report that, so if this is avoidable the "
+             "bar is treating a symptom."
+             % (100 * slowest[1] / elapsed, slowest[0], slowest[1], elapsed))
     emit("  (nothing was saved; the document is discarded)")
 
 

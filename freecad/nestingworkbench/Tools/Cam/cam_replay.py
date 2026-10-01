@@ -1293,7 +1293,89 @@ def _add_link_property(obj, name, value, doc_string):
     setattr(obj, name, value)
 
 
-def flatten_sheet(doc, sheet_group, sheet_thickness, group=None):
+class Progress:
+    """Two-level progress reporting for a replay run.
+
+    A replay is not quick. Measured on the committed fixture, `replay_layout`
+    takes **43 seconds** for one sheet of 48 parts with 7 operations, and
+    `replay_layout` loops over sheets, so a three-sheet nest is a bit over two
+    minutes of a frozen UI with nothing on screen. This is the seam that a
+    dialog, a Tasks-panel widget or a bare Console line can all hang off.
+
+    The callback is `callback(stage, current, total, message=None)`.
+
+    **Why four arguments and not the nester's three.** `nesting_strategy` takes
+    `progress_callback(current, total, message)` and a controller turns that
+    into a bar. That works there because the nester has one kind of work:
+    `progress_callback(i + 1, total_parts, "Placing X...")` over a loop of
+    parts, so `current/total` means the whole run and one percentage is
+    honest. A replay has nine stages of different kinds -- walking the source
+    job's dressup graph, transforming 48 shapes, computing seven toolpaths,
+    re-reading sub-element names off 23 parts per operation, verifying. No
+    single ratio across those is knowable without measuring, and an invented
+    weighting is a bar that lies, which is worse than no bar. So the stage is
+    named and the count is *within* it. Both are always true, and a UI is free
+    to render "stage 3 of 9" beside "part 23 of 48".
+
+    `current`/`total` are zero at the start of a stage, before anything has
+    been counted. A stage whose work is one indivisible call reports nothing
+    further: that call is the bar's blind spot, and claiming a count for it
+    would mean inventing one.
+
+    Optional throughout. `None` is the default, so the harness and every
+    existing caller are unaffected.
+    """
+
+    def __init__(self, callback=None, prefix=""):
+        self._callback = callback
+        self._prefix = ("%s " % prefix) if prefix else ""
+        self._stage = ""
+        self._failed = False
+        #: Why reporting stopped, or None. Exposed rather than only printed, so
+        #: a caller can put it in its own log and so it stays observable in the
+        #: pure-Python tier where `FreeCAD.Console` is a stand-in returning None.
+        self.warning = None
+
+    def stage(self, name):
+        """Announce a new stage. Resets the within-stage count."""
+        self._stage = name
+        self._emit(0, 0, name)
+
+    def item(self, current, total, detail=None):
+        """Report position within the current stage."""
+        self._emit(current, total, detail)
+
+    def done(self, detail=None):
+        """Close the current stage."""
+        self._emit(None, None, detail)
+
+    def _emit(self, current, total, message):
+        if self._callback is None or self._failed:
+            return
+        try:
+            self._callback(self._stage, current, total,
+                           self._prefix + (message or ""))
+        except Exception as exc:
+            # A dead widget must not cost a 43-second run, and must not repeat
+            # itself on every one of the 48 parts. One warning, then silent.
+            #
+            # The print is guarded as well. This is the one place the recovery
+            # path could itself raise: `FreeCAD.Console` is a stand-in
+            # returning None outside a real FreeCAD, and an unguarded
+            # `PrintWarning` there raises AttributeError straight through the
+            # except block that exists to prevent exactly that. Recovery code
+            # that can fail is not recovery.
+            self._failed = True
+            self.warning = ("progress callback raised %s: %s"
+                            % (type(exc).__name__, exc))
+            try:
+                FreeCAD.Console.PrintWarning("Replay %s.\n" % self.warning)
+            except Exception:
+                pass
+
+
+def flatten_sheet(doc, sheet_group, sheet_thickness, group=None,
+                  progress=None):
     """Flatten every `nested_*` container under `sheet_group`.
 
     Containers are found with the shared `get_nested_containers` helper rather
@@ -1307,8 +1389,15 @@ def flatten_sheet(doc, sheet_group, sheet_thickness, group=None):
     """
     from ...freecad_helpers import get_nested_containers
 
+    if progress is not None:
+        progress.stage("Flattening nested parts")
+    containers = list(get_nested_containers(sheet_group))
+    total = len(containers)
+
     result = FlattenResult()
-    for container in get_nested_containers(sheet_group):
+    for index, container in enumerate(containers, start=1):
+        if progress is not None:
+            progress.item(index, total, getattr(container, "Label", ""))
         flattened = flatten_container(doc, container, sheet_thickness, group=group)
         if flattened is None:
             result.skipped.append((container, "no part_* child, or its shape is null"))
@@ -1316,6 +1405,8 @@ def flatten_sheet(doc, sheet_group, sheet_thickness, group=None):
         result.parts.append(flattened.obj)
         if flattened.z_offset:
             result.z_shifts.append((flattened.obj, flattened.z_offset))
+    if progress is not None:
+        progress.done("%d part(s) from %d container(s)" % (len(result.parts), total))
     return result
 
 
@@ -2284,7 +2375,7 @@ def apply_properties(target, properties, skip=(), remap=None):
 
 
 def replay_recipe(recipe, job, clones, tool_cache=None,
-                  view_failures=None):
+                  view_failures=None, progress=None):
     """Recreate `recipe`'s operations in `job`, targeting `clones`.
 
     Two passes, in that order, and the order is not a preference.
@@ -2306,12 +2397,29 @@ def replay_recipe(recipe, job, clones, tool_cache=None,
         view_failures = []
     result.view_provider_failures = view_failures
 
+    if progress is not None:
+        progress.stage("Replaying the recipe")
+    # One unit per process step. `recipe` holds one entry per Operations.Group
+    # member -- the outermost dressup of a stack, not the stack -- so its length
+    # is the number of things this function actually builds. Counting entries
+    # rather than passes matters: pass one skips dressups and pass two skips
+    # base operations, so a counter advanced per pass would jump to half and
+    # sit there.
+    steps = len(recipe)
+    built = [0]
+
+    def report(label):
+        if progress is not None:
+            built[0] += 1
+            progress.item(built[0], steps, label)
+
     made = {}
 
     # -- pass one: base operations --
     for item in recipe:
         if is_dressup(item.source):
             continue
+        report(item.label)
         new_op = create_operation_in(item.source, job,
                                       view_failures=view_failures)
         if new_op is None:
@@ -2395,6 +2503,7 @@ def replay_recipe(recipe, job, clones, tool_cache=None,
             # be built on nothing.
             continue
 
+        report(item.label)
         layer = new_op
         outermost = new_op
         built_any = False
@@ -3173,7 +3282,7 @@ class SheetOutcome:
 
 
 def replay_sheet(doc, layout_group, sheet_group, source_job, post_processor=None,
-                 template_path=None, job_factory=None):
+                 template_path=None, job_factory=None, progress=None):
     """Run the whole pipeline for one sheet.
 
     Returns a `SheetOutcome`. Nothing is deleted on failure: an operator asked
@@ -3198,6 +3307,8 @@ def replay_sheet(doc, layout_group, sheet_group, source_job, post_processor=None
 
     _width, _height, thickness = read_sheet_dimensions(layout_group)
 
+    if progress is not None:
+        progress.stage("Reading the source CAM setup")
     try:
         recipe = read_recipe(source_job)
     except Exception as exc:
@@ -3231,7 +3342,8 @@ def replay_sheet(doc, layout_group, sheet_group, source_job, post_processor=None
             % (outcome.sheet_label, exc))
 
     try:
-        flattened = flatten_sheet(doc, sheet_group, thickness, group=parts_group)
+        flattened = flatten_sheet(doc, sheet_group, thickness, group=parts_group,
+                                 progress=progress)
     except Exception as exc:
         outcome.errors.append("Could not flatten %s: %s" % (outcome.sheet_label, exc))
         return outcome
@@ -3243,6 +3355,8 @@ def replay_sheet(doc, layout_group, sheet_group, source_job, post_processor=None
         )
         return outcome
 
+    if progress is not None:
+        progress.stage("Building the replay job")
     try:
         replay = create_replay_job(
             doc, layout_group, sheet_group, flattened.parts,
@@ -3276,7 +3390,7 @@ def replay_sheet(doc, layout_group, sheet_group, source_job, post_processor=None
                 % (outcome.sheet_label, exc))
 
     try:
-        result = replay_recipe(recipe, replay.job, replay.clones)
+        result = replay_recipe(recipe, replay.job, replay.clones, progress=progress)
     except Exception as exc:
         outcome.errors.append("Could not replay into %s: %s" % (outcome.sheet_label, exc))
         return outcome
@@ -3304,6 +3418,8 @@ def replay_sheet(doc, layout_group, sheet_group, source_job, post_processor=None
 
     # Ordering needs to know which part each replayed operation cuts, so each
     # op is attributed to the part its first base entry points at.
+    if progress is not None:
+        progress.stage("Ordering and tidying the tool table")
     try:
         nestings = find_hole_nestings(replay.clones)
         if nestings:
@@ -3331,6 +3447,8 @@ def replay_sheet(doc, layout_group, sheet_group, source_job, post_processor=None
 
     doc.recompute()
 
+    if progress is not None:
+        progress.stage("Verifying the result")
     try:
         verification = verify_replay(result, replay.warnings,
                                     clones=replay.clones, stock=replay.stock)
@@ -3342,6 +3460,10 @@ def replay_sheet(doc, layout_group, sheet_group, source_job, post_processor=None
     if not outcome.ok:
         _mark_unverified(replay, outcome)
 
+    if progress is not None:
+        progress.done("verified %d operation(s)"
+                      % (0 if verification is None
+                         else verification.operations_checked))
     return outcome
 
 
@@ -3379,12 +3501,18 @@ def _mark_unverified(replay, outcome):
 
 
 def replay_layout(doc, layout_group, source_job, post_processor=None,
-                  template_path=None, job_factory=None):
+                  template_path=None, job_factory=None, progress_callback=None):
     """Replay `source_job` onto every sheet of `layout_group`.
 
     Returns a list of `SheetOutcome`, one per sheet. A sheet that fails does
     not stop the others: they are independent jobs and one bad sheet should not
     hide a good one.
+
+    `progress_callback(stage, current, total, message=None)` is optional and
+    reported per sheet, with the sheet label prefixed to every message so a
+    multi-sheet run can be told apart. Default `None`, so the harness runs this
+    with no callback at all and is unaffected. See `Progress` for why the
+    callback is shaped this way rather than like the nester's.
     """
     from ...freecad_helpers import get_sheet_groups
 
@@ -3394,6 +3522,8 @@ def replay_layout(doc, layout_group, source_job, post_processor=None,
             doc, layout_group, sheet, source_job,
             post_processor=post_processor, template_path=template_path,
             job_factory=job_factory,
+            progress=Progress(progress_callback,
+                              prefix=getattr(sheet, "Label", "") or ""),
         ))
     return outcomes
 
