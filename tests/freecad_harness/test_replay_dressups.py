@@ -429,21 +429,83 @@ def check_write(recipe, outcomes, steps, source_job):
         job = outcome.replay_job.job
         group = list(job.Operations.Group)
         label = outcome.sheet_label
+
+        # **One entry per (source step, target part), not one per source step.**
+        #
+        # A source step is replayed once per part it applies to, so the list
+        # holds sum(targets) entries. This fixture has five distinct shapes, so
+        # every step lands on its own eight parts and there are 40 entries.
+        #
+        # The rule that replaces "the Nth entry is the Nth step" is: the list is
+        # the source's step sequence, each step repeated once per target, in
+        # source order. That is what keeps a part's own steps in the user's
+        # order -- holes before the boundary, internals before the outer
+        # boundary -- and stating it here means a reordering that broke it would
+        # fail rather than pass unnoticed.
+        clones = outcome.replay_job.clones
+
+        expected = []
+        unsplit = []
+        for index, (op, dressups) in enumerate(steps):
+            entry = dressups[-1] if dressups else op
+            chain = list(chain_kinds(entry))
+            base = getattr(op, "Base", None) or []
+            try:
+                geometry = base[0][0]
+            except (TypeError, IndexError):
+                geometry = None
+            targets = len(cam_replay.clones_for_source(clones, geometry)) \
+                if geometry is not None else 0
+            # A step carrying an unsplittable dressup stays whole -- see
+            # cam_replay.UNSPLITTABLE_DRESSUPS. The Boundary step therefore
+            # contributes ONE entry covering all its parts, not one per part.
+            blocked = any(
+                cam_replay.dressup_kind(d)[1]
+                in cam_replay.UNSPLITTABLE_DRESSUPS
+                for d in dressups)
+            if blocked and targets > 1:
+                unsplit.append(entry.Label)
+                expected.append(chain)
+            else:
+                expected.extend([chain] * targets)
+        if unsplit:
+            emit("  left whole (unsplittable dressup): %s" % ", ".join(unsplit))
+
         emit("%s: %d list entr(ies) for %d step(s)"
              % (label, len(group), len(recipe)))
 
-        check_equal(len(group), len(recipe),
-                    "%s: list has %d entries for %d step(s)"
-                    % (label, len(group), len(recipe)))
+        check_equal(len(group), len(expected),
+                    "%s: list has %d entries, expected %d (one per step per "
+                    "target part)" % (label, len(group), len(expected)))
 
         for index, entry in enumerate(group):
             chain = chain_kinds(entry)
-            want = source_kinds[index] if index < len(source_kinds) else []
+            want = expected[index] if index < len(expected) else []
             check_equal(chain, want,
                         "%s: entry %d chain shape" % (label, index))
             check(cam_replay.has_cutting_motion(entry),
                   "%s: entry %d (%s) produced no cutting motion"
                   % (label, index, entry.Label))
+            # The property the split exists for: one target per entry. A copy
+            # holding two parts is where the superlinear cost comes from.
+            bottom = entry
+            for _ in range(20):
+                base = getattr(bottom, "Base", None)
+                if cam_replay.is_dressup(bottom) and base is not None:
+                    bottom = base
+                    continue
+                break
+            # One target per entry -- but only for entries that ARE split
+            # copies. An unsplit step's single entry legitimately covers them
+            # all, and says so in its label: it has no nested part in it.
+            targets = getattr(bottom, "Base", None) or []
+            if "_replay_nested_" in entry.Label:
+                check(len(targets) == 1,
+                      "%s: entry %d (%s) is a split copy but targets %d parts"
+                      % (label, index, entry.Label, len(targets)))
+            elif len(targets) > 1:
+                emit("  whole entry %d (%s) covers %d part(s) by design"
+                     % (index, entry.Label, len(targets)))
 
         # Nothing in the list may be an operation that a dressup sits on. If it
         # is, the same contour is in the job twice.

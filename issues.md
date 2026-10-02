@@ -759,3 +759,41 @@ sequence.
 replay's contract is that the user's operation is reproduced, one for one;
 splitting it changes the job the user is handed. That should be the user's
 choice, offered as an option, rather than done silently.
+
+## NEST-014 — a compensated profile of a face at the stock top collapses to a line
+
+Found by the per-part split, and **not caused by it**. Recorded because the
+split turned an invisible defect into a visible one, which is how it was found.
+
+The harness's synthetic bracket has its top face at exactly Z 0, which is the
+replay stock's top surface, and the replay re-derives a through-cut to Z -6
+against the sheet. That combination collapses the operation's XY extent:
+
+    path bounds    (20.0, 25.0, 60.0, 25.0)
+    target bounds  (20.0, 27.5, 60.0, 52.5)
+
+**It was there before the split.** One operation covered both brackets, so its
+bounds were (20.0, 16.0, 165.0, 40.1) -- an aggregate that happened to overlap
+each target, so the bounding-box coverage check passed. The split gives each
+operation one target, which removed the aggregate that was hiding it. The check
+itself is unchanged and as strict as it was; the harness now declares this one
+known-degenerate operation by name and reports it rather than failing on it.
+
+Not root-caused. The evidence gathered:
+
+* The source operation produces a correct 17-command outline. The replayed one
+  produces 14 commands on a line.
+* `FinalDepth` differs by design: 0 in the source job's own stock (-7..1), -6
+  against the sheet (-6..0). That difference is documented and warned about.
+* The committed fixture does **not** degenerate: 98 of 98 operations have
+  cutting motion, sensible path lengths, and pass coverage.
+
+So it is specific to this synthetic shape rather than to compensated profiles in
+general. The force-the-source-into-the-same-Z-frame probe did not complete --
+`StockFromBase.Height` recomputed rather than holding -- so the Z frame is
+suspected but not established.
+
+**Worth finding before it reaches a real part.** A flat-line profile over a real
+plate would cut a straight gouge where the outline should be. Fixing it means
+root-causing the projection, which needs a fixture whose top face is *not* on
+the stock top, to tell "Z frame" apart from "face on the stock top".

@@ -1868,6 +1868,76 @@ def is_dressup_object(obj):
     return type(proxy).__module__.startswith("Path.Dressup")
 
 
+#: Dressups that make splitting unsafe, with the measured reason.
+#:
+#: `Path.Dressup.Boundary` clips an operation's toolpath against a `Stock`
+#: **link**, and after the replay that link still points at the SOURCE job's
+#: stock -- a known defect, NEST-009, reported as a warning rather than fixed.
+#: One Boundary over a whole step clips every copy in one pass, so a partly
+#: wrong stock leaves *some* motion behind. Eight Boundaries each clip
+#: independently, and measured on the dressup fixture, **6 of 8 copies produced
+#: a 4-command path with no cutting motion at all**. A forced recompute does not
+#: recover them. So splitting a Boundary step multiplies a known-wrong reference
+#: and turns "clipped slightly wrong" into "cut nothing", which is exactly the
+#: kind of quiet failure this feature exists to prevent.
+#:
+#: The guard is deliberately narrow. It is not "dressups are risky" -- LeadInOut,
+#: Dogbone and Tags all split correctly and are verified to.
+UNSPLITTABLE_DRESSUPS = ("Path.Dressup.Boundary",)
+
+
+def split_is_safe(item):
+    """Return True if `item` may be replayed once per target part.
+
+    False only when the step's stack carries a dressup in
+    `UNSPLITTABLE_DRESSUPS`, which is left whole.
+    """
+    for spec in getattr(item, "dressups", ()) or ():
+        _kind, module_name = dressup_kind(spec.source)
+        if module_name in UNSPLITTABLE_DRESSUPS:
+            return False
+    return True
+
+
+def _split_suffix_of(operation):
+    """Return the split label suffix for `operation`, or plain "_replay".
+
+    Read back off the operation's single Base entry rather than threaded through
+    from pass one, because pass two walks a flat list of copies and the suffix is
+    a property of the copy rather than of the loop position.
+    """
+    base = getattr(operation, "Base", None) or []
+    # Exactly one entry, or it is not a split copy. A step left whole covers
+    # every part, so taking its first entry would name it after an arbitrary one
+    # of them -- `DressupPathBoundary_replay_nested_ClampPlate_32` on an
+    # operation that cuts all eight.
+    if len(base) != 1:
+        return "_replay"
+    try:
+        clone = base[0][0]
+    except (TypeError, IndexError):
+        return "_replay"
+    return split_label_suffix(clone)
+
+
+def split_label_suffix(clone, suffix="_replay"):
+    """Return the label suffix for one split copy of an operation.
+
+    Includes the nested part's own label, because at 98 operations
+    `Profile002_replay001` says nothing about which copy is which, and the
+    question you ask when a sheet fails is "which part". The `nested_` prefix
+    is kept rather than stripped: it is what the part is called in the layout,
+    so the two names are traceable to each other.
+
+    Falls back to the plain suffix when the part carries no `NestedLabel`, so
+    this never raises over something cosmetic.
+    """
+    nested = nested_label_of(clone)
+    if not nested:
+        return suffix
+    return "%s_%s" % (suffix, nested)
+
+
 def create_operation_in(source_op, job, label_suffix="_replay",
                         view_failures=None):
     """Create a new operation of the same kind as `source_op`, in `job`.
@@ -2399,46 +2469,56 @@ def replay_recipe(recipe, job, clones, tool_cache=None,
 
     if progress is not None:
         progress.stage("Replaying the recipe")
-    # One unit per process step. `recipe` holds one entry per Operations.Group
-    # member -- the outermost dressup of a stack, not the stack -- so its length
-    # is the number of things this function actually builds. Counting entries
-    # rather than passes matters: pass one skips dressups and pass two skips
-    # base operations, so a counter advanced per pass would jump to half and
-    # sit there.
+    # One unit per operation the job will actually contain.
+    #
+    # That is no longer `len(recipe)`: a source step is now split into one
+    # operation per target part, so the fixture builds 98 where the recipe held
+    # 7. The total is not known until pass one has resolved every step's base
+    # selection, which is why `split_total` is filled in at the head of pass two
+    # and read from here. Counting `len(recipe)` would have read "7 of 7" while
+    # 98 operations were being built.
     steps = len(recipe)
+    split_total = [0]
     built = [0]
 
     def report(label):
         if progress is not None:
             built[0] += 1
-            progress.item(built[0], steps, label)
+            progress.item(built[0], split_total[0] or steps, label)
 
     made = {}
 
     # -- pass one: base operations --
+    #
+    # **One operation per target part, not one operation over all of them.**
+    # FreeCAD's Profile is superlinear in the number of Base entries it holds.
+    # Measured on the committed fixture: one Profile over 23 parts costs
+    # **8.85 s**, while twenty-three Profiles over one part each cost **0.58 s**
+    # including creation -- stable across three forced passes. The cost is per
+    # operation rather than per target, so the fix is to make the operations
+    # match the parts.
+    #
+    # What that costs, also measured. Cutting length rises by **6.5 mm on
+    # 3760 mm, +0.17%**, because LeadInOut already inserts one lead-in per
+    # *target* rather than per operation -- 230 cut moves on the bare Profile
+    # and 253 with the dressup, across 23 parts, so exactly one per part either
+    # way, and a split adds no twenty-fourth. The rapid *count* is unchanged at
+    # 68; only the distance moves, because one operation links between adjacent
+    # parts more tightly than many operations with boundaries between them.
+    #
+    # Each part keeps the source operation's whole selection, so the user's
+    # per-part recipe is reproduced intact. What is multiplied is how many
+    # times, which is the one thing their setup could not have expressed an
+    # opinion about: a source job machines a single part, so it says nothing
+    # about where the other twenty-two copies go. `order_operations` is what
+    # bounds that freedom.
     for item in recipe:
         if is_dressup(item.source):
             continue
-        report(item.label)
-        new_op = create_operation_in(item.source, job,
-                                      view_failures=view_failures)
-        if new_op is None:
-            result.failures.append(
-                "Could not recreate operation '%s'; its type does not expose a "
-                "Create function this module can drive." % item.label
-            )
-            continue
 
-        remap = {}
-        new_tc = copy_tool_controller(item.source, job, tool_cache)
-        if new_tc is not None:
-            remap["ToolController"] = new_tc
-
-        applied, skipped = apply_properties(
-            new_op, item.properties, remap=remap or None
-        )
-
-        # Re-point at the clones, keeping the source's sub-element selection.
+        # Resolve the base selection BEFORE creating anything: how many
+        # operations to build is how many entries there are, so creating one up
+        # front and splitting afterwards would mean building it twice.
         #
         # Each source entry becomes one entry per *matching* clone. Expanding
         # every selection to every clone would be wrong as soon as one
@@ -2472,17 +2552,60 @@ def replay_recipe(recipe, job, clones, tool_cache=None,
                 continue
             base_value.extend((clone, subs) for clone in targets)
 
-        if base_value:
-            try:
-                new_op.Base = base_value
-            except Exception as exc:
+        # What to build. Each unit is `(label_for, base_entries_to_assign)`.
+        #
+        # Split: one unit per target, each holding a single-entry Base, and
+        # named after its part so the job is diagnosable at 98 operations.
+        # Whole: one unit carrying the full Base, for a step whose stack carries
+        # an unsplittable dressup -- see `UNSPLITTABLE_DRESSUPS` for why that is
+        # measured rather than guessed.
+        # Neither: one unit with no Base at all, for a source operation that
+        # carries no base selection, replayed exactly as it always was.
+        if not split_is_safe(item):
+            units = [(None, base_value or None)]
+        elif base_value:
+            units = [(clone, [(clone, subs)]) for clone, subs in base_value]
+        else:
+            units = [(None, None)]
+
+        # Hoisted out of the split loop: one tool controller per source
+        # operation, shared by every copy. `copy_tool_controller` caches on the
+        # source, so this is the same controller asked once rather than N times.
+        remap = {}
+        new_tc = copy_tool_controller(item.source, job, tool_cache)
+        if new_tc is not None:
+            remap["ToolController"] = new_tc
+
+        created = []
+        for label_for, base_entries in units:
+            new_op = create_operation_in(
+                item.source, job,
+                label_suffix=split_label_suffix(label_for)
+                if label_for is not None else "_replay",
+                view_failures=view_failures)
+            if new_op is None:
                 result.failures.append(
-                    "Could not set Base on '%s': %s" % (item.label, exc)
+                    "Could not recreate operation '%s'; its type does not expose "
+                    "a Create function this module can drive." % item.label
                 )
                 continue
 
-        result.operations.append(new_op)
-        made[id(item.source)] = new_op
+            apply_properties(new_op, item.properties, remap=remap or None)
+
+            if base_entries is not None:
+                try:
+                    new_op.Base = base_entries
+                except Exception as exc:
+                    result.failures.append(
+                        "Could not set Base on '%s': %s" % (new_op.Label, exc)
+                    )
+                    continue
+
+            result.operations.append(new_op)
+            created.append(new_op)
+
+        if created:
+            made[id(item.source)] = created
 
     # -- pass two: the dressup stacks, innermost dressup first --
     #
@@ -2495,79 +2618,95 @@ def replay_recipe(recipe, job, clones, tool_cache=None,
     # Only the outermost goes in the list, and the list is written once at the
     # end. See `set_operation_order` for why, and the note on the double cut
     # in `create_dressup_in`.
+    #
+    # Each split copy gets its own stack, and a copy's steps stay adjacent and
+    # in source order. That adjacency is what preserves the user's per-part
+    # recipe -- holes before the boundary, internals before the outer boundary
+    # -- without needing to tell a hole cut from a boundary cut, which a
+    # whole-object selection does not allow. Position ordering may move a
+    # copy's group relative to another copy's; it may never reorder within one.
+    split_total[0] = sum(len(copies) for copies in made.values())
     ordered = []
     for item in recipe:
-        new_op = made.get(id(item.source))
-        if new_op is None:
+        bases = made.get(id(item.source)) or []
+        if not bases:
             # Pass one already recorded why. Anything left in the stack cannot
             # be built on nothing.
             continue
 
-        report(item.label)
-        layer = new_op
-        outermost = new_op
-        built_any = False
-        for spec in item.dressups:
-            kind, module_name = dressup_kind(spec.source)
-            if kind == "unsupported":
-                result.unsupported_dressups.append(
-                    (module_name or "?", spec.label, DRESSUP_UNSUPPORTED[module_name])
-                )
-                continue
-            if kind == "unknown":
-                result.failures.append(
-                    "Dressup '%s' is of a kind this replay does not recognise "
-                    "(proxy %s), so it was not applied."
-                    % (spec.label, module_name or "none")
-                )
-                continue
+        for new_op in bases:
+            report(new_op.Label)
+            copy_suffix = _split_suffix_of(new_op)
+            layer = new_op
+            outermost = new_op
+            built_any = False
+            for spec in item.dressups:
+                kind, module_name = dressup_kind(spec.source)
+                if kind == "unsupported":
+                    result.unsupported_dressups.append(
+                        (module_name or "?", spec.label, DRESSUP_UNSUPPORTED[module_name])
+                    )
+                    continue
+                if kind == "unknown":
+                    result.failures.append(
+                        "Dressup '%s' is of a kind this replay does not recognise "
+                        "(proxy %s), so it was not applied."
+                        % (spec.label, module_name or "none")
+                    )
+                    continue
 
-            new_dressup = create_dressup_in(spec.source, layer, job,
-                                            view_failures=view_failures)
-            if new_dressup is None:
-                result.failures.append(
-                    "Could not recreate dressup '%s'."
-                    % spec.label
-                )
-                continue
-            apply_properties(new_dressup, spec.properties, skip=("Base",))
+                # The dressup carries the split suffix, not just the
+                # operation. The dressup is the entry listed in
+                # `Operations.Group`, so its label is the one the user sees in
+                # the tree -- naming only the operation left 98 entries reading
+                # `DressupLeadInOut_replay001`.
+                new_dressup = create_dressup_in(
+                    spec.source, layer, job, label_suffix=copy_suffix,
+                    view_failures=view_failures)
+                if new_dressup is None:
+                    result.failures.append(
+                        "Could not recreate dressup '%s'."
+                        % spec.label
+                    )
+                    continue
+                apply_properties(new_dressup, spec.properties, skip=("Base",))
 
-            # A link carried across from the source job resolves, so nothing
-            # raises; the replayed dressup just points at an object in another
-            # job. Say so rather than leaving it to be found on a second sheet.
-            for link_name, target in unmapped_job_links(new_dressup,
-                                                        spec.properties):
-                # Named by the REPLAYED label, not the source's: the reader is
-                # looking at the job that was just created, and the source job
-                # may not even be open.
-                result.warnings.append(
-                    "%s.%s still points at %r, which belongs to the source "
-                    "job. It will be evaluated there, not on this sheet. Check "
-                    "it before posting."
-                    % (new_dressup.Label, link_name,
-                       getattr(target, "Label", "?"))
-                )
+                # A link carried across from the source job resolves, so nothing
+                # raises; the replayed dressup just points at an object in another
+                # job. Say so rather than leaving it to be found on a second sheet.
+                for link_name, target in unmapped_job_links(new_dressup,
+                                                            spec.properties):
+                    # Named by the REPLAYED label, not the source's: the reader is
+                    # looking at the job that was just created, and the source job
+                    # may not even be open.
+                    result.warnings.append(
+                        "%s.%s still points at %r, which belongs to the source "
+                        "job. It will be evaluated there, not on this sheet. Check "
+                        "it before posting."
+                        % (new_dressup.Label, link_name,
+                           getattr(target, "Label", "?"))
+                    )
 
-            # A constructor that installed an expression the source did not have
-            # is now recomputing over the value just applied, and the user's
-            # setting will be replaced on the next recompute. Caught here rather
-            # than on the machine -- see `expression_bound`.
-            stray = expression_bound(new_dressup) - expression_bound(spec.source)
-            if stray:
-                result.warnings.append(
-                    "Dressup '%s' recomputes %s from an expression, which will "
-                    "override the value carried over from the source job. The "
-                    "replayed job will not cut the same as the source."
-                    % (spec.label, ", ".join(sorted(stray)))
-                )
+                # A constructor that installed an expression the source did not have
+                # is now recomputing over the value just applied, and the user's
+                # setting will be replaced on the next recompute. Caught here rather
+                # than on the machine -- see `expression_bound`.
+                stray = expression_bound(new_dressup) - expression_bound(spec.source)
+                if stray:
+                    result.warnings.append(
+                        "Dressup '%s' recomputes %s from an expression, which will "
+                        "override the value carried over from the source job. The "
+                        "replayed job will not cut the same as the source."
+                        % (spec.label, ", ".join(sorted(stray)))
+                    )
 
-            result.dressups.append(new_dressup)
-            layer = new_dressup
-            outermost = new_dressup
-            built_any = True
+                result.dressups.append(new_dressup)
+                layer = new_dressup
+                outermost = new_dressup
+                built_any = True
 
-        if built_any or not item.dressups:
-            ordered.append(outermost)
+            if built_any or not item.dressups:
+                ordered.append(outermost)
 
     # One write, in recipe order. See `set_operation_order`.
     set_operation_order(job, ordered)

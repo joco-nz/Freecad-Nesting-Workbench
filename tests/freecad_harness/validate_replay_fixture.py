@@ -144,7 +144,9 @@ def print_assumptions():
     emit("")
     emit("  ON THE OPERATIONS LIST, because it is the part people get wrong:")
     emit("")
-    emit("    A process step contributes ONE entry to Operations.Group.")
+    emit("    A process step contributes ONE entry to Operations.Group per")
+    emit("    target part. One source step over 48 parts is 48 entries, each")
+    emit("    cut on one part alone.")
     emit("")
     emit("      - An operation with nothing dressed on it is listed directly.")
     emit("      - An operation with a dressup on it is NOT listed. Its entry")
@@ -158,7 +160,8 @@ def print_assumptions():
     emit("    cutting moves in the dressup's section and 20 in the operation's.")
     emit("")
     emit("    Stacks two and three deep are ordinary: LeadInOut -> Dogbone ->")
-    emit("    Boundary over one operation is one step and one list entry.")
+    emit("    Boundary over one operation is one step. It is also the one")
+    emit("    dressup the replay will NOT split -- see UNSPLITTABLE_DRESSUPS.")
 
 
 # -- structure ------------------------------------------------------------
@@ -497,9 +500,13 @@ def _diagnose_no_operations(doc, job, recipe):
     **The rule this encodes, because getting it backwards is the expensive
     mistake:**
 
-        A process step contributes ONE entry to Operations.Group. If the
-        operation is dressed up, that entry is the OUTERMOST DRESSUP. The
-        operation underneath is created and linked, and is NOT listed.
+        One entry per (process step, target part). A step applied to 48
+        parts is 48 entries, each cut on one part alone, which is what makes
+        FreeCAD's Profile linear rather than superlinear in its Base count.
+
+        For any ONE entry, if the operation is dressed up, that entry is the
+        OUTERMOST DRESSUP. The operation underneath is created and linked, and
+        is NOT listed.
 
     So a job whose Operations list holds a column of dressups and no operations
     is **correct**. It looks broken and is not. Listing the operations as well
