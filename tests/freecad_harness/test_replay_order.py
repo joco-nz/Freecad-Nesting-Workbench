@@ -275,6 +275,101 @@ def travel_report(outcome, result, group):
           "any more or less" % (final_cut - recipe_cut))
 
 
+def cancel_checks():
+    """A cancelled replay must stop, keep what it built, and say so.
+
+    Cancelling is an engine feature, not a widget feature. The engine had no
+    notion of being stopped at all until this, so the Cancel button on the Tasks
+    panel would have been a control that did nothing.
+
+    The rule being pinned: a cancel **keeps** the job. Deleting it would be the
+    wrong instinct -- an operator who cancels wants to see how far it got, and
+    that is also what makes a cancel debuggable. The job goes into the document
+    labelled `_UNVERIFIED` and nothing may be posted from it.
+    """
+    emit("")
+    emit("-- cancelling --")
+    doc = FreeCAD.openDocument(FIXTURE)
+    try:
+        layout, _ = cam_replay.resolve_layout_group(doc)
+        sources = [o for o in doc.Objects if cam_replay.is_cam_job(o)]
+        if layout is None or not sources:
+            check(False, "the fixture did not resolve, so cancel went unchecked")
+            return
+
+        # Cancel a few operations into "Replaying the recipe" -- the one stage
+        # with 98 countable steps in it, and so the only place a cancel can be
+        # observed to stop partway through real work rather than between two
+        # indivisible calls.
+        #
+        # Driven off the progress callback rather than off a call counter. A
+        # counter reached the threshold during "Flattening nested parts", which
+        # emits 50 events before any operation exists, so the run was cancelled
+        # before it started and there was nothing to keep. What a Cancel button
+        # does is set a flag while the work is visible, and this is that.
+        state = {"cancel": False, "built": 0}
+
+        def watch(stage, current, total, message=None):
+            if stage == "Replaying the recipe" and current:
+                state["built"] = current
+                if current >= 5:
+                    state["cancel"] = True
+
+        outcomes = cam_replay.replay_layout(doc, layout, sources[0],
+                                            progress_callback=watch,
+                                            cancel_check=lambda: state["cancel"])
+        check_equal(len(outcomes), 1, "expected one sheet, got %d" % len(outcomes))
+        if not outcomes:
+            return
+        outcome = outcomes[0]
+
+        check(outcome.ok is False,
+              "a cancelled sheet reported ok -- a half-built job that verifies "
+              "cleanly is the failure this exists to prevent")
+        check(any("ancel" in e for e in outcome.errors),
+              "the cancel was not reported: %s" % (outcome.errors,))
+
+        job = outcome.replay_job
+        check(job is not None,
+              "a cancelled replay left no job, so there is nothing to inspect")
+        if job is None:
+            return
+        check(job.job.Label.endswith(cam_replay.UNVERIFIED_SUFFIX),
+              "a cancelled job is not labelled %s, so it could be posted from "
+              "by accident: %s" % (cam_replay.UNVERIFIED_SUFFIX, job.job.Label))
+        built = len(list(job.job.Operations.Group))
+        check(built > 0,
+              "a cancelled replay kept no operations at all; the operator is "
+              "left with an empty job and no way to see where it stopped")
+        check(built < len(outcome.result.operations),
+              "a cancelled replay dressed every operation (%d of %d), so the "
+              "cancel did not actually stop anything"
+              % (built, len(outcome.result.operations)))
+
+        # The NEST-015 invariant, on the cancel path.
+        #
+        # Pass one builds every base operation before pass two dresses them, so
+        # a cancelled replay has a complete `operations` list and a partial
+        # Operations list. Ordering reads that mismatch as "repopulate", writes
+        # the bare operations over the entries, and orphans every dressup. That
+        # is what happened: cancelled 5 operations in, the list came back
+        # holding 98 bare operations.
+        bare = [o.Label for o in job.job.Operations.Group
+                if not cam_replay.is_dressup(o)]
+        check_equal(bare[:3], [],
+                    "the cancelled job's list holds bare operations, not "
+                    "entries: %d of %d, first %s"
+                    % (len(bare), built, ", ".join(map(str, bare[:3]))))
+        emit("  cancelled once %d operation(s) had been built; kept %d, all "
+             "entries, labelled %s"
+             % (state["built"], built, job.job.Label))
+        check(state["built"] >= 5,
+              "the cancel never fired during the replay stage; built reached "
+              "only %d" % state["built"])
+    finally:
+        FreeCAD.closeDocument(doc.Name)
+
+
 def run():
     if not os.path.exists(FIXTURE):
         emit("no fixture at %s -- cannot check the order" % FIXTURE)
@@ -316,6 +411,8 @@ def run():
         travel_report(outcome, result, job)
     finally:
         FreeCAD.closeDocument(doc.Name)
+
+    cancel_checks()
 
 
 if __name__ in ("__main__", "test_replay_order"):

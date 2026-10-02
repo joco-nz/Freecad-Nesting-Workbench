@@ -1351,7 +1351,8 @@ class Progress:
     per stage per sheet.
     """
 
-    def __init__(self, callback=None, prefix="", clock=None):
+    def __init__(self, callback=None, prefix="", clock=None,
+                 cancel_check=None):
         self._callback = callback
         self._prefix = ("%s " % prefix) if prefix else ""
         self._stage = ""
@@ -1370,6 +1371,46 @@ class Progress:
         #: because work outside any stage is not counted; that gap is worth
         #: seeing too, which is why callers report both.
         self.elapsed = 0.0
+
+        self._cancel_check = cancel_check
+        self._cancelled = False
+
+    @property
+    def cancelled(self):
+        """Whether the run should stop at the next opportunity.
+
+        Latched. Once true it stays true, so a caller that reads it in a loop
+        and a caller that reads it once see the same answer, and a cancel can
+        never be un-done by a widget that has already been destroyed.
+
+        `cancel_check` is polled rather than `request_cancel()` being called,
+        because the widget that owns the Cancel button lives in the GUI thread
+        and the replay runs there too -- a poll is one boolean read and works
+        whether the button sets a flag, a checkbox, or is simply gone.
+        """
+        if self._cancelled:
+            return True
+        if self._cancel_check is not None:
+            try:
+                if self._cancel_check():
+                    self._cancelled = True
+            except Exception:
+                # A cancel check that raises is a broken UI, not a request to
+                # stop. Cancel means "the user asked"; a widget that fell over
+                # on the way to being asked did not ask. Dropping the check
+                # rather than cancelling keeps a UI fault from costing the run.
+                self._cancel_check = None
+                self.warning = "cancel check raised; cancelling is disabled"
+                try:
+                    FreeCAD.Console.PrintWarning(
+                        "Replay %s.\n" % self.warning)
+                except Exception:
+                    pass
+        return self._cancelled
+
+    def request_cancel(self):
+        """Ask for the run to stop at the next opportunity."""
+        self._cancelled = True
 
     def stage(self, name):
         """Announce a new stage. Resets the within-stage count."""
@@ -2592,6 +2633,12 @@ def replay_recipe(recipe, job, clones, tool_cache=None,
     # about where the other twenty-two copies go. `order_operations` is what
     # bounds that freedom.
     for item in recipe:
+        if progress is not None and progress.cancelled:
+            result.failures.append(
+                "Cancelled after %d of %d operation(s) were built."
+                % (built[0], split_total[0] or steps)
+            )
+            break
         if is_dressup(item.source):
             continue
 
@@ -2707,6 +2754,16 @@ def replay_recipe(recipe, job, clones, tool_cache=None,
     split_total[0] = sum(len(copies) for copies in made.values())
     ordered = []
     for item in recipe:
+        if progress is not None and progress.cancelled:
+            # `ordered` keeps whatever finished, and `set_operation_order`
+            # writes that prefix. The job is kept and labelled `_UNVERIFIED` by
+            # the caller, which is the point: an operator who cancels wants to
+            # see how far it got, not to find the evidence deleted.
+            result.failures.append(
+                "Cancelled after %d of %d operation(s) were built."
+                % (built[0], split_total[0] or steps)
+            )
+            break
         bases = made.get(id(item.source)) or []
         if not bases:
             # Pass one already recorded why. Anything left in the stack cannot
@@ -2715,6 +2772,17 @@ def replay_recipe(recipe, job, clones, tool_cache=None,
 
         for new_op in bases:
             report(new_op.Label)
+            if progress is not None and progress.cancelled:
+                # Polled per copy, not per recipe item. The two are not the same
+                # distance apart: the fixture's first step lands on 23 parts, so
+                # a poll only at the item boundary would run 23 operations past
+                # a cancel. Each copy is independent -- it owns its own stack --
+                # so breaking here leaves nothing half-built.
+                result.failures.append(
+                    "Cancelled after %d of %d operation(s) were built."
+                    % (built[0], split_total[0] or steps)
+                )
+                break
             copy_suffix = _split_suffix_of(new_op)
             layer = new_op
             outermost = new_op
@@ -3869,50 +3937,70 @@ def replay_sheet(doc, layout_group, sheet_group, source_job, post_processor=None
     if progress is not None:
         progress.stage("Ordering and tidying the tool table")
     try:
-        # One cache for both steps. `find_hole_nestings` and `order_operations`
-        # need the same footprints; before this they each derived their own,
-        # and the ordering step did it 21 times over 3 distinct shapes.
-        footprints = FootprintCache()
-        nestings = find_hole_nestings(replay.clones, footprints)
+        if progress is not None and progress.cancelled:
+            # Deliberately not ordering a cancelled replay. Pass one builds
+            # every base operation before pass two dresses them, so after a
+            # cancel `result.operations` is complete while the list holds only
+            # the stacks that were finished. Ordering reads that as "98
+            # operations, 23 entries", writes all 98 back into the list, and
+            # every dressup it replaced becomes an unlisted orphan -- the
+            # NEST-015 failure reached by another road. Measured before this
+            # guard: cancelled 5 operations in, and the list came back holding
+            # 98 bare operations with every dressed one orphaned.
+            #
+            # The job is `_UNVERIFIED` and must not be posted from, so its list
+            # is left exactly as far as the replay got.
+            FreeCAD.Console.PrintMessage(
+                "Cancelled before ordering: leaving %d of %d operation(s) "
+                "dressed in the list.\n"
+                % (len(list(replay.job.Operations.Group)),
+                   len(result.operations)))
+        else:
+            # One cache for both steps. `find_hole_nestings` and
+            # `order_operations` need the same footprints; before this they
+            # each derived their own, and the ordering step did it 21 times
+            # over 3 distinct shapes.
+            footprints = FootprintCache()
+            nestings = find_hole_nestings(replay.clones, footprints)
 
-        # Built unconditionally, not under `if nestings`. Ordering by where the
-        # parts sit needs to know which part each operation cuts, and that has
-        # nothing to do with hole nesting -- a flat nest has no nesting at all
-        # and is exactly the case with the most to gain from cutting near where
-        # the torch already is.
-        ownership = {}
-        for op in result.operations:
-            base = getattr(op, "Base", None)
-            if base and isinstance(base, (list, tuple)):
-                try:
-                    ownership[op] = base[0][0]
-                except (TypeError, IndexError):
-                    pass
+            # Built unconditionally, not under `if nestings`. Ordering by where
+            # the parts sit needs to know which part each operation cuts, and
+            # that has nothing to do with hole nesting -- a flat nest has no
+            # nesting at all and is exactly the case with the most to gain from
+            # cutting near where the torch already is.
+            ownership = {}
+            for op in result.operations:
+                base = getattr(op, "Base", None)
+                if base and isinstance(base, (list, tuple)):
+                    try:
+                        ownership[op] = base[0][0]
+                    except (TypeError, IndexError):
+                        pass
 
-        # Compared as ENTRIES, not as the base operations that are passed in:
-        # `ordered` comes back translated to the outermost dressups, so comparing
-        # it against the base operations would report every entry as moved every
-        # time, however little actually changed.
-        before = [result.entry_of.get(id(o), o) for o in result.operations]
-        ordered = order_operations(replay.job, result.operations, nestings,
-                                   ownership, footprints,
-                                   entry_of=result.entry_of)
-        FreeCAD.Console.PrintMessage(
-            "Footprints: %d sliced, %d reused, across %d nesting(s).\n"
-            % (footprints.misses, footprints.hits, len(nestings)))
-        if list(ordered) != before:
-            # Counted, not listed. At 98 operations the "a then b then c" form
-            # ran to several thousand characters of labels in the Report view
-            # and said nothing actionable. What is worth saying is how much
-            # moved and under which rule.
-            moved = sum(1 for a, b in zip(before, ordered) if a is not b)
-            outcome.ordering.append(
-                "%s: %d of %d operation(s) reordered -- a part is finished "
-                "before another is started, working across the sheet from the "
-                "corner in; %d part(s) nested in another's hole are finished "
-                "before that hole is cut"
-                % (outcome.sheet_label, moved, len(ordered), len(nestings))
-            )
+            # Compared as ENTRIES, not as the base operations that are passed
+            # in: `ordered` comes back translated to the outermost dressups, so
+            # comparing it against the base operations would report every entry
+            # as moved every time, however little actually changed.
+            before = [result.entry_of.get(id(o), o) for o in result.operations]
+            ordered = order_operations(replay.job, result.operations, nestings,
+                                       ownership, footprints,
+                                       entry_of=result.entry_of)
+            FreeCAD.Console.PrintMessage(
+                "Footprints: %d sliced, %d reused, across %d nesting(s).\n"
+                % (footprints.misses, footprints.hits, len(nestings)))
+            if list(ordered) != before:
+                # Counted, not listed. At 98 operations the "a then b then c"
+                # form ran to several thousand characters of labels in the
+                # Report view and said nothing actionable. What is worth
+                # saying is how much moved and under which rule.
+                moved = sum(1 for a, b in zip(before, ordered) if a is not b)
+                outcome.ordering.append(
+                    "%s: %d of %d operation(s) reordered -- a part is finished "
+                    "before another is started, working across the sheet from "
+                    "the corner in; %d part(s) nested in another's hole are "
+                    "finished before that hole is cut"
+                    % (outcome.sheet_label, moved, len(ordered), len(nestings))
+                )
     except Exception as exc:
         outcome.errors.append(
             "Could not order the operations for %s: %s" % (outcome.sheet_label, exc)
@@ -3983,7 +4071,8 @@ def _mark_unverified(replay, outcome):
 
 
 def replay_layout(doc, layout_group, source_job, post_processor=None,
-                  template_path=None, job_factory=None, progress_callback=None):
+                  template_path=None, job_factory=None, progress_callback=None,
+                  cancel_check=None, sheets=None):
     """Replay `source_job` onto every sheet of `layout_group`.
 
     Returns a list of `SheetOutcome`, one per sheet. A sheet that fails does
@@ -3995,13 +4084,28 @@ def replay_layout(doc, layout_group, source_job, post_processor=None,
     multi-sheet run can be told apart. Default `None`, so the harness runs this
     with no callback at all and is unaffected. See `Progress` for why the
     callback is shaped this way rather than like the nester's.
+
+    `cancel_check()` is polled at every point the pipeline can stop, and returns
+    True to ask for the run to finish. It is a poll rather than a callback
+    because the thing holding the Cancel button lives on the GUI thread, where
+    this runs, and a boolean read is all that needs to cross. Cancelling keeps
+    what was built and marks the job `_UNVERIFIED` rather than deleting it -- an
+    operator who cancels wants to see how far it got.
+
+    `sheets` restricts the run to a subset of the layout's sheets, in the
+    order given. `None`, the default, means all of them. It exists because a
+    per-sheet progress display has to open and close around each sheet, and
+    without it the only way to do that is to call `replay_sheet` directly and
+    lose this function's error handling.
     """
     from ...freecad_helpers import get_sheet_groups
 
     outcomes = []
-    for sheet in get_sheet_groups(layout_group):
+    for sheet in (sheets if sheets is not None
+                  else get_sheet_groups(layout_group)):
         progress = Progress(progress_callback,
-                            prefix=getattr(sheet, "Label", "") or "")
+                            prefix=getattr(sheet, "Label", "") or "",
+                            cancel_check=cancel_check)
         outcome = replay_sheet(
             doc, layout_group, sheet, source_job,
             post_processor=post_processor, template_path=template_path,

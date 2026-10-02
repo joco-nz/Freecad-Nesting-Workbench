@@ -150,13 +150,42 @@ class ReplayCAMSetupCommand:
         # selected and the layout in front of them; see the module docstring
         # for what the dialog used to ask and why it was removed.
         #
+        # The progress display is opened per sheet rather than once for the
+        # run, because `replay_layout` reports one sheet at a time and a
+        # panel that kept the first sheet's label through the second would be
+        # describing the wrong sheet. The seam is the same either way.
+        #
+        # `ReplayTaskProgress` closes itself on the way out of every path,
+        # including an exception. A task dialog left open keeps FreeCAD's
+        # document un-editable until something closes it, which is a poor way
+        # to end a session because one replay went wrong.
+        #
         # Timed here, at the one place that spans the whole run. `Progress`
         # banks each stage's seconds as it goes, so this is only a subtraction
         # at the end -- but it has to be at this level, because a per-sheet
         # number cannot be compared against a whole-run one.
+        from freecad.nestingworkbench.Tools.Cam.replay_progress import (
+            ReplayTaskProgress,
+        )
+
         started = time.perf_counter()
+        outcomes = []
+        cancelled_at = None
         try:
-            outcomes = cam_replay.replay_layout(doc, layout_group, source_job)
+            for position, sheet in enumerate(sheets):
+                with ReplayTaskProgress(sheet.Label) as task:
+                    outcomes.extend(cam_replay.replay_layout(
+                        doc, layout_group, source_job,
+                        sheets=(sheet,),
+                        progress_callback=task.callback,
+                        cancel_check=task.cancelled))
+                if task.cancelled:
+                    # Cancelling stops the run, not the sheet. Carrying on would
+                    # open a panel for the next sheet and start working on it
+                    # while the user is still looking at the Cancel button they
+                    # just pressed.
+                    cancelled_at = position
+                    break
         except Exception as exc:
             FreeCAD.Console.PrintError("Replay failed: %s\n" % exc)
             import traceback
@@ -164,9 +193,13 @@ class ReplayCAMSetupCommand:
             return
         wall_clock = time.perf_counter() - started
 
-        self._report(layout_group, source_job, outcomes, wall_clock)
+        self._report(layout_group, source_job, outcomes, wall_clock,
+                     cancelled_at=cancelled_at,
+                     skipped=[s.Label for s in sheets[cancelled_at + 1:]]
+                     if cancelled_at is not None else [])
 
-    def _report(self, layout_group, source_job, outcomes, wall_clock=None):
+    def _report(self, layout_group, source_job, outcomes, wall_clock=None,
+                cancelled_at=None, skipped=()):
         """Print the whole run to the Report view and raise a dialog for it.
 
         Console output rather than `FreeCADGui.ReportView`, because Console
@@ -182,6 +215,12 @@ class ReplayCAMSetupCommand:
                       if o.replay_job is not None
                       and o.verification is not None and not o.verification.ok]
 
+        if skipped:
+            lines.append("")
+            lines.append(
+                "Cancelled. %d sheet(s) were not replayed at all: %s."
+                % (len(skipped), ", ".join(skipped))
+            )
         if unverified:
             lines.append("")
             lines.append(
@@ -218,12 +257,18 @@ class ReplayCAMSetupCommand:
         if failed:
             QtWidgets.QMessageBox.critical(
                 FreeCADGui.getMainWindow(),
-                "CAM Replay failed",
+                "CAM Replay cancelled" if cancelled_at is not None
+                else "CAM Replay failed",
+                ("You cancelled the replay, so what was built is incomplete.%s\n\n"
+                 if cancelled_at is not None else "") +
                 "%d of %d sheet(s) did not replay cleanly.\n\n"
                 "Jobs that failed verification are kept in the document, "
                 "labelled %s, so you can inspect them. Do not post from them.\n\n"
                 "See the Report view for detail."
-                % (len(failed), len(outcomes), cam_replay.UNVERIFIED_SUFFIX)
+                % ("\n\n%d sheet(s) were not started." % len(skipped)
+                   if skipped else "",
+                   len(failed), len(outcomes) + len(skipped),
+                   cam_replay.UNVERIFIED_SUFFIX)
             )
         else:
             QtWidgets.QMessageBox.information(

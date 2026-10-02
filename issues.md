@@ -1017,3 +1017,71 @@ The timings are printed on every run and are not behind a preference. Every
 figure that got this feature from 43.5s to 10.7s was measured this way, and a
 timing nobody can see is a timing nobody re-measures after a change makes it
 worse.
+
+## NEST-018 — Tasks panel progress, and cancellation did not exist
+
+The `Progress` seam had a callback and no consumer. Worse, it had no notion of
+being stopped at all: **a Cancel button would have been a control that did
+nothing.** Cancelling is an engine feature and the engine did not have one.
+
+### What the panel shows, and what it refuses to show
+
+There is no overall percentage, because there is no honest one. From NEST-017:
+
+    Ordering and tidying the tool table   35.1%
+    Replaying the recipe                  34.0%
+    Recomputing the toolpaths             24.7%
+
+Ordering is a third of the run and reports `total == 0` — it is a single
+indivisible call. A bar ticking once per operation would sit still for nearly
+four seconds and then jump, which is worse than no bar because it looks broken.
+
+So the bar is **within** the current stage and says so. A stage with no
+countable work gets Qt's marquee and the words "this stage reports no progress",
+which is the truth about it. The elapsed clock and "stage N of 7" are always
+visible, so something genuinely increases even when the bar cannot move.
+
+`ReplayProgressView` is pure — no Qt, no event loop — and is what the tests
+cover. The widget only draws what it is told. A progress bar cannot be
+exercised headless, and one that has been looked at once is indistinguishable
+from one that does not work.
+
+The replay is synchronous on the GUI thread, so the widget is not painted until
+the replay finishes unless the event loop is pumped. `FreeCADGui.updateGui()` on
+each event is the whole fix, and is what FreeCAD's own modules use for it.
+
+### Cancel: keeping what was built, and two bugs on the way
+
+A cancelled replay **keeps** its job and labels it `_UNVERIFIED`. Deleting it
+would be the wrong instinct — an operator who cancels wants to see how far it
+got, and that is also what makes a cancel debuggable.
+
+The polling model: the engine takes `cancel_check()` and reads it at every point
+it can stop. A widget that fell over on the way to being asked is *not* a
+request to stop, so a raising check disables cancellation rather than firing it.
+
+**Bug 1 — cancellation was 23 operations late.** The poll sat at the recipe-item
+boundary in pass two. The fixture's first step lands on 23 parts, so a cancel
+ran 23 operations past. Now polled per copy; each copy owns its own stack, so
+breaking there leaves nothing half-built.
+
+**Bug 2 — cancelling reached the NEST-015 failure by another road.** This is the
+interesting one. Pass one builds *every* base operation before pass two dresses
+them, so after a cancel `result.operations` is complete while the Operations
+list holds only the stacks that were finished. `order_operations` reads that
+mismatch as "repopulate" and writes the bare operations over the entries.
+
+Measured: cancelled 5 operations in, and the list came back holding **98 bare
+operations of 98**, with every dressup orphaned and unlisted — the exact
+NEST-015 signature, reached by a different path. The ordering step now does not
+run at all on a cancelled replay, and the harness asserts the invariant on that
+path (negative control: removing the guard reproduces 94 bare of 98).
+
+Cancellation also stops the *run*, not the sheet. Carrying on opened a panel for
+the next sheet and started working on it while the user was still looking at the
+Cancel button they had just pressed.
+
+### Still to verify
+
+The panel has not been seen in a running FreeCAD. `ReplayProgressView` is tested
+and the engine paths are tested against real FreeCAD objects; the Qt half is not.
