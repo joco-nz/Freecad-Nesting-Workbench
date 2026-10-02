@@ -797,3 +797,50 @@ suspected but not established.
 plate would cut a straight gouge where the outline should be. Fixing it means
 root-causing the projection, which needs a fixture whose top face is *not* on
 the stock top, to tell "Z frame" apart from "face on the stock top".
+
+## NEST-015 — hole-nesting reordering left every dressup unlisted
+
+**Pre-existing. Found while starting the position-ordering work (Q3), which is
+blocked until it is fixed.**
+
+`order_operations` is handed `ReplayResult.operations`, which are the **base**
+operations, and it wrote that list straight into `job.Operations.Group`. The
+group is supposed to hold the **outermost dressup** of each step -- the rule is
+stated three times in this module and in the fixture validator, and violating it
+puts every contour in the job twice.
+
+Measured on the committed fixture after the per-part split:
+
+    Operations.Group: 98 entries
+      dressups in the group: 0
+      bare operations:     98
+    in the whole document: 105 operations, 105 dressups
+
+So all 105 dressups were built, linked and **never listed**. They would not have
+been posted, which means the user's LeadInOut radii silently vanished from the
+toolpath -- while every structural check still passed, because the checks were
+looking at the base operations that *were* listed.
+
+**Why nothing caught it.** The dressup harness's fixture has no hole nesting, and
+`order_operations` returns early before the write when there is none. The real
+fixture has 15 nestings, so it writes. The two fixtures disagree about the one
+path that matters, and the one that exercises it had no coverage.
+
+**Fixed** with `ReplayResult.entry_of`, mapping `id(base operation)` to the
+outermost dressup wrapping it, filled in pass two where the stack is known.
+`order_operations` takes it and translates before writing.
+
+Two things that fell out of the same fix:
+
+* **Verification was checking the wrong objects.** `verify_replay` iterates
+  `result.operations`, so "98 of 98 operations with cutting motion" was a
+  statement about the *base* operations. The dressed entries -- the ones that
+  get posted -- were never verified. That claim is still true, but it was not
+  the claim it appeared to be.
+* The reordering note listed every label twice. At 98 operations that is several
+  thousand characters of `then` in the Report view. It now says how many
+  operations moved and under which rule.
+
+**Why it was missed for so long**: the invariant "a dressed operation's list
+entry is its dressup" was verified in three places, all of which exercised a
+path that never writes. The bug lived in the one path that does.

@@ -2311,9 +2311,19 @@ class ReplayResult:
     `failures` holds human-readable strings for anything that could not be
     replayed. A replay that silently dropped an operation would produce a job
     that cuts less than the source, and nothing would say so.
+
+    `entry_of` maps `id(base operation)` to **the outermost dressup wrapping
+    it**, and it is what `Operations.Group` must list. `operations` is not: a
+    dressed operation's list entry is its dressup, never the operation beneath
+    it. Without this map the ordering step wrote the base operations over the
+    dressup entries -- measured, 98 entries of which **0 were dressups**, with
+    all 105 dressups left built, linked and unlisted. They would not have been
+    posted, so the user's lead-in and lead-out would have silently vanished from
+    the toolpath while every structural check still passed.
     """
 
     def __init__(self):
+        self.entry_of = {}
         self.operations = []
         self.dressups = []
         self.failures = []
@@ -2707,6 +2717,10 @@ def replay_recipe(recipe, job, clones, tool_cache=None,
 
             if built_any or not item.dressups:
                 ordered.append(outermost)
+                # What belongs in `Operations.Group` for this copy. Recorded
+                # rather than left implicit, because the ordering step is handed
+                # the BASE operations and has to write these instead.
+                result.entry_of[id(new_op)] = outermost
 
     # One write, in recipe order. See `set_operation_order`.
     set_operation_order(job, ordered)
@@ -3041,13 +3055,25 @@ def operation_touches_hole(operation, part, cache=None):
     return False
 
 
-def order_operations(job, operations, nestings, ownership=None, cache=None):
+def order_operations(job, operations, nestings, ownership=None, cache=None,
+                     entry_of=None):
     """Reorder `job`'s Operations.Group so hole nesting is respected.
 
     `operations` is the replayed operations in recipe order -- the user's own
     order. `nestings` is the `(outer, inner)` pairs from
     `find_hole_nestings`. `ownership` maps an operation to the part it cuts,
     needed to tell which side of a nesting it belongs to.
+
+    **`entry_of` maps `id(operation)` to the outermost dressup wrapping it, and
+    it is what gets written.** The group must list the dressup, never the
+    operation beneath it. This function is handed the base operations, because
+    that is what the ordering decisions are about, so writing what it was given
+    replaced every list entry with a bare operation: measured, 98 entries of
+    which **0 were dressups**, with all 105 dressups built, linked and unlisted.
+    They would not have been posted, so the user's lead-in and lead-out would
+    have silently vanished from the toolpath while every structural check still
+    passed. The dressup harness missed it because its fixture has no hole
+    nesting, and this write is only reached when there is one.
 
     Returns the new order. When there are no nestings, or nothing is out of
     order, the group is left alone entirely -- a run that does not need
@@ -3111,6 +3137,12 @@ def order_operations(job, operations, nestings, ownership=None, cache=None):
         ordered.append(chosen)
         placed.add(id(chosen))
         remaining.remove(chosen)
+
+    if entry_of:
+        # Translate before writing. The sort ran over base operations; the list
+        # holds their outermost dressups. Without this the group ends up holding
+        # bare operations and every dressup is built, linked and never posted.
+        ordered = [entry_of.get(id(op), op) for op in ordered]
 
     if group is not None and ordered != list(group):
         job.Operations.Group = ordered
@@ -3677,18 +3709,30 @@ def replay_sheet(doc, layout_group, sheet_group, source_job, post_processor=None
                         ownership[op] = base[0][0]
                     except (TypeError, IndexError):
                         pass
-            before = [getattr(o, "Label", "?") for o in result.operations]
+            # Compared as ENTRIES, not as the base operations that were passed
+            # in: `ordered` comes back translated to the outermost dressups, so
+            # comparing it against the base operations would report every entry
+            # as moved every time, however little actually changed.
+            before = [result.entry_of.get(id(o), o) for o in result.operations]
             ordered = order_operations(replay.job, result.operations, nestings,
-                                       ownership, footprints)
+                                       ownership, footprints,
+                                       entry_of=result.entry_of)
             FreeCAD.Console.PrintMessage(
                 "Footprints: %d sliced, %d reused, across %d nesting(s).\n"
                 % (footprints.misses, footprints.hits, len(nestings)))
-            after = [getattr(o, "Label", "?") for o in ordered]
-            if before != after:
+            if list(ordered) != before:
+                # Counted, not listed. At 98 operations the "a then b then c"
+                # form ran to thousands of characters and said nothing actionable.
+                # At 98 operations the "a then b then c" form ran to several
+                # thousand characters of labels in the Report view and said
+                # nothing actionable. What is worth saying is how much moved
+                # and under what rule.
+                moved = sum(1 for a, b in zip(before, ordered) if a is not b)
                 outcome.ordering.append(
-                    "%s: reordered for hole nesting, %s -> %s"
-                    % (outcome.sheet_label, " then ".join(before),
-                       " then ".join(after))
+                    "%s: %d of %d operation(s) reordered, so that a part nested "
+                    "in another's hole is finished before that hole is cut "
+                    "(%d nesting(s) found)"
+                    % (outcome.sheet_label, moved, len(ordered), len(nestings))
                 )
     except Exception as exc:
         outcome.errors.append(
