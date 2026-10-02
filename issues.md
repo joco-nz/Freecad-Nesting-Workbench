@@ -606,3 +606,64 @@ directly. `App.Document` is immutable; an instance attribute cannot be set.
 half a second and then sit on one stage for 43, which is reporting a symptom.
 The work worth doing is in `find_hole_nestings` and in not recomputing when
 `order_operations` changed nothing.
+
+## NEST-012 — the replay took 43 seconds
+
+Raised as "the command has no progress feedback while it works". Two thirds of
+the time turned out to be doing the same work twice.
+
+**Measured, on the committed fixture, `replay_layout` = 43.5 s.** The
+instrument was the `Progress` seam: per-stage elapsed time attributed to the
+previous event rather than to the last event of that stage. Keying it on the
+stage name instead gave the first event of each stage the whole elapsed run,
+which put 43 of the 44 seconds on verification -- and verification costs
+**0.05 s**. The prior guess, that the cost was toolpath generation, was also
+wrong. Both mistakes are recorded because both produced a confident answer.
+
+**Where it actually went:**
+
+    find_hole_nestings                            7.50s
+    order_operations                             11.71s
+    doc.recompute()  (the one that matters)       24.05s
+    everything else, including five recomputes     0.06s
+                                                ---------
+                                                 43.50s
+
+**The five "incidental" recomputes were not worth removing.** `adopt` twice,
+`create_replay_job` twice, and the staging group, measured 0.003 s to 0.025 s
+each -- 55 ms together. They are already effectively a single recompute, because
+at those points almost nothing is touched yet. The proposal to collapse them
+into one at the end was correct in principle and worth nothing in practice.
+
+**`order_operations` was re-slicing shapes it had already been given.**
+`operation_touches_hole` calls `part_footprint(geometry)` on every invocation,
+and `order_operations` calls it inside a per-nesting comprehension. Measured:
+**21 calls over 3 distinct shapes.** `part_footprint` slices with OCC and
+discretises the wires -- 543 ms on the first call, ~150 ms after. That
+duplication was 11.40 s of the 11.71 s. Fixed with `FootprintCache`, scoped to
+one sheet's run: a module-level cache would go stale, since a shape can be
+edited while its object `Name` stays the same and `id()` is reused after
+collection.
+
+**`find_hole_nestings` sliced all 48 parts to test pairs.** A footprint is
+sliced out of its own shape, so it lies within that shape's extent; an inner
+part inside an outer part's hole must therefore have an overlapping box. Every
+pair whose boxes are disjoint can be dropped without slicing. Measured on the
+fixture: **2256 ordered pairs reduced to 34, and 48 slices reduced to 21**,
+with all 15 real nestings kept. On a nest with no hole nesting, where no two
+parts' boxes touch, the cost is zero slices.
+
+**Result: 43.5 s -> 27.5 s**, same 15 nestings, same 7 operations, same
+verification, 0 failures. `21 sliced, 68 reused`.
+
+**What remains is not waste.** The 24 s `doc.recompute()` executes seven
+`Path::FeaturePython` operations -- seven `Profile*_replay` under seven
+`DressupLeadInOut*_replay` -- over 23 nested parts each, which is 161 real
+toolpath computations. Those happen exactly once: the earlier recomputes all
+precede `replay_recipe`, so no operation exists yet when they run.
+
+Note that touching the seven `Operations.Group` entries and recomputing costs
+**0.05 s**, which looks like proof that no toolpath work happens. It is not:
+those entries are the outermost *dressups*, and touching one does not propagate
+to the operation beneath it. Both the profiles and the dressups are touched, and
+the profiles are where the 24 s goes.

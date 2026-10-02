@@ -113,7 +113,9 @@ def test_preserves_the_user_order_where_the_constraints_allow(monkeypatch):
 
     monkeypatch.setattr(
         cam_replay, "operation_touches_hole",
-        lambda op, part: op.Label in ("HoleB", "HoleC"))
+        # `cache` is a third positional argument, passed so ordering can share
+        # the footprints `find_hole_nestings` already sliced.
+        lambda op, part, cache=None: op.Label in ("HoleB", "HoleC"))
 
     operations = [perimeter, hole_b, hole_c, inner_op]
     ownership = {perimeter: outer, hole_b: outer, hole_c: outer, inner_op: inner}
@@ -197,6 +199,169 @@ class TestFindHoleNestings:
 
     def test_empty_input(self):
         assert find_hole_nestings([]) == []
+
+
+class _Boxed:
+    """A part stand-in that also has a shape, for the bounding-box prune.
+
+    The prune reads `part.Shape.BoundBox`. Without a box a part cannot be
+    pruned on evidence, so it is treated as overlapping everything -- which is
+    why every other test here still passes without one.
+    """
+
+    def __init__(self, label, x0, y0, x1, y1):
+        self.Label = label
+        box = type("_B", (), {"XMin": x0, "YMin": y0, "XMax": x1,
+                              "YMax": y1})()
+        shape = type("_S", (), {"BoundBox": box, "isNull": lambda s: False})()
+        self.Shape = shape
+
+
+class TestTheBoundingBoxPrune:
+    """The prune exists for speed, so every check here is about soundness.
+
+    Dropping a real nesting would silently produce the wrong operation order,
+    which cuts the hole before the part it holds and drops it on the floor.
+    That is the failure mode, so the prune is only allowed to be wrong in the
+    other direction: keeping a pair that turns out not to nest.
+    """
+
+    def test_it_does_not_slice_parts_whose_boxes_are_disjoint(self, monkeypatch):
+        calls = []
+
+        def counting(part, **kwargs):
+            calls.append(part.Label)
+            return _plain_fp((0, 0, 1, 1))
+
+        far = _Boxed("Far", 500, 500, 520, 520)
+        near = _Boxed("Near", 0, 0, 20, 20)
+        monkeypatch.setattr(cam_replay, "part_footprint", counting)
+        assert find_hole_nestings([far, near]) == []
+        # One slice at most: the near one is asked for as a possible outer, and
+        # with no interiors it cannot host anything.
+        assert len(calls) <= 2
+
+    def test_a_nest_with_no_overlapping_boxes_slices_nothing(self, monkeypatch):
+        monkeypatch.setattr(
+            cam_replay, "part_footprint",
+            lambda p, **k: pytest.fail("sliced a part the prune should have "
+                                       "removed: %r" % p.Label))
+        parts = [_Boxed("A", 0, 0, 10, 10), _Boxed("B", 100, 0, 110, 10),
+                 _Boxed("C", 0, 100, 10, 110)]
+        assert find_hole_nestings(parts) == []
+
+    def test_it_keeps_a_nesting_whose_boxes_overlap(self, monkeypatch):
+        plate = _Boxed("Plate", -40, -40, 40, 40)
+        plug = _Boxed("Plug", -10, -10, 10, 10)
+        monkeypatch.setattr(cam_replay, "part_footprint", lambda p, **k: {
+            "Plate": _hole_fp((-40, -40, 40, 40), (-25, -25, 25, 25)),
+            "Plug": _plain_fp((-10, -10, 10, 10)),
+        }[p.Label])
+        assert find_hole_nestings([plate, plug]) == [(plate, plug)]
+
+    def test_a_part_with_no_readable_box_is_never_pruned(self, monkeypatch):
+        # The stand-ins used everywhere else have no `Shape` at all. They must
+        # keep working, so an unreadable box means "may overlap anything".
+        plate = _Part("Plate")
+        plug = _Part("Plug")
+        monkeypatch.setattr(cam_replay, "part_footprint", lambda p, **k: {
+            "Plate": _hole_fp((-40, -40, 40, 40), (-25, -25, 25, 25)),
+            "Plug": _plain_fp((-10, -10, 10, 10)),
+        }[p.Label])
+        assert find_hole_nestings([plate, plug]) == [(plate, plug)]
+
+    def test_a_null_shape_is_still_consulted_rather_than_pruned(self, monkeypatch):
+        # The prune must not treat an unreadable box as "empty" and drop the
+        # pair before the footprint is ever asked for. With the footprint
+        # stubbed to a real polygon, the pair nests -- which is the point: the
+        # decision came from the footprint, not from the missing box.
+        nullish = _Part("Null")
+        nullish.Shape = type("_S", (), {"isNull": lambda s: True})()
+        plate = _Part("Plate")
+        asked = []
+        monkeypatch.setattr(cam_replay, "part_footprint", lambda p, **k: (
+            asked.append(p.Label),
+            {"Plate": _hole_fp((-40, -40, 40, 40), (-25, -25, 25, 25)),
+             "Null": _plain_fp((-10, -10, 10, 10))}[p.Label])[1])
+        assert find_hole_nestings([plate, nullish]) == [(plate, nullish)]
+        assert "Null" in asked
+
+    def test_the_prune_does_not_change_the_order_of_results(self, monkeypatch):
+        # `order_operations` consumes these in sequence, so a different order
+        # for the same nestings could change what it does.
+        parts = [_Boxed("P%d" % i, i * 2, 0, i * 2 + 8, 8) for i in range(4)]
+        fps = {
+            p.Label: (_hole_fp((p.Shape.BoundBox.XMin, -40,
+                                p.Shape.BoundBox.XMax, 40), (-5, -5, 5, 5))
+                      if p.Label == "P0" else _plain_fp((-2, -2, 2, 2)))
+            for p in parts}
+        monkeypatch.setattr(cam_replay, "part_footprint",
+                            lambda p, **k: fps[p.Label])
+        got = find_hole_nestings(parts)
+        assert [inner.Label for _o, inner in got] == ["P1", "P2", "P3"]
+        assert all(outer.Label == "P0" for outer, _i in got)
+
+
+class TestFootprintCache:
+    """`operation_touches_hole` re-derived footprints `find_hole_nestings` had
+    already sliced: 21 calls over 3 distinct shapes, 11.40 s of the 11.71 s that
+    ordering took on the committed fixture."""
+
+    def test_it_computes_a_footprint_once_per_part(self, monkeypatch):
+        calls = []
+        monkeypatch.setattr(cam_replay, "part_footprint",
+                            lambda p, **k: calls.append(p.Label)
+                            or _plain_fp((0, 0, 1, 1)))
+        cache = cam_replay.FootprintCache()
+        part = _Part("A")
+        for _ in range(5):
+            cache.get(part)
+        assert calls == ["A"]
+        assert cache.misses == 1
+        assert cache.hits == 4
+
+    def test_it_caches_a_none_footprint_too(self, monkeypatch):
+        # None means "cannot tell", and callers treat it as a distinct answer.
+        # Caching it is what stops the same unknown being re-derived.
+        calls = []
+        monkeypatch.setattr(cam_replay, "part_footprint",
+                            lambda p, **k: calls.append(1) or None)
+        cache = cam_replay.FootprintCache()
+        part = _Part("A")
+        assert cache.get(part) is None
+        assert cache.get(part) is None
+        assert len(calls) == 1
+
+    def test_distinct_parts_get_distinct_footprints(self, monkeypatch):
+        monkeypatch.setattr(cam_replay, "part_footprint",
+                            lambda p, **k: _plain_fp((0, 0, 1, 1)))
+        cache = cam_replay.FootprintCache()
+        a, b = _Part("A"), _Part("B")
+        assert cache.get(a) is not cache.get(b)
+        assert cache.misses == 2
+
+    def test_no_cache_behaves_exactly_as_before(self, monkeypatch):
+        monkeypatch.setattr(cam_replay, "part_footprint",
+                            lambda p, **k: _plain_fp((0, 0, 1, 1)))
+        part = _Part("A")
+        assert cam_replay._footprint_for(part, None) is not None
+
+    def test_ordering_hands_the_cache_to_operation_touches_hole(self, monkeypatch):
+        # The wiring itself. `cache` is passed positionally because the tests
+        # replace this function with a `lambda *a: True`.
+        seen = []
+
+        def spy(op, part, cache=None):
+            seen.append(cache)
+            return True
+
+        outer, inner = _Part("x"), _Part("y")
+        a, b = _Operation("A"), _Operation("B")
+        cache = cam_replay.FootprintCache()
+        monkeypatch.setattr(cam_replay, "operation_touches_hole", spy)
+        order_operations(_Job([a, b]), [a, b], [(outer, inner)],
+                         {a: outer, b: inner}, cache)
+        assert seen and all(c is cache for c in seen)
 
 
 # -- hole-cutting classification ----------------------------------------
