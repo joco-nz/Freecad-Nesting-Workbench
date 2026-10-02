@@ -101,6 +101,8 @@ creates no objects, which is what makes it testable under plain pytest with
 stand-in objects. The flattener (`flatten_sheet` and what it calls) does
 create objects, and is covered by the freecadcmd harness instead.
 """
+import math
+
 import FreeCAD
 
 # -- job creation ---------------------------------------------------------
@@ -2840,6 +2842,26 @@ def _footprint_for(part, cache):
     return cache.get(part)
 
 
+def part_position(part):
+    """Return `(x, y)` at the centre of `part`'s XY bounds, or None.
+
+    The XY centre, not the first vertex: nearest-neighbour travel is a coarse
+    preference and a representative point serves it. Returns None rather than a
+    guess when the bounds cannot be read, and the caller reads that as "no
+    position to prefer" rather than as the origin.
+    """
+    shape = getattr(part, "Shape", None)
+    if shape is None:
+        return None
+    try:
+        if shape.isNull():
+            return None
+        centre = shape.BoundBox.Center
+    except Exception:
+        return None
+    return (float(centre.x), float(centre.y))
+
+
 def _footprint_box(part):
     """Return `(x0, y0, x1, y1)` for `part`, or None if it cannot be read."""
     shape = getattr(part, "Shape", None)
@@ -3056,7 +3078,7 @@ def operation_touches_hole(operation, part, cache=None):
 
 
 def order_operations(job, operations, nestings, ownership=None, cache=None,
-                     entry_of=None):
+                     entry_of=None, start_point=None):
     """Reorder `job`'s Operations.Group so hole nesting is respected.
 
     `operations` is the replayed operations in recipe order -- the user's own
@@ -3075,17 +3097,29 @@ def order_operations(job, operations, nestings, ownership=None, cache=None,
     passed. The dressup harness missed it because its fixture has no hole
     nesting, and this write is only reached when there is one.
 
-    Returns the new order. When there are no nestings, or nothing is out of
-    order, the group is left alone entirely -- a run that does not need
-    reordering should not churn the document.
+    **`start_point` is where the chain begins**, XY, defaulting to the sheet
+    origin. The parts have already been moved to sheet-local coordinates, so
+    (0, 0) is a corner of the sheet rather than an arbitrary point in space.
 
-    The sort is a topological sort that breaks ties by the original order, so
-    the user's sequence is preserved wherever the constraints allow it. That is
-    the whole point: the replay reproduces what the user set up, and only moves
-    what physically has to move.
+    Returns the new order. When there is nothing to order -- no operations, or
+    none of them carrying a part whose position can be read -- the group is left
+    alone entirely: a run that cannot improve the order should not churn the
+    document. An order that turns out unchanged is not written either.
+
+    Two rules decide the order among operations that are free to go anywhere:
+
+    * **Where things are.** The parts have been laid out by the nest, so their
+      positions on the sheet are real, and cutting near where the torch already
+      is costs less than cutting far away. A single-part source job says nothing
+      about where to go between its parts, because it never had any. This fills
+      that in rather than overriding a choice the user made.
+    * **A part is finished before another is started.** Not a preference between
+      equal options -- leaving a part half cut and returning to it is a round
+      trip, and the return costs more than the entire chain of nearest-neighbour
+      decisions saves.
     """
     group = getattr(getattr(job, "Operations", None), "Group", None)
-    if not group or not nestings or not operations:
+    if not group or not operations:
         return list(operations)
 
     by_part = ownership or {}
@@ -3096,8 +3130,7 @@ def order_operations(job, operations, nestings, ownership=None, cache=None,
     # Constraint: for each nesting, every hole-cutting op on `outer` must come
     # after every op that cuts `inner`.
     later_than = {id(op): set() for op in operations}
-    has_constraint = False
-    for outer, inner in nestings:
+    for outer, inner in nestings or ():
         # `cache` goes positionally on purpose. The tests replace
         # `operation_touches_hole` with `lambda *a: True`, which takes no
         # keyword arguments, so passing it by name would break every one of them.
@@ -3111,14 +3144,64 @@ def order_operations(job, operations, nestings, ownership=None, cache=None,
             for other in inner_ops:
                 if id(op) != id(other):
                     later_than[id(op)].add(id(other))
-                    has_constraint = True
 
-    if not has_constraint:
-        return list(operations)
+    # A part's own steps keep their source order -- as a hard constraint, not as
+    # a tie-break preference.
+    #
+    # It has to be hard, because the two rules the user gave can otherwise be
+    # satisfied in the wrong order. On the committed fixture the spacers carry
+    # two hole steps then their outer boundary (Profile004, Profile005,
+    # Profile006), and hole nesting holds the two hole steps back until the
+    # nested parts are finished. With within-part order left to the tie-break,
+    # the boundary step was not held back with them, so it went first and the
+    # result was boundary-then-holes on both spacers -- measured, source indices
+    # [96, 92, 94] and [97, 93, 95]. That frees the spacer before the parts
+    # nested in its hole have been machined, and the parts fall out.
+    #
+    # Chained in source order, so the boundary is held behind the holes, and the
+    # holes are held behind the nested parts. That is the user's rule 3 -- all
+    # of a part's internal work before its boundary -- falling out of the
+    # nesting constraint rather than being enforced beside it.
+    steps_by_part = {}
+    for op in operations:
+        part = part_of.get(id(op))
+        if part is not None:
+            steps_by_part.setdefault(part, []).append(op)
+    for steps in steps_by_part.values():
+        for earlier, later in zip(steps, steps[1:]):
+            later_than[id(later)].add(id(earlier))
 
-    # Stable topological sort, preferring the original order at every step.
+    # Topological sort, with the free choices made by position rather than by
+    # the original order.
+    #
+    # **What the tie-break must not break.** Two things, and both are the user's:
+    #
+    #   * A part's own steps stay in the order they were written. That is
+    #     already a hard constraint by this point, so it cannot be broken here.
+    #     What is left is a preference for doing them back to back.
+    #   * Hole nesting stays hard. `ready` only ever offers operations whose
+    #     constraints are already satisfied, so no preference is consulted for an
+    #     operation that cannot legally go here yet.
+    #
+    # The first is why staying on the current part outranks distance: leaving a
+    # part half done to start a nearer one, and coming back for it, costs more
+    # travel than the distance saved.
     order = list(operations)
     position = {id(op): i for i, op in enumerate(order)}
+    where = {}
+    for op in operations:
+        part = part_of.get(id(op))
+        where[id(op)] = part_position(part) if part is not None else None
+
+    # A part with no readable position is not skipped and does not stop the sort.
+    # Position is a preference and the nesting constraints are a requirement, so
+    # when no position can be read the tie-break falls back to the source order
+    # and the constraints are still honoured. Bailing out instead would drop a
+    # real hole-nesting constraint because a bounding box could not be read.
+
+    cursor = list(start_point) if start_point else [0.0, 0.0]
+    current_part = None
+
     remaining = list(order)
     ordered = []
     placed = set()
@@ -3133,10 +3216,25 @@ def order_operations(job, operations, nestings, ownership=None, cache=None,
             # for the rest rather than looping, and say so.
             ordered.extend(remaining)
             break
-        chosen = min(ready, key=lambda op: position[id(op)])
+
+        def rank(op):
+            source = position[id(op)]
+            if current_part is not None and part_of.get(id(op)) is current_part:
+                return (0.0, source)
+            at = where[id(op)]
+            if at is None:
+                return (float("inf"), source)
+            return (math.hypot(at[0] - cursor[0], at[1] - cursor[1]), source)
+
+        chosen = min(ready, key=rank)
         ordered.append(chosen)
         placed.add(id(chosen))
         remaining.remove(chosen)
+        if part_of.get(id(chosen)) is not current_part:
+            current_part = part_of.get(id(chosen))
+            at = where[id(chosen)]
+            if at is not None:
+                cursor = [at[0], at[1]]
 
     if entry_of:
         # Translate before writing. The sort ran over base operations; the list
@@ -3700,40 +3798,45 @@ def replay_sheet(doc, layout_group, sheet_group, source_job, post_processor=None
         # and the ordering step did it 21 times over 3 distinct shapes.
         footprints = FootprintCache()
         nestings = find_hole_nestings(replay.clones, footprints)
-        if nestings:
-            ownership = {}
-            for op in result.operations:
-                base = getattr(op, "Base", None)
-                if base and isinstance(base, (list, tuple)):
-                    try:
-                        ownership[op] = base[0][0]
-                    except (TypeError, IndexError):
-                        pass
-            # Compared as ENTRIES, not as the base operations that were passed
-            # in: `ordered` comes back translated to the outermost dressups, so
-            # comparing it against the base operations would report every entry
-            # as moved every time, however little actually changed.
-            before = [result.entry_of.get(id(o), o) for o in result.operations]
-            ordered = order_operations(replay.job, result.operations, nestings,
-                                       ownership, footprints,
-                                       entry_of=result.entry_of)
-            FreeCAD.Console.PrintMessage(
-                "Footprints: %d sliced, %d reused, across %d nesting(s).\n"
-                % (footprints.misses, footprints.hits, len(nestings)))
-            if list(ordered) != before:
-                # Counted, not listed. At 98 operations the "a then b then c"
-                # form ran to thousands of characters and said nothing actionable.
-                # At 98 operations the "a then b then c" form ran to several
-                # thousand characters of labels in the Report view and said
-                # nothing actionable. What is worth saying is how much moved
-                # and under what rule.
-                moved = sum(1 for a, b in zip(before, ordered) if a is not b)
-                outcome.ordering.append(
-                    "%s: %d of %d operation(s) reordered, so that a part nested "
-                    "in another's hole is finished before that hole is cut "
-                    "(%d nesting(s) found)"
-                    % (outcome.sheet_label, moved, len(ordered), len(nestings))
-                )
+
+        # Built unconditionally, not under `if nestings`. Ordering by where the
+        # parts sit needs to know which part each operation cuts, and that has
+        # nothing to do with hole nesting -- a flat nest has no nesting at all
+        # and is exactly the case with the most to gain from cutting near where
+        # the torch already is.
+        ownership = {}
+        for op in result.operations:
+            base = getattr(op, "Base", None)
+            if base and isinstance(base, (list, tuple)):
+                try:
+                    ownership[op] = base[0][0]
+                except (TypeError, IndexError):
+                    pass
+
+        # Compared as ENTRIES, not as the base operations that are passed in:
+        # `ordered` comes back translated to the outermost dressups, so comparing
+        # it against the base operations would report every entry as moved every
+        # time, however little actually changed.
+        before = [result.entry_of.get(id(o), o) for o in result.operations]
+        ordered = order_operations(replay.job, result.operations, nestings,
+                                   ownership, footprints,
+                                   entry_of=result.entry_of)
+        FreeCAD.Console.PrintMessage(
+            "Footprints: %d sliced, %d reused, across %d nesting(s).\n"
+            % (footprints.misses, footprints.hits, len(nestings)))
+        if list(ordered) != before:
+            # Counted, not listed. At 98 operations the "a then b then c" form
+            # ran to several thousand characters of labels in the Report view
+            # and said nothing actionable. What is worth saying is how much
+            # moved and under which rule.
+            moved = sum(1 for a, b in zip(before, ordered) if a is not b)
+            outcome.ordering.append(
+                "%s: %d of %d operation(s) reordered -- a part is finished "
+                "before another is started, working across the sheet from the "
+                "corner in; %d part(s) nested in another's hole are finished "
+                "before that hole is cut"
+                % (outcome.sheet_label, moved, len(ordered), len(nestings))
+            )
     except Exception as exc:
         outcome.errors.append(
             "Could not order the operations for %s: %s" % (outcome.sheet_label, exc)

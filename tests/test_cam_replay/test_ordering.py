@@ -79,7 +79,150 @@ def test_reorders_so_the_hole_is_cut_after_what_it_holds(monkeypatch):
     assert [o.Label for o in ordered] == ["PlugOutline", "PlateHole"]
 
 
-def test_leaves_the_group_alone_without_nestings(monkeypatch):
+class _At:
+    def __init__(self, x, y):
+        self.x, self.y = x, y
+
+
+class _Box:
+    def __init__(self, x, y):
+        self.Center = _At(x, y)
+
+
+class _Shape:
+    def __init__(self, x, y):
+        self.BoundBox = _Box(x, y)
+
+    def isNull(self):
+        return False
+
+
+class _Placed(_Part):
+    """A part that can be located on the sheet.
+
+    `_Part` on its own has no `Shape`, so `part_position` cannot place it. That
+    is deliberate -- it is how the "cannot be located" path is reached -- but it
+    also means these stubs have to be explicit about position.
+    """
+
+    def __init__(self, label, x, y, footprint=None):
+        _Part.__init__(self, label, footprint)
+        self.Shape = _Shape(x, y)
+
+
+def test_orders_by_where_the_parts_are_even_with_no_nesting_at_all(monkeypatch):
+    """A flat nest is the case with the most to gain, and has no constraints.
+
+    Nothing forces these three into any order, so the only thing to go on is
+    where they sit. The chain starts at the sheet origin and takes the nearest
+    each time: B at X 5, then C at X 50, then A out at X 100.
+    """
+    monkeypatch.setattr(cam_replay, "operation_touches_hole", lambda *a: False)
+    a = _Operation("A", _Placed("PA", 100, 0))
+    b = _Operation("B", _Placed("PB", 5, 0))
+    c = _Operation("C", _Placed("PC", 50, 0))
+
+    ordered = order_operations(_Job([a, b, c]), [a, b, c], [],
+                               {a: a.Base, b: b.Base, c: c.Base})
+    assert [o.Label for o in ordered] == ["B", "C", "A"]
+
+
+def test_finishes_a_part_before_starting_another(monkeypatch):
+    """Leaving a part half done and coming back is a round trip.
+
+    Part B is nearer to the cursor than part A's second step, but A's second
+    step is still on the part the torch is standing at. Taking it is free;
+    crossing to B and returning is not.
+    """
+    monkeypatch.setattr(cam_replay, "operation_touches_hole", lambda *a: False)
+    at_origin = _Placed("PA", 0, 0)
+    near = _Placed("PB", 1, 0)
+    far = _Placed("PC", 10, 0)
+    a1 = _Operation("A1", at_origin)
+    b1 = _Operation("B1", near)
+    a2 = _Operation("A2", at_origin)
+    c1 = _Operation("C1", far)
+
+    operations = [a1, b1, a2, c1]
+    ownership = {a1: at_origin, b1: near, a2: at_origin, c1: far}
+    ordered = order_operations(_Job(operations), operations, [], ownership)
+    assert [o.Label for o in ordered] == ["A1", "A2", "B1", "C1"]
+
+
+def test_a_parts_boundary_waits_for_its_own_holes(monkeypatch):
+    """A boundary must not overtake the holes cut into the same part.
+
+    This is the ordering the fixture measurement got wrong. The outer part's
+    steps are written holes-then-boundary, hole nesting holds the holes back
+    until the nested part is finished, and the boundary is not itself held by
+    nesting. Treating within-part order as a tie-break preference rather than a
+    constraint put the boundary first -- source indices [96, 92, 94] on
+    CAMPart_644 and [97, 93, 95] on CAMPart_645 -- which frees the spacer before
+    the parts nested in its hole have been machined.
+
+    The outer part sits on the origin here, so the tie-break is actively tempted
+    to take its boundary before travelling to the inner part.
+    """
+    outer, inner = _Placed("Outer", 0, 0), _Placed("Inner", 100, 0)
+    perimeter = _Operation("Perimeter", outer)
+    hole_b = _Operation("HoleB", outer)
+    hole_c = _Operation("HoleC", outer)
+    inner_op = _Operation("InnerCut", inner)
+
+    monkeypatch.setattr(
+        cam_replay, "operation_touches_hole",
+        lambda op, part, cache=None: op.Label in ("HoleB", "HoleC"))
+
+    operations = [hole_b, hole_c, perimeter, inner_op]
+    ownership = {perimeter: outer, hole_b: outer, hole_c: outer,
+                 inner_op: inner}
+    ordered = order_operations(_Job(operations), operations,
+                               [(outer, inner)], ownership)
+    assert [o.Label for o in ordered] == ["InnerCut", "HoleB", "HoleC",
+                                          "Perimeter"]
+
+
+def test_nesting_survives_parts_that_cannot_be_located(monkeypatch):
+    """Position is a preference; the nesting constraint is a requirement.
+
+    Neither part has a `Shape`, so there is nothing to order by. The constraint
+    must still be honoured -- an unreadable bounding box is no reason to cut a
+    spacer's hole before the part sitting in it.
+    """
+    outer, inner = _Part("Outer"), _Part("Inner")
+    hole_op = _Operation("PlateHole")
+    inner_op = _Operation("PlugOutline")
+    monkeypatch.setattr(cam_replay, "operation_touches_hole", lambda *a: True)
+
+    operations = [hole_op, inner_op]
+    ownership = {hole_op: outer, inner_op: inner}
+    ordered = order_operations(_Job(operations), operations,
+                               [(outer, inner)], ownership)
+    assert [o.Label for o in ordered] == ["PlugOutline", "PlateHole"]
+
+
+def test_the_chain_can_be_told_where_to_start(monkeypatch):
+    monkeypatch.setattr(cam_replay, "operation_touches_hole", lambda *a: False)
+    a = _Operation("A", _Placed("PA", 0, 0))
+    b = _Operation("B", _Placed("PB", 100, 0))
+    operations = [a, b]
+    ownership = {a: a.Base, b: b.Base}
+
+    from_origin = order_operations(_Job(operations), operations, [], ownership)
+    assert [o.Label for o in from_origin] == ["A", "B"]
+
+    from_far_end = order_operations(_Job(operations), operations, [], ownership,
+                                    start_point=(100, 0))
+    assert [o.Label for o in from_far_end] == ["B", "A"]
+
+
+def test_leaves_the_group_alone_when_no_part_can_be_located(monkeypatch):
+    """No nestings and no positions: the user's order is the only order.
+
+    Named for what it does rather than for the absence of nestings, which is no
+    longer a reason to leave the list alone. A flat, unlocatable job still gets
+    its own order back untouched.
+    """
     a, b = _Operation("A"), _Operation("B")
     job = _Job([a, b])
     monkeypatch.setattr(cam_replay, "operation_touches_hole", lambda *a: True)

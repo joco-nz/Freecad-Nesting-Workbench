@@ -436,13 +436,35 @@ def check_write(recipe, outcomes, steps, source_job):
         # holds sum(targets) entries. This fixture has five distinct shapes, so
         # every step lands on its own eight parts and there are 40 entries.
         #
-        # The rule that replaces "the Nth entry is the Nth step" is: the list is
-        # the source's step sequence, each step repeated once per target, in
-        # source order. That is what keeps a part's own steps in the user's
-        # order -- holes before the boundary, internals before the outer
-        # boundary -- and stating it here means a reordering that broke it would
-        # fail rather than pass unnoticed.
+        # The rule that replaces "the Nth entry is the Nth step" is: the list
+        # holds exactly one entry per (source step, target part), whatever order
+        # they come out in.
+        #
+        # It used to also require step-major order -- the source's step sequence,
+        # each step repeated once per target -- and to compare entry N against
+        # step N by index. Position ordering made that false on purpose: a part
+        # is finished before another is started, and the parts are visited from
+        # the sheet origin outwards. Comparing by index then compared unrelated
+        # things and reported 11 chain-shape failures against a correct job.
+        #
+        # So the chains are compared as a multiset of (chain, target part) pairs,
+        # which still catches a step that lost its dressup or gained one, and --
+        # which a multiset of chains alone would miss -- a copy that landed on
+        # the wrong part. Order is the subject of test_replay_order.py, which is
+        # the only replay check whose fixture nests a part in a hole.
         clones = outcome.replay_job.clones
+
+        # Parts are identified by label, not by `id()`. `id()` is unique, and
+        # that is the problem: a failure prints the ids it found and the ids it
+        # wanted, and neither says which part either of them is. Labels read.
+        # The uniqueness this then relies on is checked rather than assumed.
+        def label_of(target):
+            return getattr(target, "Label", "?") or "?"
+
+        labels = [label_of(c) for c in clones]
+        check_equal(len(set(labels)), len(labels),
+                    "nested part labels are not unique, so they cannot identify "
+                    "a copy's target")
 
         expected = []
         unsplit = []
@@ -454,8 +476,8 @@ def check_write(recipe, outcomes, steps, source_job):
                 geometry = base[0][0]
             except (TypeError, IndexError):
                 geometry = None
-            targets = len(cam_replay.clones_for_source(clones, geometry)) \
-                if geometry is not None else 0
+            targets = cam_replay.clones_for_source(clones, geometry) \
+                if geometry is not None else []
             # A step carrying an unsplittable dressup stays whole -- see
             # cam_replay.UNSPLITTABLE_DRESSUPS. The Boundary step therefore
             # contributes ONE entry covering all its parts, not one per part.
@@ -463,11 +485,13 @@ def check_write(recipe, outcomes, steps, source_job):
                 cam_replay.dressup_kind(d)[1]
                 in cam_replay.UNSPLITTABLE_DRESSUPS
                 for d in dressups)
-            if blocked and targets > 1:
+            if blocked and len(targets) > 1:
                 unsplit.append(entry.Label)
-                expected.append(chain)
+                # One entry for all of them, so the expected target is the set
+                # rather than any single part.
+                expected.append((chain, frozenset(label_of(t) for t in targets)))
             else:
-                expected.extend([chain] * targets)
+                expected.extend((chain, label_of(t)) for t in targets)
         if unsplit:
             emit("  left whole (unsplittable dressup): %s" % ", ".join(unsplit))
 
@@ -478,11 +502,36 @@ def check_write(recipe, outcomes, steps, source_job):
                     "%s: list has %d entries, expected %d (one per step per "
                     "target part)" % (label, len(group), len(expected)))
 
-        for index, entry in enumerate(group):
+        # Chain and target together, as a multiset. Every entry must carry the
+        # stack of the step it came from, and that step's copy of it.
+        def pair_for(entry):
             chain = chain_kinds(entry)
-            want = expected[index] if index < len(expected) else []
-            check_equal(chain, want,
-                        "%s: entry %d chain shape" % (label, index))
+            bottom = entry
+            for _ in range(20):
+                base = getattr(bottom, "Base", None)
+                if cam_replay.is_dressup(bottom) and base is not None:
+                    bottom = base
+                    continue
+                break
+            targets = getattr(bottom, "Base", None) or []
+            labels = [label_of(pair[0]) for pair in targets
+                      if isinstance(pair, (list, tuple))]
+            if len(labels) > 1:
+                return (chain, frozenset(labels))
+            return (chain, labels[0] if labels else None)
+
+        # Chains are lists, so they are not orderable against each other; the
+        # chain goes into the sort key as its own text.
+        def sort_key(pair):
+            chain, target = pair
+            return ("/".join(map(str, chain)), str(target))
+
+        check_equal(sorted(sort_key(p) for p in map(pair_for, group)),
+                    sorted(sort_key(p) for p in expected),
+                    "%s: (chain, target part) pairs over the list, as a "
+                    "multiset" % label)
+
+        for index, entry in enumerate(group):
             check(cam_replay.has_cutting_motion(entry),
                   "%s: entry %d (%s) produced no cutting motion"
                   % (label, index, entry.Label))

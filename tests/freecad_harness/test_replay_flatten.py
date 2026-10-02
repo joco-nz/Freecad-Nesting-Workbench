@@ -847,7 +847,7 @@ def run_ordering_checks(doc):
     check(new_order.index("PlateHole") > new_order.index("PlugOutline"),
           "the plate's hole must be cut after the plug, got %s" % new_order)
 
-    # -- and the negative: no nestings means no reordering --
+    # -- and the negative: nothing to order by, so nothing is reordered --
     class _Job:
         def __init__(self, group):
             self.Operations = type("_O", (), {"Group": list(group)})()
@@ -855,9 +855,36 @@ def run_ordering_checks(doc):
     untouched = _Job(operations)
     same = cam_replay.order_operations(untouched, operations, [], ownership)
     check(same == operations,
-          "with no nestings the order must be left exactly as it was")
+          "with the two parts concentric the chain cannot tell them apart, so "
+          "the order must be left exactly as it was; got %s"
+          % [o.Label for o in same])
     check(untouched.Operations.Group == operations,
-          "with no nestings the job's group must not be reassigned")
+          "with nothing to order by, the job's group must not be reassigned")
+
+    # -- and the positive: an actual position to order by --
+    #
+    # The check above passes for a coincidental reason -- the plate and the
+    # plug are concentric, so both are the same distance from the origin and the
+    # chain falls back to the source order. It would have passed with position
+    # ordering deleted outright. Move one part and the chain has something to
+    # work with, which is the only way to know it is running.
+    moved_job = _Job(operations)
+    plate.Placement = FreeCAD.Placement(FreeCAD.Vector(500, 0, 0),
+                                        FreeCAD.Rotation())
+    doc.recompute()
+    by_position = cam_replay.order_operations(moved_job, operations, [],
+                                              ownership)
+    emit("  with the plate moved 500mm away: %s"
+         % [o.Label for o in by_position])
+    check([o.Label for o in by_position] == ["PlugOutline", "PlateHole"],
+          "the part nearest the sheet origin should be cut first, got %s"
+          % [o.Label for o in by_position])
+    check([o.Label for o in moved_job.Operations.Group]
+          == ["PlugOutline", "PlateHole"],
+          "the reordered list must be written to the job, got %s"
+          % [o.Label for o in moved_job.Operations.Group])
+    plate.Placement = FreeCAD.Placement()
+    doc.recompute()
 
     # -- a cycle must not hang --
     # Each part treated as nesting inside the other: unsatisfiable.

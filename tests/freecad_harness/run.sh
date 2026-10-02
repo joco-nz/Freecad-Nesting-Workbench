@@ -35,8 +35,10 @@ UNITS_STATUS="$HARNESS_DIR/.last_status_units"
 PYTEST_STATUS="$HARNESS_DIR/.last_status_pytest"
 REPLAY_STATUS="$HARNESS_DIR/.last_status_replay"
 DRESSUP_STATUS="$HARNESS_DIR/.last_status_dressup"
+ORDER_STATUS="$HARNESS_DIR/.last_status_order"
 rm -f "$BENCH_STATUS" "$TEST_STATUS" "$GA_STATUS" "$PANEL_STATUS" \
-      "$UNITS_STATUS" "$PYTEST_STATUS" "$REPLAY_STATUS" "$DRESSUP_STATUS"
+      "$UNITS_STATUS" "$PYTEST_STATUS" "$REPLAY_STATUS" "$DRESSUP_STATUS" \
+      "$ORDER_STATUS"
 
 cd "$REPO_ROOT"
 "$FREECADCMD" "$HARNESS_DIR/nest_benchmark.py" || true
@@ -44,16 +46,23 @@ cd "$REPO_ROOT"
 "$FREECADCMD" "$HARNESS_DIR/test_ga_loop.py" || true
 "$FREECADCMD" "$HARNESS_DIR/test_panel_teardown.py" || true
 "$FREECADCMD" "$HARNESS_DIR/test_document_units.py" || true
-# The two replay checks. These need real FreeCAD objects -- analytic surfaces,
+# The three replay checks. These need real FreeCAD objects -- analytic surfaces,
 # actual dressup proxies, an actual Operations list -- because what they guard
 # is precisely the things a stand-in cannot show: that a dressed operation is
 # absent from the list it is dressed up in, and that the post-processor emits
 # that list verbatim. Neither is expressible in pytest.
+#
+# The order check is the odd one out: the other two build their own geometry and
+# neither nests a part in a hole, so the ordering step returned before its write
+# in every gated run. It is the only one that runs the committed fixture, which
+# is the only one with nesting in it -- which is exactly why a bug in the
+# ordering write sat behind a green gate (NEST-015).
 "$FREECADCMD" "$HARNESS_DIR/test_replay_flatten.py" || true
 "$FREECADCMD" "$HARNESS_DIR/test_replay_dressups.py" || true
+"$FREECADCMD" "$HARNESS_DIR/test_replay_order.py" || true
 
 for f in "$BENCH_STATUS" "$TEST_STATUS" "$GA_STATUS" "$PANEL_STATUS" \
-         "$UNITS_STATUS" "$REPLAY_STATUS" "$DRESSUP_STATUS"; do
+         "$UNITS_STATUS" "$REPLAY_STATUS" "$DRESSUP_STATUS" "$ORDER_STATUS"; do
     if [ ! -f "$f" ]; then
         echo "harness did not write $f -- it probably did not run" >&2
         exit 3
@@ -125,6 +134,12 @@ fi
 DRESSUP=$(cat "$DRESSUP_STATUS")
 if [ "$DRESSUP" -ne 0 ]; then
     echo "replay-dressup regression test FAILED (status $DRESSUP)" >&2
+    [ "$STATUS" -eq 0 ] && STATUS=1
+fi
+
+ORDER=$(cat "$ORDER_STATUS")
+if [ "$ORDER" -ne 0 ]; then
+    echo "replay-order regression test FAILED (status $ORDER)" >&2
     [ "$STATUS" -eq 0 ] && STATUS=1
 fi
 

@@ -844,3 +844,103 @@ Two things that fell out of the same fix:
 **Why it was missed for so long**: the invariant "a dressed operation's list
 entry is its dressup" was verified in three places, all of which exercised a
 path that never writes. The bug lived in the one path that does.
+
+## NEST-016 — position ordering put each spacer's boundary before its own holes
+
+**Found by measuring the ordering on the committed fixture, not by reading the
+code. Both fixes below were wrong on the first attempt and the measurement is
+what caught them.**
+
+Position ordering (Q3) originally made a part's internal step order a *tie-break
+preference*. Two things that must be separate had been conflated:
+
+* which part to visit next — a free choice, made by position;
+* the order of one part's own steps — not a free choice at all, and the user's.
+
+With within-part order left to the tie-break, hole nesting held a spacer's two
+hole steps back until the nested parts were finished, but nothing held its outer
+boundary back with them. It went first. Measured on the fixture:
+
+    CAMPart_644  source indices [96, 92, 94]
+    CAMPart_645  source indices [97, 93, 95]
+
+The spacers carry `Profile004`, `Profile005` (both hole-cutting) then
+`Profile006` (not), so the source order is holes-then-boundary — the user's rule.
+The replay produced the reverse for both.
+
+**This is physical, not cosmetic.** A spacer is held in the sheet by its
+boundary, and the parts nested in its hole fall out the moment that boundary is
+cut. Every operation after that point is machining loose parts. The user's third
+rule — all of a part's internal work before its boundary — is not a separate
+rule to enforce; it *falls out* of the nesting constraint once within-part order
+is chained in source order.
+
+Fixed by chaining each part's steps in source order as a hard constraint. It
+also made contiguity exact: 50 stretches → 48, one per part.
+
+### What the measurement was, and what it cost to trust it
+
+Three of the four order measurements came back wrong before they came back
+right, and each wrong one was a **vacuous pass**, not a wrong answer:
+
+| what went wrong | what it reported |
+|---|---|
+| walked `.Base` from the entry to find its part | 0 parts; contiguity "perfect" |
+| built the map from `entry_of.items()`, whose keys are `id()` ints | 0 parts; nesting "0 violations" |
+| then wrapped those int keys in `id()` a second time | 0 parts; within-part order "0 of 0" broken" |
+
+`0 of 0` is not a result. Three separate probes had reported a clean run while
+checking nothing at all. `test_replay_order.py` now refuses to proceed if the
+part maps do not fully resolve, and says so in a comment, because a check that
+cannot see anything and a check that passes look identical from the outside.
+
+The fourth measurement — nesting — reported **10 violations that were not
+there**: it called `operation_touches_hole` on the dressup entries, and that
+function returns `True` for anything whose `Base` is not a list of
+`(geometry, subs)`, which a dressup is not. Every step of every outer part read
+as a hole step.
+
+### Measured result on the committed fixture
+
+| | recipe order | after |
+|---|---|---|
+| rapid travel | 26 410 mm | **9 397 mm** |
+| cutting travel | 14 030 mm | 14 030 mm |
+| stretches per part | 98 | **48** (0 parts split) |
+| within-part order broken | — | **0 of 48** |
+| nesting violations | — | **0 of 15** |
+
+`HorizRapid = 0.0 mm/s` on the fixture's tool controller, so machine time cannot
+be derived and distances are the honest measure.
+
+## The gate had a hole, and it is now closed
+
+NEST-015 was reachable because the only fixture with hole nesting was the one
+**nothing asserted against**:
+
+* `test_replay_flatten.py` and `test_replay_dressups.py` both build their own
+  geometry, and neither nests a part in a hole, so `order_operations` returned
+  early before its write in **every gated run**;
+* `replay-fixture-CAM-Nested.FCStd` — 15 nestings, the fixture that reaches the
+  write — was read only by `validate_replay_fixture.py`, which is a diagnostic
+  and is not gated.
+
+`test_replay_order.py` closes it: 322 checks against the committed fixture, end
+to end through the real FreeCAM modules, asserting that the list holds entries
+and not bare operations, that each step's copy lands on exactly one part, that a
+part's steps keep their source order, that hole nesting holds, and that parts
+are contiguous. Both fixes were proved to bite by reverting each in turn.
+
+### Two tests that were passing for the wrong reason
+
+* `test_replay_dressups.py` compared `Operations.Group[i]` against recipe step
+  `i` by index, under a comment asserting the list was step-major. Position
+  ordering made that false *on purpose*, and it reported 11 chain-shape failures
+  against a correct job. It now compares `(chain, target part)` pairs as a
+  multiset — which also catches a copy that landed on the wrong part, something
+  the previous index-wise comparison could not.
+* `test_replay_flatten.py`'s "no nestings means no reordering" check passed
+  because the plate and the plug are **concentric**: both are the same distance
+  from the origin, so the chain falls back to source order. It would have passed
+  with position ordering deleted outright. A second check now moves a part and
+  asserts the order actually flips.
