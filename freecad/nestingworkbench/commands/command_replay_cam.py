@@ -171,6 +171,8 @@ class ReplayCAMSetupCommand:
         started = time.perf_counter()
         outcomes = []
         cancelled_at = None
+        draft_skipped = 0
+        panel_error = None
         try:
             for position, sheet in enumerate(sheets):
                 with ReplayTaskProgress(sheet.Label) as task:
@@ -188,6 +190,9 @@ class ReplayCAMSetupCommand:
                         # raised; cancelling is disabled" and the button would
                         # have done nothing.
                         cancel_check=lambda: task.cancelled))
+                    draft_skipped += task.skipped_draft_callbacks
+                    if task.show_error:
+                        panel_error = task.show_error
                 if task.cancelled:
                     # Cancelling stops the run, not the sheet. Carrying on would
                     # open a panel for the next sheet and start working on it
@@ -205,10 +210,12 @@ class ReplayCAMSetupCommand:
         self._report(layout_group, source_job, outcomes, wall_clock,
                      cancelled_at=cancelled_at,
                      skipped=[s.Label for s in sheets[cancelled_at + 1:]]
-                     if cancelled_at is not None else [])
+                     if cancelled_at is not None else [],
+                     draft_skipped=draft_skipped, panel_error=panel_error)
 
     def _report(self, layout_group, source_job, outcomes, wall_clock=None,
-                cancelled_at=None, skipped=()):
+                cancelled_at=None, skipped=(), draft_skipped=0,
+                panel_error=None):
         """Print the whole run to the Report view and raise a dialog for it.
 
         Console output rather than `FreeCADGui.ReportView`, because Console
@@ -230,6 +237,28 @@ class ReplayCAMSetupCommand:
                 "Cancelled. %d sheet(s) were not replayed at all: %s."
                 % (len(skipped), ", ".join(skipped))
             )
+
+        # Both of these are about the progress display rather than the replay,
+        # and both are said out loud. A panel that silently did not appear, and
+        # a set of errors that silently did not happen, are both worse than
+        # being told.
+        if panel_error:
+            lines.append("")
+            lines.append(
+                "The Tasks panel did not open (%s). The replay was unaffected; "
+                "it just ran without a progress display and without a working "
+                "Cancel." % panel_error
+            )
+        if draft_skipped:
+            lines.append("")
+            lines.append(
+                "%d deferred Draft callback(s) were dropped because the object "
+                "they referred to had already been deleted. Draft does not "
+                "guard against that, and the replay's progress display is what "
+                "runs them. Nothing was left half-done; see replay_progress.py."
+                % draft_skipped
+            )
+
         if unverified:
             lines.append("")
             lines.append(

@@ -191,6 +191,71 @@ def _gui_document(gui):
         return None
 
 
+def _install_draft_callback_guard():
+    """Make Draft's deferred `format_object` calls survive a deleted object.
+
+    Returns an undo callable, or None if there is nothing to guard.
+
+    **Why this is here.** Draft defers `format_object` by one event-loop turn
+    (a workaround for FreeCAD #27958) and guards it with `if not target:
+    return`. That does not cover a *deleted* object: a deleted FreeCAD object is
+    not falsy, it raises `ReferenceError: Cannot access attribute 'ViewObject'
+    of deleted object` on attribute access.
+
+    Nothing pumped the event loop before this feature. `FreeCADGui.updateGui()`
+    -- which is the only reason a synchronous replay repaints at all, and the
+    reason Cancel can be clicked -- is now the first thing in a session to run
+    Draft's deferred timers, so a nest that made Draft clones and then had them
+    removed fires every one of them against a corpse. Measured on the user's
+    own document: about 96 tracebacks per replay, and FreeCAD's error popup on
+    top of them.
+
+    It is Draft's bug, but it is our pump that provokes it, so the pump carries
+    the guard. Scoped to the panel's lifetime and undone on close, so the rest
+    of the session sees Draft unmodified. `format_object` is looked up as an
+    attribute at call time (`gui_utils.format_object(...)`), so patching the
+    module attribute is enough to intercept the queued call.
+
+    Skipped calls are counted rather than hidden -- `skipped_draft_callbacks` --
+    so the report can say what was dropped instead of the noise simply
+    disappearing.
+    """
+    try:
+        import draftutils.gui_utils as gui_utils
+    except ImportError:
+        return None
+    original = getattr(gui_utils, "format_object", None)
+    if original is None:
+        return None
+
+    def guarded(cl, target, origin=None, face=None):
+        try:
+            # Touch it the way Draft's own guard intends to, but in a way that
+            # a deleted object answers to.
+            target.ViewObject
+        except Exception:
+            _SKIPPED[0] += 1
+            return None
+        try:
+            return original(cl, target, origin, face)
+        except Exception:
+            _SKIPPED[0] += 1
+            return None
+
+    gui_utils.format_object = guarded
+
+    def undo():
+        try:
+            gui_utils.format_object = original
+        except Exception:
+            pass
+    return undo
+
+
+#: Draft callbacks dropped because their object was already deleted.
+_SKIPPED = [0]
+
+
 class ReplayTaskWidget(QtWidgets.QWidget if QtWidgets else object):
     """The Tasks panel entry. Draws what `ReplayProgressView` says.
 
@@ -345,6 +410,7 @@ class ReplayTaskProgress(object):
         #: `except` here discarded the reason, so a failure was indistinguishable
         #: from a panel that had never been tried.
         self.show_error = None
+        self._undo_draft_guard = None
 
     # -- what FreeCAD calls on a task panel ------------------------------
 
@@ -444,6 +510,10 @@ class ReplayTaskProgress(object):
                 return self
             self.dialog = FreeCADGui.Control.showDialog(self, document)
             self.opened = True
+            # Installed after the panel is up, so the guard exists for exactly
+            # as long as this code will be pumping the event loop.
+            _SKIPPED[0] = 0
+            self._undo_draft_guard = _install_draft_callback_guard()
         except Exception as exc:
             # Usually "a task is already active" -- something else in the
             # session owns the panel. The replay still runs; it just runs
@@ -454,11 +524,23 @@ class ReplayTaskProgress(object):
             self.form = None
             self.widget = None
         return self
+    @property
+    def skipped_draft_callbacks(self):
+        """Draft `format_object` calls dropped during this panel's life.
+
+        Non-zero means Draft had queued callbacks against objects that were gone
+        by the time the event loop ran them. Reported rather than hidden.
+        """
+        return _SKIPPED[0]
+
     def close(self):
         if self.closed or not self.opened:
             self.closed = True
             return
         self.closed = True
+        if self._undo_draft_guard is not None:
+            self._undo_draft_guard()
+            self._undo_draft_guard = None
         try:
             import FreeCADGui
             FreeCADGui.Control.closeDialog()

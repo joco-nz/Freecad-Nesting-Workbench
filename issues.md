@@ -1214,3 +1214,69 @@ The panel and the cancel path are now verified in a real GUI (`freecad` against
 
 Both would have caught the `setRange` and property bugs. They are probes rather
 than gate tests because they need a display.
+
+## NEST-021 — the Draft `ReferenceError` flood (resolved)
+
+**The user reported it as an unusable error popup. It was resolved, and the
+count matches their log exactly: 96 before, 0 after.**
+
+Draft's `make_clone` defers `format_object` by one event-loop turn — a
+workaround for FreeCAD #27958 — and guards it with `if not target: return`.
+That does not cover a **deleted** object. A deleted FreeCAD object is not
+falsy; it raises on attribute access:
+
+    File ".../Draft/draftmake/make_clone.py", line 156, in <lambda>
+      QtCore.QTimer.singleShot(0, lambda: gui_utils.format_object(cl, obj[0]))
+    File ".../Draft/draftutils/gui_utils.py", line 557, in format_object
+      if not hasattr(target, "ViewObject"):
+    ReferenceError: Cannot access attribute 'ViewObject' of deleted object
+
+A nest that made Draft clones and then removed its staging clones leaves one
+queued callback per clone, all pointing at corpses.
+
+**Nothing pumped the event loop before this feature.** Measured, pumping
+`updateGui()` on a freshly-opened fixture produces **0** of these — they need
+the replay, because that is where the deletion happens. But `updateGui()` is
+also the only reason a synchronous replay repaints at all, and the reason Cancel
+can be clicked. So the feature that fixed the missing progress bar is the same
+one that surfaced 96 tracebacks and an error popup.
+
+### The investigation, including two dead ends
+
+* Assumption: we call `Draft.make_clone`. **False.** `grep` found no call in
+  this repository, and instrumenting `make_clone` during a replay counted **0**
+  calls. The clones come from earlier in the user's session, not from the replay.
+* Assumption: the noise is proportional to what the replay deletes. **False.**
+  Pumping the loop on the opened fixture without replaying produced 0 errors;
+  the replay is required.
+* What is actually proportional: `format_object` runs **48 times** per replay --
+  once per flattened part -- and in a clean session all 48 land on live objects.
+  The user's session differs by timing: its callbacks fire after the objects are
+  gone.
+
+So the count is not derivable from anything the replay does. It depends on what
+the *session* left queued. That is why the fix had to be at the pump rather than
+at a call site.
+
+### The fix
+
+The bug is Draft's; the provocation is ours. So the pump carries the guard:
+`format_object` is wrapped for exactly as long as the panel is open, returning
+None for a deleted object, and **undone on close** so the rest of the session
+sees Draft unmodified. A permanently patched Draft would be a worse thing to hand
+a user than a burst of tracebacks.
+
+`format_object` is looked up as an attribute at call time
+(`gui_utils.format_object(...)`), so patching the module attribute intercepts
+the already-queued call.
+
+Skipped calls are **counted and reported**, not hidden — `show_error` for a panel
+that did not open, and a line in the report for dropped Draft callbacks. Both
+went through three rounds of "the panel is just absent and nobody knows why",
+because the `except` discarded the reason. A panel that is merely absent and a
+panel that was never tried look identical from outside.
+
+Verified by negative control in a real GUI:
+
+    ReferenceErrors without the guard:  96
+    ReferenceErrors with the guard:      0

@@ -216,3 +216,44 @@ class TestPipelineCancellation:
                 break
             p.item(i, 5, "step %d" % i)
         assert p.cancelled is True
+
+
+class TestDraftGuard:
+    """Draft's deferred callbacks, and the guard our event-loop pump needs.
+
+    Draft defers `format_object` by one event-loop turn and guards it with
+    `if not target`, which does not cover a *deleted* object: a deleted FreeCAD
+    object is not falsy, it raises `ReferenceError` on attribute access.
+
+    Nothing pumped the event loop before this feature. `updateGui()` -- the
+    only reason a synchronous replay repaints -- is the first thing in a session
+    to run those timers, so a nest that made Draft clones and then removed them
+    fires every callback against a corpse. Measured on the user's document: 96
+    tracebacks per replay, plus FreeCAD's error popup. With the guard: 0.
+    """
+
+    def test_it_is_a_no_op_when_draft_is_not_there(self):
+        # The guard must never be the reason a run fails. With no Draft
+        # importable there is nothing to guard and nothing to do.
+        from freecad.nestingworkbench.Tools.Cam.replay_progress import (
+            _install_draft_callback_guard,
+        )
+        undo = _install_draft_callback_guard()
+        # Either None (no Draft), or a callable (Draft present). Never an
+        # exception, and never something that has to be called to be harmless.
+        assert undo is None or callable(undo)
+        if undo is not None:
+            undo()
+
+    def test_the_guard_is_scoped_to_the_panel(self):
+        # It is installed by show() and removed by close(), so the rest of the
+        # session sees Draft unmodified. A permanently patched Draft would be a
+        # much worse thing to hand a user than a burst of tracebacks.
+        from freecad.nestingworkbench.Tools.Cam.replay_progress import (
+            ReplayTaskProgress,
+        )
+        task = ReplayTaskProgress("Sheet_1")
+        # Never shown, so no guard, and closing is harmless.
+        task.close()
+        assert task.closed is True
+        assert task.skipped_draft_callbacks == 0
