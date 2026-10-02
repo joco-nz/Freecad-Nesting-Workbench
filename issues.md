@@ -667,3 +667,62 @@ Note that touching the seven `Operations.Group` entries and recomputing costs
 those entries are the outermost *dressups*, and touching one does not propagate
 to the operation beneath it. Both the profiles and the dressups are touched, and
 the profiles are where the 24 s goes.
+
+## NEST-013 — FreeCAD's Profile is superlinear in its number of base targets
+
+Raised as "the remaining 24 s of toolpath computation might be the replay making
+FreeCAD's work harder". It is not, and there is a 15x win available that costs
+something the user has to weigh.
+
+**What the 24 s is.** Seven `Profile*_replay` under seven
+`DressupLeadInOut*_replay`, 161 real toolpath computations. Measured one at a
+time, per operation, touching the *base* of each dressup rather than the group
+entry -- `Operations.Group` holds the outermost dressup and touching that does
+not execute the operation under it, which is what made two earlier probes
+report 0.05 s and conclude wrongly that no toolpath work happens at all.
+
+**It is FreeCAD's, not the replay's.** The source job's own `Profile001` --
+the user's operation, untouched, with the user's own settings -- pointed at 23
+targets costs **8.51 s**. The replayed one costs **8.89 s**. Switching
+`UseComp` off changes nothing (8.59 s), so 3D projection is not the driver, and
+rotating a part 45 degrees costs the same as leaving it upright (0.02 s), so the
+nester's placements are not the driver. `HandleMultipleFeatures` is already
+`Individually` on both jobs, so batch mode is not the driver.
+
+**The cost per part rises with the number of parts**, which is the finding:
+
+    Profile001, 8 sub-elements, per-target cost
+
+      1 target    0.018s        5 targets   0.083s
+      2 targets   0.036s       23 targets   0.370s
+
+Roughly quadratic. The replay inherits it exactly; there is no replay-specific
+waste left in this path.
+
+**The available win: one operation per part.** Measured, three passes each,
+forcing a recompute every time:
+
+    A. one Profile, 23 targets      8.85 / 8.68 / 8.55 s
+    B. 23 Profiles, 1 target each   0.11 create + 0.47 / 0.46 / 0.47 s
+
+**8.7 s to 0.58 s, a 15x win**, and stable across passes. An earlier version of
+this probe reported 18.3x by putting operation creation and the first recompute
+in one bucket and comparing it against a later forced recompute; the two are
+apart now and 15x is the honest figure.
+
+**What it costs, which is why it is not simply taken:**
+
+* **577 commands against 621, +7.6%.** One operation cutting 23 parts links
+  between them; 23 separate operations each reposition. That is more G-code and
+  probably more table time, on the machine this work exists to feed.
+* **161 operations instead of 7.** It breaks the invariant recorded on the
+  validator: *a process step contributes ONE entry to `Operations.Group`*. It
+  also puts 23 dressups per step in the tree, changes verification granularity,
+  and changes how a failed sheet is labelled.
+* It would apply only to the replay. In FreeCAD's own CAM the user would hit the
+  same superlinearity, but there it is their own setup and their own choice.
+
+**Not implemented. It is a product decision, not a performance fix.** The
+replay's contract is that the user's operation is reproduced, one for one;
+splitting it changes the job the user is handed. That should be the user's
+choice, offered as an option, rather than done silently.
