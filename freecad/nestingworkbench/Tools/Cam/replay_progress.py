@@ -29,6 +29,11 @@ from one that does not work.
 """
 import time
 
+try:
+    import FreeCAD
+except ImportError:      # pragma: no cover - no FreeCAD in the pure tier
+    FreeCAD = None
+
 #: Stages that report `total == 0` are work the pipeline cannot break up. The
 #: largest of them is "Ordering and tidying the tool table" at about a third of
 #: the run, so this is not an edge case.
@@ -169,13 +174,30 @@ STAGES = [
 ]
 
 
+def _gui_document(gui):
+    """The active document as a **Gui** document, or None.
+
+    `Control.showDialog` wants `Gui.Document`. `FreeCAD.ActiveDocument` is the
+    `App.Document`, and passing it raises `TypeError: argument 2 must be
+    Gui.Document, not App.Document`. None means "attach to nothing", which
+    FreeCAD also refuses -- silently enough to look like an empty panel.
+    """
+    try:
+        active = FreeCAD.ActiveDocument
+        if active is None:
+            return None
+        return gui.getDocument(active.Name)
+    except Exception:
+        return None
+
+
 class ReplayTaskWidget(QtWidgets.QWidget if QtWidgets else object):
     """The Tasks panel entry. Draws what `ReplayProgressView` says.
 
-    Deliberately a `QWidget` and not a FreeCAD `TaskPanel`. A `TaskPanel` is
-    for a modal task that owns a document edit; this is a read-only progress
-    display next to a synchronous replay, and `Control.showDialog` accepts a
-    plain widget.
+    Deliberately a bare `QWidget` and nothing more. `Control.showDialog` does
+    not embed the object it is given: it looks for an attribute named `form`
+    and embeds that. So this widget is the payload of
+    `ReplayTaskProgress.form`, not the thing handed to FreeCAD.
 
     The Cancel button sets `cancelled`, which `Progress.cancelled` polls. The
     button disables itself rather than disappearing, so a click that lands
@@ -276,6 +298,14 @@ class ReplayTaskWidget(QtWidgets.QWidget if QtWidgets else object):
 class ReplayTaskProgress(object):
     """Owns the Tasks panel entry for the length of one replay.
 
+    **This object is what `Control.showDialog` is given, not the widget.**
+    `TaskDialogPython` looks for an attribute named `form` (or `ui`) and
+    embeds the QWidget it finds there; handed the widget itself it silently
+    builds an empty dialog. So FreeCAD reported success, the task panel opened,
+    and there was no progress bar in it -- measured, the widget's `parent()` was
+    still `None` after `showDialog`, because nothing had embedded it. This is
+    the same idiom `NestingTaskPanel` uses: `self.form = NestingPanel()`.
+
     Used as a context manager so the panel is closed on the way out of
     *every* path, including an exception:
 
@@ -289,48 +319,141 @@ class ReplayTaskProgress(object):
     open is bad -- FreeCAD keeps the panel up and the document un-editable until
     something closes it, which is a way of breaking the rest of the session
     because one replay went wrong.
+
+    `reject()` is FreeCAD's "the user closed the panel", which is a cancel --
+    so closing the panel by hand stops the replay rather than hiding it and
+    letting it run on unwatched.
     """
 
     def __init__(self, sheet_label=None):
         self.sheet_label = sheet_label
+        #: The QWidget FreeCAD embeds. Named `form` because that is the
+        #: attribute `TaskDialogPython` looks for.
+        self.form = None
+        #: The same object under a readable name. Two names for one thing is
+        #: the cost of the `form` convention; they are always set together.
         self.widget = None
         self.dialog = None
         self.opened = False
         self.closed = False
+        self._rejecting = False
+        #: Why the panel did not open, as `exception: message`, or None.
+        #: Recorded rather than swallowed. A panel that fails to open is silent
+        #: by construction -- the replay succeeds, the panel is absent, and the
+        #: only symptom is a user report that they saw no progress. That is not
+        #: hypothetical: this stayed unfixed through three rounds because the
+        #: `except` here discarded the reason, so a failure was indistinguishable
+        #: from a panel that had never been tried.
+        self.show_error = None
 
-    def open(self):
+    # -- what FreeCAD calls on a task panel ------------------------------
+
+    def reject(self):
+        """The panel was closed. Treat it as a cancel.
+
+        Guarded because `closeDialog()` reaches this too, on the way out after a
+        run that has already finished. A cancel raised there is meaningless --
+        though harmless, since there is nothing left to stop.
+        """
+        if self._rejecting or self.closed:
+            return True
+        self._rejecting = True
+        try:
+            if self.widget is not None:
+                self.widget._on_cancel()
+        except Exception:
+            pass
+        finally:
+            self._rejecting = False
+        return True
+
+    def accept(self):
+        """FreeCAD's OK. Nothing to accept mid-run, so this just closes."""
+        self.close()
+        return True
+
+    def getStandardButtons(self):
+        """None. The panel's only action is its own Cancel.
+
+        FreeCAD puts OK and Cancel on a task panel by default, which is wrong
+        twice over here: OK means nothing while a replay is in flight, and
+        Cancel would *close* the panel, taking the feedback with it. This
+        panel's own Cancel does not close it -- it disables itself, says
+        "Cancelling", and the panel stays up until the run really has stopped,
+        which is the whole point of having it.
+
+        Returning 0 rather than importing QtWidgets for the enum: FreeCAD
+        converts the return value straight to a `QDialogButtonBox.StandardButtons`,
+        and 0 is no buttons.
+        """
+        return 0
+
+    def show(self):
+        # **Not called `open`.** FreeCAD's task panel calls `open()` on the
+        # object it is given when the dialog opens, so that name is not ours to
+        # choose: showing the panel called `open()`, which built another widget
+        # and showed another panel, which called `open()` again. Measured as
+        # ~500 frames of recursion and a RecursionError inside the
+        # constructor, with the panel apparently opening successfully on every
+        # attempt right up until the stack gave out.
+        #
+        # The two hooks FreeCAD *does* own on a task panel are `accept` and
+        # `reject`, and those are defined deliberately below.
         if QtWidgets is None:
+            self.show_error = "PySide/QtWidgets is not importable"
             return self
         import FreeCADGui
         try:
-            self.widget = ReplayTaskWidget()
-            self.widget.view.subject = self.sheet_label
-        except Exception:
+            self.form = ReplayTaskWidget()
+            self.form.view.subject = self.sheet_label
+            self.widget = self.form
+        except Exception as exc:
             # A widget that will not build is not a reason to refuse the run.
+            self.show_error = "%s building the panel widget: %s" % (
+                type(exc).__name__, exc)
+            self.form = None
             self.widget = None
             return self
-        if self.sheet_label:
-            self.widget.view.detail = ""
         try:
             # The task pane lives in the Start workbench's dock. If the user is
-            # in Model or CAM, `showDialog` still succeeds and the widget is
-            # still there -- just off screen, which reads as "no progress".
-            # `showTaskView` brings it into view first. Both are guarded and
-            # both are best-effort: on a layout with no task pane they raise,
-            # and neither is a reason to refuse the replay.
+            # in Model or CAM, the panel still opens but off screen, which
+            # reads as "no progress". `showTaskView` brings it into view first.
+            # Both guarded: on a layout with no task pane they raise, and
+            # neither is a reason to refuse the replay.
             try:
                 FreeCADGui.Control.showTaskView()
             except Exception:
                 pass
-            self.dialog = FreeCADGui.Control.showDialog(self.widget)
+            # The document is passed explicitly, and it has to be the *Gui*
+            # document -- `showDialog` raises
+            # `TypeError: argument 2 must be Gui.Document, not App.Document`
+            # for `FreeCAD.ActiveDocument`. Omitting it is worse: FreeCAD
+            # attaches to a null document and refuses, logging "Cannot attach
+            # to nullptr document" and showing nothing, while still returning
+            # normally to Python, so the caller sees a panel that opened and is
+            # empty. Passing None explicitly is worse again: it raises, and the
+            # broad except below then reports no panel at all.
+            document = _gui_document(FreeCADGui)
+            if document is None:
+                # Nothing to attach to. The replay runs without a progress
+                # display rather than not at all. The command always has a
+                # document open, so this is the probe path.
+                self.show_error = "no active document to attach the panel to"
+                self.form = None
+                self.widget = None
+                return self
+            self.dialog = FreeCADGui.Control.showDialog(self, document)
             self.opened = True
-        except Exception:
-            # "a task is already active". Something else in the session owns
-            # the panel. The replay still runs; it just runs without a
-            # progress display, which is better than refusing to work.
+        except Exception as exc:
+            # Usually "a task is already active" -- something else in the
+            # session owns the panel. The replay still runs; it just runs
+            # without a progress display, which is better than refusing to
+            # work. The reason is kept, because a panel that is merely absent
+            # is indistinguishable from one that was never tried.
+            self.show_error = "%s: %s" % (type(exc).__name__, exc)
+            self.form = None
             self.widget = None
         return self
-
     def close(self):
         if self.closed or not self.opened:
             self.closed = True
@@ -344,7 +467,7 @@ class ReplayTaskProgress(object):
         self.opened = False
 
     def __enter__(self):
-        return self.open()
+        return self.show()
 
     def __exit__(self, *_exc):
         self.close()
@@ -355,7 +478,15 @@ class ReplayTaskProgress(object):
             # Nothing to draw into. The run continues: the seam is optional and
             # was always optional, and a missing panel is not a failure.
             return
-        self.widget.callback(stage, current, total, message)
+        try:
+            self.widget.callback(stage, current, total, message)
+        except (RuntimeError, ReferenceError):
+            # The panel was closed by hand mid-run, so the widget is a deleted
+            # C++ object. Drawing into it raises, and an exception here would
+            # travel back into `Progress` and disable the seam. The run carries
+            # on unobserved, which is what closing the panel asked for.
+            self.form = None
+            self.widget = None
 
     @property
     def cancelled(self):
