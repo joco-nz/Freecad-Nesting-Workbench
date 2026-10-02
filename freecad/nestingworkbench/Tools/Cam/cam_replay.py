@@ -189,40 +189,36 @@ def replay_job_name(source_job, sheet_label):
     return "%s_Replay" % source
 
 
-def prune_unused_tool_controllers(job):
-    """Remove tool controllers in `job` that no operation references.
+def remove_tool_controllers(job, controllers):
+    """Remove `controllers` from `job`'s tool table. Returns their labels.
 
-    `PathJob.Create` gives a new job a default `TC: 5mm Endmill`, and the
-    replay then copies the user's own controller in alongside it. Nothing
-    references the endmill, and it is not merely untidy: the job's SetupSheet
-    resolves the active tool from the controllers present, so a replayed job
-    offered a machine head the operations never use.
+    Split out from `prune_unused_tool_controllers` because the replay now needs
+    to remove a *known* set of controllers at a known moment -- the ones the
+    fresh job arrived with -- rather than discovering the unused ones once the
+    operations exist to be inspected.
 
-    Only a controller that nothing references is removed, and only when at
-    least one controller *is* referenced -- so a replay that failed before any
-    operation got a tool cannot end up with no tools at all.
-
-    Returns the labels removed, for the report.
+    **Labels are read before anything is removed.** This is not a style point.
+    `_remove_with_orphans` deletes the controller, and reading `Label` off a
+    deleted FreeCAD object raises `ReferenceError: Cannot access attribute
+    'Label' of deleted object` -- which `getattr(controller, "Label", "?")` does
+    *not* catch, because `getattr`'s default only swallows `AttributeError`. The
+    exception escaped the whole prune, so the step aborted half-done and the
+    console said only "Could not tidy the tool table". Measured: exactly that,
+    on the fixture, every run.
     """
+    if not controllers:
+        return []
     tools = getattr(job, "Tools", None)
-    group = list(getattr(tools, "Group", None) or [])
-    if len(group) < 2:
-        return []
-
-    used = set()
-    for obj in _job_objects(job):
-        controller = getattr(obj, "ToolController", None)
-        if controller is not None:
-            used.add(id(controller))
-
-    if not used:
-        return []
+    doc = getattr(job, "Document", None)
 
     removed = []
-    doc = getattr(job, "Document", None)
-    for controller in group:
-        if id(controller) in used:
-            continue
+    for controller in list(controllers):
+        # First, while the object can still answer.
+        try:
+            label = controller.Label
+        except Exception:
+            label = "?"
+
         # `Tools` is a group, and a group's own removal recurses into what it
         # holds. That matters because a tool bit is not one object: a
         # controller links a Part::FeaturePython wrapper, which wraps a
@@ -236,7 +232,7 @@ def prune_unused_tool_controllers(job):
             tools.removeObject(controller)
         except Exception:
             try:
-                group.remove(controller)
+                list(getattr(tools, "Group", []) or []).remove(controller)
             except Exception:
                 continue
         # FreeCAD will not do this in one call, and the order matters more than
@@ -254,8 +250,45 @@ def prune_unused_tool_controllers(job):
         # discovered rather than assumed, because it is FreeCAD's shape and it
         # differs between tool bits.
         _remove_with_orphans(doc, controller)
-        removed.append(getattr(controller, "Label", "?"))
+        removed.append(label)
     return removed
+
+
+def prune_unused_tool_controllers(job):
+    """Remove tool controllers in `job` that no operation references.
+
+    `PathJob.Create` gives a new job a default `TC: 5mm Endmill`, and the
+    replay then copies the user's own controller in alongside it. Nothing
+    references the endmill, and it is not merely untidy: the job's SetupSheet
+    resolves the active tool from the controllers present, so a replayed job
+    offered a machine head the operations never use.
+
+    Only a controller that nothing references is removed, and only when at
+    least one controller *is* referenced -- so a replay that failed before any
+    operation got a tool cannot end up with no tools at all.
+
+    This is the safety net. The default is normally gone before the first
+    operation is created, because leaving it there is what makes the SetupSheet
+    prompt; see `remove_tool_controllers` and its call site.
+
+    Returns the labels removed, for the report.
+    """
+    tools = getattr(job, "Tools", None)
+    group = list(getattr(tools, "Group", None) or [])
+    if len(group) < 2:
+        return []
+
+    used = set()
+    for obj in _job_objects(job):
+        controller = getattr(obj, "ToolController", None)
+        if controller is not None:
+            used.add(id(controller))
+
+    if not used:
+        return []
+
+    unused = [c for c in group if id(c) not in used]
+    return remove_tool_controllers(job, unused)
 
 
 def _remove_with_orphans(doc, obj, _depth=0):
@@ -2565,7 +2598,7 @@ def apply_properties(target, properties, skip=(), remap=None):
 
 
 def replay_recipe(recipe, job, clones, tool_cache=None,
-                  view_failures=None, progress=None):
+                  view_failures=None, progress=None, obsolete_tools=None):
     """Recreate `recipe`'s operations in `job`, targeting `clones`.
 
     Two passes, in that order, and the order is not a preference.
@@ -2704,6 +2737,30 @@ def replay_recipe(recipe, job, clones, tool_cache=None,
 
         created = []
         for label_for, base_entries in units:
+            if obsolete_tools:
+                # The controllers this job arrived with, removed *before* the
+                # first operation object exists.
+                #
+                # `PathJob.Create` puts a `TC: 5mm Endmill` in every new job,
+                # and the replay adds the user's own controller next to it. The
+                # job's SetupSheet resolves the active tool from the controllers
+                # present, so leaving both in place makes it prompt -- once per
+                # operation created, all 98 of them on the fixture. The user
+                # reports it as "still there in the new Job"; it is there for
+                # the whole of pass one, and the prune at the end of the sheet
+                # never ran because it raised (see `remove_tool_controllers`).
+                #
+                # Done here rather than before the loop because the user's
+                # controller is *copied in* inside this loop, by
+                # `copy_tool_controller`. Removing the defaults first would leave
+                # a window with no tool at all, which is the same prompt from
+                # the other direction.
+                removed = remove_tool_controllers(job, obsolete_tools)
+                obsolete_tools = None
+                if removed:
+                    FreeCAD.Console.PrintMessage(
+                        "Removed the tool controller(s) the new job came with, "
+                        "before creating any operation: %s\n" % ", ".join(removed))
             new_op = create_operation_in(
                 item.source, job,
                 label_suffix=split_label_suffix(label_for)
@@ -3905,8 +3962,14 @@ def replay_sheet(doc, layout_group, sheet_group, source_job, post_processor=None
                 "Could not remove the now-empty staging group for %s: %s\n"
                 % (outcome.sheet_label, exc))
 
+    # What the job arrived with. Snapshot now, before the replay adds the
+    # user's own controller, so the two can be told apart.
+    obsolete_tools = list(getattr(getattr(replay.job, "Tools", None),
+                                  "Group", None) or [])
+
     try:
-        result = replay_recipe(recipe, replay.job, replay.clones, progress=progress)
+        result = replay_recipe(recipe, replay.job, replay.clones, progress=progress,
+                               obsolete_tools=obsolete_tools)
     except Exception as exc:
         outcome.errors.append("Could not replay into %s: %s" % (outcome.sheet_label, exc))
         return outcome
@@ -3917,9 +3980,9 @@ def replay_sheet(doc, layout_group, sheet_group, source_job, post_processor=None
             "View provider: %s. The replayed job will look and behave "
             "partly like a plain object.\n" % note)
 
-    # `PathJob.Create` leaves a default tool controller in every new job, and
-    # the replay copies the user's own in beside it. Drop the one nothing uses,
-    # so the job offers the tool its operations actually cut with.
+    # Safety net, not the main event. `replay_recipe` drops what the job came
+    # with before its first operation; anything still unreferenced here came
+    # from a custom `job_factory` whose job was not empty to begin with.
     try:
         removed_tools = prune_unused_tool_controllers(replay.job)
         if removed_tools:

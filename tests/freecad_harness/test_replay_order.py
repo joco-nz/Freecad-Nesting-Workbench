@@ -275,6 +275,119 @@ def travel_report(outcome, result, group):
           "any more or less" % (final_cut - recipe_cut))
 
 
+def tool_table_checks():
+    """The job must offer only the tool its operations cut with.
+
+    `PathJob.Create` puts a `TC: 5mm Endmill` in every new job. The replay adds
+    the user's own controller beside it, and the job's SetupSheet resolves the
+    active tool from the controllers present -- so while both are there it
+    prompts, once per operation created. The user sees it as "still there in
+    the new Job".
+
+    The check is deliberately about *when* the default goes, not only that it
+    goes: pruning after the operations exist is too late to stop the prompt.
+    """
+    emit("")
+    emit("-- tool table --")
+    doc = FreeCAD.openDocument(FIXTURE)
+    try:
+        layout, _ = cam_replay.resolve_layout_group(doc)
+        sources = [o for o in doc.Objects if cam_replay.is_cam_job(o)]
+        if layout is None or not sources:
+            check(False, "the fixture did not resolve, so the tool table went "
+                  "unchecked")
+            return
+
+        # Watch the tool table from the first progress event of the replay, so
+        # "before any operation was created" is observed rather than assumed.
+        seen = []
+        originals = {}
+
+        def watch(stage, current, total, message=None):
+            if stage != "Replaying the recipe":
+                return
+            if "job" not in originals:
+                # The replay built the job in the previous stage, so it exists
+                # by the time this stage starts. Looked up once rather than
+                # held from before the run, because there is nothing to hold
+                # then.
+                for candidate in doc.Objects:
+                    if getattr(candidate, "Label", "").startswith("Job_Replay_") \
+                            and hasattr(candidate, "Tools"):
+                        originals["job"] = candidate
+                        break
+            job = originals.get("job")
+            if job is None:
+                return
+            tools = list(getattr(job.Tools, "Group", []) or [])
+            seen.append((current, len(tools),
+                         [getattr(t, "Label", "?") for t in tools]))
+
+        source_job = sources[0]
+        outcomes = cam_replay.replay_layout(doc, layout, source_job,
+                                            progress_callback=watch)
+        if not outcomes or outcomes[0].replay_job is None:
+            check(False, "no replay job was produced")
+            return
+        job = outcomes[0].replay_job.job
+
+        tools = list(getattr(job.Tools, "Group", []) or [])
+        labels = [getattr(t, "Label", "?") for t in tools]
+        emit("  tool table after the replay: %s" % (labels or "(empty)",))
+        check_equal(len(tools), 1,
+                    "expected exactly one tool controller, got %d: %s"
+                    % (len(tools), labels))
+        check(not any("5mm" in label for label in labels),
+              "the default '5mm Endmill' controller is still in the tool table: "
+              "%s" % labels)
+
+        # Every operation points at a controller that exists.
+        for entry in job.Operations.Group:
+            bottom = entry
+            for _ in range(20):
+                if not cam_replay.is_dressup(bottom):
+                    break
+                base = getattr(bottom, "Base", None)
+                if base is None:
+                    break
+                bottom = base
+            controller = getattr(bottom, "ToolController", None)
+            check(controller is not None and controller in tools,
+                  "%s cuts with %r, which is not in the tool table %s"
+                  % (entry.Label, getattr(controller, "Label", None), labels))
+
+        # The property that matters: never an operation in existence while two
+        # controllers are in the table.
+        #
+        # Checking the *first* event proves nothing -- at that point the replay
+        # has not copied the user's controller in yet, so the table holds only
+        # the default and the count is 1 by accident. The default is dropped
+        # after `copy_tool_controller` runs and before the first operation is
+        # created, so the table is briefly 2 controllers with nothing built,
+        # which is harmless, and 1 from the first operation onward, which is
+        # the point.
+        with_operations = [row for row in seen if (row[0] or 0) >= 1]
+        check(with_operations,
+              "no replay event was seen with an operation built, so the tool "
+              "table's timing went unchecked")
+        for current, count, labels in with_operations:
+            if count != 1:
+                check(False,
+                      "with %d operation(s) built the job held %d tool "
+                      "controllers %s; the SetupSheet prompts on that"
+                      % (current, count, labels))
+                break
+        else:
+            ok_seen = len(with_operations)
+            emit("  %d replay event(s) with an operation built, all with "
+                 "exactly 1 tool controller" % ok_seen)
+        if with_operations:
+            emit("  tool table at the first built operation: %s"
+                 % (with_operations[0][2] or "(none)",))
+    finally:
+        FreeCAD.closeDocument(doc.Name)
+
+
 def cancel_checks():
     """A cancelled replay must stop, keep what it built, and say so.
 
@@ -412,6 +525,7 @@ def run():
     finally:
         FreeCAD.closeDocument(doc.Name)
 
+    tool_table_checks()
     cancel_checks()
 
 

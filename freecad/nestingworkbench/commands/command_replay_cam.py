@@ -178,7 +178,16 @@ class ReplayCAMSetupCommand:
                         doc, layout_group, source_job,
                         sheets=(sheet,),
                         progress_callback=task.callback,
-                        cancel_check=task.cancelled))
+                        # A lambda, not `task.cancelled`. `cancelled` is a
+                        # property, so naming it here would evaluate it *now*
+                        # and hand `replay_layout` the bool it happened to be --
+                        # False. `Progress` would then call that False, get
+                        # `TypeError: 'bool' object is not callable`, and
+                        # disable cancelling for the entire run. Which is
+                        # exactly what happened: the console said "cancel check
+                        # raised; cancelling is disabled" and the button would
+                        # have done nothing.
+                        cancel_check=lambda: task.cancelled))
                 if task.cancelled:
                     # Cancelling stops the run, not the sheet. Carrying on would
                     # open a panel for the next sheet and start working on it

@@ -260,8 +260,16 @@ class ReplayTaskWidget(QtWidgets.QWidget if QtWidgets else object):
         self._headline.setText(self.view.stage_text())
         self._detail.setText(self.view.detail_text())
         self._clock.setText(self.view.elapsed_text())
+        # `setRange(min, max)` -- two arguments. Called with one it raises
+        # `TypeError: setRange expected 2 arguments, got 1`, and that exception
+        # propagates out of the progress callback, which is why the panel never
+        # appeared: the first event killed it and `Progress` correctly gave up
+        # on a callback that had already failed.
+        #
+        # `(0, 0)` is Qt's busy indicator, which is what the view asks for when
+        # a stage cannot say where it is.
         maximum, value = self.view.bar_range()
-        self._bar.setRange(maximum)
+        self._bar.setRange(0, maximum)
         self._bar.setValue(value)
 
 
@@ -304,6 +312,16 @@ class ReplayTaskProgress(object):
         if self.sheet_label:
             self.widget.view.detail = ""
         try:
+            # The task pane lives in the Start workbench's dock. If the user is
+            # in Model or CAM, `showDialog` still succeeds and the widget is
+            # still there -- just off screen, which reads as "no progress".
+            # `showTaskView` brings it into view first. Both are guarded and
+            # both are best-effort: on a layout with no task pane they raise,
+            # and neither is a reason to refuse the replay.
+            try:
+                FreeCADGui.Control.showTaskView()
+            except Exception:
+                pass
             self.dialog = FreeCADGui.Control.showDialog(self.widget)
             self.opened = True
         except Exception:
@@ -341,4 +359,19 @@ class ReplayTaskProgress(object):
 
     @property
     def cancelled(self):
-        return bool(self.widget is not None and self.widget.cancelled)
+        """Whether the user asked to stop. Never raises.
+
+        Read from the engine on every poll, so it is on a hot path and it runs
+        while Qt may be tearing the panel down underneath it. A widget that has
+        been deleted is a normal state, not an error: touching its attributes
+        raises `ReferenceError: Cannot access attribute ... of deleted object`,
+        and letting that escape would make `Progress` disable cancellation --
+        turning a harmless race into a button that does nothing.
+        """
+        if self.widget is None:
+            return False
+        try:
+            return bool(self.widget.cancelled)
+        except Exception:
+            # The panel went away. Not a cancel, and not a failure.
+            return False

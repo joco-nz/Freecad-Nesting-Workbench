@@ -1085,3 +1085,132 @@ Cancel button they had just pressed.
 
 The panel has not been seen in a running FreeCAD. `ReplayProgressView` is tested
 and the engine paths are tested against real FreeCAD objects; the Qt half is not.
+
+## NEST-019 — the Tasks panel never appeared, and cancelling never worked
+
+**All three bugs found by the user running it, from the console log. None of
+them was visible to any test in this repository, because all three are Qt.**
+
+### 1. `setRange` takes two arguments
+
+    Replay progress callback raised TypeError: setRange expected 2 arguments, got 1.
+
+Called with one argument it raises on the *first progress event*, the exception
+propagates out of the callback, and `Progress` correctly gives up on a callback
+that has already failed. So the panel died before drawing anything. The
+pytest tier covers `ReplayProgressView`, which is pure; the widget is exactly
+the part it cannot catch.
+
+### 2. `cancel_check=task.cancelled` passed a bool, not a callable
+
+    Replay cancel check raised; cancelling is disabled.
+
+`cancelled` is a **property**, so naming it in a call evaluates it there and
+hands `replay_layout` the bool it happened to be — `False`. `Progress` then
+called that `False` and got `TypeError: 'bool' object is not callable`, and
+because a cancel check that raises is treated as a broken UI rather than as a
+request to stop, **cancelling was disabled for the entire run**. The button
+would have looked plausible and done nothing.
+
+This is the second time in this file that a name evaluated at the wrong moment
+produced a silent no-op. The general lesson, cheap to state and apparently not
+instinctive: a property read at the wrong time is a value, and a value where a
+callable is expected fails *later*, in the consumer, where nothing connects it
+to the mistake.
+
+### 3. The task pane was not in view
+
+`Control.showDialog` succeeded — the widget existed, which is why `cancelled`
+could be read at all — but the task pane lives in the Start workbench's dock.
+From the Model or CAM workbench it is off screen, which reads as "no progress".
+`Control.showTaskView()` is now called first.
+
+### What the console log also showed
+
+**A `ReferenceError` per deleted object, from Draft, not from here.** About 96
+of them:
+
+    File ".../Draft/draftmake/make_clone.py", line 156, in <lambda>
+      QtCore.QTimer.singleShot(0, lambda: gui_utils.format_object(cl, obj[0]))
+    File ".../Draft/draftutils/gui_utils.py", line 557, in format_object
+      if not hasattr(target, "ViewObject"):
+    ReferenceError: Cannot access attribute 'ViewObject' of deleted object
+
+Draft defers `format_object` by one event-loop turn (a workaround for
+FreeCAD #27958) and guards it with `if not target: return`, which does not
+cover a *deleted* object — a deleted FreeCAD object is not falsy, it raises on
+attribute access. Our nesting workbench creates Draft clones and then removes
+its staging clones, so by the time anything pumps the event loop those deferred
+callbacks point at corpses.
+
+Nothing pumped the event loop before this feature. `FreeCADGui.updateGui()` —
+which is what makes a synchronous replay repaint at all — is now the first thing
+to run them, so the noise appears during the replay instead of on the next
+unrelated event.
+
+**Not fixed here.** The honest fix is at the point the clones are deleted: pump
+the event loop while they are still alive. That is in the nesting path, which is
+benchmarked and out of scope for this feature. Recorded so it is not mistaken
+for a replay defect, and so nobody re-derives it.
+
+Also seen and not ours: `Could not tidy the tool table on ...: Cannot access
+attribute 'Label' of deleted object` — which is the next issue, and *was* ours.
+
+## NEST-020 — the default 5 mm endmill was present for the whole replay
+
+Reported by the user: the new job still carried the `TC: 5mm Endmill` controller
+and the SetupSheet's tool dialog kept triggering.
+
+Two bugs, one hiding the other.
+
+**`prune_unused_tool_controllers` had never completed successfully.** It did
+
+    removed.append(getattr(controller, "Label", "?"))
+
+*after* `_remove_with_orphans` deleted the controller. Reading `Label` off a
+deleted FreeCAD object raises `ReferenceError`, and `getattr`'s default only
+swallows `AttributeError`, so the exception escaped, aborted the prune
+mid-flight, and the console said only "Could not tidy the tool table". This had
+been firing on every run since the step was written.
+
+**The prune ran in the wrong place anyway.** It came *after* `replay_recipe`,
+which is where all 98 operations are created — so even working, it was far too
+late to stop a prompt that fires while operations are being made.
+
+Fixed by removing the controllers the job arrived with, at the moment the user's
+own controller is copied in and before the first operation object exists:
+
+    `PathJob.Create`      job has TC: 5mm Endmill
+    copy_tool_controller  job has both            <- nothing built yet, harmless
+    remove obsolete      job has only the user's
+    create operation      1 operation, 1 controller
+
+Deliberately not before `copy_tool_controller` runs: that would leave a window
+with *no* tool, which is the same prompt from the other direction. The harness
+now asserts the property directly — **never an operation in existence while two
+controllers are in the table** — over all 98 built operations. Negative control:
+
+    FAIL: with 1 operation(s) built the job held 2 tool controllers
+          ['TC: 5mm Endmill', 'TC: Plasma, 40A, 1.2mm kerf001'];
+
+The first version of that check asserted on the *first* replay event, which
+passed for the wrong reason: the user's controller had not been copied in yet, so
+the count was 1 by accident. It is the first event *with an operation built*
+that matters, and 98 of those now agree.
+
+`prune_unused_tool_controllers` is kept as the safety net for a custom
+`job_factory` whose job was not empty to begin with.
+
+## GUI verification
+
+The panel and the cancel path are now verified in a real GUI (`freecad` against
+`DISPLAY=:10.0`), not just headless:
+
+    18 checks  widget construction, bar ranges, marquee, panel open/close,
+               cancel flag, reading the flag after the widget is deleted
+    12 checks  end-to-end: panel open, replay draws 156 stage events, cancel
+               keeps 4 of 98 operations labelled _UNVERIFIED, panel closes,
+               and an uncancelled run with the panel open is still ok
+
+Both would have caught the `setRange` and property bugs. They are probes rather
+than gate tests because they need a display.
