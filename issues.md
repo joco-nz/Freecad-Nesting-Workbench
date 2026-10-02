@@ -944,3 +944,76 @@ are contiguous. Both fixes were proved to bite by reverting each in turn.
   from the origin, so the chain falls back to source order. It would have passed
   with position ordering deleted outright. A second check now moves a part and
   asserts the order actually flips.
+
+## NEST-017 — the per-stage timing table was missing the largest cost, and 60% of the run
+
+**Found while adding per-stage timings to the command's report. The timing table
+that had been finding the expensive stages was itself wrong by more than half
+the run.**
+
+Two defects, one of which made the other invisible.
+
+**The final recompute was in no stage at all.** `replay_sheet` called
+`doc.recompute()` between the ordering stage and the verification stage, so it
+fell between the brackets. It is the single largest item in the pipeline —
+measured at 24.0s of a 43.5s run at the time — and it appeared in no row. A
+timing table that silently omits the biggest cost is worse than none, because
+it points at the wrong thing. It is now its own stage, "Recomputing the
+toolpaths", and costs 2.65s.
+
+**The validator timed from progress events rather than from stage boundaries.**
+Events land at arbitrary points *within* a stage, so nothing brackets the work
+before a stage's first event or after its last. Measured on the committed
+fixture, that method summed to **4.30s of a 10.54s run** — a 6.2s hole, and it
+fell on the two largest stages:
+
+| stage | event-delta (wrong) | bracketed (right) |
+|---|---|---|
+| Ordering and tidying the tool table | ~1.0s | **3.8s** |
+| Replaying the recipe | ~1.4s | **3.6s** |
+| Recomputing the toolpaths | *absent* | **2.7s** |
+| SUM | 4.30s | **10.7s** |
+| wall clock | 10.54s | 10.7s |
+
+Undercounting by 60% while reading as a plausible table is the same failure
+class as the rest of this file: an instrument that reports a confident wrong
+answer. The 6.2s was not "some overhead" — it was the two stages anyone would
+have been told to optimise.
+
+Fixed by making `Progress` time itself. It already has exactly one boundary per
+stage, so the timings come from there rather than from a second set of brackets
+kept in step by hand. `clock` is injectable, which is what lets the pytest tier
+assert on the numbers without sleeping.
+
+### Why the timings live on the outcome
+
+`Progress` is built inside `replay_layout`, one per sheet, so the caller could
+not see them. `SheetOutcome.timings` carries them out, which means the command's
+report, the fixture validator and any future caller read the same numbers from
+the same place rather than each reconstructing them.
+
+The stages account for `10.73s` against a `10.74s` wall clock, so nothing is
+running outside a stage. The command prints the gap explicitly when it exists
+rather than letting the table quietly stop short.
+
+### What the table now says
+
+    where the time went:
+    Ordering and tidying the tool table     3.77s  35.1%
+    Replaying the recipe                    3.65s  34.0%
+    Recomputing the toolpaths               2.65s  24.7%
+    Building the replay job                 0.48s   4.5%
+    Flattening nested parts                 0.13s   1.2%
+    Verifying the result                    0.05s   0.5%
+    Reading the source CAM setup            0.00s   0.0%
+    accounted for                          10.73s
+    wall clock                             10.74s
+
+Ordering and replaying are two thirds of the run, so that is where the next
+effort belongs. Recomputing at 24.7% is FreeCAD evaluating 98 toolpaths, which
+is the floor for this design.
+
+The timings are printed on every run and are not behind a preference. Every
+figure that got this feature from 43.5s to 10.7s was measured this way, and a
+timing nobody can see is a timing nobody re-measures after a change makes it
+worse.

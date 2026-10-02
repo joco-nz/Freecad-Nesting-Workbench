@@ -1072,10 +1072,10 @@ def dry_run(doc, layout, job, identity_by_operation=()):
     emit("")
     emit("  replay wall clock: %.0f ms" % (1000 * elapsed))
 
-    _report_progress(events, deltas, elapsed)
+    _report_progress(events, deltas, elapsed, outcomes)
 
 
-def _report_progress(events, deltas, elapsed):
+def _report_progress(events, deltas, elapsed, outcomes=()):
     """Check the progress seam fired, and where the wall clock went.
 
     The per-stage table is not decoration. It is the instrument that found
@@ -1093,7 +1093,8 @@ def _report_progress(events, deltas, elapsed):
 
     expected = ["Reading the source CAM setup", "Flattening nested parts",
                 "Building the replay job", "Replaying the recipe",
-                "Ordering and tidying the tool table", "Verifying the result"]
+                "Ordering and tidying the tool table",
+                "Recomputing the toolpaths", "Verifying the result"]
     if stages != expected:
         fail("progress stages are not the pipeline's stages",
              "expected %r, got %r" % (expected, stages))
@@ -1108,35 +1109,53 @@ def _report_progress(events, deltas, elapsed):
 
     ok("%d progress event(s) over %d stage(s)" % (len(events), len(stages)))
 
-    # Per-stage seconds, measured between consecutive events and attributed to
-    # the stage that was running. `total` is the true elapsed, so the column
-    # adds up.
-    per_stage = []
-    prev_stage = None
-    for (stage, _c, _t, _m), secs in zip(events, deltas):
-        if prev_stage is not None and stage != prev_stage:
-            per_stage[-1][1] += secs
-        if not per_stage or per_stage[-1][0] != stage:
-            per_stage.append([stage, 0.0])
-        prev_stage = stage
-    if per_stage:
-        per_stage[-1][1] += deltas[-1]
+    # Per-stage seconds, from `Progress`, which brackets each stage itself.
+    #
+    # **Not** measured between consecutive events, which is what this table did
+    # before, and which undercounted badly: events land at arbitrary points
+    # within a stage, so nothing brackets the work before a stage's first event
+    # or after its last. Measured here it summed to 4.30s of a 10.54s run --
+    # a 6.2s hole, and it landed on the largest cost in the pipeline. A table
+    # that silently drops 60% of the run points at the wrong stage.
+    rows = [row for outcome in outcomes for row in outcome.timings]
+    if not rows:
+        fail("the outcomes carry no per-stage timings")
+        return
+
+    by_stage = {}
+    for stage, secs, runs in rows:
+        slot = by_stage.setdefault(stage, [0.0, 0])
+        slot[0] += secs
+        slot[1] += runs
+    timed = sum(o.timed_seconds for o in outcomes)
 
     emit("")
-    emit("    %-36s %7s %10s" % ("stage", "events", "seconds"))
-    for stage, secs in per_stage:
-        n = sum(1 for e in events if e[0] == stage)
-        emit("    %-36s %7d %9.2fs" % (stage, n, secs))
-    accounted = sum(s for _n, s in per_stage)
-    emit("    %-36s %7s %9.2fs  (measured %.2fs)"
-         % ("SUM", "", accounted, elapsed))
+    emit("    %-36s %7s %10s" % ("stage", "runs", "seconds"))
+    for stage, (secs, runs) in sorted(by_stage.items(), key=lambda kv: -kv[1][0]):
+        emit("    %-36s %7d %9.2fs" % (stage, runs, secs))
+    emit("    %-36s %7s %9.2fs  (wall clock %.2fs)"
+         % ("SUM", "", timed, elapsed))
 
-    slowest = max(per_stage, key=lambda row: row[1])
-    if slowest[1] > 0.5 * elapsed and slowest[1] > 1.0:
+    # Cross-check: the stages cannot account for more than the run took, and
+    # cannot account for none of it.
+    if timed > elapsed + 0.05:
+        fail("the stages account for %.2fs but the run took %.2fs -- the "
+             "timings are not a subset of the run"
+             % (timed, elapsed))
+    gap = elapsed - timed
+    if gap > 0.5 * elapsed:
+        note("%.0f%% of the run (%.2fs of %.2fs) is outside any stage. A "
+             "progress bar can only report stages, so this part is a blind "
+             "spot rather than slow progress."
+             % (100 * gap / elapsed, gap, elapsed))
+
+    slowest_stage, (slowest, _runs) = max(by_stage.items(),
+                                          key=lambda kv: kv[1][0])
+    if slowest > 0.5 * elapsed and slowest > 1.0:
         note("%.0f%% of the run is in one stage: %s (%.1fs of %.1fs). A "
              "progress bar can only report that, so if this is avoidable the "
              "bar is treating a symptom."
-             % (100 * slowest[1] / elapsed, slowest[0], slowest[1], elapsed))
+             % (100 * slowest / elapsed, slowest_stage, slowest, elapsed))
     emit("  (nothing was saved; the document is discarded)")
 
 

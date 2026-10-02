@@ -102,6 +102,7 @@ stand-in objects. The flattener (`flatten_sheet` and what it calls) does
 create objects, and is covered by the freecadcmd harness instead.
 """
 import math
+import time
 
 import FreeCAD
 
@@ -1298,11 +1299,16 @@ def _add_link_property(obj, name, value, doc_string):
 class Progress:
     """Two-level progress reporting for a replay run.
 
-    A replay is not quick. Measured on the committed fixture, `replay_layout`
-    takes **43 seconds** for one sheet of 48 parts with 7 operations, and
-    `replay_layout` loops over sheets, so a three-sheet nest is a bit over two
-    minutes of a frozen UI with nothing on screen. This is the seam that a
-    dialog, a Tasks-panel widget or a bare Console line can all hang off.
+    A replay is not quick, though it got a great deal quicker: the committed
+    fixture is 48 parts with 7 source operations, and `replay_layout` took
+    **43.5s** for one sheet before the per-part split and the footprint cache,
+    and takes **~10.5s** now. It was worth getting that far down before deciding
+    a progress bar was needed, because a bar is the honest answer to a slow
+    command and a workaround is the honest answer to a slow *implementation*.
+
+    `replay_layout` loops over sheets, so the numbers multiply: a three-sheet
+    nest is half a minute, not two minutes. This is the seam that a dialog, a
+    Tasks-panel widget or a bare Console line can all hang off.
 
     The callback is `callback(stage, current, total, message=None)`.
 
@@ -1326,9 +1332,26 @@ class Progress:
 
     Optional throughout. `None` is the default, so the harness and every
     existing caller are unaffected.
+
+    **It also times itself.** `timing_rows()` gives `(stage, seconds, runs)`
+    per stage, and `elapsed` is the time accounted for. Timing lives here rather
+    than in whoever wants the numbers for two reasons:
+
+      * There is already one boundary per stage in this class, and a caller who
+        wanted timings would otherwise have to bracket each stage again. Two
+        sets of stage boundaries drift apart the first time one is edited.
+      * A caller timing from *progress events* rather than from stage
+        boundaries gets the wrong answer. Events land at arbitrary points
+        within a stage, so the deltas between them are attributed correctly but
+        nothing brackets the work before the first event or after the last one.
+
+    `clock` is injectable so the pure-Python tier can assert on the numbers
+    without sleeping. `runs` counts how many separate times a stage was entered,
+    so a multi-sheet run aggregates into one row per stage rather than one row
+    per stage per sheet.
     """
 
-    def __init__(self, callback=None, prefix=""):
+    def __init__(self, callback=None, prefix="", clock=None):
         self._callback = callback
         self._prefix = ("%s " % prefix) if prefix else ""
         self._stage = ""
@@ -1338,18 +1361,62 @@ class Progress:
         #: pure-Python tier where `FreeCAD.Console` is a stand-in returning None.
         self.warning = None
 
+        self._clock = clock or time.perf_counter
+        #: `[stage, seconds, runs]`, merged by stage name, in first-seen order.
+        self.timings = []
+        self._opened_at = None
+        self._stage_events = 0
+        #: Seconds accounted for by the stages. Less than the run's wall clock,
+        #: because work outside any stage is not counted; that gap is worth
+        #: seeing too, which is why callers report both.
+        self.elapsed = 0.0
+
     def stage(self, name):
         """Announce a new stage. Resets the within-stage count."""
+        self._close_stage()
         self._stage = name
+        self._stage_events = 0
+        self._opened_at = self._clock()
         self._emit(0, 0, name)
 
     def item(self, current, total, detail=None):
         """Report position within the current stage."""
+        self._stage_events += 1
         self._emit(current, total, detail)
 
     def done(self, detail=None):
         """Close the current stage."""
         self._emit(None, None, detail)
+
+    def _close_stage(self):
+        """Bank the running stage's elapsed time, if one is running."""
+        if self._opened_at is None:
+            return
+        seconds = self._clock() - self._opened_at
+        self._opened_at = None
+        self.elapsed += seconds
+        for row in self.timings:
+            if row[0] == self._stage:
+                row[1] += seconds
+                row[2] += 1
+                break
+        else:
+            self.timings.append([self._stage, seconds, 1])
+
+    def finish(self):
+        """Close the running stage. Idempotent."""
+        self._close_stage()
+
+    def timing_rows(self):
+        """`[(stage, seconds, runs)]`, banking the running stage first.
+
+        The row for the last stage is only correct after it has been closed, so
+        this closes it rather than reporting an undercount. Idempotent, so
+        reading the timings twice does not double-count anything.
+        """
+        self._close_stage()
+        return [(stage, seconds, runs)
+                for stage, seconds, runs in self.timings]
 
     def _emit(self, current, total, message):
         if self._callback is None or self._failed:
@@ -1358,7 +1425,7 @@ class Progress:
             self._callback(self._stage, current, total,
                            self._prefix + (message or ""))
         except Exception as exc:
-            # A dead widget must not cost a 43-second run, and must not repeat
+            # A dead widget must not cost a 10-second run, and must not repeat
             # itself on every one of the 48 parts. One warning, then silent.
             #
             # The print is guarded as well. This is the one place the recovery
@@ -3640,6 +3707,15 @@ class SheetOutcome:
         self.verification = verification
         self.ordering = ordering or []
         self.errors = errors or []
+        #: `[(stage, seconds, runs)]` for this sheet, from `Progress`. Empty
+        #: when no progress seam was in use. Carried on the outcome rather than
+        #: returned separately so that whoever ran the pipeline is the one who
+        #: can see where the time went, whether that is the command's report or
+        #: the fixture validator.
+        self.timings = []
+        #: Seconds the stages accounted for. Below the wall clock when work
+        #: happened outside any stage, which is itself worth reporting.
+        self.timed_seconds = 0.0
 
     @property
     def ok(self):
@@ -3842,7 +3918,16 @@ def replay_sheet(doc, layout_group, sheet_group, source_job, post_processor=None
             "Could not order the operations for %s: %s" % (outcome.sheet_label, exc)
         )
 
+    # Its own stage, because it is not cheap and it was not being counted.
+    # This recompute was measured at 24.0s of a 43.5s run -- the single largest
+    # item in the whole replay -- while sitting between two stages, so it
+    # appeared in neither. A timing table that silently omits the largest cost
+    # is worse than no table, because it points at the wrong thing.
+    if progress is not None:
+        progress.stage("Recomputing the toolpaths")
     doc.recompute()
+    if progress is not None:
+        progress.done()
 
     if progress is not None:
         progress.stage("Verifying the result")
@@ -3915,14 +4000,56 @@ def replay_layout(doc, layout_group, source_job, post_processor=None,
 
     outcomes = []
     for sheet in get_sheet_groups(layout_group):
-        outcomes.append(replay_sheet(
+        progress = Progress(progress_callback,
+                            prefix=getattr(sheet, "Label", "") or "")
+        outcome = replay_sheet(
             doc, layout_group, sheet, source_job,
             post_processor=post_processor, template_path=template_path,
-            job_factory=job_factory,
-            progress=Progress(progress_callback,
-                              prefix=getattr(sheet, "Label", "") or ""),
-        ))
+            job_factory=job_factory, progress=progress)
+        # Banked here, not inside `replay_sheet`, because this is the frame that
+        # owns the seam: the sheet does not know when its last stage really
+        # ended, and a `Progress` that closed its own final stage would report a
+        # stage that ran to the end of the *run*.
+        outcome.timings = progress.timing_rows()
+        outcome.timed_seconds = progress.elapsed
+        outcomes.append(outcome)
     return outcomes
+
+
+def describe_timings(timings, timed_seconds=None, wall_clock=None, indent="  "):
+    """Return report lines for where a replay's time went.
+
+    Sorted by cost, largest first, because that is the question the table is
+    asked. The pipeline's own stage order is the progress bar's business.
+
+    `wall_clock` is the caller's own measurement of the whole run. When it is
+    given and does not match `timed_seconds`, the difference is printed rather
+    than hidden: time spent outside any stage is still time the operator spent,
+    and a table that quietly drops it points at the wrong stage.
+    """
+    if not timings:
+        return []
+    rows = sorted(timings, key=lambda row: -row[1])
+    total = sum(seconds for _name, seconds, _runs in rows)
+    width = max(len(name) for name, _s, _r in rows)
+
+    lines = ["%swhere the time went:" % indent]
+    for name, seconds, runs in rows:
+        share = (100.0 * seconds / total) if total > 0 else 0.0
+        times = "  (x%d)" % runs if runs > 1 else ""
+        lines.append("%s%-*s %8.2fs %5.1f%%%s"
+                     % (indent, width, name, seconds, share, times))
+
+    accounted = timed_seconds if timed_seconds is not None else total
+    lines.append("%s%-*s %8.2fs" % (indent, width, "accounted for", accounted))
+    if wall_clock is not None:
+        gap = wall_clock - accounted
+        if gap > 0.05:
+            lines.append("%s%-*s %8.2fs  outside any stage"
+                         % (indent, width, "unaccounted", gap))
+        lines.append("%s%-*s %8.2fs" % (indent, width, "wall clock",
+                                        wall_clock))
+    return lines
 
 
 def describe_sheet_outcome(outcome):

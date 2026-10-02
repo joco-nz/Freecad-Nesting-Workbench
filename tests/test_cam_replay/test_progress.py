@@ -25,7 +25,10 @@ broke:
 import pytest
 
 from freecad.nestingworkbench.Tools.Cam import cam_replay
-from freecad.nestingworkbench.Tools.Cam.cam_replay import Progress
+from freecad.nestingworkbench.Tools.Cam.cam_replay import (
+    Progress,
+    describe_timings,
+)
 
 
 class _Sink:
@@ -265,3 +268,158 @@ class TestTheCountsAreTrue:
         p.stage("nothing to do")
         p.item(0, 0)
         assert sink.events[-1][1:3] == (0, 0)
+
+
+class _Clock:
+    """A clock that only moves when told to.
+
+    Timings are the one thing here that cannot be asserted on with a real
+    clock: a test that sleeps is a test that is slow and flaky, and one that
+    tolerates a tolerance is one that will pass when the thing it guards is
+    broken. So `Progress` takes the clock as an argument.
+    """
+
+    def __init__(self, start=100.0):
+        self.now = start
+
+    def __call__(self):
+        return self.now
+
+    def advance(self, seconds):
+        self.now += seconds
+
+
+class TestTimings:
+    def test_each_stage_is_banked_when_the_next_one_starts(self):
+        clock = _Clock()
+        p = Progress(clock=clock)
+        p.stage("first")
+        clock.advance(2.0)
+        p.stage("second")
+        clock.advance(3.0)
+
+        assert p.timing_rows() == [("first", 2.0, 1), ("second", 3.0, 1)]
+        assert p.elapsed == 5.0
+
+    def test_the_running_stage_is_banked_only_once(self):
+        # `timing_rows()` closes the last stage, so reading the timings twice
+        # must not double-count it. It also must not zero the running stage
+        # out from under the caller.
+        clock = _Clock()
+        p = Progress(clock=clock)
+        p.stage("only")
+        clock.advance(4.0)
+
+        assert p.timing_rows() == [("only", 4.0, 1)]
+        clock.advance(4.0)
+        assert p.timing_rows() == [("only", 4.0, 1)]
+        assert p.elapsed == 4.0
+
+    def test_finish_is_idempotent(self):
+        clock = _Clock()
+        p = Progress(clock=clock)
+        p.stage("work")
+        clock.advance(1.0)
+        p.finish()
+        p.finish()
+        assert p.elapsed == 1.0
+
+    def test_a_repeated_stage_is_merged_and_counted(self):
+        # A multi-sheet run enters the same stage name once per sheet. Six
+        # rows per stage per sheet would be unreadable in a report; six rows
+        # with a count is one table for the whole run.
+        clock = _Clock()
+        p = Progress(clock=clock)
+        p.stage("Reading")
+        clock.advance(1.0)
+        p.stage("Other")
+        clock.advance(1.0)
+        p.stage("Reading")
+        clock.advance(2.0)
+
+        rows = dict((name, (secs, runs)) for name, secs, runs in p.timing_rows())
+        assert rows == {"Reading": (3.0, 2), "Other": (1.0, 1)}
+
+    def test_events_do_not_change_the_timings(self):
+        # `item()` counts events but is not a stage boundary. If an event were
+        # treated as one, a stage with 48 parts would be split into 48 rows.
+        clock = _Clock()
+        p = Progress(clock=clock)
+        p.stage("Flattening")
+        for _ in range(48):
+            p.item(1, 48, "part")
+        clock.advance(0.5)
+        p.stage("next")
+        clock.advance(0.5)
+
+        assert p.timing_rows() == [("Flattening", 0.5, 1), ("next", 0.5, 1)]
+
+    def test_no_progress_callback_still_timings(self):
+        # Timings are not a side effect of there being a widget to feed.
+        clock = _Clock()
+        p = Progress(clock=clock)
+        p.stage("work")
+        clock.advance(2.0)
+        p.finish()
+        assert p.timing_rows() == [("work", 2.0, 1)]
+
+    def test_a_dead_callback_does_not_stop_the_timings(self):
+        # The seam gives up after a callback raises, so that a broken widget
+        # does not cost the run. The timings must survive that: they are what
+        # says the run was slow, and losing them would hide exactly the case
+        # where a UI was misbehaving.
+        clock = _Clock()
+
+        def boom(*_a):
+            raise RuntimeError("no widget")
+
+        p = Progress(boom, clock=clock)
+        p.stage("work")
+        clock.advance(3.0)
+        p.finish()
+        assert p.timing_rows() == [("work", 3.0, 1)]
+        assert p.warning is not None
+
+
+class TestDescribeTimings:
+    def _rows(self):
+        return [("Ordering", 4.0, 1), ("Replaying", 3.0, 2), ("Reading", 1.0, 1)]
+
+    def test_largest_first(self):
+        # The table answers "where did the time go", and that is a ranking
+        # question. Pipeline order is the progress bar's business.
+        text = "\n".join(describe_timings(self._rows()))
+        assert text.index("Ordering") < text.index("Replaying")
+        assert text.index("Replaying") < text.index("Reading")
+
+    def test_repeats_are_shown(self):
+        text = "\n".join(describe_timings(self._rows()))
+        assert "(x2)" in text
+        assert "(x1)" not in text
+
+    def test_shares_are_reported_against_the_accounted_total(self):
+        text = "\n".join(describe_timings(self._rows()))
+        assert "50.0%" in text      # 4 of 8
+        assert "12.5%" in text      # 1 of 8
+
+    def test_the_unaccounted_gap_is_shown_when_it_matters(self):
+        # Time spent outside any stage is still time the operator spent. A
+        # table that quietly drops it points at the wrong stage, which is what
+        # the event-delta table did -- it lost 6.2s of a 10.4s run.
+        text = "\n".join(describe_timings(self._rows(), timed_seconds=8.0,
+                                         wall_clock=10.0))
+        assert "unaccounted" in text
+        assert "outside any stage" in text
+        assert "2.00s" in text
+
+    def test_no_gap_line_when_the_stages_account_for_it_all(self):
+        text = "\n".join(describe_timings(self._rows(), timed_seconds=8.0,
+                                         wall_clock=8.02))
+        assert "unaccounted" not in text
+
+    def test_nothing_to_report_gives_nothing(self):
+        assert describe_timings([]) == []
+
+    def test_a_single_zero_stage_does_not_divide_by_zero(self):
+        text = "\n".join(describe_timings([("Idle", 0.0, 1)]))
+        assert "Idle" in text

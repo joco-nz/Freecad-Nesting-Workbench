@@ -43,6 +43,8 @@ Two behaviours worth knowing before using it:
     a separate job for each, and a sheet that fails does not stop the others.
     They are independent jobs, and one bad sheet should not hide a good one.
 """
+import time
+
 import FreeCAD
 import FreeCADGui
 from PySide import QtWidgets
@@ -147,6 +149,12 @@ class ReplayCAMSetupCommand:
         # No options. Everything the replay needs is in the job the user
         # selected and the layout in front of them; see the module docstring
         # for what the dialog used to ask and why it was removed.
+        #
+        # Timed here, at the one place that spans the whole run. `Progress`
+        # banks each stage's seconds as it goes, so this is only a subtraction
+        # at the end -- but it has to be at this level, because a per-sheet
+        # number cannot be compared against a whole-run one.
+        started = time.perf_counter()
         try:
             outcomes = cam_replay.replay_layout(doc, layout_group, source_job)
         except Exception as exc:
@@ -154,10 +162,11 @@ class ReplayCAMSetupCommand:
             import traceback
             traceback.print_exc()
             return
+        wall_clock = time.perf_counter() - started
 
-        self._report(layout_group, source_job, outcomes)
+        self._report(layout_group, source_job, outcomes, wall_clock)
 
-    def _report(self, layout_group, source_job, outcomes):
+    def _report(self, layout_group, source_job, outcomes, wall_clock=None):
         """Print the whole run to the Report view and raise a dialog for it.
 
         Console output rather than `FreeCADGui.ReportView`, because Console
@@ -186,6 +195,17 @@ class ReplayCAMSetupCommand:
                 "Replayed '%s' onto %d sheet(s) of '%s'."
                 % (source_job.Label, len(outcomes), layout_group.Label)
             )
+
+        # Always in the report, never behind a preference. The figures that got
+        # this feature from 43.5s to 10.6s were all measured this way, and a
+        # timing nobody can see is a timing nobody re-measures after a change
+        # makes it worse.
+        if wall_clock is not None:
+            timed = sum(o.timed_seconds for o in outcomes)
+            lines.append("")
+            lines.extend(cam_replay.describe_timings(
+                [row for o in outcomes for row in o.timings],
+                timed_seconds=timed, wall_clock=wall_clock))
 
         text = "\n".join(lines)
         if failed:
