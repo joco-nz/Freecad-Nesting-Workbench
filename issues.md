@@ -710,17 +710,50 @@ this probe reported 18.3x by putting operation creation and the first recompute
 in one bucket and comparing it against a later forced recompute; the two are
 apart now and 15x is the honest figure.
 
-**What it costs, which is why it is not simply taken:**
+**What it costs, measured.** First measurement put it at 577 commands against
+621, +7.6%, and guessed it probably meant more table time. That guess was wrong,
+and the 7.6% was measured without dressups; with them it is +12.7%.
 
-* **577 commands against 621, +7.6%.** One operation cutting 23 parts links
-  between them; 23 separate operations each reposition. That is more G-code and
-  probably more table time, on the machine this work exists to feed.
-* **161 operations instead of 7.** It breaks the invariant recorded on the
-  validator: *a process step contributes ONE entry to `Operations.Group`*. It
-  also puts 23 dressups per step in the tree, changes verification granularity,
-  and changes how a failed sheet is labelled.
-* It would apply only to the replay. In FreeCAD's own CAM the user would hit the
-  same superlinearity, but there it is their own setup and their own choice.
+Measured on the real fixture by concatenating the paths as the post processor
+would, including the move from one operation's end to the next:
+
+    A. one operation, 23 targets        347 cmd  68 rapid ( 1120 mm)  253 cut (3760.5 mm)
+
+    B. split into 23, recipe order      391 cmd  68 rapid ( 3643 mm)  253 cut (3767.0 mm)
+       B. split, sorted by position     391 cmd  68 rapid ( 2043 mm)  253 cut (3767.0 mm)
+       B. split, reversed               391 cmd  68 rapid ( 3655 mm)  253 cut (3767.0 mm)
+
+    added over one operation:
+       recipe order    rapids +2524 mm    cutting +6.5 mm  (+0.17%)
+       nest order      rapids  +924 mm    cutting +6.5 mm  (+0.17%)
+
+**Cutting is unchanged: +6.5 mm on 3760 mm, +0.17%.** No extra material work, and
+no extra torch-on time. The reason is that LeadInOut already inserts one
+lead-in per *target*, not per operation -- measured 230 cut moves on the bare
+Profile and 253 with the dressup, across 23 targets, so exactly one per part in
+either arrangement. Splitting does not add a 24th.
+
+**The rapid count is identical at 68.** Only the distance changes, and only
+because one operation links between adjacent parts more tightly than 23
+operations with boundaries between them. 0.9 to 2.5 m of extra torch-off travel
+against 3.8 m of cutting.
+
+**Operation order matters more than anything else here**: sorting the split
+operations by position on the sheet cuts the penalty from +2524 mm to +924 mm, a
+2.7x difference. That is free and it is the nest's whole premise. It has to
+compose with the existing hole-nesting constraint rather than replace it -- hole
+nesting is a hard ordering requirement, position is a preference, so position
+belongs as the tie-break inside the topological sort `order_operations` already
+performs.
+
+**Two measurement mistakes recorded, because both gave alarming answers that
+were not real.** Summing the split operation's path *and* its dressup's path
+counted every move twice, since the dressup's path already contains the base
+operation's -- that produced "+98% cutting, torch-on time nearly doubles", which
+is not what happens. And measuring rapids per operation rather than on the
+concatenated sequence counted a rapid from the origin for every operation, which
+the post processor does not do. The figures above are from the concatenated
+sequence.
 
 **Not implemented. It is a product decision, not a performance fix.** The
 replay's contract is that the user's operation is reproduced, one for one;
