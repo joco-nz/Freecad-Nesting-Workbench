@@ -63,12 +63,19 @@ def _worker_pin_is_explicit():
 
 
 def _rotation_worker_pin():
-    """The width to pin, or the core count when the width is "auto"."""
+    """The width to pin, or the core count when the width is "auto".
+
+    0 is passed through, not clamped to 1: 0 means "no ThreadPoolExecutor at
+    all", which is a different execution model from a one-worker pool and is
+    the width the serial-versus-pool comparison needs. `max(1, ...)` here made a
+    requested width of 0 measure width 1, so a GA run pinned to serial was
+    silently reported and measured as parallel.
+    """
     raw = os.environ.get("NEST_BENCH_ROTATION_WORKERS", "1").strip()
     if raw.lower() == "auto":
         import os as _os
         return max(1, _os.cpu_count() or 1)
-    return max(1, int(raw or 1))
+    return max(0, int(raw or 1))
 
 
 def _parse_quantities(spec):

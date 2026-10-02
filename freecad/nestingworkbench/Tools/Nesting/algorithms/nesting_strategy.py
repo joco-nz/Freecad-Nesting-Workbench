@@ -81,7 +81,7 @@ def _rotation_workers_explicit(kwargs=None):
 
 
 def _rotation_worker_limit(kwargs=None):
-    """Resolve the rotation thread-pool width. Always returns a positive int.
+    """Resolve the rotation execution width. Returns 0 for "no pool at all".
 
     One core per thread is the default. This used to be `None`, meaning "let
     ThreadPoolExecutor decide", and the stdlib decides `min(32, cpu_count() + 4)`
@@ -97,8 +97,9 @@ def _rotation_worker_limit(kwargs=None):
 
     Precedence: an explicit positive value from the caller (the "Rotation
     Threads" field), then `NESTING_ROTATION_WORKERS` for scripted and benchmark
-    runs, then the core count. 0 and unset both mean auto, so the field can be
-    left alone.
+    runs, then the core count. An unset field and 0 both mean auto at the UI
+    layer; 0 arriving through the environment is honoured, because it is how
+    the benchmark harness asks for true serial.
 
     `NESTING_ROTATION_WORKERS` deliberately survives the UI field: the benchmark
     harness pins the width for reproducible work counters and never builds an
@@ -114,13 +115,17 @@ def _rotation_worker_limit(kwargs=None):
     if raw:
         try:
             value = int(raw)
-            if value > 0:
+            # 0 is meaningful and explicit: "no pool at all". It is not the
+            # same as 1, which still builds and tears down a ThreadPoolExecutor
+            # with a single worker on every placement. Distinguishing the two is
+            # what makes the serial-versus-pool comparison measurable at all.
+            if value >= 0:
                 return value
         except ValueError:
             pass
-    # Never 0: a zero-width pool would silently disable parallelism, and
-    # max_workers must be positive. cpu_count() can return None on platforms
-    # that cannot answer, hence the fallback.
+    # Positive by default: max_workers must be >= 1, so a fallback of 0 would
+    # be a silently different execution model. cpu_count() can return None on
+    # platforms that cannot answer, hence the fallback.
     return max(1, os.cpu_count() or 1)
 
 
@@ -290,6 +295,25 @@ class CandidateGeometryCache:
             return len(self._polygons)
 
 
+class _RotationTotals:
+    """Accumulator for the sub-phase timings of one placement's rotations.
+
+    Replaces three locals that were incremented from inside the future loop.
+    The pool path and the serial path both fill one of these, so the totals are
+    summed in one place afterwards rather than in each branch. The fields are
+    plain floats because the serial path -- and the pool's drain loop, which
+    runs on this thread -- are the only writers; `_evaluate_rotation` returns
+    per-rotation timings rather than accumulating them itself.
+    """
+
+    __slots__ = ("nfp_ms", "validity_ms", "score_ms")
+
+    def __init__(self):
+        self.nfp_ms = 0.0
+        self.validity_ms = 0.0
+        self.score_ms = 0.0
+
+
 class PlacementOptimizer:
     """
     Handles the geometric logic of finding the best position for a part on a sheet.
@@ -456,13 +480,11 @@ class PlacementOptimizer:
         else:
             angles = [i * (360.0 / part_rotation_steps) for i in range(part_rotation_steps)]
         
-        # Parallel evaluation — one thread per rotation. Candidate point-in-polygon
-        # rejection runs on the CPU via shapely.
+        # Rotations are evaluated either serially or through a pool. Candidate
+        # point-in-polygon rejection runs on the CPU via shapely, which releases
+        # the GIL around the GEOS call but not around the surrounding Python.
         import time as _time
         t0_parallel = _time.perf_counter()
-        total_nfp_ms = 0.0
-        total_validity_ms = 0.0
-        total_score_ms = 0.0
         # Recorded so the report line is self-describing: a run measured with
         # the env override must say so, otherwise the 4-vs-8 comparison is
         # unattributable. max_workers=None means the stdlib default.
@@ -476,111 +498,59 @@ class PlacementOptimizer:
             # The width actually used, and whether it was chosen. Both are
             # recorded because neither is visible in the output otherwise, and
             # two runs with identical packing can differ in wall clock by 22%
-            # purely on this.
+            # purely on this. 0 is a real width here: it means "no pool", which
+            # is a different execution model from a one-worker pool.
             self._perf_stats['rotation_workers'] = worker_limit
             self._perf_stats['rotation_workers_auto'] = int(was_auto)
-        with ThreadPoolExecutor(max_workers=worker_limit) as executor:
-            futures = {
-                executor.submit(
-                    self._evaluate_rotation_tracked,
-                    angle,
-                    part,
-                    placed_parts_grouped,
-                    sheet,
-                    direction,
-                ): angle
-                for angle in angles
-            }
 
-            for future in as_completed(futures):
-                try:
-                    res = future.result()
+        totals = _RotationTotals()
+        if worker_limit:
+            with ThreadPoolExecutor(max_workers=worker_limit) as executor:
+                futures = {
+                    executor.submit(
+                        self._evaluate_rotation_tracked,
+                        angle,
+                        part,
+                        placed_parts_grouped,
+                        sheet,
+                        direction,
+                    ): angle
+                    for angle in angles
+                }
+
+                for future in as_completed(futures):
+                    try:
+                        res = future.result()
+                    except Exception as e:
+                        self.log(f"Error in rotation evaluation thread: {e}")
+                        continue
                     if res:
-                        total_nfp_ms += res.get('_t_nfp_ms', 0)
-                        total_validity_ms += res.get('_t_validity_ms', 0)
-                        total_score_ms += res.get('_t_score_ms', 0)
-                        with self._perf_lock:
-                            self._perf_stats['rotation_evaluations'] += 1
-                            self._perf_stats['successful_rotations'] += int(
-                                res.get('x') is not None)
-                            self._perf_stats['candidate_points'] += res.get(
-                                '_candidate_points', 0)
-                            self._perf_stats['valid_candidate_points'] += res.get(
-                                '_valid_candidate_points', 0)
-                            self._perf_stats['nfp_ms'] += res.get('_t_nfp_ms', 0)
-                            self._perf_stats['candidate_validity_ms'] += res.get(
-                                '_t_validity_ms', 0)
-                            self._perf_stats['score_ms'] += res.get('_t_score_ms', 0)
-                            for key in (
-                                'bounds_survivors', 'sheet_candidates',
-                                'sheet_rejections', 'sheet_boundary_candidates',
-                                'collision_candidates',
-                                'collision_rejections', 'bbox_rejections',
-                                'polygon_checks',
-                            ):
-                                self._perf_stats[key] += res.get(f'_{key}', 0)
-                            self._perf_stats['candidate_geometry_ms'] += res.get(
-                                '_candidate_geometry_ms', 0)
-                            self._perf_stats['sheet_difference_ms'] += res.get(
-                                '_sheet_difference_ms', 0)
-                            self._perf_stats['collision_intersection_ms'] += res.get(
-                                '_collision_intersection_ms', 0)
-                            # The collision stage's decomposition. The probe
-                            # keys arrive here underscore-prefixed -- that is the
-                            # convention every other absorbed key uses, and
-                            # reading them unprefixed yields a silent 0 rather
-                            # than an error, because .get() defaults.
-                            for _key in ('collision_intersects_ms',
-                                          'collision_overlay_ms',
-                                          'collision_hole_probe_ms'):
-                                self._perf_stats[_key] = self._perf_stats.get(
-                                    _key, 0.0) + res.get(f'_{_key}', 0.0)
-                            self._perf_stats['rotation_wall_ms'] += res.get(
-                                '_t_wall_ms', 0)
-                            self._perf_stats['candidate_evaluation_wall_ms'] += res.get(
-                                '_t_candidate_evaluation_ms', 0)
-                            for key in (
-                                'candidate_geometries_built',
-                                'candidate_geometry_cache_hits',
-                                'candidate_geometry_cache_misses',
-                                'candidate_geometry_cache_ms',
-                                'bbox_checks', 'bbox_overlap_pairs',
-                                'exact_collision_checks',
-                                'collision_intersects_true',
-                                'collision_intersects_false',
-                                'collision_grazing_pairs',
-                                'mask_hole_rings', 'mask_hole_vertices',
-                                'mask_exterior_vertices',
-                                'mask_hole_sensitive_pairs',
-                                'mask_hole_exploiting_placements',
-                                'mask_candidate_rings',
-                                'mask_subthreshold_hole_rings',
-                                'mask_subthreshold_hole_vertices',
-                                'mask_calls', 'mask_batch_candidates',
-                                'collision_intersects_calls',
-                                'collision_overlay_calls',
-                                'collision_hole_probe_calls',
-                                'collision_overlay_area_zero',
-                                'collision_overlay_area_sub_tol',
-                                'collision_overlay_area_over_tol',
-                                'collision_overlay_area_total',
-                            ):
-                                self._perf_stats[key] += res.get(f'_{key}', 0)
-                            self._perf_stats['mask_batch_max'] = max(
-                                self._perf_stats['mask_batch_max'],
-                                res.get('_mask_batch_max', 0),
-                            )
-                            self._perf_stats['candidate_geometry_cache_entries'] = max(
-                                self._perf_stats['candidate_geometry_cache_entries'],
-                                res.get('_candidate_geometry_cache_entries', 0),
-                            )
-                        if res['metric'] < best_result['metric']:
-                            best_result = res
-                            # Call trial callback from main thread for each better result found
-                            if self.trial_callback and best_result.get('x') is not None:
-                                self.trial_callback(part, best_result['angle'], best_result['x'], best_result['y'])
+                        best_result = self._absorb_rotation_result(
+                            res, part, best_result, totals)
+        else:
+            # No pool. Same evaluation, same order as the angles list, on this
+            # thread. Two consequences, both measured in
+            # tests/freecad_harness/bench_rotation_workers.py:
+            #   - no pool construction or teardown per placement. The pool was
+            #     built once per part placed -- 122 times in a GA run.
+            #   - the result stops depending on completion order. Taking the
+            #     best with a strict `<` means a metric tie is won by whichever
+            #     rotation finishes first, which under a pool is a scheduling
+            #     detail. Serial evaluation is order-stable by construction.
+            for angle in angles:
+                try:
+                    res = self._evaluate_rotation_tracked(
+                        angle, part, placed_parts_grouped, sheet, direction)
                 except Exception as e:
-                    self.log(f"Error in rotation evaluation thread: {e}")
+                    self.log(f"Error in rotation evaluation: {e}")
+                    continue
+                if res:
+                    best_result = self._absorb_rotation_result(
+                        res, part, best_result, totals)
+
+        total_nfp_ms = totals.nfp_ms
+        total_validity_ms = totals.validity_ms
+        total_score_ms = totals.score_ms
 
         dt_parallel = (_time.perf_counter() - t0_parallel) * 1000
         with self._perf_lock:
@@ -591,8 +561,9 @@ class PlacementOptimizer:
                      f"score={total_score_ms:.0f}ms "
                      f"({len(angles)} rotations, {len(sheet.parts)} placed)")
         if self.verbose:
-            self.log(f"  -> Parallel eval: {len(angles)} rotations in {dt_parallel:.1f}ms "
-                     f"(ideal speedup: {len(angles)}x, pool workers: {min(len(angles), os.cpu_count() or 1)})")
+            self.log(f"  -> {'Serial' if not worker_limit else 'Pool'} eval: "
+                     f"{len(angles)} rotations in {dt_parallel:.1f}ms "
+                     f"(workers: {worker_limit or 0})")
         best_result['_t_nfp_ms'] = total_nfp_ms
         best_result['_t_validity_ms'] = total_validity_ms
         best_result['_t_score_ms'] = total_score_ms
@@ -608,6 +579,102 @@ class PlacementOptimizer:
              part.move(best_result['x'] - curr.x, best_result['y'] - curr.y)
              return part
         return None
+
+    def _absorb_rotation_result(self, res, part, best_result, totals):
+        """Fold one evaluated rotation into the perf counters and the best-so-far.
+
+        Extracted from the future loop so the pool and serial paths cannot
+        drift apart: they were one block before, duplicated by hand the moment
+        a second caller appeared. Everything the caller had to do -- accumulate
+        the three sub-phase timings, add ~50 counters under the lock, then
+        apply the strict `<` that decides the winner -- lives here.
+
+        Returns the updated best_result, because the strict `<` compares
+        against the incumbent and the winner is not necessarily `res`.
+        """
+        totals.nfp_ms += res.get('_t_nfp_ms', 0)
+        totals.validity_ms += res.get('_t_validity_ms', 0)
+        totals.score_ms += res.get('_t_score_ms', 0)
+        with self._perf_lock:
+            self._perf_stats['rotation_evaluations'] += 1
+            self._perf_stats['successful_rotations'] += int(
+                res.get('x') is not None)
+            self._perf_stats['candidate_points'] += res.get(
+                '_candidate_points', 0)
+            self._perf_stats['valid_candidate_points'] += res.get(
+                '_valid_candidate_points', 0)
+            self._perf_stats['nfp_ms'] += res.get('_t_nfp_ms', 0)
+            self._perf_stats['candidate_validity_ms'] += res.get(
+                '_t_validity_ms', 0)
+            self._perf_stats['score_ms'] += res.get('_t_score_ms', 0)
+            for key in (
+                'bounds_survivors', 'sheet_candidates',
+                'sheet_rejections', 'sheet_boundary_candidates',
+                'collision_candidates',
+                'collision_rejections', 'bbox_rejections',
+                'polygon_checks',
+            ):
+                self._perf_stats[key] += res.get(f'_{key}', 0)
+            self._perf_stats['candidate_geometry_ms'] += res.get(
+                '_candidate_geometry_ms', 0)
+            self._perf_stats['sheet_difference_ms'] += res.get(
+                '_sheet_difference_ms', 0)
+            self._perf_stats['collision_intersection_ms'] += res.get(
+                '_collision_intersection_ms', 0)
+            # The collision stage's decomposition. The probe keys arrive here
+            # underscore-prefixed -- that is the convention every other absorbed
+            # key uses, and reading them unprefixed yields a silent 0 rather
+            # than an error, because .get() defaults.
+            for _key in ('collision_intersects_ms',
+                          'collision_overlay_ms',
+                          'collision_hole_probe_ms'):
+                self._perf_stats[_key] = self._perf_stats.get(
+                    _key, 0.0) + res.get(f'_{_key}', 0.0)
+            self._perf_stats['rotation_wall_ms'] += res.get(
+                '_t_wall_ms', 0)
+            self._perf_stats['candidate_evaluation_wall_ms'] += res.get(
+                '_t_candidate_evaluation_ms', 0)
+            for key in (
+                'candidate_geometries_built',
+                'candidate_geometry_cache_hits',
+                'candidate_geometry_cache_misses',
+                'candidate_geometry_cache_ms',
+                'bbox_checks', 'bbox_overlap_pairs',
+                'exact_collision_checks',
+                'collision_intersects_true',
+                'collision_intersects_false',
+                'collision_grazing_pairs',
+                'mask_hole_rings', 'mask_hole_vertices',
+                'mask_exterior_vertices',
+                'mask_hole_sensitive_pairs',
+                'mask_hole_exploiting_placements',
+                'mask_candidate_rings',
+                'mask_subthreshold_hole_rings',
+                'mask_subthreshold_hole_vertices',
+                'mask_calls', 'mask_batch_candidates',
+                'collision_intersects_calls',
+                'collision_overlay_calls',
+                'collision_hole_probe_calls',
+                'collision_overlay_area_zero',
+                'collision_overlay_area_sub_tol',
+                'collision_overlay_area_over_tol',
+                'collision_overlay_area_total',
+            ):
+                self._perf_stats[key] += res.get(f'_{key}', 0)
+            self._perf_stats['mask_batch_max'] = max(
+                self._perf_stats['mask_batch_max'],
+                res.get('_mask_batch_max', 0),
+            )
+            self._perf_stats['candidate_geometry_cache_entries'] = max(
+                self._perf_stats['candidate_geometry_cache_entries'],
+                res.get('_candidate_geometry_cache_entries', 0),
+            )
+        if res['metric'] < best_result['metric']:
+            best_result = res
+            # Call trial callback for each better result found
+            if self.trial_callback and best_result.get('x') is not None:
+                self.trial_callback(part, best_result['angle'], best_result['x'], best_result['y'])
+        return best_result
 
     def _evaluate_rotation_tracked(
         self, angle, part, placed_parts_grouped, sheet, direction

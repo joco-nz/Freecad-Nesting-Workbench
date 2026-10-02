@@ -51,8 +51,13 @@ _STATUS_FILE = os.path.join(_HERE, ".last_status_bench")
 # Defaults chosen for a 4-CPU machine. Width 8 deliberately oversubscribes 2x:
 # with 4 CPUs available, "is the pool worth it" and "does oversubscription
 # hurt" are the same question, and main's claim is about serial beating it.
+# 0 is in the sweep and is the point of the whole exercise: it means "no
+# pool at all", which is a different execution model from width 1 (a
+# ThreadPoolExecutor with one worker, still built and torn down once per
+# placement). Comparing 1 against 0 is what tests the serial claim; the
+# rest is context.
 WIDTHS = [int(w) for w in os.environ.get(
-    "NEST_BENCH_ROTATION_WORKERS_SWEEP", "1,2,4,8").split(",") if w.strip()]
+    "NEST_BENCH_ROTATION_WORKERS_SWEEP", "0,1,2,4,8").split(",") if w.strip()]
 REPS = int(os.environ.get("NEST_BENCH_REPS", "5"))
 SEED = int(os.environ.get("NEST_BENCH_SEED", "20260925"))
 SHEET = os.environ.get("NEST_BENCH_SHEET", "450x350")
@@ -223,6 +228,8 @@ def main():
     emit(f"  seed          {SEED}")
     emit(f"  sheet         {SHEET}")
     emit(f"  cpus          {os.cpu_count()}")
+    if 0 in WIDTHS:
+        emit("  NOTE: width 0 = serial, no ThreadPoolExecutor is built")
     if (max(WIDTHS) or 1) > (os.cpu_count() or 1):
         emit(f"  NOTE: width {max(WIDTHS)} exceeds {os.cpu_count()} CPUs "
              f"(oversubscribed)")
