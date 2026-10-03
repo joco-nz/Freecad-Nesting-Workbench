@@ -16,6 +16,9 @@ from .physics_engine import PhysicsEngine, RADIUS_MIN_MM, RADIUS_MAX_MM
 from .collision_resolver import CollisionResolver
 from .input_manager import InputManager
 from ...constants import SHEET_BOUNDARY_PREFIX
+from ...freecad_helpers import (
+    find_sheet_boundary, get_sheet_groups, read_sheet_instance, write_sheet_instance,
+)
 
 def _compute_physics_frame(
     working_cache,
@@ -169,13 +172,6 @@ def _compute_physics_frame(
         'valid': True, 'displaced_keys': displaced_set, 'final_positions': final_positions,
         'total_peers': total_peers, 'peers_in_range': peers_in_range,
     }
-
-
-def _find_sheet_boundary(group):
-    """The Sheet_Boundary_* child of *group*, or None. Matches startswith("Sheet_Boundary_")."""
-    if not group or not hasattr(group, "Group"):
-        return None
-    return next((c for c in group.Group if c.Label.startswith(SHEET_BOUNDARY_PREFIX)), None)
 
 
 try:
@@ -350,7 +346,7 @@ class ManualNesterToolObserver:
         for sheet_group in self.layout_group.Group:
             if sheet_group.isDerivedFrom("App::DocumentObjectGroup") and sheet_group.Label.startswith("Sheet_"):
                 # Ensure sheet boundary is visible
-                sheet_boundary = _find_sheet_boundary(sheet_group)
+                sheet_boundary = find_sheet_boundary(sheet_group)
                 if sheet_boundary and hasattr(sheet_boundary, "ViewObject"):
                     self.original_visibilities[sheet_boundary] = sheet_boundary.ViewObject.Visibility
                     sheet_boundary.ViewObject.Visibility = True
@@ -679,7 +675,7 @@ class ManualNesterToolObserver:
                 )
         if not clamp_sheet:
             return
-        boundary = _find_sheet_boundary(clamp_sheet)
+        boundary = find_sheet_boundary(clamp_sheet)
         if not boundary or not hasattr(boundary, "Shape") or not hasattr(boundary.Shape, "BoundBox"):
             return
         self.collision_resolver.translate_from_placement(self.selected_obj)
@@ -792,7 +788,7 @@ class ManualNesterToolObserver:
         dragged_sheet = self._drag_active_sheet or self.obj_to_sheet.get(obj)
         if not dragged_sheet: return 0.0, 0.0
         
-        boundary = _find_sheet_boundary(dragged_sheet)
+        boundary = find_sheet_boundary(dragged_sheet)
         if not boundary or not hasattr(boundary, "Shape"): return 0.0, 0.0
         
         sheet_bb, part_bb = boundary.Shape.BoundBox, self._get_shape_bbox(obj)
@@ -892,7 +888,7 @@ class ManualNesterToolObserver:
         # Read sheet bbox while still on main thread (FreeCAD API).
         dragged_sheet_bbox = None
         if dragged_sheet:
-            boundary = _find_sheet_boundary(dragged_sheet)
+            boundary = find_sheet_boundary(dragged_sheet)
             if boundary and hasattr(boundary, "Shape"):
                 dragged_sheet_bbox = boundary.Shape.BoundBox
 
@@ -1392,7 +1388,7 @@ class ManualNesterToolObserver:
             for sheet_group in self.layout_group.Group:
                 try:
                     if sheet_group.Label.startswith("Sheet_"):
-                        boundary = _find_sheet_boundary(sheet_group)
+                        boundary = find_sheet_boundary(sheet_group)
                         if boundary and hasattr(boundary, "ViewObject"):
                             if hasattr(boundary.ViewObject, "Selectable"):
                                 boundary.ViewObject.Selectable = True
@@ -1420,7 +1416,7 @@ class ManualNesterToolObserver:
         for sheet_group in self.layout_group.Group:
             if sheet_group.isDerivedFrom("App::DocumentObjectGroup") and sheet_group.Label.startswith("Sheet_"):
                 # Check boundary
-                boundary = _find_sheet_boundary(sheet_group)
+                boundary = find_sheet_boundary(sheet_group)
                 if boundary:
                     # Shape.BoundBox already includes placement (world coords)
                     bb = boundary.Shape.BoundBox
@@ -1451,45 +1447,57 @@ class ManualNesterToolObserver:
         """Adds a fresh drop-zone sheet to the layout."""
         self._add_new_sheet()
 
-    def _get_sheet_dimensions(self):
-        """Returns (width, height) from the first existing sheet, or (1000, 1000) as default."""
-        for child in self.layout_group.Group:
-            if child.isDerivedFrom("App::DocumentObjectGroup") and child.Label.startswith("Sheet_"):
-                boundary = _find_sheet_boundary(child)
-                if boundary and hasattr(boundary, "Shape"):
-                    bb = boundary.Shape.BoundBox
-                    return bb.XLength, bb.YLength
-        return 1000.0, 1000.0
+    def _last_sheet(self):
+        """Returns the last group from get_sheet_groups that has a boundary, or None."""
+        sheets = get_sheet_groups(self.layout_group)
+        for sheet in reversed(sheets):
+            b = find_sheet_boundary(sheet)
+            if b and hasattr(b, "Shape"):
+                return sheet
+        return None
 
     def _add_new_sheet(self):
         """Adds a new sheet group with a boundary, positioned after the last existing sheet."""
         doc = self.layout_group.Document
         index = len([c for c in self.layout_group.Group if c.Label.startswith("Sheet_")]) + 1
 
-        width, height = self._get_sheet_dimensions()
+        last = self._last_sheet()
+        if last is not None:
+            last_boundary = find_sheet_boundary(last)
+            bb = last_boundary.Shape.BoundBox
+            width, height = bb.XLength, bb.YLength
+        else:
+            width, height = 1000.0, 1000.0
 
         sheet_group = doc.addObject("App::DocumentObjectGroup", f"Sheet_{index}")
         sheet_group.Label = f"Sheet_{index}"
         self.layout_group.addObject(sheet_group)
 
+        # Inherit the last sheet's library instance; a layout from before the
+        # library has none, and the new sheet stays consistent with it.
+        if last is not None:
+            instance = read_sheet_instance(last)
+            if instance is not None:
+                write_sheet_instance(sheet_group, instance)
+
         # Find the rightmost edge and spacing of existing sheets
         max_right = 0.0
-        spacing = width * 0.1  # default fallback
-        sheet_origins = []
+        boundaries = []
         for child in self.layout_group.Group:
             if child.isDerivedFrom("App::DocumentObjectGroup") and child.Label.startswith("Sheet_") and child != sheet_group:
-                b = _find_sheet_boundary(child)
+                b = find_sheet_boundary(child)
                 if b and hasattr(b, "Shape"):
                     bb = b.Shape.BoundBox
-                    right_edge = bb.XMax          # BoundBox already includes Placement
-                    if right_edge > max_right:
-                        max_right = right_edge
-                    sheet_origins.append(bb.XMin)  # Use actual left edge, not Placement.Base
+                    if bb.XMax > max_right:
+                        max_right = bb.XMax
+                    boundaries.append(bb)
 
-        # Infer spacing from existing sheets if there are at least 2
-        sheet_origins.sort()
-        if len(sheet_origins) >= 2:
-            spacing = sheet_origins[1] - sheet_origins[0] - width
+        # Infer spacing from existing sheets if there are at least 2: edge-to-edge
+        boundaries.sort(key=lambda bb: bb.XMin)
+        if len(boundaries) >= 2:
+            spacing = boundaries[1].XMin - boundaries[0].XMax
+        else:
+            spacing = width * 0.1  # default fallback
 
         offset_x = max_right + spacing if max_right > 0 else 0.0
 

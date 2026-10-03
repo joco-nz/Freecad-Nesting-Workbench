@@ -10,11 +10,12 @@ import random
 import shapely
 from shapely.affinity import rotate, translate
 from .algorithms.nesting_strategy import Nester
-from .algorithms.genetic_utils import compute_layout_fitness
+from .algorithms.genetic_utils import compute_layout_fitness, unplaced_penalty
 from .algorithms.minkowski_engine import DEFAULT_CANDIDATE_SPACING
 from freecad.nestingworkbench import nw_logger
 
-UNPLACED_PENALTY_FACTOR = 10.0  # each unplaced part costs 10 sheet-areas of fitness
+
+from .algorithms import sheet_sequence
 
 
 @dataclass(frozen=True)
@@ -37,8 +38,7 @@ class MemberTask:
     rng_seed: int          # derived from (seed, generation, member_idx) for reproducible worker-process randomness
     parts: tuple           # of PartSnapshot, in chromosome order
     direction: tuple | None
-    sheet_width: float
-    sheet_height: float
+    sheet_sizes: tuple     # of (w, h) tuples
     rotation_steps: int
     compactness_weight: float
     candidate_spacing: float
@@ -56,6 +56,7 @@ class MemberResult:
     unplaced_ids: tuple
     genes: tuple
     elapsed: float
+    sheet_specs: tuple = ()  # one spec_index per output sheet, in sheet order
     diagnostics: tuple = ()  # (level, line) logged in the worker; nw_logger.drain_worker_messages
 
 
@@ -161,8 +162,7 @@ def snapshot_member(layout, ui_params: dict, gen: int, idx: int, seed: int,
         parts=tuple(part_snapshots),
         direction=(layout.direction if layout.direction is not None
                    else search_direction),
-        sheet_width=float(ui_params.get('sheet_width', 300.0)),
-        sheet_height=float(ui_params.get('sheet_height', 300.0)),
+        sheet_sizes=tuple(sheet_sequence.sizes(ui_params['sheet_sequence'])),
         rotation_steps=int(ui_params.get('rotation_steps', 1)),
         compactness_weight=float(ui_params.get('compactness_weight', 0.0)),
         candidate_spacing=float(candidate_spacing),
@@ -179,8 +179,6 @@ def nest_from_snapshot(task: MemberTask, placement_sink=None) -> MemberResult:
 
     rng = random.Random(task.rng_seed)
     nester_kwargs = {
-        'width': task.sheet_width,
-        'height': task.sheet_height,
         'rotation_steps': task.rotation_steps,
         'candidate_spacing': task.candidate_spacing,
         'quiet': True,
@@ -188,7 +186,7 @@ def nest_from_snapshot(task: MemberTask, placement_sink=None) -> MemberResult:
     }
     nester_kwargs['search_direction'] = task.direction
 
-    nester = Nester(**nester_kwargs)
+    nester = Nester(list(task.sheet_sizes), **nester_kwargs)
     if placement_sink is not None:
         def publish(part, sheet):
             c = part.polygon.centroid
@@ -199,12 +197,12 @@ def nest_from_snapshot(task: MemberTask, placement_sink=None) -> MemberResult:
     sheets, unplaced = nester.nest(shapes, sort=task.sort)
 
     fitness, efficiency = compute_layout_fitness(
-        sheets, task.sheet_width, task.sheet_height, compactness_weight=task.compactness_weight
+        sheets, compactness_weight=task.compactness_weight
     )
 
     unplaced_regular = [p for p in unplaced if not getattr(p, 'fill_sheet', False)]
     if unplaced_regular:
-        fitness += len(unplaced_regular) * task.sheet_width * task.sheet_height * UNPLACED_PENALTY_FACTOR
+        fitness += unplaced_penalty(len(unplaced_regular), task.sheet_sizes)
 
     placements = []
     for s_idx, s in enumerate(sheets):
@@ -237,10 +235,11 @@ def nest_from_snapshot(task: MemberTask, placement_sink=None) -> MemberResult:
         unplaced_ids=unplaced_ids,
         genes=genes,
         elapsed=elapsed,
+        sheet_specs=tuple(s.spec_index for s in sheets),
     )
 
 
-def apply_result(layout, result: MemberResult, ui_params: dict | None = None):
+def apply_result(layout, result: MemberResult, ui_params: dict):
     """
     Main-thread only. Writes MemberResult back onto live FreeCAD Shape objects,
     reconstructing Sheet and PlacedPart instances.
@@ -249,9 +248,8 @@ def apply_result(layout, result: MemberResult, ui_params: dict | None = None):
     from ...datatypes.sheet import Sheet
     from ...datatypes.placed_part import PlacedPart
 
-    width = ui_params.get('sheet_width', 300.0) if ui_params else 300.0
-    height = ui_params.get('sheet_height', 300.0) if ui_params else 300.0
-    spacing = ui_params.get('spacing', 0.0) if ui_params else 0.0
+    sizes = sheet_sequence.sizes(ui_params['sheet_sequence'])
+    spacing = float(ui_params.get('spacing', 0.0))
 
     original_parts_map = {p.id: p for p in layout.parts}
 
@@ -263,7 +261,15 @@ def apply_result(layout, result: MemberResult, ui_params: dict | None = None):
     sheets = []
     num_sheets = max(result.sheet_count, (max(sheet_placements.keys()) + 1) if sheet_placements else 0)
     for s_idx in range(num_sheets):
-        sheet = Sheet(s_idx, width, height, spacing=spacing)
+        spec_idx = result.sheet_specs[s_idx] if s_idx < len(result.sheet_specs) else s_idx
+        w, h = sheet_sequence.row_for_index(sizes, spec_idx)
+        sheet = Sheet(s_idx, w, h, spacing=spacing)
+        sheet.spec_index = spec_idx
+        sheets.append(sheet)
+
+    sheet_sequence.assign_origins(sheets)
+
+    for s_idx, sheet in enumerate(sheets):
         for part_id, x, y, angle in sheet_placements.get(s_idx, []):
             original_part = original_parts_map.get(part_id)
             if original_part is None:
@@ -275,13 +281,11 @@ def apply_result(layout, result: MemberResult, ui_params: dict | None = None):
             original_part.placement = original_part.get_final_placement(sheet.get_origin())
             placed = PlacedPart(original_part)
             sheet.add_part(placed)
-        sheets.append(sheet)
 
     if missing:
         nw_logger.warn(
             f"[GA] {len(missing)} placement(s) had no matching part and were dropped: "
             f"{', '.join(map(str, missing[:5]))}{' …' if len(missing) > 5 else ''}")
-
 
     layout.sheets = sheets
     layout.unplaced = [p for p in layout.parts if p.id in result.unplaced_ids]

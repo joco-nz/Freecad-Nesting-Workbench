@@ -23,8 +23,10 @@ try:
 except ImportError:
     SHAPELY_AVAILABLE = False
 
+from .. import back_side
+from ..constants import FLIP_ANGLE
 from .label_object import build_label_shape, create_label_object
-from ..freecad_helpers import calculate_label_placement, create_part_feature, recursive_delete
+from ..freecad_helpers import calculate_label_placement, create_part_feature, recursive_delete, write_sheet_instance
 from freecad.nestingworkbench import nw_logger
 
 class Sheet:
@@ -39,6 +41,14 @@ class Sheet:
         self.used_area = 0.0 # Track area usage for fast filtering
         self.parts = [] # List of PlacedPart objects
         self.spacing = spacing
+        # Which sequence row this sheet was cut from; survives renumbering.
+        self.spec_index = sheet_id
+        # World X of the sheet's left edge. The default is right only when every
+        # sheet is this size; mixed sequences set it via sheet_sequence.
+        self.origin_x = sheet_id * (width + spacing)
+        # The sequence row (write_sheet_instance dict) this sheet is cut from,
+        # set before the final draw; None during nesting.
+        self.stock = None
         self.parent_group_name = None # Will store the name of the top-level layout group
 
     def __repr__(self):
@@ -59,14 +69,14 @@ class Sheet:
 
     def get_origin(self):
         """
-        Calculates the origin (bottom-left corner) of this sheet in a layout.
+        Returns the stored world origin (bottom-left corner) of this sheet in a layout.
 
         Returns:
-            FreeCAD.Vector: The calculated origin vector.
+            FreeCAD.Vector or tuple: The origin vector (origin_x, 0, 0).
         """
         if FreeCAD:
-            return FreeCAD.Vector(self.id * (self.width + self.spacing), 0, 0)
-        return (self.id * (self.width + self.spacing), 0, 0)
+            return FreeCAD.Vector(self.origin_x, 0, 0)
+        return (self.origin_x, 0, 0)
 
     def is_placement_valid(self, shape_to_check, part_to_ignore=None):
         """
@@ -131,7 +141,9 @@ class Sheet:
             if not sheet_group:
                  sheet_group = doc.addObject("App::DocumentObjectGroup", sheet_group_name)
                  parent_group.addObject(sheet_group)
-            else:
+            if self.stock is not None:
+                write_sheet_instance(sheet_group, self.stock)
+            if hasattr(sheet_group, 'Group') and sheet_group.Group:
                 # Clear existing children (recursively — containers live
                 # inside the Shapes_ subgroup)
                 for child in list(sheet_group.Group):
@@ -159,6 +171,10 @@ class Sheet:
             for placed_part in self.parts:
                 self._draw_single_part(doc, placed_part.shape, sheet_origin, ui_params, shapes_group, parts_to_place_group, verbose=verbose)
 
+            if self.stock is not None and self.stock["flip"] != "none":
+                back_side.draw_back_side(doc, sheet_group, self.id + 1, self.stock["flip"],
+                                         FLIP_ANGLE, self.spacing)
+
         elif transient_part:
             # Draw/update sheet boundary during simulation
             sim_boundary_name = f"sim_sheet_boundary_{self.id}"
@@ -170,6 +186,14 @@ class Sheet:
                 if FreeCAD.GuiUp and hasattr(sim_boundary, "ViewObject") and sim_boundary.ViewObject:
                     sim_boundary.ViewObject.Transparency = 75
                     sim_boundary.ViewObject.DisplayMode = "Flat Lines"
+            else:
+                bb = getattr(getattr(sim_boundary, "Shape", None), "BoundBox", None)
+                x_len = getattr(bb, "XLength", None)
+                y_len = getattr(bb, "YLength", None)
+                if bb is None or x_len is None or y_len is None \
+                        or abs(float(x_len) - self.width) > 1e-6 \
+                        or abs(float(y_len) - self.height) > 1e-6:
+                    sim_boundary.Shape = Part.makePlane(self.width, self.height)
             sim_boundary.Placement = FreeCAD.Placement(sheet_origin, FreeCAD.Rotation())
             if FreeCAD.GuiUp and hasattr(sim_boundary, "ViewObject"):
                 sim_boundary.ViewObject.Visibility = True

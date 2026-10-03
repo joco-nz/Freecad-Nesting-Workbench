@@ -8,7 +8,8 @@ import FreeCADGui
 from PySide import QtWidgets
 
 from freecad.nestingworkbench import nw_logger
-from freecad.nestingworkbench.ui_helpers import QT_TRANSLATE_NOOP, make_checkbox
+from freecad.nestingworkbench.constants import PREFS_PATH, PREF_CURRENCY_SYMBOL
+from freecad.nestingworkbench.ui_helpers import QT_TRANSLATE_NOOP, make_checkbox, rich_tooltip
 
 _CTX = "SettingsCommand"
 _TITLE = QT_TRANSLATE_NOOP(_CTX, "Nesting Settings")
@@ -21,6 +22,9 @@ _DEBUG_LABEL = QT_TRANSLATE_NOOP(_CTX, "Enable debug logging")
 _DEBUG_TIP = QT_TRANSLATE_NOOP(
     _CTX, "Print detailed diagnostic messages to the Report view. Leave off unless "
           "you are investigating a problem.")
+_CURRENCY_LABEL = QT_TRANSLATE_NOOP(_CTX, "Currency symbol")
+_CURRENCY_TIP = QT_TRANSLATE_NOOP(
+    _CTX, "Prefix symbol for cost display (e.g. $, €, £).")
 
 
 class SettingsDialog(QtWidgets.QDialog):
@@ -36,10 +40,20 @@ class SettingsDialog(QtWidgets.QDialog):
         self.debug_check = make_checkbox(
             tr(_CTX, _DEBUG_LABEL), nw_logger.get_enable_debug_log(), tr(_CTX, _DEBUG_TIP))
 
+        curr = ""
+        try:
+            curr = FreeCAD.ParamGet(PREFS_PATH).GetString(PREF_CURRENCY_SYMBOL, "")
+        except Exception as e:
+            nw_logger.debug(f"Failed to read currency symbol: {e}")
+        self.currency_input = QtWidgets.QLineEdit(curr)
+        self.currency_input.setMaxLength(5)
+        self.currency_input.setToolTip(rich_tooltip(_CTX, _CURRENCY_TIP))
+
         group = QtWidgets.QGroupBox(tr(_CTX, _GROUP_DIAG))
         form = QtWidgets.QFormLayout(group)
         form.addRow(self.crash_check)
         form.addRow(self.debug_check)
+        form.addRow(tr(_CTX, _CURRENCY_LABEL), self.currency_input)
 
         buttons = QtWidgets.QDialogButtonBox(
             QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
@@ -51,9 +65,13 @@ class SettingsDialog(QtWidgets.QDialog):
         layout.addWidget(buttons)
 
     def _on_accept(self):
-        """Persist the checkboxes, then close."""
+        """Persist the checkboxes and preferences, then close."""
         nw_logger.set_enable_crash_log(self.crash_check.isChecked())
         nw_logger.set_enable_debug_log(self.debug_check.isChecked())
+        try:
+            FreeCAD.ParamGet(PREFS_PATH).SetString(PREF_CURRENCY_SYMBOL, self.currency_input.text().strip())
+        except Exception as e:
+            nw_logger.warn(f"Failed to save currency symbol: {e}")
         self.accept()
 
 

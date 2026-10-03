@@ -7,6 +7,7 @@ import copy
 
 from .algorithms import nesting_strategy
 from .algorithms import physics_nester
+from .algorithms import sheet_sequence
 from .visualization_manager import VisualizationManager
 from freecad.nestingworkbench import nw_logger
 from freecad.nestingworkbench.ui_helpers import show_warning_dialog
@@ -251,7 +252,7 @@ def _teardown_sim(viz_manager, parts):
     _main_thread_wrapper(lambda: _cleanup_highlighting(viz_manager))()
     _main_thread_wrapper(lambda: _hide_sim_outlines(parts))()
 
-def nest(parts, width, height, rotation_steps=1, simulate=False, algorithm='Minkowski', viz_manager=None, **kwargs):
+def nest(parts, sheet_sizes, rotation_steps=1, simulate=False, algorithm='Minkowski', viz_manager=None, **kwargs):
     """
     Convenience function to run the nesting algorithm.
     """
@@ -276,9 +277,9 @@ def nest(parts, width, height, rotation_steps=1, simulate=False, algorithm='Mink
         viz_manager = _bind_sim_callbacks(kwargs, viz_manager)
 
     if algorithm == 'Physics':
-        nester = physics_nester.PhysicsNester(width, height, rotation_steps, **kwargs)
+        nester = physics_nester.PhysicsNester(sheet_sizes, rotation_steps, **kwargs)
     else:
-        nester = nesting_strategy.Nester(width, height, rotation_steps, **kwargs)
+        nester = nesting_strategy.Nester(sheet_sizes, rotation_steps, **kwargs)
 
     if simulate:
         _bind_sim_update(nester)
@@ -302,13 +303,14 @@ def nest(parts, width, height, rotation_steps=1, simulate=False, algorithm='Mink
 
     return sheets, unplaced, steps, elapsed
 
-def fill_existing_sheets(sheets, fill_parts, width, height, rotation_steps=1,
+def fill_existing_sheets(sheets, fill_parts, sheet_sizes, rotation_steps=1,
                          simulate=False, viz_manager=None, **kwargs):
     """Runs only the round-robin fill phase against already-populated sheets.
 
     Used by the GA coordinator to fill the winning layout once, after the
     generation loop deferred all fill placement. Mutates `sheets` in place
-    (appends one sheet only when the run is fill-only and no sheet exists).
+    (appends one sheet only when the run is fill-only and no sheet exists;
+    compacts empty sheets at the end).
     Parts are NOT deep-copied — placements land on the caller's instances.
     Returns (unplaced_fill, elapsed_seconds).
     """
@@ -322,7 +324,7 @@ def fill_existing_sheets(sheets, fill_parts, width, height, rotation_steps=1,
     if simulate:
         viz_manager = _bind_sim_callbacks(kwargs, viz_manager)
 
-    nester = nesting_strategy.Nester(width, height, rotation_steps, **kwargs)
+    nester = nesting_strategy.Nester(sheet_sizes, rotation_steps, **kwargs)
 
     if simulate:
         _bind_sim_update(nester)
@@ -333,6 +335,10 @@ def fill_existing_sheets(sheets, fill_parts, width, height, rotation_steps=1,
     unplaced = []
     nester._nest_fill_parts(sheets, ordered_fill, unplaced,
                             quiet=kwargs.get('quiet', False))
+    sheets[:] = sheet_sequence.compact_sheets(sheets)
+    for sheet in sheets:
+        for placed_part in sheet.parts:
+            placed_part.shape.placement = placed_part.shape.get_final_placement(sheet.get_origin())
     elapsed = time.monotonic() - start_time
 
     if simulate:

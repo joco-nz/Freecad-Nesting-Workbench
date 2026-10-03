@@ -6,8 +6,18 @@ from PySide import QtWidgets, QtCore
 from freecad.nestingworkbench import nw_logger
 from freecad.nestingworkbench.Tools.Cam import cam_manager
 from freecad.nestingworkbench.constants import PREFS_PATH
-from freecad.nestingworkbench.ui_helpers import QT_TRANSLATE_NOOP
+from freecad.nestingworkbench.ui_helpers import QT_TRANSLATE_NOOP, make_checkbox, rich_tooltip
 from freecad.nestingworkbench.freecad_helpers import is_layout_group
+
+_TITLE = QT_TRANSLATE_NOOP("CAMOptionsDialog", "CAM Job Options")
+_SELECT_LABEL = QT_TRANSLATE_NOOP("CAMOptionsDialog", "Select objects to include in CAM job:")
+_PARTS_LABEL = QT_TRANSLATE_NOOP("CAMOptionsDialog", "Parts (full cuts)")
+_LABELS_LABEL = QT_TRANSLATE_NOOP("CAMOptionsDialog", "Labels (engraving)")
+_SILHOUETTES_LABEL = QT_TRANSLATE_NOOP("CAMOptionsDialog", "Silhouettes (outlines)")
+_TEMPLATE_LABEL = QT_TRANSLATE_NOOP("CAMOptionsDialog", "CAM Template (Optional):")
+_NO_TEMPLATE_TEXT = QT_TRANSLATE_NOOP("CAMOptionsDialog", "None")
+_BROWSE_TEXT = QT_TRANSLATE_NOOP("CAMOptionsDialog", "Browse...")
+_POST_LABEL = QT_TRANSLATE_NOOP("CAMOptionsDialog", "Post Processor:")
 
 
 class CAMOptionsDialog(QtWidgets.QDialog):
@@ -15,42 +25,54 @@ class CAMOptionsDialog(QtWidgets.QDialog):
     
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("CAM Job Options")
+        tr = QtWidgets.QApplication.translate
+        self.setWindowTitle(tr("CAMOptionsDialog", _TITLE))
         self.setMinimumWidth(250)
         
         layout = QtWidgets.QVBoxLayout(self)
         
         # Title label
-        title = QtWidgets.QLabel("Select objects to include in CAM job:")
+        title = QtWidgets.QLabel(tr("CAMOptionsDialog", _SELECT_LABEL))
         layout.addWidget(title)
         
         # Checkboxes
-        self.parts_checkbox = QtWidgets.QCheckBox("Parts (full cuts)")
-        self.parts_checkbox.setChecked(True)
+        self.parts_checkbox = make_checkbox(
+            tr("CAMOptionsDialog", _PARTS_LABEL),
+            checked=True,
+            tooltip=rich_tooltip("CAMOptionsDialog", QT_TRANSLATE_NOOP("CAMOptionsDialog", "Cuts each part's full outline through the sheet."))
+        )
         layout.addWidget(self.parts_checkbox)
-        
-        self.labels_checkbox = QtWidgets.QCheckBox("Labels (engraving)")
-        self.labels_checkbox.setChecked(True)
+
+        self.labels_checkbox = make_checkbox(
+            tr("CAMOptionsDialog", _LABELS_LABEL),
+            checked=True,
+            tooltip=rich_tooltip("CAMOptionsDialog", QT_TRANSLATE_NOOP("CAMOptionsDialog", "Engraves each part's identifier label."))
+        )
         layout.addWidget(self.labels_checkbox)
-        
-        self.silhouettes_checkbox = QtWidgets.QCheckBox("Silhouettes (outlines)")
-        self.silhouettes_checkbox.setChecked(False)
+
+        self.silhouettes_checkbox = make_checkbox(
+            tr("CAMOptionsDialog", _SILHOUETTES_LABEL),
+            checked=False,
+            tooltip=rich_tooltip("CAMOptionsDialog", QT_TRANSLATE_NOOP("CAMOptionsDialog", "Adds each part's silhouette outline as a toolpath."))
+        )
         layout.addWidget(self.silhouettes_checkbox)
         
         # Separator
         layout.addSpacing(10)
 
         # Template Selection
-        layout.addWidget(QtWidgets.QLabel("CAM Template (Optional):"))
+        layout.addWidget(QtWidgets.QLabel(tr("CAMOptionsDialog", _TEMPLATE_LABEL)))
         
         template_layout = QtWidgets.QHBoxLayout()
         
         self.template_combo = QtWidgets.QComboBox()
-        self.template_combo.addItem("None", None)
+        self.template_combo.addItem(tr("CAMOptionsDialog", _NO_TEMPLATE_TEXT), None)
         self.template_combo.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
+        self.template_combo.setToolTip(rich_tooltip("CAMOptionsDialog", QT_TRANSLATE_NOOP(
+            "CAMOptionsDialog", "Optional CAM job template to take operations and tools from.")))
         self._populate_templates()
         
-        self.browse_button = QtWidgets.QPushButton("Browse...")
+        self.browse_button = QtWidgets.QPushButton(tr("CAMOptionsDialog", _BROWSE_TEXT))
         self.browse_button.clicked.connect(self.browse_template)
         
         template_layout.addWidget(self.template_combo)
@@ -59,8 +81,10 @@ class CAMOptionsDialog(QtWidgets.QDialog):
         layout.addLayout(template_layout)
 
         # Post Processor Selection
-        layout.addWidget(QtWidgets.QLabel("Post Processor:"))
+        layout.addWidget(QtWidgets.QLabel(tr("CAMOptionsDialog", _POST_LABEL)))
         self.post_processor_combo = QtWidgets.QComboBox()
+        self.post_processor_combo.setToolTip(rich_tooltip("CAMOptionsDialog", QT_TRANSLATE_NOOP(
+            "CAMOptionsDialog", "Post processor that turns the job into G-code.")))
         self._populate_post_processors()
         layout.addWidget(self.post_processor_combo)
         

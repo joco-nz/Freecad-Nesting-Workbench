@@ -9,15 +9,18 @@ from shapely.ops import unary_union
 from ....datatypes.sheet import Sheet
 from ....datatypes.placed_part import PlacedPart
 from .... import nw_logger
+from . import sheet_sequence
 
 class BaseNester(object):
     """
     Base class for nesting algorithms. 
     It provides a common greedy loop and utility methods for placement attempts.
     """
-    def __init__(self, width, height, rotation_steps=1, **kwargs):
-        self._bin_width = width
-        self._bin_height = height
+    def __init__(self, sheet_sizes, rotation_steps=1, **kwargs):
+        if not sheet_sizes:
+            raise ValueError("sheet_sizes must be a non-empty list of (width, height) tuples")
+        self.sheet_sizes = [(float(w), float(h)) for w, h in sheet_sizes]
+        self.spacing = kwargs.get("spacing", 0)
         self.rotation_steps = max(1, rotation_steps)
         self.max_spawn_count = kwargs.get("max_spawn_count", 100)
         self.anneal_steps = kwargs.get("anneal_steps", 25)
@@ -41,9 +44,6 @@ class BaseNester(object):
         self.update_callback = None
         self.progress_callback = None
         self.cancel_callback = kwargs.get("cancel_callback", None)
-        
-        self._bin_polygon = Polygon([(0, 0), (width, 0), (width, height), (0, height)])
-        self._bin_boundary = self._bin_polygon.exterior
 
     def log(self, message):
         nw_logger.info(f"NESTING: {message}")
@@ -88,20 +88,29 @@ class BaseNester(object):
                     break
             
             if not placed:
-                new_sheet = Sheet(len(self.sheets), self._bin_width, self._bin_height)
-                placed_shape = self._try_place_part_on_sheet(part, new_sheet)
-                if placed_shape:
-                    sheet_origin = new_sheet.get_origin()
-                    placed_shape.placement = placed_shape.get_final_placement(sheet_origin)
-                    new_sheet.add_part(PlacedPart(placed_shape))
+                while True:
+                    new_sheet = sheet_sequence.open_sheet(self.sheets, self.sheet_sizes, self.spacing)
+                    placed_shape = self._try_place_part_on_sheet(part, new_sheet)
+                    if placed_shape:
+                        sheet_origin = new_sheet.get_origin()
+                        placed_shape.placement = placed_shape.get_final_placement(sheet_origin)
+                        new_sheet.add_part(PlacedPart(placed_shape))
+                        self.sheets.append(new_sheet)
+                        
+                        if self.update_callback:
+                            self.update_callback(placed_shape, new_sheet)
+                        
+                        placed = True
+                        break
+                    if sheet_sequence.is_repeat_index(self.sheet_sizes, new_sheet.id):
+                        unplaced_parts.append(part)
+                        break
                     self.sheets.append(new_sheet)
-                    
-                    if self.update_callback:
-                        self.update_callback(placed_shape, new_sheet)
-                    
-                    placed = True
-                else:
-                    unplaced_parts.append(part)
+
+        self.sheets = sheet_sequence.compact_sheets(self.sheets)
+        for sheet in self.sheets:
+            for placed_part in sheet.parts:
+                placed_part.shape.placement = placed_part.shape.get_final_placement(sheet.get_origin())
 
         return self.sheets, unplaced_parts
 

@@ -12,34 +12,67 @@ except ImportError:
     FreeCAD = None
 
 from freecad.nestingworkbench import nw_logger
-from .constants import LAYOUT_PREFIX
+from .constants import (
+    BACK_BOUNDARY_PREFIX, BACK_GROUP_PREFIX, LAYOUT_PREFIX, PROP_FLOAT,
+    PROP_LENGTH, PROP_SHEET_COST, PROP_SHEET_FLIP, PROP_SHEET_HEIGHT,
+    PROP_SHEET_LIBRARY_ID, PROP_SHEET_LIBRARY_NAME, PROP_SHEET_MATERIAL,
+    PROP_SHEET_THICKNESS, PROP_SHEET_WIDTH, PROP_STRING,
+    SHEET_BOUNDARY_PREFIX, SHEET_INSTANCE_GROUP,
+)
 
-def get_up_direction_rotation(up_direction):
+
+def find_sheet_boundary(group):
+    """The Sheet_Boundary_* child of *group*, or None."""
+    if not group or not hasattr(group, "Group"):
+        return None
+    return next((c for c in group.Group if c.Label.startswith(SHEET_BOUNDARY_PREFIX)), None)
+
+
+def find_back_group(sheet_group):
+    """The Back_* subgroup of a Sheet_N group (a flipped sheet's back side), or None."""
+    if not sheet_group or not hasattr(sheet_group, "Group"):
+        return None
+    return next((c for c in sheet_group.Group if c.Label.startswith(BACK_GROUP_PREFIX)), None)
+
+
+def find_back_boundary(back_group):
+    """The Back_Boundary_* child of a Back_* group, or None."""
+    if not back_group or not hasattr(back_group, "Group"):
+        return None
+    return next((c for c in back_group.Group if c.Label.startswith(BACK_BOUNDARY_PREFIX)), None)
+
+
+def world_shape(obj):
+    """A copy of obj.Shape in world coordinates.
+
+    obj.Shape carries obj's own Placement only. A parent's placement (a PartDesign
+    Body around a Pad or Sketch, an App::Part around any feature) is not in it, so
+    reading obj.Shape as world drew such parts unrotated and at the parent's origin
+    (GLB-001). getGlobalPlacement() is the whole chain, own Placement included.
     """
-    Returns a FreeCAD.Rotation that transforms the given up_direction to Z+.
+    shape = obj.Shape.copy()
+    shape.Placement = obj.getGlobalPlacement()
+    return shape
+
+
+def get_up_vector_rotation(up_vector):
+    """
+    Returns a FreeCAD.Rotation that rotates the given up_vector to point along +Z.
 
     Args:
-        up_direction: One of "Z+", "Z-", "Y+", "Y-", "X+", "X-", or None.
+        up_vector: A FreeCAD.Vector giving the part's local "up" direction, or None.
 
     Returns:
-        FreeCAD.Rotation to apply to make the given direction point to Z+.
-        Returns identity rotation for Z+ or None.
+        FreeCAD.Rotation to apply so up_vector ends up pointing at (0, 0, 1).
+        Returns identity for (0, 0, 1), None, or a zero-length vector.
     """
-    if up_direction == "Z+" or up_direction is None:
-        return FreeCAD.Rotation()  # Identity - no rotation needed
-    elif up_direction == "Z-":
-        return FreeCAD.Rotation(FreeCAD.Vector(1, 0, 0), 180)
-    elif up_direction == "Y+":
-        return FreeCAD.Rotation(FreeCAD.Vector(1, 0, 0), -90)
-    elif up_direction == "Y-":
-        return FreeCAD.Rotation(FreeCAD.Vector(1, 0, 0), 90)
-    elif up_direction == "X+":
-        return FreeCAD.Rotation(FreeCAD.Vector(0, 1, 0), 90)
-    elif up_direction == "X-":
-        return FreeCAD.Rotation(FreeCAD.Vector(0, 1, 0), -90)
-    else:
-        nw_logger.warn(f"Unknown up_direction '{up_direction}', using Z+")
+    if up_vector is None:
         return FreeCAD.Rotation()
+    v = FreeCAD.Vector(up_vector)
+    if v.Length < 1e-9:
+        nw_logger.warn(f"Up vector '{up_vector}' has zero length, using (0, 0, 1)")
+        return FreeCAD.Rotation()
+    return FreeCAD.Rotation(v, FreeCAD.Vector(0, 0, 1))
 
 def recursive_delete(doc, obj, protected_names=None):
     """
@@ -127,6 +160,49 @@ def get_sheet_groups(layout_group):
     sheet_groups = [obj for obj in layout_group.Group if obj.Label.startswith("Sheet_")]
     sheet_groups.sort(key=lambda g: int(g.Label.split('_')[1]))
     return sheet_groups
+
+_SHEET_INSTANCE_PROPS = (
+    # (key in the values dict, property name, FreeCAD type)
+    ("sheet_id", PROP_SHEET_LIBRARY_ID, PROP_STRING),
+    ("sheet_name", PROP_SHEET_LIBRARY_NAME, PROP_STRING),
+    ("material", PROP_SHEET_MATERIAL, PROP_STRING),
+    ("cost", PROP_SHEET_COST, PROP_FLOAT),
+    ("width", PROP_SHEET_WIDTH, PROP_LENGTH),
+    ("height", PROP_SHEET_HEIGHT, PROP_LENGTH),
+    ("thickness", PROP_SHEET_THICKNESS, PROP_LENGTH),
+    ("flip", PROP_SHEET_FLIP, PROP_STRING),
+)
+
+
+def write_sheet_instance(sheet_group, values):
+    """Stamp a Sheet_N group with the sheet it was spawned from.
+
+    *values* must have every key in _SHEET_INSTANCE_PROPS; a missing key is a
+    KeyError raised before anything is written, not a default. An empty
+    sheet_id means a Custom size.
+    """
+    missing = [key for key, _prop, _type in _SHEET_INSTANCE_PROPS if key not in values]
+    if missing:
+        raise KeyError(f"sheet instance values missing {missing}")
+    for key, prop, prop_type in _SHEET_INSTANCE_PROPS:
+        if not hasattr(sheet_group, prop):
+            sheet_group.addProperty(prop_type, prop, SHEET_INSTANCE_GROUP, "")
+        setattr(sheet_group, prop, values[key])
+
+
+def read_sheet_instance(sheet_group):
+    """The values write_sheet_instance stored, or None if the group was never stamped.
+
+    None means a layout nested before the sheet library existed (or a Sheet_N
+    added by the manual nester to such a layout). None also for a Sheet_N stamped
+    before SheetFlip existed (no migration, SVF decision 13).
+    """
+    if not all(hasattr(sheet_group, prop) for _key, prop, _type in _SHEET_INSTANCE_PROPS):
+        return None
+    return {key: (float(getattr(sheet_group, prop)) if prop_type in (PROP_LENGTH, PROP_FLOAT)
+                  else str(getattr(sheet_group, prop)))
+            for key, prop, prop_type in _SHEET_INSTANCE_PROPS}
+
 
 def get_nested_containers(sheet_group):
     """

@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: LGPL-2.1-or-later
 import random
 import math
-import FreeCAD
 from .base_nester import BaseNester
 
 class PhysicsNester(BaseNester):
@@ -11,8 +10,8 @@ class PhysicsNester(BaseNester):
     direction until they collide with the sheet edge or another part.
     """
 
-    def __init__(self, width, height, rotation_steps=1, **kwargs):
-        super().__init__(width, height, rotation_steps, **kwargs)
+    def __init__(self, sheet_sizes, rotation_steps=1, **kwargs):
+        super().__init__(sheet_sizes, rotation_steps, **kwargs)
         self.physics_direction = kwargs.get("physics_direction", (0, -1))
         self.max_spawn_count = kwargs.get("max_spawn_count", 100)
         self.max_nesting_steps = kwargs.get("max_nesting_steps", 500)
@@ -26,8 +25,8 @@ class PhysicsNester(BaseNester):
 
             _, _, w, h = shape.bounding_box()
             
-            max_target_x = self._bin_width - w
-            max_target_y = self._bin_height - h
+            max_target_x = sheet.width - w
+            max_target_y = sheet.height - h
             target_x = random.uniform(0, max_target_x) if max_target_x > 0 else 0
             target_y = random.uniform(0, max_target_y) if max_target_y > 0 else 0
             shape.move_to(target_x, target_y)

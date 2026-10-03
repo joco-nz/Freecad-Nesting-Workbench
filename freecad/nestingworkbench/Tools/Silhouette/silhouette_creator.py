@@ -12,22 +12,34 @@ Supports two methods:
 import FreeCAD
 import Part
 from freecad.nestingworkbench import nw_logger
-from ..Nesting.algorithms.shape_processor import get_2d_profile_from_obj
-from ...freecad_helpers import get_nested_containers
+from ..Nesting.shape_processor import get_2d_profile_from_obj
+from ... import back_side
+from ...freecad_helpers import get_nested_containers, world_shape
 
 SILHOUETTE_COLOR = (0.2, 0.6, 1.0)   # light blue
 SILHOUETTE_TRANSPARENCY = 50
 SILHOUETTE_LINE_WIDTH = 2.0
+_BBOX_CONTAIN_TOL_MM = 1e-4  # slack for float noise when testing bbox containment
 
 def _apply_silhouette_style(view_object):
     view_object.ShapeColor = SILHOUETTE_COLOR
     view_object.Transparency = SILHOUETTE_TRANSPARENCY
     view_object.LineWidth = SILHOUETTE_LINE_WIDTH
 
-def create_cross_section(obj, cut_height=None):
-    """Cut *obj* with a horizontal plane at *cut_height* (Z height, None=midpoint), returning a 2D Face."""
+def create_cross_section(obj, cut_height=None, frame=None):
+    """Cut *obj* with a horizontal plane at *cut_height* (Z height, None=midpoint), returning a 2D Face.
+
+    Args:
+        obj: The FreeCAD object to cross-section.
+        cut_height: Z height to cut at, or None for midpoint.
+        frame: A FreeCAD.Placement to express the result in, or None for world.
+    """
     try:
-        shape = obj.Shape
+        shape = world_shape(obj)
+        if frame is not None:
+            # The silhouette is shown inside a container with this global placement:
+            # express the shape in that frame, or the container places it twice (UPD-017).
+            shape.Placement = frame.inverse().multiply(shape.Placement)
         
         if shape.isNull():
             nw_logger.warn(f"[CrossSection] Shape is null for '{obj.Label}'")
@@ -72,8 +84,8 @@ def create_cross_section(obj, cut_height=None):
             is_hole = False
             for idx, outer in enumerate(outer_faces):
                 outer_bb = outer.BoundBox
-                if (bb.XMin >= outer_bb.XMin - 1e-4 and bb.XMax <= outer_bb.XMax + 1e-4 and
-                    bb.YMin >= outer_bb.YMin - 1e-4 and bb.YMax <= outer_bb.YMax + 1e-4):
+                if (bb.XMin >= outer_bb.XMin - _BBOX_CONTAIN_TOL_MM and bb.XMax <= outer_bb.XMax + _BBOX_CONTAIN_TOL_MM and
+                    bb.YMin >= outer_bb.YMin - _BBOX_CONTAIN_TOL_MM and bb.YMax <= outer_bb.YMax + _BBOX_CONTAIN_TOL_MM):
                     try:
                         # BoundBox containment is only a pre-filter: a separate body can
                         # sit inside another's bbox (an island in a hole, a piece in a
@@ -143,11 +155,12 @@ def is_valid_shape_object(obj):
     
     return True, "Valid"
 
-def create_silhouette(obj, up_direction="Z+"):
-    """Project *obj* onto the XY plane along *up_direction* (e.g. 'Z+', 'Y-'), returning a 2D Face."""
+def create_silhouette(obj, up_vector=None):
+    """Project *obj* onto the XY plane along *up_vector* (a FreeCAD.Vector, default
+    (0, 0, 1)), returning a 2D Face."""
     try:
         # Use existing projection function to get Shapely polygon
-        shapely_polygon = get_2d_profile_from_obj(obj, up_direction)
+        shapely_polygon = get_2d_profile_from_obj(obj, up_vector)
         
         if shapely_polygon is None or shapely_polygon.is_empty:
             nw_logger.error(f"Failed to create silhouette for '{obj.Label}': Empty projection")
@@ -217,10 +230,10 @@ def _find_valid_part_in_container(container):
                     return child
     return None
 
-def _compute_silhouette_face(part_obj, cut_height=None, method="cross_section"):
+def _compute_silhouette_face(part_obj, cut_height=None, method="cross_section", frame=None):
     """Compute the silhouette face using either cross_section or projection."""
     if method == "cross_section":
-        return create_cross_section(part_obj, cut_height)
+        return create_cross_section(part_obj, cut_height, frame)
     return create_silhouette(part_obj)
 
 def _create_silhouette_object(doc, label_base, silhouette_face, parent_container=None):
@@ -283,7 +296,7 @@ def create_silhouettes_for_layout(doc, layout_group, cut_height=None, method="cr
                 continue
             
             try:
-                silhouette_face = _compute_silhouette_face(part_obj, cut_height, method)
+                silhouette_face = _compute_silhouette_face(part_obj, cut_height, method, container.getGlobalPlacement())
                 if silhouette_face is None:
                     nw_logger.warn(f"[Silhouette] Could not create silhouette for '{container.Label}'")
                     continue
@@ -293,7 +306,12 @@ def create_silhouettes_for_layout(doc, layout_group, cut_height=None, method="cr
             except Exception as e:
                 nw_logger.error(f"[Silhouette] Error for '{container.Label}': {e}")
                 continue
-    
+
+        try:
+            back_side.refresh_back_outlines(doc, sheet_group)
+        except Exception as e:
+            nw_logger.error(f"[Silhouette] Back side of '{sheet_group.Label}': {e}")
+
     nw_logger.info(f"[Silhouette] Created {len(all_silhouettes)} silhouettes across {len(sheets_processed)} sheets")
     
     return all_silhouettes
@@ -324,7 +342,7 @@ def create_silhouette_for_container(doc, container, cut_height=None, method="cro
         nw_logger.warn(f"[Silhouette] No part object found in '{container.Label}'")
         return None
     
-    silhouette_face = _compute_silhouette_face(part_obj, cut_height, method)
+    silhouette_face = _compute_silhouette_face(part_obj, cut_height, method, container.getGlobalPlacement())
     if silhouette_face is None:
         nw_logger.warn(f"[Silhouette] Could not create silhouette for '{container.Label}'")
         return None
@@ -338,7 +356,8 @@ def create_silhouette_for_part(doc, part_obj, parent_container=None, cut_height=
         nw_logger.warn(f"[Silhouette] '{part_obj.Label}' is not valid: {reason}")
         return None
     
-    silhouette_face = _compute_silhouette_face(part_obj, cut_height, method)
+    frame = parent_container.getGlobalPlacement() if parent_container is not None else None
+    silhouette_face = _compute_silhouette_face(part_obj, cut_height, method, frame)
     if silhouette_face is None:
         nw_logger.warn(f"[Silhouette] Could not create silhouette for '{part_obj.Label}'")
         return None

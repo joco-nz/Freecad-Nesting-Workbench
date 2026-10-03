@@ -3,7 +3,7 @@ import FreeCAD
 import FreeCADGui
 from freecad.nestingworkbench import nw_logger
 from freecad.nestingworkbench.Tools.Exporter import exporter
-from freecad.nestingworkbench.ui_helpers import QT_TRANSLATE_NOOP
+from freecad.nestingworkbench.ui_helpers import QT_TRANSLATE_NOOP, make_checkbox, rich_tooltip
 from freecad.nestingworkbench.freecad_helpers import is_layout_group
 from PySide import QtWidgets
 import os
@@ -11,9 +11,12 @@ import os
 _SELECT_DIR_TITLE = QT_TRANSLATE_NOOP("ExportSheetsCommand", "Select Export Directory")
 _EXPORT_OPTIONS_TITLE = QT_TRANSLATE_NOOP("ExportSheetsCommand", "Export Options")
 _DELETE_2D_VIEWS_TEXT = QT_TRANSLATE_NOOP("ExportSheetsCommand", "Delete 2D Views after DXF Export")
+_DELETE_2D_VIEWS_TOOLTIP = QT_TRANSLATE_NOOP(
+    "ExportSheetsCommand", "Deletes the temporary 2D views created for the DXF export once it finishes.")
+
 
 class ExportSheetsCommand:
-    """The command to export each sheet as an SVG file."""
+    """The command to export each sheet as a DXF file."""
     def GetResources(self):
         return {
             'Pixmap': 'Nesting_DXF_Icon.svg',
@@ -72,8 +75,11 @@ class ExportSheetsCommand:
         dialog = QtWidgets.QDialog()
         dialog.setWindowTitle(tr("ExportSheetsCommand", _EXPORT_OPTIONS_TITLE))
         layout = QtWidgets.QVBoxLayout(dialog)
-        checkbox = QtWidgets.QCheckBox(tr("ExportSheetsCommand", _DELETE_2D_VIEWS_TEXT))
-        checkbox.setChecked(True)
+        checkbox = make_checkbox(
+            tr("ExportSheetsCommand", _DELETE_2D_VIEWS_TEXT),
+            checked=True,
+            tooltip=rich_tooltip("ExportSheetsCommand", _DELETE_2D_VIEWS_TOOLTIP)
+        )
         layout.addWidget(checkbox)
         button_box = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
         layout.addWidget(button_box)

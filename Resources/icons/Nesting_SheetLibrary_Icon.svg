@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64" version="1.1">
+  <!-- Stacked sheets for Sheet Library -->
+  <!-- Bottom sheet -->
+  <rect x="8" y="24" width="38" height="28" rx="2" style="fill:#e0e0e0;stroke:#000000;stroke-width:2"/>
+  <!-- Middle sheet -->
+  <rect x="13" y="17" width="38" height="28" rx="2" style="fill:#ffffff;stroke:#000000;stroke-width:2"/>
+  <!-- Top sheet (Secondary accent purple border/fill) -->
+  <rect x="18" y="10" width="38" height="28" rx="2" style="fill:#f8f9fa;stroke:#9b5de5;stroke-width:2"/>
+  <!-- Nested part on top sheet (Primary accent teal green) -->
+  <rect x="23" y="15" width="14" height="10" rx="1" style="fill:#00a86b;stroke:#000000;stroke-width:1.5"/>
+  <circle cx="45" cy="28" r="4" style="fill:#00a86b;stroke:#000000;stroke-width:1.5"/>
+</svg>

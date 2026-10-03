@@ -16,7 +16,7 @@ try:
 except ImportError:
     FreeCAD = None
 import threading
-from ..freecad_helpers import get_up_direction_rotation, calculate_container_centroid
+from ..freecad_helpers import get_up_vector_rotation, calculate_container_centroid
 
 try:
     from shapely.affinity import translate, rotate
@@ -44,9 +44,20 @@ class Shape:
     
     @classmethod
     def clear_caches(cls):
-        """Clears decomposition cache between nesting runs. Does NOT clear NFP cache
-        since NFP calculations are expensive and benefit from persistence."""
+        """Clears the decomposition cache between nesting runs, and any NFP
+        entries that record a failure.
+
+        Successful NFPs are expensive and are kept; that is the point of the
+        cache. A failure is not a result. Kept across runs, it means a fixed
+        input (new geometry, a repaired part, changed settings) is never
+        retried, which is how issue #19 survived its own fix until FreeCAD
+        was restarted. Within a run the failure stays cached, so a pair that
+        cannot be computed is tried once, not on every placement attempt.
+        """
         cls.decomposition_cache.clear()
+        with cls.nfp_cache_lock:
+            for key in [k for k, v in cls.nfp_cache.items() if v.get('error')]:
+                del cls.nfp_cache[key]
 
     @classmethod
     def clear_nfp_cache(cls):
@@ -70,7 +81,7 @@ class Shape:
         self.spacing = 0 # The spacing used for the nesting operation.
         self.deflection = 0.05 # The deflection tolerance used.
         self.simplification = 1.0 # The simplification tolerance used.
-        self.up_direction = "Z+" # The up direction for 2D projection
+        self.up_vector = FreeCAD.Vector(0, 0, 1) # The up vector for 2D projection
         self.fill_sheet = False # If True, use to fill remaining space
         
         self.fc_object = None # Link to the physical FreeCAD object in the 'PartsToPlace' group
@@ -179,7 +190,7 @@ class Shape:
         Calculates the final FreeCAD.Placement for the container.
         
         CLEAN OFFSET DESIGN:
-        - The child shape inside the container has its own rotation for up_direction
+        - The child shape inside the container has its own rotation for up_vector
         - The container placement only handles XY position and in-plane (Z) rotation
         - This keeps bounds flat on the sheet
 

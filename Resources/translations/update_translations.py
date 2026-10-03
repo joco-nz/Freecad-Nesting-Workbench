@@ -66,6 +66,15 @@ class TranslationExtractor(ast.NodeVisitor):
                 self.entries.append((context, text, node.lineno))
             else:
                 self.unresolved.append(node.lineno)
+        elif func_name in ("translate", "tr") and len(node.args) == 2:
+            ctx_node = node.args[0]
+            txt_node = node.args[1]
+
+            context = self._extract_str(ctx_node)
+            text = self._extract_str(txt_node)
+
+            if context is not None and text is not None:
+                self.entries.append((context, text, node.lineno))
 
         self.generic_visit(node)
 
