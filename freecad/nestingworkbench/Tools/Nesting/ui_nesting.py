@@ -494,43 +494,11 @@ class NestingPanel(QtWidgets.QWidget):
         self.logging_group = CollapsibleSection("Logging", expanded=False)
         logging_box_layout = QtWidgets.QVBoxLayout()
 
-        # Set initial visibility
-        self.minkowski_settings_group.setVisible(True)
-        self.minkowski_optimization_group.setVisible(True)
-        self.physics_settings_group.setVisible(False)
+        self._set_initial_section_visibility()
 
+        self._build_helper_fields()
+        self._build_action_buttons()
 
-        self.show_bounds_checkbox = make_checkbox("Show Bounds", checked=True)
-        self.add_labels_checkbox = make_checkbox(
-            "Add Identifier Labels", checked=_DEFAULTS["add_labels"])
-        self.label_height_input = LengthField(mm_min=0, mm_max=1000)
-        self.label_height_input.set_mm(_DEFAULTS["label_height"])
-        self.label_height_input.widget().setToolTip("The height (Z-offset) for the identifier labels.")
-        self._length_fields.append(self.label_height_input)
-        self.label_size_input = LengthField(mm_min=1, mm_max=100)
-        self.label_size_input.set_mm(_DEFAULTS["label_size"])
-        self.label_size_input.widget().setToolTip("The text size for identifier labels.")
-        self._length_fields.append(self.label_size_input)
-        self.simulate_nesting_checkbox = make_checkbox(
-            "Simulate Nesting (slower)",
-            checked=_DEFAULTS["simulate_nesting"])
-        self.verbose_logging_checkbox = make_checkbox(
-            "Verbose Logging", checked=_DEFAULTS["verbose_logging"])
-        self.verbose_logging_checkbox.setToolTip("Enables detailed logging of the nesting process in the FreeCAD console.")
-        self.performance_logging_checkbox = make_checkbox(
-            "Performance Logging",
-            checked=_DEFAULTS["performance_logging"])
-        self.performance_logging_checkbox.setToolTip("Enables performance and timing diagnostics in the FreeCAD console.")
-        self.sound_checkbox = make_checkbox(
-            "Play sound on completion", checked=True)
-        
-        self.nest_button = QtWidgets.QPushButton("Run Nesting")
-        self.cancel_button = QtWidgets.QPushButton("Cancel Nesting")
-        self.cancel_button.setEnabled(False)
-
-        self.add_parts_button = QtWidgets.QPushButton("Add Selected")
-        self.remove_parts_button = QtWidgets.QPushButton("Remove Selected")
-        
         self.font_select_button = QtWidgets.QPushButton("Select Font")
         self.font_label = QtWidgets.QLabel("No Font Selected")
         self.font_label.setWordWrap(True)
@@ -654,6 +622,75 @@ class NestingPanel(QtWidgets.QWidget):
 
         # Load initial selection
         self.controller.load_selection()
+
+    def _set_initial_section_visibility(self):
+        """Which sections are on screen before the algorithm is chosen.
+
+        Physics starts hidden because Minkowski is the default algorithm. This
+        is the same setVisible pair _on_algorithm_change uses, so it is the
+        algorithm toggle's starting state and nothing more -- it does not touch
+        the collapsed state, which is set in each CollapsibleSection's
+        constructor.
+        """
+        # Set initial visibility
+        self.minkowski_settings_group.setVisible(True)
+        self.minkowski_optimization_group.setVisible(True)
+        self.physics_settings_group.setVisible(False)
+
+
+
+
+    def _build_helper_fields(self):
+        """The Helpers and Logging contents: labels, and the display switches.
+
+        Both sections read unconditionally by NestingController whatever the
+        algorithm is, which is why they sit apart from the algorithm-specific
+        sections and are never hidden by the algorithm toggle.
+
+        The two label LengthFields append to self._length_fields, so this must
+        run after _build_length_fields has reassigned that list.
+        """
+        self.show_bounds_checkbox = make_checkbox("Show Bounds", checked=True)
+        self.add_labels_checkbox = make_checkbox(
+            "Add Identifier Labels", checked=_DEFAULTS["add_labels"])
+        self.label_height_input = LengthField(mm_min=0, mm_max=1000)
+        self.label_height_input.set_mm(_DEFAULTS["label_height"])
+        self.label_height_input.widget().setToolTip("The height (Z-offset) for the identifier labels.")
+        self._length_fields.append(self.label_height_input)
+        self.label_size_input = LengthField(mm_min=1, mm_max=100)
+        self.label_size_input.set_mm(_DEFAULTS["label_size"])
+        self.label_size_input.widget().setToolTip("The text size for identifier labels.")
+        self._length_fields.append(self.label_size_input)
+        self.simulate_nesting_checkbox = make_checkbox(
+            "Simulate Nesting (slower)",
+            checked=_DEFAULTS["simulate_nesting"])
+        self.verbose_logging_checkbox = make_checkbox(
+            "Verbose Logging", checked=_DEFAULTS["verbose_logging"])
+        self.verbose_logging_checkbox.setToolTip("Enables detailed logging of the nesting process in the FreeCAD console.")
+        self.performance_logging_checkbox = make_checkbox(
+            "Performance Logging",
+            checked=_DEFAULTS["performance_logging"])
+        self.performance_logging_checkbox.setToolTip("Enables performance and timing diagnostics in the FreeCAD console.")
+        self.sound_checkbox = make_checkbox(
+            "Play sound on completion", checked=True)
+        
+
+
+    def _build_action_buttons(self):
+        """Run, cancel, and the parts-table add/remove pair.
+
+        Cancel starts disabled; a run enables it. Kept apart from the helper
+        fields because these are the panel's only controls that act rather than
+        configure.
+        """
+        self.nest_button = QtWidgets.QPushButton("Run Nesting")
+        self.cancel_button = QtWidgets.QPushButton("Cancel Nesting")
+        self.cancel_button.setEnabled(False)
+
+        self.add_parts_button = QtWidgets.QPushButton("Add Selected")
+        self.remove_parts_button = QtWidgets.QPushButton("Remove Selected")
+        
+
 
     def _build_length_fields(self):
         """The sheet dimensions, part spacing, deflection, and simplification.
