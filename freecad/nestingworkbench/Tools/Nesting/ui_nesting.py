@@ -255,85 +255,7 @@ class NestingPanel(QtWidgets.QWidget):
         mink_rot_layout.addWidget(self.minkowski_rotation_steps_slider)
         mink_rot_layout.addWidget(self.minkowski_rotation_display_label)
 
-        # Layout of the three controls:
-        #
-        #     Use Random Direction  |   Nesting Direction
-        #     ----------------------+   (dial, spanning both rows)
-        #     Rotation Angle        |
-        #
-        # Built as a QGridLayout rather than the QFormLayout it replaces,
-        # because QFormLayout cannot express this: its label column is
-        # shared, so a labelled "Rotation Angle" row would start to the right of
-        # the checkbox and run its slider underneath the dial. That is what the
-        # first attempt did, and the two controls overlapped in width rather
-        # than stacking in columns. A grid has a label cell per row and a
-        # spanning cell for the dial, so the left column is genuinely its own
-        # column and the slider cannot grow into the dial's space.
-        #
-        # The dial spans both rows on the right because it is the tallest of
-        # the three by an order of magnitude. It defines the group's height, and
-        # the two smaller controls stack alongside it instead of the group being
-        # three rows tall.
-        #
-        # The checkbox sits above the slider because it qualifies the dial it
-        # sits beside -- it decides whether the dial is used at all -- and the
-        # rotation angle is the one control of the three that is independent of
-        # both.
-        #
-        # Column 0 is sized to its widest cell, and the widest is the
-        # "Use Random Direction" checkbox, not the "Rotation Angle:" label. That
-        # left the left column far wider than either control needs and pushed
-        # the slider right until it ran under the dial. Sizing the column to the
-        # LABEL instead and letting the checkbox keep its own natural size
-        # within it is what makes the two rows of column 1 start at the same x,
-        # which is the whole point of the arrangement.
-        direction_grid = QtWidgets.QGridLayout()
-        direction_grid.setHorizontalSpacing(_GRID_COLUMN_SPACING)
-        direction_grid.setVerticalSpacing(_GRID_ROW_SPACING)
-        direction_grid.setContentsMargins(*MARGINS_NONE)
-
-        # Column 0 is the whole left side -- the checkbox above, the rotation
-        # angle below -- and the dial owns column 1 across both rows. The
-        # rotation angle's label and slider are stacked in a VBox and placed as
-        # ONE cell, which is what makes the left column a column: laid out as
-        # separate cells the slider took the full width of the grid and ran
-        # underneath the dial, because a slider has a large sizeHint and the
-        # grid gives one cell whatever width it asks for.
-        rotation_angle_column = QtWidgets.QVBoxLayout()
-        rotation_angle_column.setContentsMargins(*MARGINS_NONE)
-        rotation_angle_column.setSpacing(2)
-        rotation_angle_label = QtWidgets.QLabel("Rotation Angle:")
-        rotation_angle_label.setAlignment(
-            QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
-        rotation_angle_column.addWidget(rotation_angle_label)
-        rotation_angle_column.addLayout(mink_rot_layout)
-        rotation_angle_column.addStretch()
-
-        direction_grid.addWidget(self.minkowski_random_checkbox, 0, 0)
-        _place(direction_grid, rotation_angle_column, 1, 0, 1)
-        direction_grid.addWidget(minkowski_dial_widget, 0, 1, 2, 1)
-
-        # Column widths. A QSlider's sizeHint is wide enough to claim the
-        # panel on its own: measured, the left column took 348px and left the
-        # dial 118px, because a grid gives column 0 every pixel the dial does
-        # not ask for. setColumnMinimumWidth is a floor, not a ceiling, so it
-        # does nothing here.
-        #
-        # The dial is instead given a FIXED width -- it is a circle, so it has
-        # no reason to grow -- and column 0 takes what is left. A
-        # maximumWidth on the slider's containing widget is what actually stops
-        # it claiming the surplus, and the slider itself is told it may shrink,
-        # so a narrow panel shortens the slider rather than clipping the dial.
-        self.minkowski_rotation_steps_slider.setMinimumWidth(0)
-        minkowski_dial_widget.setFixedWidth(_DIAL_COLUMN_WIDTH)
-        direction_grid.setColumnStretch(0, 1)
-        direction_grid.setColumnStretch(1, 0)
-        # The dial is the tall one, so it decides the group's height. Give it
-        # the slack in column 1 and let the left column's rows share what is
-        # left, which is what the two row-stretches below ask for.
-        direction_grid.setRowStretch(0, 1)
-        direction_grid.setRowStretch(1, 1)
-        self.minkowski_settings_group.addLayout(direction_grid)
+        self._build_direction_grid(minkowski_dial_widget, mink_rot_layout)
 
         # Optimizations. Compactness and Clear NFP Cache were not on the
         # requested list but are Minkowski-only controls, and this is the only
@@ -528,6 +450,109 @@ class NestingPanel(QtWidgets.QWidget):
 
         # Load initial selection
         self.controller.load_selection()
+
+    def _build_direction_grid(self, minkowski_dial_widget, mink_rot_layout):
+        """The three-control arrangement at the top of Nesting Settings.
+
+        Both arguments are locals owned further up _setup_ui, passed in rather
+        than read off self: the dial's container, from _build_direction_control,
+        and the slider-plus-readout row. Naming them is most of the point -- a
+        reader previously had to scan eighty lines to learn that this block is
+        handed its two inputs rather than building them.
+
+        Kept whole rather than split at its comment boundaries. The five comment
+        paragraphs are one argument -- why a QFormLayout could not express this,
+        why the dial spans both rows, why column 0 is sized to the label and not
+        the checkbox, the measured 348px/118px failure, why the dial gets a
+        fixed width -- and cutting it would leave fragments citing a rationale
+        stored somewhere else.
+
+        Everything it creates is local to here and nothing is returned.
+
+        The arrangement is asserted in probe_unit_panel's case_direction_dial:
+        two columns, the checkbox at (0,0), the dial's container at (0,1)
+        spanning both rows, and the rotation angle as ONE layout cell at (1,0).
+        """
+        # Layout of the three controls:
+        #
+        #     Use Random Direction  |   Nesting Direction
+        #     ----------------------+   (dial, spanning both rows)
+        #     Rotation Angle        |
+        #
+        # Built as a QGridLayout rather than the QFormLayout it replaces,
+        # because QFormLayout cannot express this: its label column is
+        # shared, so a labelled "Rotation Angle" row would start to the right of
+        # the checkbox and run its slider underneath the dial. That is what the
+        # first attempt did, and the two controls overlapped in width rather
+        # than stacking in columns. A grid has a label cell per row and a
+        # spanning cell for the dial, so the left column is genuinely its own
+        # column and the slider cannot grow into the dial's space.
+        #
+        # The dial spans both rows on the right because it is the tallest of
+        # the three by an order of magnitude. It defines the group's height, and
+        # the two smaller controls stack alongside it instead of the group being
+        # three rows tall.
+        #
+        # The checkbox sits above the slider because it qualifies the dial it
+        # sits beside -- it decides whether the dial is used at all -- and the
+        # rotation angle is the one control of the three that is independent of
+        # both.
+        #
+        # Column 0 is sized to its widest cell, and the widest is the
+        # "Use Random Direction" checkbox, not the "Rotation Angle:" label. That
+        # left the left column far wider than either control needs and pushed
+        # the slider right until it ran under the dial. Sizing the column to the
+        # LABEL instead and letting the checkbox keep its own natural size
+        # within it is what makes the two rows of column 1 start at the same x,
+        # which is the whole point of the arrangement.
+        direction_grid = QtWidgets.QGridLayout()
+        direction_grid.setHorizontalSpacing(_GRID_COLUMN_SPACING)
+        direction_grid.setVerticalSpacing(_GRID_ROW_SPACING)
+        direction_grid.setContentsMargins(*MARGINS_NONE)
+
+        # Column 0 is the whole left side -- the checkbox above, the rotation
+        # angle below -- and the dial owns column 1 across both rows. The
+        # rotation angle's label and slider are stacked in a VBox and placed as
+        # ONE cell, which is what makes the left column a column: laid out as
+        # separate cells the slider took the full width of the grid and ran
+        # underneath the dial, because a slider has a large sizeHint and the
+        # grid gives one cell whatever width it asks for.
+        rotation_angle_column = QtWidgets.QVBoxLayout()
+        rotation_angle_column.setContentsMargins(*MARGINS_NONE)
+        rotation_angle_column.setSpacing(2)
+        rotation_angle_label = QtWidgets.QLabel("Rotation Angle:")
+        rotation_angle_label.setAlignment(
+            QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
+        rotation_angle_column.addWidget(rotation_angle_label)
+        rotation_angle_column.addLayout(mink_rot_layout)
+        rotation_angle_column.addStretch()
+
+        direction_grid.addWidget(self.minkowski_random_checkbox, 0, 0)
+        _place(direction_grid, rotation_angle_column, 1, 0, 1)
+        direction_grid.addWidget(minkowski_dial_widget, 0, 1, 2, 1)
+
+        # Column widths. A QSlider's sizeHint is wide enough to claim the
+        # panel on its own: measured, the left column took 348px and left the
+        # dial 118px, because a grid gives column 0 every pixel the dial does
+        # not ask for. setColumnMinimumWidth is a floor, not a ceiling, so it
+        # does nothing here.
+        #
+        # The dial is instead given a FIXED width -- it is a circle, so it has
+        # no reason to grow -- and column 0 takes what is left. A
+        # maximumWidth on the slider's containing widget is what actually stops
+        # it claiming the surplus, and the slider itself is told it may shrink,
+        # so a narrow panel shortens the slider rather than clipping the dial.
+        self.minkowski_rotation_steps_slider.setMinimumWidth(0)
+        minkowski_dial_widget.setFixedWidth(_DIAL_COLUMN_WIDTH)
+        direction_grid.setColumnStretch(0, 1)
+        direction_grid.setColumnStretch(1, 0)
+        # The dial is the tall one, so it decides the group's height. Give it
+        # the slack in column 1 and let the left column's rows share what is
+        # left, which is what the two row-stretches below ask for.
+        direction_grid.setRowStretch(0, 1)
+        direction_grid.setRowStretch(1, 1)
+        self.minkowski_settings_group.addLayout(direction_grid)
+
 
     def _build_physics_section(self):
         """The Physics Nesting Settings section: dial, limits, and annealing.
