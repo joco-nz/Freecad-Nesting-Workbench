@@ -62,6 +62,7 @@ the symbol when you edit the entry.
 | [NEST-007](#nest-007) | Nesting converts analytic source geometry to B-splines to centre it | open | medium | geometry |
 | [NEST-008](#nest-008) | Hole-nesting detection costs 148 ms per part on real geometry | open | medium | performance |
 | [NEST-022](#nest-022) | Logging is 230 ad-hoc call sites and 165 exception handlers that record nothing | open | medium | diagnostics |
+| [NEST-023](#nest-023) | "Stop At Sheets" was a dead control: read by nobody, never reached the engine | resolved | high | UI wiring |
 
 ---
 
@@ -1391,3 +1392,101 @@ consequences worth keeping:
 
     # 165 silent handlers: for each `except`, look at the next two lines for
     # Console./print(/logger, and for a bare `except ...: pass`
+
+---
+
+## NEST-023 — "Stop At Sheets" was a dead control (resolved)
+
+**`status: resolved`** · `severity: high` · `area: UI wiring`
+
+Reported as "the early-finish flag does not seem to be working". It was not
+working at all: the dial was read by nobody, so the feature was permanently off
+and every run went to completion with no error, warning, or log line.
+
+### The break, in four links
+
+| link | state |
+|---|---|
+| `ui_nesting.py:871` — the spinbox, "Stop At Sheets:", 0-100, "Off" at 0 | existed |
+| `nesting_controller._collect_ui_params` | **never read it** |
+| `nesting_controller._prepare_algo_kwargs` | **never set `algo_kwargs['target_sheets']`** |
+| `ga_coordinator.run:530`, `_run_generation:1175` | reads `algo_kwargs['target_sheets']` |
+
+The coordinator was handed no target, defaulted it to 0, and never stopped
+early. The engine was never wrong: `_evaluate_layout:1290` returns the instant a
+layout qualifies, `run:797` skips breeding a generation nothing will use, and
+`run:851` breaks and records the hit as a **success, not a cancel**.
+
+### Why it survived
+
+Every test that covers the target passes it **directly into `ALGO_KWARGS`**,
+bypassing the panel:
+
+    tests/freecad_harness/test_ga_loop.py:329,373,396,429
+
+Those five cases (met, not-met-by-dropping-parts, unreachable, fill-only, and a
+hit being a success) all passed throughout. Testing the engine and testing the
+wiring are different jobs, and only one of them was being done — so the suite was
+green and comprehensive about the wrong thing.
+
+This is the reusable finding: **a panel control can exist, hold a sensible value,
+be laid out correctly, and still be read by nobody.** Nothing about the widget,
+the layout probes, or the unit tests can see that.
+
+### Scoped, and it was not systemic
+
+Audited all 39 panel value-controls. `minkowski_target_sheets_input` was the only
+one read nowhere. The three other apparent orphans (`add_parts_button`,
+`font_select_button`, `remove_parts_button`) are wired via `clicked.connect`,
+which is correct. So this was an isolated two-line gap, not a family.
+
+### The fix, and its guard
+
+Two lines: collect the spinbox in `_collect_ui_params`, pass it on in
+`_prepare_algo_kwargs`'s Minkowski branch beside `generations` and
+`population_size`. Not persisted, as the widget's own comment says —
+`save_settings` names its preference keys explicitly, so adding the key to the
+collected dict cannot leak it into prefs.
+
+Guard is `probe_target_sheets.py` (panel → `_collect_ui_params` →
+`_prepare_algo_kwargs` → a real GA run) plus the panel-side half in
+`probe_unit_panel.case_ga_dials_reach_the_run`. **Injection-verified**: 13/13
+with the fix, 8/13 with it reverted.
+
+That verification earned its place. The probe's first version took a
+`target_sheets` argument and assigned it into the kwargs, and with the fix
+reverted the GA assertions still passed — the run was being handed the target
+directly, so it could not detect the target not arriving. Injecting the value
+made the check decorative. `run_ga` now takes no target at all.
+
+### Also found: the `log_callback` / `draw_callback=None` trap
+
+Hunting this abort cost most of the session, and the trap is worth keeping.
+
+`_prepare_algo_kwargs` puts `log_callback=NestingPanel.log_message` — a **Qt
+widget method** — into `algo_kwargs`, and `nesting_strategy` calls it from the
+rotation worker threads (`nesting_strategy.py:449,1402`). Production never hits
+this: `_run_generation` replaces `log_callback` with a console sink whenever
+`draw_callback` is set.
+
+Any caller passing `draw_callback=None` — which `bench_ga.py`,
+`test_ga_loop.py` and `probe_target_sheets.py` all do, to run synchronously —
+loses that substitution, and with `performance_logging` on, thousands of
+`[TIMING]` lines reach the widget from a worker and the process aborts:
+
+    GUI API 'FreeCADGui.updateGui' may only be used from the main thread.
+    terminate called after throwing an instance of 'Py::RuntimeError'
+
+It reads as a coordinator fault and the stack points at the coordinator. Still
+latent in production because `draw_callback` is always set there, but it is a
+trap for any future probe or headless caller. Pass a null or console sink, as
+`bench_ga.py` already does.
+
+### Reproducing
+
+    /home/james/freecad_env/usr/bin/freecad \
+        tests/freecad_harness/probe_target_sheets.py
+
+    # and confirm the guard bites
+    git stash push freecad/nestingworkbench/Tools/Nesting/nesting_controller.py
+    # -> 8/13, exit 1; then git stash pop

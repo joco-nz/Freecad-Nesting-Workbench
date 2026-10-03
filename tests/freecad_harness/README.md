@@ -254,11 +254,71 @@ downstream of them stays in millimetres. Two files, two interpreters:
 |---|---|---|
 | `test_document_units.py` | `units.py` — schema resolution, length/area formatting, `parse_length`, `length_mm` | `freecadcmd`, wired into `run.sh` |
 | `probe_unit_panel.py` | `length_field.py` and the real `NestingPanel` | `freecad` (GUI), run by hand |
+| `probe_target_sheets.py` | the "Stop At Sheets" dial, panel → coordinator → a real GA run | `freecad` (GUI), run by hand |
 
 The split is forced: `freecadcmd` has no `FreeCADGui.UiLoader`, so
 `Gui::QuantitySpinBox` cannot be constructed there at all
 (`AttributeError: module 'FreeCADGui' has no attribute 'UiLoader'`). No Xvfb
 needed — see above.
+
+### Panel controls that reach the run
+
+`probe_target_sheets.py` exists because a panel control can exist, hold a
+sensible value, be laid out correctly, and still be **read by nobody**. "Stop At
+Sheets" did exactly that: `_collect_ui_params` never read the spinbox and
+`_prepare_algo_kwargs` never set `algo_kwargs['target_sheets']`, so
+`GACoordinator` was handed no target, defaulted it to 0, and the dial did
+nothing — silently, every run.
+
+The engine was never at fault. `test_ga_loop.py` has five cases for the target,
+all passing, because every one of them passes `target_sheets` **directly** into
+`ALGO_KWARGS` and so bypasses the panel. Testing the engine and testing the
+wiring are different jobs, and only one of them was being done.
+
+Two rules that came out of it, both applied in `probe_target_sheets.py`:
+
+- **Drive the run from panel-derived kwargs.** The probe's first version took a
+  `target_sheets` argument and assigned it into the kwargs. With the controller's
+  wiring reverted, the wiring assertions failed but the GA assertions still
+  passed — a decorative check. `run_ga` now takes no target and uses whatever
+  the panel produced.
+- **Inject-verify the guard.** With the fix in place the probe is 13/13; with
+  the two-line fix reverted it is 8/13, and the end-to-end assertions fail
+  meaningfully (`_target_met=False`, `layout_evaluations=3`).
+
+### The `log_callback` / `draw_callback=None` trap
+
+Worth knowing before writing any probe that drives `GACoordinator.run` directly.
+`_prepare_algo_kwargs` puts `log_callback=NestingPanel.log_message` — a **Qt
+widget method** — into `algo_kwargs`, and `nesting_strategy` calls it from the
+rotation worker threads (`nesting_strategy.py:449,1402`). Production never hits
+this, because `_run_generation` replaces `log_callback` with a console sink
+whenever `draw_callback` is set.
+
+A caller that passes `draw_callback=None` — which `bench_ga.py`,
+`test_ga_loop.py` and this probe all do, to run synchronously — loses that
+substitution, and with `performance_logging` on, thousands of `[TIMING]` lines
+reach the widget from a worker and the process aborts:
+
+    GUI API 'FreeCADGui.updateGui' may only be used from the main thread.
+    terminate called after throwing an instance of 'Py::RuntimeError'
+
+It looks like a coordinator fault and the stack points there. Pass a null or
+console sink instead, as `bench_ga.py` does.
+
+### Closing a GUI probe without the Unsaved Document dialog
+
+Two separate problems, and the older GUI probes only solve the first.
+
+- **Documents.** `FreeCAD.closeDocument(name)` *discards*: it does not prompt,
+  so the Unsaved Document dialog never appears and nothing is written. Every
+  probe closes its documents explicitly for this reason, and none of them call
+  `doc.save()` — a fixture must come out of a run byte-identical.
+- **The window.** `sys.exit()` at the end of the script leaves the main window on
+  screen; the process is gone but the window still has to be dismissed by hand.
+  `FreeCADGui.getMainWindow().close()` followed by
+  `QApplication.instance().quit()` makes the session end on its own.
+  `probe_target_sheets.py` does this in `close_out()`.
 
 ### The invariant the probe exists to hold
 

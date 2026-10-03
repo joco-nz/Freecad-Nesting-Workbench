@@ -837,6 +837,75 @@ def case_ga_fields_persist():
     _fc.closeDocument(doc.Name)
 
 
+def case_ga_dials_reach_the_run():
+    """Every GA dial the coordinator reads is actually handed to it.
+
+    Generations and Population Size reached the run; "Stop At Sheets" did not.
+    `_collect_ui_params` never read the spinbox and `_prepare_algo_kwargs` never
+    set `algo_kwargs['target_sheets']`, so GACoordinator was handed no target,
+    defaulted it to 0, and the dial did nothing -- with no error anywhere. The
+    engine was correct and well covered by test_ga_loop.py; only the wiring was
+    untested, because every one of those tests passes `target_sheets` in
+    directly and so bypasses the panel entirely.
+
+    Asserted here as a group because the failure mode is silent and per-field: a
+    widget can exist, hold a sensible value, be laid out correctly and still be
+    read by nobody. probe_target_sheets.py carries the end-to-end run; this is
+    the cheap panel-side half, next to the other GA-field case.
+    """
+    import FreeCAD as _fc
+
+    from freecad.nestingworkbench.Tools.Nesting.ui_nesting import NestingPanel
+
+    emit("")
+    emit("--- GA dials reach the run ---")
+
+    doc = _fc.newDocument("gawiring")
+    enums = doc.getEnumerationsOfProperty("UnitSystem")
+    doc.UnitSystem = enums[6]
+    _fc.setActiveDocument(doc.Name)
+
+    panel = NestingPanel()
+    try:
+        panel.algorithm_dropdown.setCurrentText("Minkowski")
+        panel.minkowski_generations_input.setValue(3)
+        panel.minkowski_population_size_input.setValue(5)
+        panel.minkowski_target_sheets_input.setValue(2)
+
+        params = panel.controller._collect_ui_params()
+        check("Generations is collected",
+              params.get('generations') == 3,
+              f"generations={params.get('generations')!r}")
+        check("Population Size is collected",
+              params.get('population_size') == 5,
+              f"population_size={params.get('population_size')!r}")
+        check("Stop At Sheets is collected",
+              params.get('target_sheets') == 2,
+              f"target_sheets={params.get('target_sheets')!r}")
+
+        # The coordinator reads target_sheets from algo_kwargs, not ui_params,
+        # so collecting it without passing it on is the same bug one layer down.
+        kwargs = panel.controller._prepare_algo_kwargs(params)
+        for key, want in (('generations', 3), ('population_size', 5),
+                          ('target_sheets', 2)):
+            check(f"{key} reaches algo_kwargs",
+                  kwargs.get(key) == want, f"{key}={kwargs.get(key)!r}")
+
+        # And 0 has to arrive as 0 rather than absent: `algo_kwargs.get(... ) or 0`
+        # in the coordinator makes those equivalent, but a key that only exists
+        # when non-zero is the shape of bug this whole case is about.
+        panel.minkowski_target_sheets_input.setValue(0)
+        off = panel.controller._prepare_algo_kwargs(
+            panel.controller._collect_ui_params())
+        check("an off target still arrives as 0, not as a missing key",
+              'target_sheets' in off and off['target_sheets'] == 0,
+              f"keys={sorted(off)} target_sheets={off.get('target_sheets')!r}")
+    finally:
+        panel.dispose()
+        panel.deleteLater()
+        _fc.closeDocument(doc.Name)
+
+
 # --------------------------------------------------------------------------
 # Case 8: the two-column grids
 # --------------------------------------------------------------------------
@@ -1113,6 +1182,7 @@ def main():
                  case_direction_dial,
                  case_direction_persists,
                  case_ga_fields_persist,
+                 case_ga_dials_reach_the_run,
                  case_two_column_grids):
         try:
             case()

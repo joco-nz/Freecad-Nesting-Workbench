@@ -996,6 +996,13 @@ class NestingController:
             'label_size': self.ui.label_size_input.mm(),
             'generations': self.ui.minkowski_generations_input.value(),
             'population_size': self.ui.minkowski_population_size_input.value(),
+            # Read here and passed on by _prepare_algo_kwargs. It used to be
+            # read by neither, so the coordinator's `target_sheets` was always
+            # absent and the Stop At Sheets dial did nothing at all -- see
+            # issues.md and probe_target_sheets.py. Not persisted, deliberately,
+            # as the widget's own comment says; save_settings names its
+            # preference keys explicitly, so adding the key here cannot leak it.
+            'target_sheets': self.ui.minkowski_target_sheets_input.value(),
             'compactness_weight': self.ui.minkowski_compactness_input.value(),
             'verbose': self.ui.verbose_logging_checkbox.isChecked(),
             'performance_logging': self.ui.performance_logging_checkbox.isChecked(),
@@ -1171,6 +1178,12 @@ class NestingController:
             
             algo_kwargs['population_size'] = self.ui.minkowski_population_size_input.value()
             algo_kwargs['generations'] = self.ui.minkowski_generations_input.value()
+            # The Stop At Sheets dial, alongside the two GA dials it belongs
+            # with. GACoordinator reads it from algo_kwargs (run() and
+            # _run_generation), not from ui_params, so collecting it without
+            # passing it on is exactly the bug probe_target_sheets.py guards.
+            # 0 means off, which is the spinbox's special-value text.
+            algo_kwargs['target_sheets'] = ui_params.get('target_sheets', 0) or 0
             algo_kwargs['clear_nfp_cache'] = self.ui.clear_cache_checkbox.isChecked()
             algo_kwargs['candidate_geometry_cache'] = ui_params.get(
                 'candidate_geometry_cache', CANDIDATE_GEOMETRY_CACHE_DEFAULT
