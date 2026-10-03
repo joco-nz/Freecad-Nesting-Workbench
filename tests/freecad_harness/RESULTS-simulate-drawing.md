@@ -179,6 +179,13 @@ positions publish at placement cadence instead of continuously. Placements
 themselves are untouched and each is still drawn; that was the constraint this
 was scoped under.
 
+**That cost was then checked by eye and is acceptable** — confirmed against a
+real Simulate run in the GUI. Worth recording because it is the one claim in
+this file no automated check can make: no test distinguishes "the animation
+reads fine" from "the animation did not change", and the bench cannot see a
+frame at all. If this is ever reverted or re-tuned, that check has to be redone
+by hand.
+
 The guard for this is in `bench_ga.validate_sim_draw`: it asserts
 `trial_invoked == trial_calls`, so a change that starves the relay fails the run
 rather than quietly shipping a truncated animation. Injection-verified — it fires
