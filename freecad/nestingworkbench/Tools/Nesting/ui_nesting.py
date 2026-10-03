@@ -360,101 +360,7 @@ class NestingPanel(QtWidgets.QWidget):
             (None, self.clear_cache_checkbox),
         ]))
 
-        # Expanded, for the same reason as Optimizations: previously a plain
-        # QGroupBox and therefore always visible.
-        self.physics_settings_group = CollapsibleSection(
-            "Physics Nesting Settings", expanded=True)
-        physics_form_layout = QtWidgets.QFormLayout()
-
-        # Direction Dial for Physics. Shares the default, the label map and the
-        # step with the Minkowski dial above: the two are read by the same
-        # conversion and a per-algorithm divergence here would be invisible
-        # until someone ran the other algorithm and got a different nest.
-        physics_dial_widget, self.physics_direction_dial, self.physics_direction_label = \
-            self._build_direction_control()
-
-        self.physics_random_checkbox = make_checkbox("Use Random Direction")
-        self.physics_random_checkbox.stateChanged.connect(
-            lambda state: self._set_direction_control_enabled(
-                not self.physics_random_checkbox.isChecked(),
-                dial=self.physics_direction_dial))
-
-        self.physics_step_size_input = LengthField(mm_min=0.1, mm_max=100)
-        self.physics_step_size_input.set_mm(_DEFAULTS["physics_step_size"])
-        self._length_fields.append(self.physics_step_size_input)
-        self.physics_max_spawn_input = make_int_spinbox(100, 1, 1000)
-        self.physics_max_nesting_steps_input = make_int_spinbox(500, 1, 5000)
-        
-        # Annealing controls
-        self.physics_anneal_steps_input = make_int_spinbox(25, 0, 500)
-        self.anneal_rotate_checkbox = make_checkbox(
-            "Anneal Rotate", checked=True)
-        self.anneal_translate_checkbox = make_checkbox(
-            "Anneal Translate", checked=True)
-        self.anneal_random_shake_checkbox = make_checkbox(
-            "Random Shake Direction")
-
-        self.physics_anneal_rot_steps = make_int_spinbox(10, 0, 500)
-        self.physics_anneal_rot_curve_type = QtWidgets.QComboBox()
-        self.physics_anneal_rot_curve_type.addItems(["Logarithmic", "Linear", "Power 1.5", "Quadratic", "Exponential"])
-        self.physics_anneal_rot_min = make_double_spinbox(1.0, 0.0, 360.0)
-        self.physics_anneal_rot_max = make_double_spinbox(90.0, 0.0, 360.0)
-        
-        self.physics_anneal_curve_type = QtWidgets.QComboBox()
-        self.physics_anneal_curve_type.addItems(["Logarithmic", "Linear", "Power 1.5", "Quadratic", "Exponential"])
-        
-        self.physics_anneal_min_amp = LengthField(mm_min=0.0, mm_max=1000.0)
-        self.physics_anneal_min_amp.set_mm(_DEFAULTS["physics_anneal_min_amp"])
-        self._length_fields.append(self.physics_anneal_min_amp)
-        self.physics_anneal_max_amp = LengthField(mm_min=0.0, mm_max=5000.0)
-        self.physics_anneal_max_amp.set_mm(_DEFAULTS["physics_anneal_max_amp"])
-        self._length_fields.append(self.physics_anneal_max_amp)
-        
-        self.physics_improvement_threshold_input = make_double_spinbox(
-            0.01, 0.000001, 1.0, step=0.01, decimals=6)
-        self.physics_improvement_threshold_input.setToolTip("Minimum score improvement required to reset simulation cycle. Prevents infinite loops from noise.")
-
-        physics_form_layout.addRow("Gravity Direction:", physics_dial_widget)
-        physics_form_layout.addRow(self.physics_random_checkbox)
-        
-        # Rotation Steps for Physics
-        # Mapping: 1, 4 (90), 8 (45), 12 (30), 24 (15), 36 (10), 72 (5), 180 (2), 360 (1)
-        self.physics_rotation_steps_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
-        self.physics_rotation_steps_slider.setRange(0, 8) 
-        self.physics_rotation_steps_slider.setValue(1) # Default 90 deg (4 steps)
-        self.physics_rotation_display_label = QtWidgets.QLabel("")
-        self.physics_rotation_display_label.setFixedWidth(120)
-        self.physics_rotation_steps_slider.valueChanged.connect(lambda: self._update_rotation_label())
-
-        physics_form_layout.addRow("Step Size:", self.physics_step_size_input.widget())
-        physics_form_layout.addRow("Max Spawn Attempts:", self.physics_max_spawn_input)
-        physics_form_layout.addRow("Max Nesting Steps:", self.physics_max_nesting_steps_input)
-
-        physics_form_layout.addRow(QtWidgets.QLabel("")) # Spacer
-        physics_form_layout.addRow(QtWidgets.QLabel("--- Annealing (Shake) ---"))
-        
-        # Anneal Rotate Logic
-        physics_form_layout.addRow(self.anneal_rotate_checkbox)
-        phys_rot_layout = QtWidgets.QHBoxLayout()
-        phys_rot_layout.addWidget(self.physics_rotation_steps_slider)
-        phys_rot_layout.addWidget(self.physics_rotation_display_label)
-        physics_form_layout.addRow("Rotation Steps:", phys_rot_layout)
-        physics_form_layout.addRow("Rot Anneal Steps:", self.physics_anneal_rot_steps)
-        physics_form_layout.addRow("Rot Curve Type:", self.physics_anneal_rot_curve_type)
-        physics_form_layout.addRow("Rot Min Angle:", self.physics_anneal_rot_min)
-        physics_form_layout.addRow("Rot Max Angle:", self.physics_anneal_rot_max)
-        
-        # Anneal Translate Logic
-        physics_form_layout.addRow(self.anneal_translate_checkbox)
-        physics_form_layout.addRow("Anneal Steps:", self.physics_anneal_steps_input)
-        physics_form_layout.addRow("Improvement Threshold:", self.physics_improvement_threshold_input)
-        physics_form_layout.addRow(QtWidgets.QLabel("")) # Spacer
-        physics_form_layout.addRow("Curve Type:", self.physics_anneal_curve_type)
-        physics_form_layout.addRow("Min Amplitude:", self.physics_anneal_min_amp.widget())
-        physics_form_layout.addRow("Max Amplitude:", self.physics_anneal_max_amp.widget())
-        physics_form_layout.addRow(self.anneal_random_shake_checkbox)
-
-        self.physics_settings_group.addLayout(physics_form_layout)
+        self._build_physics_section()
 
         # Helpers and Logging are NOT tied to the algorithm, even though they
         # sit in the same panel as the Minkowski groups.
@@ -622,6 +528,127 @@ class NestingPanel(QtWidgets.QWidget):
 
         # Load initial selection
         self.controller.load_selection()
+
+    def _build_physics_section(self):
+        """The Physics Nesting Settings section: dial, limits, and annealing.
+
+        One method rather than a fields builder plus a form builder, because
+        the block interleaves the two -- each widget is created and immediately
+        added to the form, with spacer rows and the "--- Annealing (Shake) ---"
+        separator sitting between them. Splitting it would mean either
+        returning twenty widgets or rewriting it as two passes, which is churn
+        on a block that is currently verified, to satisfy a line-count target.
+        So it stays cohesive and runs slightly over budget.
+
+        Returns nothing. physics_form_layout and physics_dial_widget are both
+        created and consumed here, so there is nothing to hand back -- which is
+        also why this cannot hit the bug the optimisation-fields builder did,
+        where a documented return value was simply never written and the caller
+        passed None into the layout.
+
+        Must be called before _set_initial_section_visibility, which reads
+        self.physics_settings_group.
+
+        The dial itself is not here: _build_direction_control is shared with
+        Minkowski, deliberately, so the two algorithms cannot diverge on the
+        default, the label map or the step.
+        """
+        # Expanded, for the same reason as Optimizations: previously a plain
+        # QGroupBox and therefore always visible.
+        self.physics_settings_group = CollapsibleSection(
+            "Physics Nesting Settings", expanded=True)
+        physics_form_layout = QtWidgets.QFormLayout()
+
+        # Direction Dial for Physics. Shares the default, the label map and the
+        # step with the Minkowski dial above: the two are read by the same
+        # conversion and a per-algorithm divergence here would be invisible
+        # until someone ran the other algorithm and got a different nest.
+        physics_dial_widget, self.physics_direction_dial, self.physics_direction_label = \
+            self._build_direction_control()
+
+        self.physics_random_checkbox = make_checkbox("Use Random Direction")
+        self.physics_random_checkbox.stateChanged.connect(
+            lambda state: self._set_direction_control_enabled(
+                not self.physics_random_checkbox.isChecked(),
+                dial=self.physics_direction_dial))
+
+        self.physics_step_size_input = LengthField(mm_min=0.1, mm_max=100)
+        self.physics_step_size_input.set_mm(_DEFAULTS["physics_step_size"])
+        self._length_fields.append(self.physics_step_size_input)
+        self.physics_max_spawn_input = make_int_spinbox(100, 1, 1000)
+        self.physics_max_nesting_steps_input = make_int_spinbox(500, 1, 5000)
+        
+        # Annealing controls
+        self.physics_anneal_steps_input = make_int_spinbox(25, 0, 500)
+        self.anneal_rotate_checkbox = make_checkbox(
+            "Anneal Rotate", checked=True)
+        self.anneal_translate_checkbox = make_checkbox(
+            "Anneal Translate", checked=True)
+        self.anneal_random_shake_checkbox = make_checkbox(
+            "Random Shake Direction")
+
+        self.physics_anneal_rot_steps = make_int_spinbox(10, 0, 500)
+        self.physics_anneal_rot_curve_type = QtWidgets.QComboBox()
+        self.physics_anneal_rot_curve_type.addItems(["Logarithmic", "Linear", "Power 1.5", "Quadratic", "Exponential"])
+        self.physics_anneal_rot_min = make_double_spinbox(1.0, 0.0, 360.0)
+        self.physics_anneal_rot_max = make_double_spinbox(90.0, 0.0, 360.0)
+        
+        self.physics_anneal_curve_type = QtWidgets.QComboBox()
+        self.physics_anneal_curve_type.addItems(["Logarithmic", "Linear", "Power 1.5", "Quadratic", "Exponential"])
+        
+        self.physics_anneal_min_amp = LengthField(mm_min=0.0, mm_max=1000.0)
+        self.physics_anneal_min_amp.set_mm(_DEFAULTS["physics_anneal_min_amp"])
+        self._length_fields.append(self.physics_anneal_min_amp)
+        self.physics_anneal_max_amp = LengthField(mm_min=0.0, mm_max=5000.0)
+        self.physics_anneal_max_amp.set_mm(_DEFAULTS["physics_anneal_max_amp"])
+        self._length_fields.append(self.physics_anneal_max_amp)
+        
+        self.physics_improvement_threshold_input = make_double_spinbox(
+            0.01, 0.000001, 1.0, step=0.01, decimals=6)
+        self.physics_improvement_threshold_input.setToolTip("Minimum score improvement required to reset simulation cycle. Prevents infinite loops from noise.")
+
+        physics_form_layout.addRow("Gravity Direction:", physics_dial_widget)
+        physics_form_layout.addRow(self.physics_random_checkbox)
+        
+        # Rotation Steps for Physics
+        # Mapping: 1, 4 (90), 8 (45), 12 (30), 24 (15), 36 (10), 72 (5), 180 (2), 360 (1)
+        self.physics_rotation_steps_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self.physics_rotation_steps_slider.setRange(0, 8) 
+        self.physics_rotation_steps_slider.setValue(1) # Default 90 deg (4 steps)
+        self.physics_rotation_display_label = QtWidgets.QLabel("")
+        self.physics_rotation_display_label.setFixedWidth(120)
+        self.physics_rotation_steps_slider.valueChanged.connect(lambda: self._update_rotation_label())
+
+        physics_form_layout.addRow("Step Size:", self.physics_step_size_input.widget())
+        physics_form_layout.addRow("Max Spawn Attempts:", self.physics_max_spawn_input)
+        physics_form_layout.addRow("Max Nesting Steps:", self.physics_max_nesting_steps_input)
+
+        physics_form_layout.addRow(QtWidgets.QLabel("")) # Spacer
+        physics_form_layout.addRow(QtWidgets.QLabel("--- Annealing (Shake) ---"))
+        
+        # Anneal Rotate Logic
+        physics_form_layout.addRow(self.anneal_rotate_checkbox)
+        phys_rot_layout = QtWidgets.QHBoxLayout()
+        phys_rot_layout.addWidget(self.physics_rotation_steps_slider)
+        phys_rot_layout.addWidget(self.physics_rotation_display_label)
+        physics_form_layout.addRow("Rotation Steps:", phys_rot_layout)
+        physics_form_layout.addRow("Rot Anneal Steps:", self.physics_anneal_rot_steps)
+        physics_form_layout.addRow("Rot Curve Type:", self.physics_anneal_rot_curve_type)
+        physics_form_layout.addRow("Rot Min Angle:", self.physics_anneal_rot_min)
+        physics_form_layout.addRow("Rot Max Angle:", self.physics_anneal_rot_max)
+        
+        # Anneal Translate Logic
+        physics_form_layout.addRow(self.anneal_translate_checkbox)
+        physics_form_layout.addRow("Anneal Steps:", self.physics_anneal_steps_input)
+        physics_form_layout.addRow("Improvement Threshold:", self.physics_improvement_threshold_input)
+        physics_form_layout.addRow(QtWidgets.QLabel("")) # Spacer
+        physics_form_layout.addRow("Curve Type:", self.physics_anneal_curve_type)
+        physics_form_layout.addRow("Min Amplitude:", self.physics_anneal_min_amp.widget())
+        physics_form_layout.addRow("Max Amplitude:", self.physics_anneal_max_amp.widget())
+        physics_form_layout.addRow(self.anneal_random_shake_checkbox)
+
+        self.physics_settings_group.addLayout(physics_form_layout)
+
 
     def _set_initial_section_visibility(self):
         """Which sections are on screen before the algorithm is chosen.
