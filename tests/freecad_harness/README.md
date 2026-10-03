@@ -141,14 +141,38 @@ Raising the width is how you measure whether the thread pool is earning its
 keep:
 
 ```sh
-for w in 1 4 8; do
+for w in 0 1 4 8; do
   NEST_BENCH_ROTATION_WORKERS=$w $FREECAD tests/freecad_harness/nest_benchmark.py
 done
 ```
 
-That comparison is still outstanding — `make-faster.md` lists "test four
-rotation workers versus eight" as not yet done, and it is what would settle
-main's claim that serial evaluation is 2.4–3.3× faster.
+**Width 0 means no pool at all**, which is not the same as width 1: width 1
+still constructs and tears down a `ThreadPoolExecutor` on every placement.
+There was no way to express "serial" before it, so the serial-versus-pool
+comparison this benchmark was written for could not be run.
+
+That comparison has now been run — see **[RESULTS-rotation-width.md](RESULTS-rotation-width.md)**.
+`bench_rotation_workers.py` sweeps 0 by default for this reason.
+
+Headline: main@eac1e30's claim that "serial evaluation is 2.4–3.3× faster" does
+**not** reproduce. Serial is 45% faster on the synthetic corpus (p=0.0008,
+n=8, interleaved) and 1.9% *slower* on the n70 corpus (p=0.036, n=8). The sign
+flips with the geometry, because it depends on how much of each rotation is
+spent in GIL-released shapely calls versus Python. The default stays at
+`os.cpu_count()`.
+
+Two things that file records and this section does not:
+
+- Work counts are unstable above width 1 — 28 of 82 moved across three
+  identical width-4 runs — because the shared `self.rng` is drawn from *inside*
+  `_evaluate_rotation` (`nesting_strategy.py:805`), so threads consume it in
+  scheduling order. Ordering the pool's results does not fix it. The **result**
+  is stable regardless. It also means a serial run is not doing identical work
+  to a pooled one: on the n70 GA path the pool builds 46% more candidate
+  geometry, so the two are not comparable even for timing.
+- Width 1 is the worst of the four on n70 (4.68 s min, against 4.30 s serial,
+  4.09 s at width 4 and 4.11 s at width 8): full pool cost, no parallelism.
+  Noted, not changed.
 
 ## Dead-ring pruning must be active
 
