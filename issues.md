@@ -61,6 +61,7 @@ the symbol when you edit the entry.
 | [NEST-006](#nest-006) | Deflection tooltip states unmeasured ranges | open | low | docs |
 | [NEST-007](#nest-007) | Nesting converts analytic source geometry to B-splines to centre it | open | medium | geometry |
 | [NEST-008](#nest-008) | Hole-nesting detection costs 148 ms per part on real geometry | open | medium | performance |
+| [NEST-022](#nest-022) | Logging is 230 ad-hoc call sites and 165 exception handlers that record nothing | open | medium | diagnostics |
 
 ---
 
@@ -1280,3 +1281,113 @@ Verified by negative control in a real GUI:
 
     ReferenceErrors without the guard:  96
     ReferenceErrors with the guard:      0
+
+
+---
+
+## NEST-022
+
+**Logging is 230 ad-hoc call sites and 165 exception handlers that record nothing**
+
+`status: open` · `severity: medium` · `area: diagnostics`
+
+Measured 2026-10-04 while assessing whether to adopt upstream's `nw_logger.py`.
+Nothing has been built. This entry exists so the measurements survive, and so the
+next person does not re-derive them.
+
+### The two numbers
+
+**230 `FreeCAD.Console.Print*` call sites across 25 files:**
+
+| file | sites | file | sites |
+|---|---:|---|---:|
+| `manual_nester_tool.py` | 33 | `exporter.py` | 8 |
+| `nesting_controller.py` | 24 | `command_create_silhouette.py` | 8 |
+| `ga_coordinator.py` | 23 | `nesting_logic.py` | 7 |
+| `cam_replay.py` | 20 | `ui_nesting.py` | 6 |
+| `silhouette_creator.py` | 18 | `minkowski_engine.py` | 4 |
+| `shape_processor.py` | 15 | `layout_manager.py` | 4 |
+| `cam_manager.py` | 11 | `nesting_job.py` | 3 |
+| `input_manager.py` | 10 | everything else | 36 |
+
+**165 exception handlers record nothing at all** — no `Console` call, no
+`print`, no logger, nothing. Counted by looking at the two lines after each
+`except` for any recording:
+
+| file | silent handlers | file | silent handlers |
+|---|---:|---|---:|
+| `cam_replay.py` | 60 | `ga_coordinator.py` | 6 |
+| `replay_progress.py` | 14 | `ui_nesting.py` | 5 |
+| `units.py` | 12 | `collision_resolver.py` | 5 |
+| `manual_nester_tool.py` | 10 | *all others* | 53 |
+| `nesting_strategy.py` | 10 | | |
+| `length_field.py` | 8 | | |
+| `nesting_controller.py` | 7 | | |
+
+**The second number is the interesting one.** The 230 are untidy; the 165 are
+where evidence currently disappears. Several are load-bearing races — a deleted
+widget during teardown, a `removeObject` that fails because the object is already
+gone. Those fire routinely and, today, leave no trace.
+
+### The two existing panel controls are not log levels
+
+Worth recording because the obvious first move — add a third dial — is the wrong
+one. Neither existing control is verbosity:
+
+| control | scope | what it gates |
+|---|---|---|
+| `verbose` | per-run panel field, **not persisted** | narration of normal operation — "Rotation eval: 4 rotations in 12ms". 25 `if verbose:` sites. |
+| `performance_logging` | per-run panel field | whether **instrumentation is computed at all**, not just printed. `CandidateGeometryKeyTracker` is only constructed when it is on (`nesting_strategy.py:350`); `LayoutManager._layout_perf` stays `None` unless on. It is a *cost* switch. |
+
+So `performance_logging` answers "is this run worth measuring?" and `verbose`
+answers "do I want to watch it work?" Neither is "should this library emit at
+info or debug?".
+
+### What upstream's `nw_logger.py` is, and is not
+
+`nw_logger.py` (228 lines, not in our tree) is a `logging`-module wrapper with
+level helpers, a rotating file handler, and two preferences
+(`EnableDebugLog`, `EnableCrashLog`).
+
+Two things to know before considering it:
+
+**Its `debug()` is for recovered failures, not narration.** All 47 `debug()`
+call sites sampled are `except` handlers recording a swallowed error:
+
+    [Sheet] recursive_delete skipped during child cleanup: {e}
+    [ShapePreparer] Face creation failed, falling back to Compound wires: {e}
+    [NestingPanel] update_progress widget deleted: {e}
+
+That is the 165-handler problem, and it is the part worth having.
+
+**About a third of it is dead code for us.** `_in_worker`,
+`_buffer_worker_lines`, `drain_worker_messages`, `replay_worker_messages` and
+`_WORKER_BUFFERED` exist to carry warnings out of GA *worker processes*. We have
+no process pool, so adopting them as-is means shipping code with no caller.
+
+Its `EnableDebugLog` is a persistent preference, which is the opposite lifetime
+from the two panel fields — and deliberately so, since those are documented as
+not persisted ("every open starts in the same shape"). Standing interest in
+"what happened last Tuesday" is a standing preference; "watch this run work" is
+not.
+
+### Why nothing was done
+
+Scoped as an option, then parked in favour of a different approach. Two
+consequences worth keeping:
+
+- **A blanket conversion of the 165 would be noise.** Many are silent *on
+  purpose* — a widget-deleted race during teardown is expected, not exceptional.
+  Whether a given silence loses information is a judgement per site, so this is
+  not a sweep.
+- **The two preferences need a UI or they are unreachable.** Upstream toggles
+  them in a `command_settings.py` we do not have. Set by hand only, that is a
+  control nobody can reach.
+
+### Reproducing
+
+    # 230 call sites
+    grep -rn 'FreeCAD\.Console\.Print' freecad/ --include=*.py | grep -v __pycache__ | wc -l
+
+    # 165 silent handlers: for each `except`, look at the next two lines for
+    # Console./print(/logger, and for a bare `except ...: pass`
