@@ -177,23 +177,33 @@ def run_case(create_doc_objects):
     # nothing outside layout_manager reads the attribute and commit() matches
     # by prefix. Asserted here by prefix so the test tracks the real invariant.
     shared = getattr(manager, "shared_master_group", None)
-    if not create_doc_objects:
-        check("[headless] a document-level shared group exists", shared is not None)
-        check("[headless] layout points at the shared group",
-              layout.master_shapes_group is shared,
-              "create_layout must fall back to the shared group, or commit "
-              "cannot find the masters")
-        check("[headless] shared group holds the masters",
-              shared is not None and len(shared.Group) == 2,
-              f"got {0 if shared is None else len(shared.Group)}")
-    else:
-        under_layout = [
-            c for c in layout.layout_group.Group
-            if c.Label.startswith("MasterShapes")
-        ]
-        check("[simulate] a MasterShapes group is parented under the layout",
-              len(under_layout) == 1,
-              f"got {[c.Label for c in under_layout]}")
+    # Both modes now hold their masters in the document-level shared group, so
+    # this is no longer a headless-only invariant. Simulate used to parent a
+    # MasterShapes group under its own layout instead, on the reasoning that a
+    # drawn layout must own its masters -- which conflated sharing (safe) with
+    # parenting (the actual hazard, since delete_layout recursively removes
+    # everything under a layout group). See
+    # LayoutManager._get_shared_master_group.
+    mode = "simulate" if create_doc_objects else "headless"
+    check(f"[{mode}] a document-level shared group exists", shared is not None)
+    check(f"[{mode}] layout points at the shared group",
+          layout.master_shapes_group is shared,
+          "create_layout must fall back to the shared group, or commit "
+          "cannot find the masters")
+    check(f"[{mode}] shared group holds the masters",
+          shared is not None and len(shared.Group) == 2,
+          f"got {0 if shared is None else len(shared.Group)}")
+    # The property that makes sharing safe, asserted directly: no layout may own
+    # the masters, or the teardown of whichever layout is discarded first would
+    # destroy objects another still points at.
+    under_layout = [
+        c for c in layout.layout_group.Group
+        if c.Label.startswith("MasterShapes")
+    ]
+    check(f"[{mode}] no layout-owned MasterShapes group",
+          len(under_layout) == 0,
+          f"got {[c.Label for c in under_layout]} -- masters parented under a "
+          f"layout are destroyed by its teardown")
 
     job = NestingJob.from_ga_result(
         doc=doc,

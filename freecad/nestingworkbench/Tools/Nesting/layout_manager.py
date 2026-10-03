@@ -133,12 +133,12 @@ class LayoutManager:
         # Shape.copy() on a part this complex is the whole cost: the fixture
         # measures lm_master_prepare_s at 9.79s, 98% of layout management.
         #
-        # Headless only. A simulate-mode layout is drawn while it nests, so it
-        # genuinely needs its own master objects parented under its own group
-        # -- sharing them there would let one layout's teardown delete objects
-        # another layout is still drawing. Headless layouts are never drawn and
-        # are torn down by delete_layout, so they must NOT own the masters:
-        # see the shared group below.
+        # Every GA mode, including simulate. A layout is torn down by
+        # delete_layout whether or not it was drawn, so no layout may own the
+        # masters: one layout's teardown would delete objects another still
+        # points at. The shared group below is where they live instead.
+        # Simulate's exemption was withdrawn once it was established that the
+        # hazard was parenting rather than sharing.
         self._master_pool = {}
         self._shared_master_group = None
 
@@ -153,17 +153,31 @@ class LayoutManager:
             stats[key] = stats.get(key, 0) + count
 
     def _get_shared_master_group(self):
-        """Document-level group owning the pooled masters, headless only.
+        """Document-level group owning the pooled masters, for every GA mode.
 
         Deliberately NOT a child of any layout group. delete_layout recursively
         deletes a layout group and everything under it, so masters parented
         there would be destroyed by the teardown of whichever layout happened
         to be discarded first, leaving every later layout with dangling
-        references. A layout-level group is still created per layout in
-        simulate mode, where ownership is unambiguous.
+        references.
+
+        Simulate used to be excluded, on the reasoning that it "must own its
+        own" masters because it draws as it nests. That conflated two separate
+        things. Sharing a master object is safe in either mode: `ShapePreparer`
+        already excludes pooled masters from `_arrange_masters` (only a master
+        this call built is repositioned), so a pooled container keeps the
+        placement it was given when first built, and part features copy
+        `master.Placement` at creation -- every layout therefore agrees. What
+        actually broke simulate pooling was *where the shared object was
+        parented*, not that it was shared. This group is that answer, and it is
+        the same arrangement headless has always used.
+
+        Measured on n70 at pop 10 x gen 4 (RESULTS-simulate-churn.md):
+        master_containers 111 -> 3 and `masters` 17.86s -> ~1.8s. The
+        per-part features are untouched -- simulate genuinely needs those to
+        draw -- so this is worth about 9% of the run, not the 45% that layout
+        management accounts for.
         """
-        if self.create_doc_objects:
-            return None
         if self._shared_master_group is None:
             self._shared_master_group = self.doc.addObject(
                 "App::DocumentObjectGroup", "MasterShapes")
@@ -173,11 +187,12 @@ class LayoutManager:
 
     @property
     def shared_master_group(self):
-        """The document-level master group, or None in simulate mode.
+        """The document-level master group, or None if not yet created.
 
         Read-only, and does NOT create the group -- the caller may just be
         inspecting. NestingJob needs this to find the masters when the winning
-        layout has no MasterShapes child of its own.
+        layout has no MasterShapes child of its own, which is now the case in
+        every GA mode rather than headless only.
         """
         return self._shared_master_group
 

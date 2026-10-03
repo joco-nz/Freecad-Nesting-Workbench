@@ -24,8 +24,8 @@ class NestingJob:
                 None. Supplied by the coordinator, which owns the LayoutManager
                 and so the cached reference to it. Called by cleanup().
             shared_master_group: The document-level group holding the pooled
-                master shapes in headless mode, or None in simulate mode. A
-                headless layout has no MasterShapes child of its own -- see
+                master shapes, or None. A GA layout has no MasterShapes child
+                of its own in either mode -- see
                 LayoutManager._get_shared_master_group -- so without this,
                 commit() finds no masters, silently skips promoting them, and
                 leaves them parented outside every layout while the previous

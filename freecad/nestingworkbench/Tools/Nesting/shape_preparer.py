@@ -47,16 +47,24 @@ class ShapePreparer:
         # and the geometry settings, so they are identical for all layouts and
         # are built once instead of per layout. See LayoutManager.
         self.master_pool = master_pool if master_pool is not None else {}
-        # Document-level group for pooled masters, or None in simulate mode
-        # (where the per-layout MasterShapes group is used instead).
+        # Document-level group the pooled masters are parented into. None only
+        # when a caller wants no sharing at all, which the GA never does.
         self.shared_master_group = shared_master_group
-        # Pooling is gated on create_doc_objects, NOT on master_pool being
-        # non-empty. LayoutManager always supplies a pool dict, so gating on
-        # the dict alone let simulate mode read it: layouts 2..N then reused
-        # layout 1's masters instead of owning their own, which is exactly
-        # what simulate mode must not do -- it draws as it nests, so tearing
-        # one down must not remove objects another is still using.
-        self.pool_masters = not create_doc_objects
+        # Pooling is gated on HAVING a shared group, not on create_doc_objects.
+        # It used to be `not create_doc_objects`, which excluded simulate mode,
+        # and the stated reason was that "simulate must own its own masters --
+        # it draws as it nests, so tearing one down must not remove objects
+        # another is still using". That is a true statement about *lifetime*,
+        # and the shared group satisfies it: a master parented there is
+        # unreachable by recursive_delete of any layout group, so no layout's
+        # teardown can destroy another's master. Measured on n70 at pop 10 x
+        # gen 4, this takes simulate's master_containers from 111 to 3.
+        #
+        # Sharing the object was never the hazard. `_arrange_masters` runs only
+        # for masters this call built (`if newly_built`), so a pooled container
+        # keeps the placement it was given when first built, and part features
+        # copy `master.Placement` at creation -- every layout agrees.
+        self.pool_masters = shared_master_group is not None
 
     def _perf_add(self, key, seconds):
         stats = self._perf_stats
@@ -173,8 +181,9 @@ class ShapePreparer:
                     master_shape_obj_map[id(master_obj)] = master_shape_obj
                     master_geometry_cache[id(master_obj)] = temp_shape_wrapper
                     # Hand the wrapper to the next layout that needs this
-                    # master, so it can skip the build entirely. Headless
-                    # only: in simulate mode each layout must own its masters.
+                    # master, so it can skip the build entirely. Every mode:
+                    # the masters live in the shared group, so no layout owns
+                    # them and none can destroy another's on teardown.
                     if self.pool_masters:
                         self.master_pool.setdefault(
                             cache_key, (master_shape_obj, temp_shape_wrapper))

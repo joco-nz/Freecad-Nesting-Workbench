@@ -271,9 +271,10 @@ class GACoordinator:
             f"(group={lm['lm_group_s']:.2f}s "
             f"prepare={lm['lm_prepare_parts_s']:.2f}s "
             f"masters={lm['lm_master_prepare_s']:.2f}s "
-            # Headless only. Should be masters_processed - pooled, i.e. one
-            # real build per master type per run, not one per layout. A
-            # non-zero pooled count in simulate mode would be a bug.
+            # Every mode. Should be masters_processed - pooled, i.e. one real
+            # build per master type per run, not one per layout. A zero here
+            # means pooling is off, which would rebuild every master per
+            # layout -- see ShapePreparer.pool_masters.
             f"masters_pooled={lm['lm_masters_pooled']} "
             f"instances={lm['lm_part_instances_s']:.2f}s "
             f"ordering={lm['lm_ordering_s']:.2f}s) "
