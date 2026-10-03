@@ -61,3 +61,4 @@ opencode.json
 tests/Test_Files/*
 !tests/Test_Files/replay-fixture-CAM-Nested.FCStd
 tests/freecad_harness/.last_status_probe_gui_collapsible
+tests/freecad_harness/.last_status_probe_gui_layout
