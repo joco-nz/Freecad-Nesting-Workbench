@@ -620,6 +620,62 @@ def case_direction_dial():
           panel.minkowski_direction_label.text().startswith("Left"),
           repr(panel.minkowski_direction_label.text()))
 
+    # -- the shape of the grid the three controls sit in ---------------------
+    # Everything above checks what the dial DOES. This checks where it sits,
+    # which is the part the grid's five comment paragraphs exist to justify:
+    # the checkbox above the rotation angle in column 0, the dial owning
+    # column 1 across both rows. Nothing else in this file asserted the
+    # arrangement, so a transposition or a lost span would have passed.
+    grid = panel.minkowski_settings_group.content_area.layout()
+    check("the Nesting Settings content area holds a QGridLayout",
+          isinstance(grid, QtWidgets.QGridLayout), type(grid).__name__)
+    if isinstance(grid, QtWidgets.QGridLayout):
+        def cell_of(target):
+            """(row, col, rowspan, colspan) for a widget or a nested layout."""
+            for index in range(grid.count()):
+                item = grid.itemAt(index)
+                if item is None:
+                    continue
+                if item.widget() is target or item.layout() is target:
+                    return grid.getItemPosition(index)[:4]
+            return None
+
+        check("the grid is two columns wide", grid.columnCount() == 2,
+              f"columnCount={grid.columnCount()}")
+        check("the random-direction checkbox is at row 0, column 0",
+              cell_of(panel.minkowski_random_checkbox) == (0, 0, 1, 1),
+              f"at {cell_of(panel.minkowski_random_checkbox)}")
+        # The grid holds the dial's CONTAINER, not the dial itself --
+        # _build_direction_control returns (container, dial, label) so the
+        # caller can disable the whole control from the checkbox. So the check
+        # is that the cell spanning both rows of column 1 CONTAINS the dial.
+        def container_at(row, col, rowspan, colspan):
+            for index in range(grid.count()):
+                if grid.getItemPosition(index)[:4] != (row, col, rowspan, colspan):
+                    continue
+                item = grid.itemAt(index)
+                return item.widget() if item is not None else None
+            return None
+
+        spanning = container_at(0, 1, 2, 1)
+        check("row 0 column 1 is a cell spanning both rows",
+              spanning is not None, "no such cell")
+        check("...and that cell contains the dial",
+              spanning is not None
+              and (spanning is dial or spanning.isAncestorOf(dial)),
+              f"cell holds {type(spanning).__name__ if spanning else None}, "
+              f"which does not contain the dial")
+        # The rotation angle's label and slider are stacked in a VBox added as
+        # ONE cell, so it is a layout item rather than a widget -- which is the
+        # whole point: laid out as separate cells the slider's sizeHint took the
+        # grid's full width and ran under the dial.
+        lower = [(index, grid.getItemPosition(index)[:4])
+                 for index in range(grid.count())
+                 if grid.itemAt(index) is not None
+                 and grid.itemAt(index).layout() is not None]
+        check("the rotation angle is one layout cell at row 1, column 0",
+              lower == [(1, (1, 0, 1, 1))], f"layout cells at {lower}")
+
     panel.dispose()
     panel.deleteLater()
     _fc.closeDocument(doc.Name)
