@@ -391,9 +391,10 @@ def case_collapsible_groups():
 
     for name in ("minkowski_settings_group", "helpers_group", "logging_group"):
         group = getattr(panel, name)
-        check(f"{name} is checkable", group.isCheckable(), "not a toggle")
-        check(f"{name} starts collapsed", group.isChecked() is False,
-              f"isChecked={group.isChecked()}")
+        check(f"{name} is checkable", group.toggle_button.isCheckable(),
+              "not a toggle")
+        check(f"{name} starts collapsed", group.isExpanded() is False,
+              f"isExpanded={group.isExpanded()}")
         # Collapsed must mean HIDDEN, never disabled. Disabling the group
         # greys out its controls and reads as broken rather than tucked away,
         # and it is the easy way to "collapse" something by mistake -- state
@@ -430,8 +431,8 @@ def case_collapsible_groups():
     panel.show()
     for _ in range(20):
         _fgui.updateGui()
-    helpers.setChecked(True)
-    logging.setChecked(True)
+    helpers.setExpanded(True)
+    logging.setExpanded(True)
     for _ in range(20):
         _fgui.updateGui()
     check("expanding Helpers reveals its children",
@@ -450,9 +451,9 @@ def case_collapsible_groups():
     panel.show()
     for _ in range(20):
         _fgui.updateGui()
-    helpers.setChecked(True)
-    logging.setChecked(True)
-    panel.minkowski_settings_group.setChecked(True)
+    helpers.setExpanded(True)
+    logging.setExpanded(True)
+    panel.minkowski_settings_group.setExpanded(True)
     for _ in range(20):
         _fgui.updateGui()
     check("expanding Helpers reveals its children",
@@ -474,9 +475,9 @@ def case_collapsible_groups():
     logging_expanded = logging.sizeHint().height()
     settings = panel.minkowski_settings_group
     settings_expanded = settings.sizeHint().height()
-    helpers.setChecked(False)
-    logging.setChecked(False)
-    settings.setChecked(False)
+    helpers.setExpanded(False)
+    logging.setExpanded(False)
+    settings.setExpanded(False)
     for _ in range(20):
         _fgui.updateGui()
     collapsed_height = helpers.sizeHint().height()
@@ -498,7 +499,7 @@ def case_collapsible_groups():
     # And the unit refresh must survive a collapse: LengthFields live inside
     # Helpers, and re-rendering a hidden widget is the interaction most likely
     # to be quietly wrong.
-    helpers.setChecked(False)
+    helpers.setExpanded(False)
     doc.UnitSystem = enums[3]
     panel.refresh_unit_display()
     check("a collapsed group's unit fields still re-render",
@@ -514,8 +515,8 @@ def case_collapsible_groups():
     panel.deleteLater()
     again = NestingPanel()
     check("a reopened panel starts collapsed again",
-          again.helpers_group.isChecked() is False
-          and again.logging_group.isChecked() is False)
+          again.helpers_group.isExpanded() is False
+          and again.logging_group.isExpanded() is False)
     again.dispose()
     again.deleteLater()
     _fc.closeDocument(doc.Name)
@@ -556,8 +557,16 @@ def case_direction_dial():
 
     # 1. The four buttons are gone.
     from PySide import QtCore
-    buttons = [w for w in panel.minkowski_settings_group.findChildren(
-        QtWidgets.QPushButton)]
+    # Search the section's CONTENT AREA. Searching the section itself became
+    # vacuous the moment it became a CollapsibleSection -- its contents live
+    # inside content_area, so findChildren there finds nothing and the check
+    # passes while testing nothing. Searching the whole panel instead is also
+    # wrong, just differently: it picks up Add Selected / Run Nesting / Cancel
+    # Nesting, which are supposed to be there, and fails for the right reason
+    # at the wrong scope. The assertion is about the direction buttons, so it
+    # stays scoped to the section that used to hold them.
+    settings_content = panel.minkowski_settings_group.content_area
+    buttons = [w for w in settings_content.findChildren(QtWidgets.QPushButton)]
     check("the direction buttons are gone", not buttons,
           f"still present: {[b.text() for b in buttons]}")
 
@@ -796,8 +805,21 @@ def case_two_column_grids():
     panel = NestingPanel()
 
     def grid_of(widget):
+        """The QGridLayout holding a section's contents, or None.
+
+        A CollapsibleSection's own layout is the QVBoxLayout that stacks the
+        toggle button over the content area, so the grid is one level down. Both
+        are checked so this keeps working whichever shape a section has.
+        """
         layout = widget.layout()
-        return layout if isinstance(layout, QtWidgets.QGridLayout) else None
+        if isinstance(layout, QtWidgets.QGridLayout):
+            return layout
+        content_area = getattr(widget, "content_area", None)
+        if content_area is not None:
+            inner = content_area.layout()
+            if isinstance(inner, QtWidgets.QGridLayout):
+                return inner
+        return None
 
     def occupied(grid):
         """The widgets actually placed in a grid, in row-major order."""

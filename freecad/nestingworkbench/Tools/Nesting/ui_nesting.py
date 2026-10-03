@@ -15,6 +15,7 @@ from ... import FONTS_DIR, DEFAULT_FONT
 from ...freecad_helpers import set_visibility
 from ...length_field import LengthField
 from ... import units
+from ...ui_helpers import CollapsibleSection
 
 _MINKOWSKI_DIR_MAX = 359
 
@@ -24,9 +25,9 @@ _MINKOWSKI_DIR_MAX = 359
 _GRID_COLUMN_SPACING = 12
 _GRID_ROW_SPACING = 6
 
-# QFormLayout adds a margin of its own, which inside a QGroupBox stacks with
-# the box's frame and indents the controls twice over. The group already has
-# the frame; the layout does not need a second one.
+# QFormLayout adds a margin of its own, which inside a section stacks with the
+# content area's frame and indents the controls twice over. The content area
+# already has the frame; the layout does not need a second one.
 _MARGINS_NONE = (0, 0, 0, 0)
 
 # Fixed width for the dial's column in the Nesting Settings grid. A QDial is a
@@ -51,29 +52,6 @@ def _snap_to_step(value, step=None):
     except (TypeError, ValueError):
         return _DEFAULT_DIRECTION_DIAL
     return int(round(value / float(step))) * int(step)
-
-
-def _set_group_collapsed(group, expanded):
-    """Show or hide a collapsible QGroupBox's contents.
-
-    A checkable QGroupBox that is unchecked DISABLES its children; it does not
-    hide them. Measured on a two-widget group, 64px checked and 64px unchecked,
-    with the child reporting isHidden()=False in both states. So the toggle on
-    its own greys the controls out and reclaims no space, which is the worst of
-    both -- it looks broken and saves nothing. The hiding has to be done here.
-
-    setVisible rather than setEnabled, deliberately: a hidden widget still
-    returns its real checked state, so _collect_ui_params keeps reading
-    verbose_logging, add_labels, the font path and the label fields exactly as
-    it does when the group is open. Disabling them would have been the obvious
-    one-liner and would have silently changed what a run uses.
-
-    Only DIRECT children are touched, so a nested group inside this one would
-    keep its own state rather than being flattened into the parent's.
-    """
-    for child in group.findChildren(QtWidgets.QWidget,
-                                    options=QtCore.Qt.FindDirectChildrenOnly):
-        child.setVisible(expanded)
 
 
 def _place(grid, widget, row, column, span):
@@ -293,16 +271,18 @@ class NestingPanel(QtWidgets.QWidget):
         # Nesting Settings collapses like Helpers and Logging do, and starts
         # collapsed. Its dial is the tallest single control in the panel by a
         # wide margin, and it is a set-and-forget choice -- a run uses whatever
-        # direction it is left on. See _set_group_collapsed for why the toggle
-        # flag alone is not enough.
-        self.minkowski_settings_group = QtWidgets.QGroupBox("Nesting Settings")
-        self.minkowski_settings_group.setCheckable(True)
-        self.minkowski_settings_group.setChecked(False)
-        self.minkowski_settings_group.toggled.connect(
-            lambda checked: _set_group_collapsed(self.minkowski_settings_group, checked))
-        minkowski_form_layout = QtWidgets.QFormLayout()
+        # direction it is left on. See ui_helpers.CollapsibleSection for why a
+        # toggle flag alone is not enough.
+        # Collapsed by default, matching the state this section has always
+        # opened in. See ui_helpers.CollapsibleSection for why a checkable
+        # QGroupBox could not do this and what setVisible-not-setEnabled buys.
+        self.minkowski_settings_group = CollapsibleSection(
+            "Nesting Settings", expanded=False)
 
-        self.minkowski_optimization_group = QtWidgets.QGroupBox("Optimizations")
+        # Opens expanded: it was a plain QGroupBox before, so it was always
+        # visible. Making it collapsible must not also tuck it away.
+        self.minkowski_optimization_group = CollapsibleSection(
+            "Optimizations", expanded=True)
 
         # Direction Dial for Minkowski
         minkowski_dial_widget, self.minkowski_direction_dial, self.minkowski_direction_label = \
@@ -522,7 +502,7 @@ class NestingPanel(QtWidgets.QWidget):
         # left, which is what the two row-stretches below ask for.
         direction_grid.setRowStretch(0, 1)
         direction_grid.setRowStretch(1, 1)
-        self.minkowski_settings_group.setLayout(direction_grid)
+        self.minkowski_settings_group.addLayout(direction_grid)
 
         # Optimizations. Compactness and Clear NFP Cache were not on the
         # requested list but are Minkowski-only controls, and this is the only
@@ -538,7 +518,7 @@ class NestingPanel(QtWidgets.QWidget):
         # Candidate Geometry Cache and Clear NFP Cache are passed with no
         # label: a checkbox carries its own text, and giving it a label column
         # of its own would leave a gap where the word should be.
-        self.minkowski_optimization_group.setLayout(self._two_column_grid([
+        self.minkowski_optimization_group.addLayout(self._two_column_grid([
             ("Generations:", self.minkowski_generations_input),
             ("Population Size:", self.minkowski_population_size_input),
             ("Stop At Sheets:", self.minkowski_target_sheets_input),
@@ -549,7 +529,10 @@ class NestingPanel(QtWidgets.QWidget):
             (None, self.clear_cache_checkbox),
         ]))
 
-        self.physics_settings_group = QtWidgets.QGroupBox("Physics Nesting Settings")
+        # Expanded, for the same reason as Optimizations: previously a plain
+        # QGroupBox and therefore always visible.
+        self.physics_settings_group = CollapsibleSection(
+            "Physics Nesting Settings", expanded=True)
         physics_form_layout = QtWidgets.QFormLayout()
 
         # Direction Dial for Physics. Shares the default, the label map and the
@@ -640,7 +623,7 @@ class NestingPanel(QtWidgets.QWidget):
         physics_form_layout.addRow("Max Amplitude:", self.physics_anneal_max_amp.widget())
         physics_form_layout.addRow(self.anneal_random_shake_checkbox)
 
-        self.physics_settings_group.setLayout(physics_form_layout)
+        self.physics_settings_group.addLayout(physics_form_layout)
 
         # Helpers and Logging are NOT tied to the algorithm, even though they
         # sit in the same panel as the Minkowski groups.
@@ -667,23 +650,17 @@ class NestingPanel(QtWidgets.QWidget):
         # and 64px unchecked, and the child reports isHidden()=False in both
         # states. So the first version of this greyed the controls out and
         # reclaimed no space at all -- the worst of both, looking broken and
-        # saving nothing. _set_group_collapsed does the hiding.
+        # saving nothing. CollapsibleSection hides an explicit content_area
+        # instead; see ui_helpers for the measurement and for why it uses
+        # setVisible rather than setEnabled.
         #
         # Nothing here conflicts with the algorithm toggle above, which shows
         # and hides the Minkowski groups by setVisible. A collapsed group's
         # children are hidden but alive, so _collect_ui_params still reads
         # them and refresh_unit_display can still re-render their fields.
-        self.helpers_group = QtWidgets.QGroupBox("Helpers")
-        self.helpers_group.setCheckable(True)
-        self.helpers_group.setChecked(False)
-        self.helpers_group.toggled.connect(
-            lambda checked: _set_group_collapsed(self.helpers_group, checked))
+        self.helpers_group = CollapsibleSection("Helpers", expanded=False)
         helpers_layout = QtWidgets.QVBoxLayout()
-        self.logging_group = QtWidgets.QGroupBox("Logging")
-        self.logging_group.setCheckable(True)
-        self.logging_group.setChecked(False)
-        self.logging_group.toggled.connect(
-            lambda checked: _set_group_collapsed(self.logging_group, checked))
+        self.logging_group = CollapsibleSection("Logging", expanded=False)
         logging_box_layout = QtWidgets.QVBoxLayout()
 
         # Set initial visibility
@@ -775,21 +752,11 @@ class NestingPanel(QtWidgets.QWidget):
         helpers_form.addRow(self.show_bounds_checkbox)
         helpers_form.addRow(self.sound_checkbox)
         helpers_layout.addLayout(helpers_form)
-        self.helpers_group.setLayout(helpers_layout)
+        self.helpers_group.addLayout(helpers_layout)
 
         logging_box_layout.addWidget(self.verbose_logging_checkbox)
         logging_box_layout.addWidget(self.performance_logging_checkbox)
-        self.logging_group.setLayout(logging_box_layout)
-
-        # Collapse for real, now that all three groups have content. The
-        # toggled connections above only fire on a CHANGE, and every group is
-        # created unchecked, so without these calls the panel opens with the
-        # controls shown and merely greyed -- which is what the first version
-        # did, saving no space at all. Applied after setLayout because there is
-        # nothing to hide until the children exist.
-        _set_group_collapsed(self.minkowski_settings_group, False)
-        _set_group_collapsed(self.helpers_group, False)
-        _set_group_collapsed(self.logging_group, False)
+        self.logging_group.addLayout(logging_box_layout)
 
         form_layout.addRow(self.helpers_group)
         form_layout.addRow(self.logging_group)

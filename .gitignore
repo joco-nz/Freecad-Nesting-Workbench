@@ -60,3 +60,4 @@ opencode.json
 # before; a directory rule is less work than extending that list each time.
 tests/Test_Files/*
 !tests/Test_Files/replay-fixture-CAM-Nested.FCStd
+tests/freecad_harness/.last_status_probe_gui_collapsible

@@ -578,6 +578,13 @@ class TestPerformanceDialsAreReachable:
         of a QFormLayout into the shared two-column grid, taking
         `perf_form_layout` with them. The property under test is which GROUP
         owns the fields, so the group is what is asserted on.
+
+        Both `setLayout` and `addLayout` count as "this group takes this
+        layout": the collapsible sections expose `addLayout`, which hands over
+        a finished layout and drops the QFormLayout their constructor made.
+        Matching only one of the two would make this test pass vacuously the
+        moment a section switched between them -- the failure mode this test
+        exists to prevent, applied to itself.
         """
         tree = ast.parse(_PANEL_SRC)
         owner = None
@@ -585,7 +592,7 @@ class TestPerformanceDialsAreReachable:
             if not isinstance(node, ast.Call):
                 continue
             func = ast.unparse(node.func)
-            if not func.endswith("setLayout"):
+            if not (func.endswith("setLayout") or func.endswith("addLayout")):
                 continue
             for arg in node.args:
                 source = _flat(ast.unparse(arg))
