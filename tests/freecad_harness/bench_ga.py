@@ -148,6 +148,18 @@ def cfg():
         # Recorded rather than inherited, so a baseline cannot silently
         # change meaning when the product default moves.
         "candidate_geometry_cache": _cache_setting(),
+        # Simulate mode (`is_simulating=True`) is the one path where the GA
+        # creates FreeCAD objects per population member: it draws every layout
+        # as it nests, so it cannot run headless. It also has master pooling
+        # switched off by `ShapePreparer.pool_masters = not create_doc_objects`,
+        # deliberately, because a discarded layout must not remove objects
+        # another still uses. That makes it the only configuration on this
+        # workbench with the per-member object churn that
+        # RESULTS-rotation-width.md measures at ~0.6% in the headless path --
+        # so it needs to be measurable rather than assumed.
+        "simulate": os.environ.get(
+            "NEST_BENCH_GA_SIMULATE", "").strip().lower()
+            in ("1", "yes", "true", "on"),
     }
 
 
@@ -238,7 +250,7 @@ def one_run(c):
     started = time.perf_counter()
     job = coordinator.run(target, ui_params, full_quantities,
                           {p.Label: p for p in parts}, {}, algo_kwargs,
-                          False, viz_manager=None)
+                          c.get("simulate", False), viz_manager=None)
     wall = time.perf_counter() - started
 
     ga_perf = dict(coordinator._ga_perf or {})
@@ -359,6 +371,10 @@ def report(c, runs):
     hc.emit(f"  rot workers  {c['rotation_workers']}"
             + ("" if c["rotation_workers_pinned"]
                else "  (product default, not pinned)"))
+    # Not decoration. Simulate and headless differ in whether FreeCAD objects
+    # are built per population member, so the layout counters below are not
+    # comparable between them and a baseline must say which it recorded.
+    hc.emit(f"  mode         {'SIMULATE (doc objects per layout)' if c.get('simulate') else 'headless'}")
     hc.emit(f"  cand cache   {'on' if c['candidate_geometry_cache'] else 'off'}")
     walls = [r["wall"] for r in runs]
     best = runs[0]["result"]
