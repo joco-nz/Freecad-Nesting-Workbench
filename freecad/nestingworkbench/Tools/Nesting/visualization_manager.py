@@ -35,6 +35,12 @@ class VisualizationManager:
                 trial_view.LineWidth = 1.5
                 trial_view.Transparency = 50
         
+        # Measurement-only; see nesting_logic._SIM_DRAW for what these are for.
+        # Timed here rather than at the call site because the split that matters
+        # is *inside* this function: reassigning Shape versus the forced
+        # synchronous FreeCADGui.updateGui() on the next line.
+        import time as _tv
+        _v0 = _v1 = _tv.perf_counter()
         try:
             if isinstance(bounds, Part.Shape):
                 self._trial_viz_obj.Shape = bounds
@@ -42,11 +48,19 @@ class VisualizationManager:
                 # Assume list of vectors
                 wire = Part.makePolygon(bounds)
                 self._trial_viz_obj.Shape = wire
-            
+            _v1 = _tv.perf_counter()
             # Force UI update to show the change immediately during simulation
             FreeCADGui.updateGui()
         except Exception as e:
             FreeCAD.Console.PrintWarning(f"[VisualizationManager] Draw failed: {e}\n")
+        finally:
+            # In `finally`, not the try body: a throw from updateGui must not
+            # discard the timings, since a partial measurement is still worth
+            # more than none when deciding whether this call is worth removing.
+            from .nesting_logic import _SIM_DRAW
+            _v2 = _tv.perf_counter()
+            _SIM_DRAW["trial_shape_s"] = _SIM_DRAW.get("trial_shape_s", 0.0) + (_v1 - _v0)
+            _SIM_DRAW["trial_gui_s"] = _SIM_DRAW.get("trial_gui_s", 0.0) + (_v2 - _v1)
 
     def clear_trial_placement(self, doc):
         """

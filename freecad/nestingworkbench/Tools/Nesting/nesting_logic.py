@@ -69,7 +69,43 @@ except ImportError:
 
 # Global manager removed to improve testability and thread safety (CR-118)
 
+# Measurement-only. Simulate mode draws through several callback families and
+# the cost is not attributable from the outside: simulate's `nesting_s`
+# includes all of it, so the only way to separate object creation from
+# drawing is to time the drawing calls themselves. Never read by any decision.
+#
+# `trial` fires per improving rotation result; `start` fires per part; `end`
+# fires per part but is currently a no-op; `update` fires per placement and
+# is the only one that calls doc.recompute(). There are two `update_sim_view`
+# blocks -- one in nest(), one in fill_existing_sheets() -- and both timed.
+_SIM_DRAW = {
+    "trial_calls": 0, "trial_s": 0.0,
+    "start_calls": 0, "start_s": 0.0,
+    "end_calls": 0, "end_s": 0.0,
+    "update_calls": 0, "update_s": 0.0,
+    "draw_s": 0.0, "recompute_s": 0.0, "update_gui_s": 0.0,
+    "trial_geom_s": 0.0, "trial_draw_call_s": 0.0,
+}
+
+
+def sim_draw_timing():
+    """Snapshot of the simulate drawing timers. A copy, not the live dict."""
+    return dict(_SIM_DRAW)
+
+
 def _visualize_trial_placement(part, angle, x, y, viz_manager):
+    # Fires per *improving* rotation result inside find_best_placement, so the
+    # call count is a multiple of the part count rather than equal to it.
+    import time as _t
+    _t0 = _t.perf_counter()
+    _SIM_DRAW["trial_calls"] += 1
+    try:
+        return _visualize_trial_placement_inner(part, angle, x, y, viz_manager)
+    finally:
+        _SIM_DRAW["trial_s"] += _t.perf_counter() - _t0
+
+
+def _visualize_trial_placement_inner(part, angle, x, y, viz_manager):
 # ... (rest of function)
     if not viz_manager: return
     doc = FreeCAD.ActiveDocument
@@ -81,6 +117,8 @@ def _visualize_trial_placement(part, angle, x, y, viz_manager):
         if hasattr(part, 'polygon') and part.polygon:
             # Rotate and translate the polygon to the trial position.
             # x,y is the target centroid position; translate by the delta from current centroid.
+            import time as _tg
+            _g0 = _tg.perf_counter()
             rotated_poly = rotate(part.polygon, angle, origin='centroid')
             cx, cy = rotated_poly.centroid.x, rotated_poly.centroid.y
             translated_poly = translate(rotated_poly, xoff=x - cx, yoff=y - cy)
@@ -89,9 +127,12 @@ def _visualize_trial_placement(part, angle, x, y, viz_manager):
             coords = list(translated_poly.exterior.coords)
             points = [FreeCAD.Vector(c[0], c[1], 0) for c in coords]
             wire = Part.makePolygon(points)
+            _g1 = _tg.perf_counter()
+            _SIM_DRAW["trial_geom_s"] += _g1 - _g0
             
             # Use the visualization manager to draw
             viz_manager.draw_trial_placement(doc, wire)
+            _SIM_DRAW["trial_draw_call_s"] += _tg.perf_counter() - _g1
     except Exception as e:
         FreeCAD.Console.PrintWarning(f"[nesting_logic] Draw failed: {e}\n")
 
@@ -129,10 +170,16 @@ def _find_master_container_for_part(part):
 
 def _on_part_start(part, viz_manager):
 # ... (rest of function)
-    if not viz_manager: return
-    master_container = _find_master_container_for_part(part)
-    if master_container:
-        viz_manager.highlight_master(master_container)
+    import time as _t
+    _t0 = _t.perf_counter()
+    _SIM_DRAW["start_calls"] += 1
+    try:
+        if not viz_manager: return
+        master_container = _find_master_container_for_part(part)
+        if master_container:
+            viz_manager.highlight_master(master_container)
+    finally:
+        _SIM_DRAW["start_s"] += _t.perf_counter() - _t0
 
 def _on_part_end(part, placed, viz_manager):
 # ... (rest of function)
@@ -180,11 +227,26 @@ def nest(parts, width, height, rotation_steps=1, simulate=False, algorithm='Mink
 
     if simulate:
         def update_sim_view(part, sheet):
+            import time as _t
+            _t0 = _t.perf_counter()
             doc = FreeCAD.ActiveDocument
             if doc:
+                _t1 = _t.perf_counter()
                 sheet.draw(doc, {}, transient_part=part)
+                _t2 = _t.perf_counter()
+                _SIM_DRAW["draw_s"] += _t2 - _t1
+                # doc.recompute() is whole-document, and this runs once per
+                # placement while the document accumulates every live
+                # layout's Part::Feature objects -- so the per-call cost rises
+                # through the run. Timed apart from the draw and the event
+                # pump to see which of the three is actually the cost.
                 doc.recompute()
+                _SIM_DRAW["recompute_s"] += _t.perf_counter() - _t2
+            _t3 = _t.perf_counter()
             FreeCADGui.updateGui()
+            _SIM_DRAW["update_gui_s"] += _t.perf_counter() - _t3
+            _SIM_DRAW["update_calls"] += 1
+            _SIM_DRAW["update_s"] += _t.perf_counter() - _t0
             
         nester.update_callback = _main_thread_wrapper(update_sim_view)
 
@@ -241,11 +303,26 @@ def fill_existing_sheets(sheets, fill_parts, width, height, rotation_steps=1,
 
     if simulate:
         def update_sim_view(part, sheet):
+            import time as _t
+            _t0 = _t.perf_counter()
             doc = FreeCAD.ActiveDocument
             if doc:
+                _t1 = _t.perf_counter()
                 sheet.draw(doc, {}, transient_part=part)
+                _t2 = _t.perf_counter()
+                _SIM_DRAW["draw_s"] += _t2 - _t1
+                # doc.recompute() is whole-document, and this runs once per
+                # placement while the document accumulates every live
+                # layout's Part::Feature objects -- so the per-call cost rises
+                # through the run. Timed apart from the draw and the event
+                # pump to see which of the three is actually the cost.
                 doc.recompute()
+                _SIM_DRAW["recompute_s"] += _t.perf_counter() - _t2
+            _t3 = _t.perf_counter()
             FreeCADGui.updateGui()
+            _SIM_DRAW["update_gui_s"] += _t.perf_counter() - _t3
+            _SIM_DRAW["update_calls"] += 1
+            _SIM_DRAW["update_s"] += _t.perf_counter() - _t0
         nester.update_callback = _main_thread_wrapper(update_sim_view)
 
     import time

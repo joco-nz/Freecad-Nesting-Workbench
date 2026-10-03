@@ -54,6 +54,42 @@ def _safe_ratio(numerator, denominator):
         return 0.0
 
 
+def _sim_draw_block():
+    """The [SIMDRAW]/[TRIAL] segment of the [LAYOUT PERF] line.
+
+    Present in both modes so a headless run shows zeroes rather than an absent
+    field -- an absent field reads as "not measured" when it means "not drawn".
+
+    Two blocks rather than one nested bracket, so each can be grepped on its
+    own. Snapshot taken once: this is a report string built on the main thread
+    after the run, and calling the accessor per field re-imported and re-copied
+    the dict a dozen times for no benefit.
+    """
+    d = _sim_draw()
+    return (
+        f"[SIMDRAW trial={d['trial_calls']}/{d['trial_s']:.2f}s "
+        f"start={d['start_calls']}/{d['start_s']:.2f}s "
+        f"update={d['update_calls']}/{d['update_s']:.2f}s "
+        f"draw={d['draw_s']:.2f}s "
+        f"recompute={d['recompute_s']:.2f}s "
+        f"gui={d['update_gui_s']:.2f}s] "
+        f"[TRIAL geom={d.get('trial_geom_s', 0.0):.2f}s "
+        f"shape={d.get('trial_shape_s', 0.0):.2f}s "
+        f"gui={d.get('trial_gui_s', 0.0):.2f}s] "
+    )
+
+
+def _sim_draw():
+    """Snapshot of the simulate-mode drawing timers, or zeroes if unavailable."""
+    try:
+        from .nesting_logic import sim_draw_timing
+        return sim_draw_timing()
+    except Exception:
+        return {"trial_calls": 0, "trial_s": 0.0, "start_calls": 0, "start_s": 0.0,
+                "end_calls": 0, "end_s": 0.0, "update_calls": 0, "update_s": 0.0,
+                "draw_s": 0.0, "recompute_s": 0.0, "update_gui_s": 0.0}
+
+
 def _subthreshold_pct(perf):
     """Share of hole vertices sitting in rings too small to hold any part.
 
@@ -263,6 +299,7 @@ class GACoordinator:
         if self._layout_perf is None:
             return ""
         lm = self._layout_perf
+        simdraw = _sim_draw_block()
         return (
             " [LAYOUT PERF] "
             f"population={lm['lm_population_s']:.2f}s "
@@ -285,6 +322,7 @@ class GACoordinator:
             f"efficiency={lm['lm_efficiency_s']:.2f}s "
             f"fill={lm['lm_fill_s']:.2f}s "
             f"materialize={lm['lm_materialize_s']:.2f}s "
+            f"{simdraw}"
             f"layouts_created={lm['lm_layouts_created']} "
             f"layouts_deleted={lm['lm_layouts_deleted']} "
             f"parts_created={lm['lm_parts_created']} "
