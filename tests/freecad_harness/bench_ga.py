@@ -160,6 +160,23 @@ def cfg():
         "simulate": os.environ.get(
             "NEST_BENCH_GA_SIMULATE", "").strip().lower()
             in ("1", "yes", "true", "on"),
+        # Ceiling arm for the simulate drawing path: neutralise every forced
+        # event pump and measure the wall time that remains. Establishes what
+        # the pumps actually cost before anything tries to remove some of them.
+        # Harness-only and default-off -- it monkeypatches FreeCADGui in this
+        # process, so it is a measurement switch, not a product behaviour.
+        "no_pump": os.environ.get(
+            "NEST_BENCH_GA_NO_PUMP", "").strip().lower()
+            in ("1", "yes", "true", "on"),
+        # Trial-pump-only ceiling. Removes the updateGui() inside
+        # draw_trial_placement while leaving the placement pump intact, which is
+        # the arm that matches the agreed constraint (every placement painted).
+        # Distinct from no_pump because updateGui() also acts as the event-loop
+        # drain for callbacks posted from the rotation worker thread: neutering
+        # it wholesale silently drops those rather than merely not drawing them.
+        "no_trial_pump": os.environ.get(
+            "NEST_BENCH_GA_NO_TRIAL_PUMP", "").strip().lower()
+            in ("1", "yes", "true", "on"),
     }
 
 
@@ -170,6 +187,9 @@ def one_run(c):
     from freecad.nestingworkbench.Tools.Nesting.ga_coordinator import GACoordinator
     from freecad.nestingworkbench.Tools.Nesting.shape_preparer import ShapePreparer
     from freecad.nestingworkbench.datatypes.shape import Shape
+    from freecad.nestingworkbench.Tools.Nesting.nesting_logic import sim_draw_timing
+
+    prev = sim_draw_timing()
 
     # Class-level and process-wide; without this a second rep is all cache hits.
     Shape.clear_nfp_cache()
@@ -247,11 +267,59 @@ def one_run(c):
         doc=doc, shape_preparer=ShapePreparer(doc, {}),
         ui_callbacks={}, draw_callback=None, worker=None,
     )
+
+    # Ceiling arm. Patched on the FreeCADGui module object, so every call site
+    # sees it -- nesting_logic.py and visualization_manager.py both hold the
+    # module, not the function. Deliberately not a product flag: it lives here,
+    # in the harness, so there is no way for it to reach a user.
+    if c.get("no_pump"):
+        import FreeCADGui
+        FreeCADGui.updateGui = lambda: None
+        hc.emit("  [ceiling arm] FreeCADGui.updateGui() is a no-op")
+    elif c.get("no_trial_pump"):
+        # Switch the pump off only for the span of a trial draw. Wrapping the
+        # *call site* rather than the pump is deliberate: suppressing nested
+        # pumps too is the point, because each trial draw's pump is what drains
+        # the next queued trial, so leaving them on would measure almost nothing.
+        import FreeCADGui
+        from freecad.nestingworkbench.Tools.Nesting.visualization_manager import (
+            VisualizationManager)
+
+        _real_update_gui = FreeCADGui.updateGui
+        _state = {"suppress": False}
+
+        def _selective_update_gui():
+            if not _state["suppress"]:
+                _real_update_gui()
+
+        _orig_trial = VisualizationManager.draw_trial_placement
+
+        def _trial_without_pump(self, *args, **kwargs):
+            _state["suppress"] = True
+            try:
+                return _orig_trial(self, *args, **kwargs)
+            finally:
+                _state["suppress"] = False
+
+        FreeCADGui.updateGui = _selective_update_gui
+        VisualizationManager.draw_trial_placement = _trial_without_pump
+        hc.emit("  [ceiling arm] trial-pump suppressed, placement pump intact")
+
     started = time.perf_counter()
     job = coordinator.run(target, ui_params, full_quantities,
                           {p.Label: p for p in parts}, {}, algo_kwargs,
                           c.get("simulate", False), viz_manager=None)
     wall = time.perf_counter() - started
+
+    # The drawing counters are process-global and monotonic, so a second rep
+    # would read the first rep's totals plus its own. Deltas, not snapshots --
+    # otherwise rep 2 reports roughly double and the number looks like growth.
+    from freecad.nestingworkbench.Tools.Nesting.nesting_logic import sim_draw_timing
+    after = sim_draw_timing()
+    sim_draw = {k: round(v - prev.get(k, 0), 6) if isinstance(v, float)
+                else v - prev.get(k, 0)
+                for k, v in after.items()}
+    prev = dict(after)
 
     ga_perf = dict(coordinator._ga_perf or {})
     layout_perf = dict(coordinator._layout_perf or {})
@@ -282,7 +350,7 @@ def one_run(c):
         "used_area": round(used_area, 4),
         "density": efficiency,
     }
-    return result, ga_perf, layout_perf, wall, corpus
+    return result, ga_perf, layout_perf, wall, corpus, sim_draw
 
 
 def validate_ga_perf(ga_perf, layout_perf, c):
@@ -375,6 +443,10 @@ def report(c, runs):
     # are built per population member, so the layout counters below are not
     # comparable between them and a baseline must say which it recorded.
     hc.emit(f"  mode         {'SIMULATE (doc objects per layout)' if c.get('simulate') else 'headless'}")
+    if c.get("no_pump"):
+        hc.emit("  pumps        DISABLED (ceiling arm)")
+    elif c.get("no_trial_pump"):
+        hc.emit("  trial pump   DISABLED (ceiling arm), placement pump intact")
     hc.emit(f"  cand cache   {'on' if c['candidate_geometry_cache'] else 'off'}")
     walls = [r["wall"] for r in runs]
     best = runs[0]["result"]
@@ -421,6 +493,31 @@ def report(c, runs):
          only=("generation_s", "nesting_s", "nfp_compute_s", "layout_management_s",
                "placement_wall_s", "rotation_wall_s"))
     show("layout-management phases (s)", layout)
+
+    # Simulate-only, and deliberately not folded into the counters above: these
+    # are process-global and monotonic, so they are per-rep deltas and are not
+    # comparable across a no_pump arm (where the pumps never ran and the counters
+    # measure the patch, not the drawing).
+    if c.get("simulate") and not c.get("no_pump"):
+        hc.emit("")
+        hc.emit("  --- simulate drawing (this rep, delta) ---")
+        sd = runs[0].get("sim_draw") or {}
+        hc.emit(f"  {'threading regime':34s} "
+                f"{sd.get('direct_calls', 0)} direct / "
+                f"{sd.get('relay_posted', 0)} relayed   "
+                f"queue high-water {sd.get('relay_pending_max', 0)}")
+        for label, key in (("trial callbacks", "trial_calls"),
+                           ("  trial gui pump", "trial_gui_s"),
+                           ("  trial geometry", "trial_geom_s"),
+                           ("  trial shape assign", "trial_shape_s"),
+                           ("placement callbacks", "update_calls"),
+                           ("  placement gui pump", "update_gui_s"),
+                           ("  sheet.draw", "draw_s"),
+                           ("  doc.recompute", "recompute_s"),
+                           ("part-start callbacks", "start_calls")):
+            hc.emit(f"  {label:34s} {sd.get(key, 0):>12.3f}"
+                    if isinstance(sd.get(key, 0), float)
+                    else f"  {label:34s} {sd.get(key, 0):>12d}")
     return ga, layout
 
 
@@ -494,9 +591,10 @@ def main():
         os.environ.pop("NESTING_ROTATION_WORKERS", None)
     runs = []
     for rep in range(c["reps"]):
-        result, ga_perf, layout_perf, wall, corpus = one_run(c)
+        result, ga_perf, layout_perf, wall, corpus, sim_draw = one_run(c)
         runs.append({"result": result, "ga_perf": ga_perf,
-                     "layout_perf": layout_perf, "wall": wall, "corpus": corpus})
+                     "layout_perf": layout_perf, "wall": wall, "corpus": corpus,
+                     "sim_draw": sim_draw})
         hc.emit(f"  rep {rep}: sheets={result['sheets']} placed={result['placed']} "
                 f"efficiency={result['efficiency']}% wall={wall:.3f}s")
 
@@ -547,6 +645,7 @@ def main():
         "result": runs[0]["result"],
         "ga_perf": hc.collapse([r["ga_perf"] for r in runs]),
         "layout_perf": hc.collapse([r["layout_perf"] for r in runs]),
+        "sim_draw": runs[0].get("sim_draw") or {},
         "wall_seconds": round(min(walls), 4),
         "noise": hc.noise_block(c["reps"], c["rotation_workers"],
                                 unstable_counts, unstable_timings, walls),

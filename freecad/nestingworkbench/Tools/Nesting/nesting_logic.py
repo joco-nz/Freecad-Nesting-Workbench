@@ -26,9 +26,20 @@ class _MainThreadRelay(QtCore.QObject):
             fn()
         except Exception as e:
             FreeCAD.Console.PrintWarning(f"[MainThreadRelay] Callback error: {e}\n")
+        finally:
+            # Decremented after fn(), not before, so `relay_pending` counts
+            # callbacks posted but not yet *finished* -- the backlog the main
+            # thread still owes the GUI. Under the GIL this read-modify-write is
+            # not atomic, so read the depth as an estimate, not a census.
+            _SIM_DRAW["relay_pending"] = max(
+                0, _SIM_DRAW.get("relay_pending", 0) - 1)
 
     def post(self, fn):
         """Post callable to be executed on the main thread."""
+        _SIM_DRAW["relay_posted"] = _SIM_DRAW.get("relay_posted", 0) + 1
+        _SIM_DRAW["relay_pending"] = _SIM_DRAW.get("relay_pending", 0) + 1
+        _SIM_DRAW["relay_pending_max"] = max(
+            _SIM_DRAW.get("relay_pending_max", 0), _SIM_DRAW["relay_pending"])
         self._fn_signal.emit(fn)
 
 # Created once at module load time (always the main thread)
@@ -49,7 +60,16 @@ def _main_thread_wrapper(fn):
             fn(*args, **kwargs)
             return
 
+        # Which of the two regimes this call took. They are not the same cost:
+        # the direct path runs the drawing inline, so every forced updateGui()
+        # blocks the caller, while the relay path returns immediately and leaves
+        # the main thread a backlog to drain. bench_ga.py drives the coordinator
+        # synchronously and so always takes the direct path, even though the real
+        # app runs it on a NestingWorker thread and always takes the relay. A
+        # benchmark that cannot tell you which regime it measured is a
+        # benchmark whose timings do not transfer.
         if QtCore.QThread.currentThread() == app.thread():
+            _SIM_DRAW["direct_calls"] = _SIM_DRAW.get("direct_calls", 0) + 1
             fn(*args, **kwargs)
         else:
             _main_thread_relay.post(lambda: fn(*args, **kwargs))
@@ -85,6 +105,14 @@ _SIM_DRAW = {
     "update_calls": 0, "update_s": 0.0,
     "draw_s": 0.0, "recompute_s": 0.0, "update_gui_s": 0.0,
     "trial_geom_s": 0.0, "trial_draw_call_s": 0.0,
+    # Threading regime, so a timing can be attributed to a regime rather than
+    # to "simulate mode". `direct_calls` counts callbacks that ran inline on the
+    # caller's thread (each forced updateGui() blocking the caller); the rest
+    # went through the relay, where the same call returns immediately and the
+    # main thread inherits a backlog. `relay_pending_max` is the high-water mark
+    # of that backlog.
+    "direct_calls": 0, "relay_posted": 0,
+    "relay_pending": 0, "relay_pending_max": 0,
 }
 
 
