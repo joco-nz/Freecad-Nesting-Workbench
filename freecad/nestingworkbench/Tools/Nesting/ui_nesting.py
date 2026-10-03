@@ -299,110 +299,11 @@ class NestingPanel(QtWidgets.QWidget):
         self.clear_cache_checkbox = make_checkbox("Clear NFP Cache")
         self.clear_cache_checkbox.setToolTip("Forces recalculation of No-Fit Polygons. Slower, but resolves potential caching issues.")
 
-        # Genetic options for Minkowski
-        self.minkowski_population_size_input = make_int_spinbox(1, 1, 500)
-        self.minkowski_population_size_input.setToolTip("Set to 1 for a single pass. Increase with generations for Genetic Algorithm.")
-        
-        # 1 is the default: no genetic loop.
-        self.minkowski_generations_input = make_int_spinbox(1, 1, 1000)
-        self.minkowski_generations_input.setToolTip("Set to 1 for a single pass. Increase to optimize using Genetic Algorithm.")
+        self._build_minkowski_ga_fields()
 
-        # Deliberately not persisted, like Generations and Population Size:
-        # it is meaningless without a GA configuration next to it, and a stale
-        # target armed against a default single-pass run is a surprise.
-        # 0 = off, following the Rotation Threads "Auto" convention.
-        self.minkowski_target_sheets_input = make_int_spinbox(0, 0, 100)
-        self.minkowski_target_sheets_input.setSpecialValueText("Off")
-        self.minkowski_target_sheets_input.setToolTip(
-            "Stop the run as soon as one layout places every part on this "
-            "many sheets.\n\n"
-            "Off (0) by default, which is the normal behaviour: run every "
-            "generation, and stop early only when the search stops improving.\n\n"
-            "A target is a maximum, not a goal to beat. Nothing can do better "
-            "than every part on one sheet, so the run ends the moment one "
-            "layout achieves it and the layouts and generations still to come "
-            "are skipped. Note that a target looser than the natural result "
-            "(3 target, 1 sheet needed) is therefore met by the very first "
-            "layout.\n\n"
-            "This does not make the search find a good layout sooner -- it only "
-            "caps the time once the target is met. If the target is not "
-            "achievable the run behaves exactly as it does now and finishes on "
-            "the usual rules, and the log says the target was not reached.\n\n"
-            "Fill parts are best-effort: they are placed after the search ends "
-            "and are not counted towards the target.\n\n"
-            "Only affects GA runs (population/generations > 1)."
-        )
+        mink_compactness_layout = self._build_optimization_fields()
 
-        self.candidate_geometry_cache_checkbox = make_checkbox(
-            "Candidate Geometry Cache",
-            checked=_DEFAULTS["candidate_geometry_cache"])
-        self.candidate_geometry_cache_checkbox.setToolTip(
-            "Caches translated candidate polygons within one nesting run. "
-            "Collision and validity checks are still performed for every candidate."
-        )
-
-        self.minkowski_compactness_input = make_double_spinbox(
-            0.0, 0.0, 10.0, step=0.1)
-        self.minkowski_compactness_input.setToolTip(
-            "Weight of the compactness fitness term (0 = off).\n"
-            "Rewards GA layouts that leave one large contiguous open area on "
-            "the last sheet\ninstead of scattered gaps. 1.0 blends equally "
-            "with the bounding-box score;\nhigher values favor compactness "
-            "over bounding box. Only affects GA selection\n"
-            "(population/generations > 1), not individual part placement."
-        )
-
-        self.minkowski_compactness_help = QtWidgets.QPushButton("?")
-        self.minkowski_compactness_help.setFixedSize(20, 20)
-        self.minkowski_compactness_help.setToolTip("Click to learn more about how the Compactness function works.")
-        self.minkowski_compactness_help.clicked.connect(self._show_compactness_info)
-
-        # -- performance dials -------------------------------------------------
-        # Both of these were environment variables and are now fields, because
-        # the measurement says they are the two largest levers in a run and a
-        # control nobody can reach is not a control. Defaults are unchanged, so
-        # leaving them alone reproduces the previous behaviour exactly.
-        self.minkowski_step_size_input = LengthField(mm_min=0.1, mm_max=100.0, single_step_mm=0.5)
-        self.minkowski_step_size_input.set_mm(_DEFAULTS["minkowski_step_size"])
-        self._length_fields.append(self.minkowski_step_size_input)
-        self._step_size_tooltip = (
-            "Spacing between candidate positions.<br><br>"
-            "Every position a part can occupy comes from sampling the boundary "
-            "of a No-Fit Polygon at this interval, and a boundary of length L "
-            "yields about L / step positions. Each one is then tested against "
-            "the parts already placed, so the total number of collision tests "
-            "scales with this value and it is the main control over how long a "
-            "run takes.<br><br>"
-            "Larger: fewer positions, faster, and coarser packing.<br>"
-            "Smaller: more positions, slower, and finer packing.<br><br>"
-            "Only affects jobs that need positions away from the sheet corners "
-            "and edges. Where parts simply line up against each other or the "
-            "sheet border, the extra positions are tested and discarded and "
-            "changing this has no visible effect on the result. Where parts "
-            "interlock or have curved or closely spaced features, it does.<br><br>"
-            "If you raise it, check that the packing and the number of sheets "
-            "are unchanged before keeping the change."
-        )
-
-        self.minkowski_rotation_workers_input = make_int_spinbox(0, 0, 64)
-        self.minkowski_rotation_workers_input.setSpecialValueText("Auto")
-        self.minkowski_rotation_workers_input.setToolTip(
-            "How many rotations are checked at the same time.\n\n"
-            "Each rotation is one candidate orientation of the part, checked "
-            "independently, so this is how many of them are worked on "
-            "concurrently. A separate pool is started for every part placed.\n\n"
-            "Auto uses one thread per CPU core, which is the right setting for "
-            "most machines. Going above the core count is usually slower: the "
-            "geometry work runs outside the interpreter lock, but the code "
-            "around it does not, so extra threads spend their time waiting on "
-            "each other and on the shared NFP cache rather than doing work.\n\n"
-            "Does not affect the packing, only how long it takes.")
-
-        mink_compactness_layout = QtWidgets.QHBoxLayout()
-        mink_compactness_layout.addWidget(self.minkowski_compactness_input)
-        mink_compactness_layout.addWidget(self.minkowski_compactness_help)
-        mink_compactness_layout.addStretch()
-        mink_compactness_layout.setContentsMargins(0, 0, 0, 0)
+        self._build_minkowski_perf_dials()
 
         # Rotation Steps for Minkowski
         self.minkowski_rotation_steps_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
@@ -815,6 +716,144 @@ class NestingPanel(QtWidgets.QWidget):
 
         # Load initial selection
         self.controller.load_selection()
+
+    def _build_minkowski_ga_fields(self):
+        """The three GA dials: population, generations, and a sheet target.
+
+        Pure widget creation onto self. They are not added to a layout here --
+        all three land in the Optimizations two-column grid further down, which
+        is why the panel's field construction must all finish before its layout
+        assembly begins.
+        """
+        # Genetic options for Minkowski
+        self.minkowski_population_size_input = make_int_spinbox(1, 1, 500)
+        self.minkowski_population_size_input.setToolTip("Set to 1 for a single pass. Increase with generations for Genetic Algorithm.")
+        
+        # 1 is the default: no genetic loop.
+        self.minkowski_generations_input = make_int_spinbox(1, 1, 1000)
+        self.minkowski_generations_input.setToolTip("Set to 1 for a single pass. Increase to optimize using Genetic Algorithm.")
+
+        # Deliberately not persisted, like Generations and Population Size:
+        # it is meaningless without a GA configuration next to it, and a stale
+        # target armed against a default single-pass run is a surprise.
+        # 0 = off, following the Rotation Threads "Auto" convention.
+        self.minkowski_target_sheets_input = make_int_spinbox(0, 0, 100)
+        self.minkowski_target_sheets_input.setSpecialValueText("Off")
+        self.minkowski_target_sheets_input.setToolTip(
+            "Stop the run as soon as one layout places every part on this "
+            "many sheets.\n\n"
+            "Off (0) by default, which is the normal behaviour: run every "
+            "generation, and stop early only when the search stops improving.\n\n"
+            "A target is a maximum, not a goal to beat. Nothing can do better "
+            "than every part on one sheet, so the run ends the moment one "
+            "layout achieves it and the layouts and generations still to come "
+            "are skipped. Note that a target looser than the natural result "
+            "(3 target, 1 sheet needed) is therefore met by the very first "
+            "layout.\n\n"
+            "This does not make the search find a good layout sooner -- it only "
+            "caps the time once the target is met. If the target is not "
+            "achievable the run behaves exactly as it does now and finishes on "
+            "the usual rules, and the log says the target was not reached.\n\n"
+            "Fill parts are best-effort: they are placed after the search ends "
+            "and are not counted towards the target.\n\n"
+            "Only affects GA runs (population/generations > 1)."
+        )
+
+
+
+    def _build_optimization_fields(self):
+        """Candidate-geometry cache, compactness weight, and the help button.
+
+        Returns the compactness row's layout rather than storing it: it is
+        consumed by exactly one caller, the Optimizations grid, and a builder
+        that leaves its widgets on self but keeps its layout as a local is how
+        a layout ends up owned by nobody.
+        """
+        self.candidate_geometry_cache_checkbox = make_checkbox(
+            "Candidate Geometry Cache",
+            checked=_DEFAULTS["candidate_geometry_cache"])
+        self.candidate_geometry_cache_checkbox.setToolTip(
+            "Caches translated candidate polygons within one nesting run. "
+            "Collision and validity checks are still performed for every candidate."
+        )
+
+        self.minkowski_compactness_input = make_double_spinbox(
+            0.0, 0.0, 10.0, step=0.1)
+        self.minkowski_compactness_input.setToolTip(
+            "Weight of the compactness fitness term (0 = off).\n"
+            "Rewards GA layouts that leave one large contiguous open area on "
+            "the last sheet\ninstead of scattered gaps. 1.0 blends equally "
+            "with the bounding-box score;\nhigher values favor compactness "
+            "over bounding box. Only affects GA selection\n"
+            "(population/generations > 1), not individual part placement."
+        )
+
+        self.minkowski_compactness_help = QtWidgets.QPushButton("?")
+        self.minkowski_compactness_help.setFixedSize(20, 20)
+        self.minkowski_compactness_help.setToolTip("Click to learn more about how the Compactness function works.")
+        self.minkowski_compactness_help.clicked.connect(self._show_compactness_info)
+
+        mink_compactness_layout = QtWidgets.QHBoxLayout()
+        mink_compactness_layout.addWidget(self.minkowski_compactness_input)
+        mink_compactness_layout.addWidget(self.minkowski_compactness_help)
+        mink_compactness_layout.addStretch()
+        mink_compactness_layout.setContentsMargins(0, 0, 0, 0)
+        return mink_compactness_layout
+
+
+
+    def _build_minkowski_perf_dials(self):
+        """Candidate step size and rotation thread count.
+
+        The two largest levers in a run per RESULTS-parallelism.md, which is
+        why they were promoted from environment variables to fields at all.
+
+        `_step_size_tooltip` lives on self because _refresh_unit_tooltips reads
+        it, and the LengthField is appended to _length_fields because
+        refresh_unit_display walks that list rather than the widget tree.
+        """
+        # -- performance dials -------------------------------------------------
+        # Both of these were environment variables and are now fields, because
+        # the measurement says they are the two largest levers in a run and a
+        # control nobody can reach is not a control. Defaults are unchanged, so
+        # leaving them alone reproduces the previous behaviour exactly.
+        self.minkowski_step_size_input = LengthField(mm_min=0.1, mm_max=100.0, single_step_mm=0.5)
+        self.minkowski_step_size_input.set_mm(_DEFAULTS["minkowski_step_size"])
+        self._length_fields.append(self.minkowski_step_size_input)
+        self._step_size_tooltip = (
+            "Spacing between candidate positions.<br><br>"
+            "Every position a part can occupy comes from sampling the boundary "
+            "of a No-Fit Polygon at this interval, and a boundary of length L "
+            "yields about L / step positions. Each one is then tested against "
+            "the parts already placed, so the total number of collision tests "
+            "scales with this value and it is the main control over how long a "
+            "run takes.<br><br>"
+            "Larger: fewer positions, faster, and coarser packing.<br>"
+            "Smaller: more positions, slower, and finer packing.<br><br>"
+            "Only affects jobs that need positions away from the sheet corners "
+            "and edges. Where parts simply line up against each other or the "
+            "sheet border, the extra positions are tested and discarded and "
+            "changing this has no visible effect on the result. Where parts "
+            "interlock or have curved or closely spaced features, it does.<br><br>"
+            "If you raise it, check that the packing and the number of sheets "
+            "are unchanged before keeping the change."
+        )
+
+        self.minkowski_rotation_workers_input = make_int_spinbox(0, 0, 64)
+        self.minkowski_rotation_workers_input.setSpecialValueText("Auto")
+        self.minkowski_rotation_workers_input.setToolTip(
+            "How many rotations are checked at the same time.\n\n"
+            "Each rotation is one candidate orientation of the part, checked "
+            "independently, so this is how many of them are worked on "
+            "concurrently. A separate pool is started for every part placed.\n\n"
+            "Auto uses one thread per CPU core, which is the right setting for "
+            "most machines. Going above the core count is usually slower: the "
+            "geometry work runs outside the interpreter lock, but the code "
+            "around it does not, so extra threads spend their time waiting on "
+            "each other and on the shared NFP cache rather than doing work.\n\n"
+            "Does not affect the packing, only how long it takes.")
+
+
 
     def refresh_unit_display(self, force=False):
         """Re-render every unit-aware field for the active document.
