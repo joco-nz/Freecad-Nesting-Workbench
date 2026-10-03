@@ -100,6 +100,13 @@ except ImportError:
 # blocks -- one in nest(), one in fill_existing_sheets() -- and both timed.
 _SIM_DRAW = {
     "trial_calls": 0, "trial_s": 0.0,
+    # `trial_invoked` counts trial callbacks called by the search; `trial_calls`
+    # counts the ones that then *executed* on the main thread after the relay.
+    # They are equal unless a posted callback was never drained, and the
+    # difference is otherwise invisible: a dropped callback is a visualisation
+    # that silently never appears, with no error anywhere. Asserted by the bench
+    # -- see RESULTS-simulate-drawing.md section 4.
+    "trial_invoked": 0,
     "start_calls": 0, "start_s": 0.0,
     "end_calls": 0, "end_s": 0.0,
     "update_calls": 0, "update_s": 0.0,
@@ -163,6 +170,32 @@ def _visualize_trial_placement_inner(part, angle, x, y, viz_manager):
             _SIM_DRAW["trial_draw_call_s"] += _tg.perf_counter() - _g1
     except Exception as e:
         FreeCAD.Console.PrintWarning(f"[nesting_logic] Draw failed: {e}\n")
+
+def _trial_callback(viz_manager):
+    """The simulate-mode trial callback, counted where it is *called*.
+
+    The counter is deliberately outside `_main_thread_wrapper`. The wrapper posts
+    its whole payload and the payload then runs on the main thread, so an
+    increment inside it fires *after* the relay delivers -- which makes it count
+    executions, i.e. a second copy of `trial_calls`, and the pair can then never
+    disagree. Counting here, in the function the search calls, puts it on the
+    search side of the relay.
+
+    So `trial_invoked` counts callbacks the search made and `trial_calls` counts
+    the ones that executed, and a difference means posted callbacks were never
+    drained. Nothing raises when that happens; a dropped callback is just an
+    animation that silently stops appearing. Asserted by the bench -- see
+    RESULTS-simulate-drawing.md section 4.
+    """
+    relayed = _main_thread_wrapper(
+        lambda part, angle, x, y: _visualize_trial_placement(
+            part, angle, x, y, viz_manager))
+
+    def _cb(part, angle, x, y):
+        _SIM_DRAW["trial_invoked"] = _SIM_DRAW.get("trial_invoked", 0) + 1
+        return relayed(part, angle, x, y)
+    return _cb
+
 
 def _cleanup_trial_viz(viz_manager):
 # ... (rest of function)
@@ -240,9 +273,9 @@ def nest(parts, width, height, rotation_steps=1, simulate=False, algorithm='Mink
         if viz_manager is None:
             viz_manager = VisualizationManager()
             
-        kwargs['trial_callback'] = _main_thread_wrapper(
-            lambda p, a, x, y: _visualize_trial_placement(p, a, x, y, viz_manager)
-        )
+        # Already main-thread-relayed inside; wrapping again would count the
+        # invocation after the relay and defeat the invoked/executed pair.
+        kwargs['trial_callback'] = _trial_callback(viz_manager)
         kwargs['part_start_callback'] = _main_thread_wrapper(
             lambda p: _on_part_start(p, viz_manager)
         )
@@ -319,9 +352,9 @@ def fill_existing_sheets(sheets, fill_parts, width, height, rotation_steps=1,
     if simulate:
         if viz_manager is None:
             viz_manager = VisualizationManager()
-        kwargs['trial_callback'] = _main_thread_wrapper(
-            lambda p, a, x, y: _visualize_trial_placement(p, a, x, y, viz_manager)
-        )
+        # Already main-thread-relayed inside; wrapping again would count the
+        # invocation after the relay and defeat the invoked/executed pair.
+        kwargs['trial_callback'] = _trial_callback(viz_manager)
         kwargs['part_start_callback'] = _main_thread_wrapper(
             lambda p: _on_part_start(p, viz_manager)
         )

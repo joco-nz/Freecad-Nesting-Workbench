@@ -136,30 +136,76 @@ overstate any fix by roughly 2×. The measured ceiling for trial coalescing is
 **−25.6 s (−16.8%)**, and a coalescing scheme that keeps some trial paints will
 land below it.
 
-## 6. What is left, and what it would cost
+## 6. Implemented: trial repaints coalesced onto the placement pump
+
+The forced pump in `VisualizationManager.draw_trial_placement` is gone. Nothing
+replaces it: assigning `Shape` already marks the view dirty, so the trial marker
+repaints at the next event-loop pass — which in simulate mode is the placement
+pump. The 1,325 trial repaints coalesce onto the 637 repaints that are wanted
+anyway.
+
+Same configuration, same session:
+
+| | before | after | delta |
+|---|---:|---:|---:|
+| **outer wall** | **150.60 s** | **127.90 s** | **−22.70 s (−15.1%)** |
+| `trial_gui_s` | 52.83 s | 0.03 s | −52.80 s |
+| `update_gui_s` | 19.21 s | 24.45 s | **+5.24 s** |
+| total pump | 72.04 s | 24.48 s | −47.56 s |
+| `trial_shape_s` | 1.38 s | 1.43 s | +0.05 s |
+| result | 6 / 18 / 0.35397 | 6 / 18 / 0.35397 | — |
+| trial callbacks | 1,325 of 1,325 | 1,325 of 1,325 | — |
+
+**Landed within 3 s of the −25.56 s ceiling** (arm C), and the gap is run-to-run
+noise on single samples rather than a shortfall: `trial_gui_s` is 0.03 s, so there
+is essentially nothing left to remove in that path.
+
+Three things the numbers say that the design intuition did not:
+
+- **The saving is not the 52.8 s.** Total pump time fell 47.6 s while wall fell
+  22.7 s, because `update_gui_s` *rose* 5.24 s — the placement pump inherited
+  painting the trial pump used to do. This is §5's deferral effect, and it is why
+  the ceiling had to be measured rather than read off the counter.
+- **`trial_shape_s` did not move.** The `Shape` is still reassigned 1,325 times;
+  only the repaint was coalesced. This is a repaint fix, not a redraw fix, so
+  `TrialBounds` still tracks the search exactly — it is only *published* at
+  placement cadence.
+- **The relay kept up.** Queue high-water went 3 → 4. Removing the trial pumps did
+  *not* starve the relay, because the placement pumps still drain it — which is
+  the whole reason this change is safe and arm B is not.
+
+Cost, stated plainly: **the search now looks coarser between placements.** Trial
+positions publish at placement cadence instead of continuously. Placements
+themselves are untouched and each is still drawn; that was the constraint this
+was scoped under.
+
+The guard for this is in `bench_ga.validate_sim_draw`: it asserts
+`trial_invoked == trial_calls`, so a change that starves the relay fails the run
+rather than quietly shipping a truncated animation. Injection-verified — it fires
+on arm B with `invoked=1325 but executed=646`.
+
+## 7. What is left, and what it would cost
 
 Not started. Ordered by value.
 
-1. **Coalesce trial draws** (the scoped work). Keep one pending trial draw;
-   replace it with the latest rather than queueing all 1,325. Must keep a pump
-   to drain the slot — see §4 — so the placement pump is load-bearing and cannot
-   be throttled away as part of this.
-   *Ceiling:* −25.6 s measured (arm C). *Risk:* the trial animation becomes
-   coarser; visual quality needs a human eye, since no test can distinguish "the
-   animation reads fine" from "the animation did not change".
+1. **Nothing remains in the trial path.** `trial_gui_s` is 0.03 s, so neither
+   rate-limiting nor further coalescing there can pay.
 
-2. **Stop redrawing stale trials at all.** The relay delivering a trial
-   visualisation after the rotation has moved on (§4) is arguably wrong
-   independent of cost, but fixing it changes what the animation shows.
+2. **Stop drawing stale trials at all.** The relay delivering a trial
+   visualisation after the rotation it visualises has finished (§4) is arguably
+   wrong independent of cost. Coalescing makes the stale draws *less* frequent
+   but does not make them *correct*: the marker still shows a position the search
+   has moved past, just at placement cadence.
 
 3. **Time-budget the placement pump.** Deliberately excluded — the constraint is
-   that every placement is painted. Worth ~19.7 s if that constraint is ever
-   revisited.
+   that every placement is painted. Worth most of the remaining 24.5 s of pump
+   time if that constraint is ever revisited, and it is now the entire drawing
+   cost.
 
 4. The `instances` churn (51.8 s) and master sharing are `RESULTS-simulate-churn.md`
    §6 items and are untouched here.
 
-## 7. Caveats
+## 8. Caveats
 
 - **n=1 per arm.** Three arms, three runs. `validity_stage` and
   `layout_management` are flat across arms, which is the check that matters most
@@ -169,9 +215,9 @@ Not started. Ordered by value.
 - **The direct regime, not the app's.** See §3. The bench runs the GA
   synchronously; the app runs it on a worker thread. Work removed transfers;
   wall-clock overlap does not.
-- **`trial_shape_s` and `trial_geom_s` are unchanged by design** (1.37→1.52 s,
-  0.87→0.91 s). The Shape is still reassigned 1,325 times in every arm; only the
-  repaint is suppressed. This is a repaint fix, not a redraw fix.
+- **`trial_shape_s` and `trial_geom_s` are unchanged by design** (1.38→1.43 s,
+  0.87→0.92 s). The Shape is still reassigned 1,325 times in every arm; only the
+  repaint is coalesced. This is a repaint fix, not a redraw fix.
 - **Arm B is not a candidate.** It drops 679 callbacks (§4) and would be a
   behaviour regression. It is a ceiling, nothing more.
 
@@ -198,8 +244,11 @@ reports the threading regime and queue high-water alongside the timers.
 
 | | value |
 |---|---|
-| trial-pump suppression, measured ceiling | **−25.6 s of 151.9 s (−16.8%)** |
+| **shipped: trial repaints coalesced onto the placement pump** | **−22.7 s of 150.6 s (−15.1%)** |
+| measured ceiling for that change | −25.6 s (−16.8%) — landed within 3 s of it |
 | all pumps, ceiling | −54.0 s (−35.5%), but drops 679 callbacks |
-| pump cost on the critical path | **yes** — queue high-water 3, no backlog |
+| remaining drawing cost | 24.5 s, all of it the placement pump |
+| pump cost on the critical path | **yes** — queue high-water 3–4, no backlog |
 | `updateGui()` is also the event-loop drain | **yes** — deleting it loses 679 callbacks |
-| result under every arm | 6 sheets, 18 placed, 0.35397 |
+| result under every arm, before and after | 6 sheets, 18 placed, 0.35397 |
+| placements still drawn | **yes** — 637 of 637, asserted by `validate_sim_draw` |

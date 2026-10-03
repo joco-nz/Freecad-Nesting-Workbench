@@ -189,6 +189,11 @@ transformative, and it goes directly at documented teardown semantics.
   `updateGui` per placement, which is the only extra work in that path I
   verified. I did not profile it, so treat the churn/drawing split as
   indicative.
+  **Profiled since, in `RESULTS-simulate-drawing.md`:** the drawing half was the
+  forced `FreeCADGui.updateGui()` per trial placement, and coalescing those
+  repaints onto the placement pump took 22.7 s off a 150.6 s run with the result
+  unchanged. The churn/drawing split above was indicative in the right direction
+  but understated the drawing cost.
 - **One corpus.** 18 parts of n70. Simulate's per-member cost scales with part
   count × population × generations, so the *share* will differ on other inputs.
 - The silent-failure mode of §2 is worth flagging on its own: under

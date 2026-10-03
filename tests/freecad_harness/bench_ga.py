@@ -417,6 +417,46 @@ def validate_ga_perf(ga_perf, layout_perf, c):
     return failures
 
 
+def validate_sim_draw(sim_draw, c):
+    """Invariants on the simulate drawing counters. Returns failure strings.
+
+    The important one is the invoked/executed pair. `trial_invoked` counts trial
+    callbacks the search made and `trial_calls` counts the ones that executed on
+    the main thread, so a difference means posted callbacks were never drained
+    and a slice of the animation silently never appeared. That is not a
+    performance question and it raises nothing, so without this check it is
+    indistinguishable from a correct run.
+
+    Measured to fire: the NEST_BENCH_GA_NO_PUMP arm drops exactly the relayed
+    count (1325 -> 646 at 679 relayed) and fails here.
+    """
+    failures = []
+    if not c.get("simulate"):
+        return failures
+    if not sim_draw:
+        return ["simulate run recorded no sim_draw counters"]
+
+    invoked = sim_draw.get("trial_invoked", 0)
+    executed = sim_draw.get("trial_calls", 0)
+    if invoked != executed:
+        failures.append(
+            f"trial callbacks invoked={invoked} but executed={executed}: "
+            f"{invoked - executed} posted callbacks were never drained, so that "
+            f"much of the trial animation never appeared. The pumps are the "
+            f"event loop for posted callbacks -- see "
+            f"RESULTS-simulate-drawing.md section 4.")
+
+    # Every placement must still paint. This is the constraint the trial-pump
+    # work was scoped under, and it is the one a future change would break.
+    if sim_draw.get("update_calls", 0) <= 0:
+        failures.append("no placement callbacks fired: this is not a simulate run")
+    if sim_draw.get("update_gui_s", 0.0) <= 0.0:
+        failures.append(
+            "placement callbacks fired but never pumped the GUI "
+            "(update_gui_s=0): placements are being computed but not drawn")
+    return failures
+
+
 def summarise(c, runs):
     ga = {}
     for run in runs:
@@ -506,8 +546,12 @@ def report(c, runs):
                 f"{sd.get('direct_calls', 0)} direct / "
                 f"{sd.get('relay_posted', 0)} relayed   "
                 f"queue high-water {sd.get('relay_pending_max', 0)}")
-        for label, key in (("trial callbacks", "trial_calls"),
-                           ("  trial gui pump", "trial_gui_s"),
+        dropped = sd.get("trial_invoked", 0) - sd.get("trial_calls", 0)
+        hc.emit(f"  {'trial callbacks':34s} "
+                f"{sd.get('trial_calls', 0)} executed of "
+                f"{sd.get('trial_invoked', 0)} invoked"
+                + (f"   *** {dropped} DROPPED ***" if dropped else ""))
+        for label, key in (("  trial gui pump", "trial_gui_s"),
                            ("  trial geometry", "trial_geom_s"),
                            ("  trial shape assign", "trial_shape_s"),
                            ("placement callbacks", "update_calls"),
@@ -600,6 +644,7 @@ def main():
 
     ga, layout = report(c, runs)
     problems = validate_ga_perf(ga, layout, c)
+    problems += validate_sim_draw(runs[0].get("sim_draw") or {}, c)
     if problems:
         hc.emit("")
         hc.emit("ERROR: the GA instrumentation is not self-consistent, so this is "

@@ -49,8 +49,29 @@ class VisualizationManager:
                 wire = Part.makePolygon(bounds)
                 self._trial_viz_obj.Shape = wire
             _v1 = _tv.perf_counter()
-            # Force UI update to show the change immediately during simulation
-            FreeCADGui.updateGui()
+            # No forced repaint here, deliberately. This used to call
+            # FreeCADGui.updateGui() once per trial, and it was the single most
+            # expensive thing in a simulate run: 52.8s of a 150.6s run, measured,
+            # for a repaint every ~42ms against a viewport whose paint costs
+            # ~42ms -- so it was saturated and no amount of rate-limiting could
+            # have helped. The only fix is fewer repaints.
+            #
+            # Assigning Shape already marks the view dirty, so the trial marker
+            # repaints at the next event-loop pass instead. That is the
+            # placement pump, which simulate performs once per placement, so
+            # 1,325 trial repaints coalesce onto the 637 repaints that are
+            # wanted anyway and the total drops from 1,962 to 637. Measured
+            # ceiling for this change: -25.6s (-16.8%), with the packing result
+            # unchanged at 6 sheets / 18 placed / 0.35397.
+            #
+            # What it costs: trial positions are now published at placement
+            # cadence rather than continuously, so the search looks coarser
+            # between placements. Placements themselves are untouched and are
+            # still each drawn -- that is the contract this was scoped under.
+            #
+            # The pump must not simply be deleted everywhere, by the way: it is
+            # also the event loop that drains callbacks posted from the rotation
+            # worker thread. See RESULTS-simulate-drawing.md section 4.
         except Exception as e:
             FreeCAD.Console.PrintWarning(f"[VisualizationManager] Draw failed: {e}\n")
         finally:
