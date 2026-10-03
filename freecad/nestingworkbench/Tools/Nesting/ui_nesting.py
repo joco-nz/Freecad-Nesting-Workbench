@@ -192,69 +192,7 @@ class NestingPanel(QtWidgets.QWidget):
         table_button_layout = QtWidgets.QHBoxLayout()
         action_button_layout = QtWidgets.QHBoxLayout()
 
-        # Every length in the panel is a LengthField: a unit-aware spin box
-        # that shows the document's units and parses whatever FreeCAD's
-        # quantity parser does ("1/2 in", "1' 11\"", "2ft 6in"), while the
-        # value the rest of the workbench receives stays a plain millimetre
-        # float. See length_field.py for why the value is kept in Python rather
-        # than read back out of the widget.
-        self.sheet_width_input = LengthField(mm_min=1, mm_max=10000)
-        self.sheet_height_input = LengthField(mm_min=1, mm_max=10000)
-        self.sheet_thickness_input = LengthField(mm_min=0.1, mm_max=1000)
-        self.part_spacing_input = LengthField(mm_min=0, mm_max=1000)
-        self.sheet_width_input.set_mm(_DEFAULTS["sheet_width"])
-        self.sheet_height_input.set_mm(_DEFAULTS["sheet_height"])
-        self.sheet_thickness_input.set_mm(_DEFAULTS["sheet_thickness"])
-        self.part_spacing_input.set_mm(_DEFAULTS["part_spacing"])
-        # Bounds above are the same ones the QDoubleSpinBoxes these replaced
-        # had, so nothing that used to be rejected is now accepted.
-        self._length_fields = [
-            self.sheet_width_input, self.sheet_height_input,
-            self.sheet_thickness_input, self.part_spacing_input,
-        ]
-        
-        # Deflection is now specified as an angle (degrees) for more intuitive control
-        # Internally converted to linear deflection: deflection_mm = angle / 200.0
-        # 30 degrees by default, for faster processing than the 0.05mm linear
-        # deflection this replaced.
-        self.deflection_input = make_double_spinbox(
-            _DEFAULTS["deflection_angle"], 1, 90, step=1, decimals=0,
-            suffix="°")
-        self.deflection_input.setToolTip(
-            "<b>Curve Angle (Tessellation Quality):</b><br>"
-            "Maximum angular deviation when approximating curves.<br><br>"
-            "<b>Smaller (5-10°):</b> Smoother curves, more points, slower.<br>"
-            "<b>Larger (20-45°):</b> Coarser curves, fewer points, faster.<br><br>"
-            "<i>Tip: 10° is good for most parts. Use 5° for precision, 30°+ for speed.</i>"
-        )
-        
-        self.simplification_input = LengthField(mm_min=0.001, mm_max=10.0, single_step_mm=0.1)
-        self.simplification_input.set_mm(_DEFAULTS["simplification"])
-        self._length_fields.append(self.simplification_input)
-        self._simplification_tooltip = (
-            "<b>Simplify (Point Reduction):</b><br>"
-            "Tolerance for dropping boundary points. Larger = coarser, faster.<br><br>"
-            "<b>Measured</b> on a 122-part nest (3 sheets, all parts placed at every "
-            "setting), wall clock against material yield:<br>"
-            "<table cellspacing='0' cellpadding='2'>"
-            "<tr><td><b>0.1</b></td><td>12.3s</td><td>57.4%</td></tr>"
-            "<tr><td><b>0.25</b></td><td>10.4s</td><td>57.2%</td></tr>"
-            "<tr><td><b>0.5</b></td><td>9.6s</td><td>57.2%</td></tr>"
-            "<tr><td><b>1.0</b> (default)</td><td>8.3s</td><td>57.1%</td></tr>"
-            "<tr><td><b>2.0</b></td><td>7.9s</td><td>56.7%</td></tr>"
-            "</table><br>"
-            "<b>Read this as:</b> above 0.1 the curve is flat &mdash; 0.1 to 1.0 costs "
-            "about a third of the time to gain 0.3% yield. Dropping to 0.25 saves ~15% "
-            "of the time for ~0.1% yield. The large jump is <i>below</i> 0.1, where "
-            "4x the time buys 0.1% yield.<br><br>"
-            "<b>Tip:</b> set this to your machine's precision tolerance "
-            "({router_tolerance} for a router). Below ~0.25 it stops being worth "
-            "the time unless a part has fine internal detail."
-        )
-        # The measured table above is quoted in millimetres because that is what
-        # it was measured in, and it is left that way deliberately: the figures
-        # are a record of an experiment, not a live readout. Only the tip's
-        # recommendation follows the document's units.
+        self._build_length_fields()
 
         self.shape_table = QtWidgets.QTableWidget()
         self.shape_table.setColumnCount(6)
@@ -716,6 +654,87 @@ class NestingPanel(QtWidgets.QWidget):
 
         # Load initial selection
         self.controller.load_selection()
+
+    def _build_length_fields(self):
+        """The sheet dimensions, part spacing, deflection, and simplification.
+
+        Four LengthFields and one angle spin box. The LengthFields go into
+        self._length_fields, which refresh_unit_display walks to re-render
+        every unit-bearing widget in the document's units -- so the list is
+        built here and appended to by whichever builder owns each field.
+
+        This block reassigns self._length_fields rather than appending to it, so
+        it has to run before anything appends. It is the first builder called.
+
+        The two tooltips held here are quoted by _refresh_unit_tooltips, which
+        rewrites the parts that mention a measurement when the document's unit
+        system changes -- which is why the simplify table stays in millimetres
+        and only its closing recommendation follows the units.
+        """
+        # Every length in the panel is a LengthField: a unit-aware spin box
+        # that shows the document's units and parses whatever FreeCAD's
+        # quantity parser does ("1/2 in", "1' 11\"", "2ft 6in"), while the
+        # value the rest of the workbench receives stays a plain millimetre
+        # float. See length_field.py for why the value is kept in Python rather
+        # than read back out of the widget.
+        self.sheet_width_input = LengthField(mm_min=1, mm_max=10000)
+        self.sheet_height_input = LengthField(mm_min=1, mm_max=10000)
+        self.sheet_thickness_input = LengthField(mm_min=0.1, mm_max=1000)
+        self.part_spacing_input = LengthField(mm_min=0, mm_max=1000)
+        self.sheet_width_input.set_mm(_DEFAULTS["sheet_width"])
+        self.sheet_height_input.set_mm(_DEFAULTS["sheet_height"])
+        self.sheet_thickness_input.set_mm(_DEFAULTS["sheet_thickness"])
+        self.part_spacing_input.set_mm(_DEFAULTS["part_spacing"])
+        # Bounds above are the same ones the QDoubleSpinBoxes these replaced
+        # had, so nothing that used to be rejected is now accepted.
+        self._length_fields = [
+            self.sheet_width_input, self.sheet_height_input,
+            self.sheet_thickness_input, self.part_spacing_input,
+        ]
+        
+        # Deflection is now specified as an angle (degrees) for more intuitive control
+        # Internally converted to linear deflection: deflection_mm = angle / 200.0
+        # 30 degrees by default, for faster processing than the 0.05mm linear
+        # deflection this replaced.
+        self.deflection_input = make_double_spinbox(
+            _DEFAULTS["deflection_angle"], 1, 90, step=1, decimals=0,
+            suffix="°")
+        self.deflection_input.setToolTip(
+            "<b>Curve Angle (Tessellation Quality):</b><br>"
+            "Maximum angular deviation when approximating curves.<br><br>"
+            "<b>Smaller (5-10°):</b> Smoother curves, more points, slower.<br>"
+            "<b>Larger (20-45°):</b> Coarser curves, fewer points, faster.<br><br>"
+            "<i>Tip: 10° is good for most parts. Use 5° for precision, 30°+ for speed.</i>"
+        )
+        
+        self.simplification_input = LengthField(mm_min=0.001, mm_max=10.0, single_step_mm=0.1)
+        self.simplification_input.set_mm(_DEFAULTS["simplification"])
+        self._length_fields.append(self.simplification_input)
+        self._simplification_tooltip = (
+            "<b>Simplify (Point Reduction):</b><br>"
+            "Tolerance for dropping boundary points. Larger = coarser, faster.<br><br>"
+            "<b>Measured</b> on a 122-part nest (3 sheets, all parts placed at every "
+            "setting), wall clock against material yield:<br>"
+            "<table cellspacing='0' cellpadding='2'>"
+            "<tr><td><b>0.1</b></td><td>12.3s</td><td>57.4%</td></tr>"
+            "<tr><td><b>0.25</b></td><td>10.4s</td><td>57.2%</td></tr>"
+            "<tr><td><b>0.5</b></td><td>9.6s</td><td>57.2%</td></tr>"
+            "<tr><td><b>1.0</b> (default)</td><td>8.3s</td><td>57.1%</td></tr>"
+            "<tr><td><b>2.0</b></td><td>7.9s</td><td>56.7%</td></tr>"
+            "</table><br>"
+            "<b>Read this as:</b> above 0.1 the curve is flat &mdash; 0.1 to 1.0 costs "
+            "about a third of the time to gain 0.3% yield. Dropping to 0.25 saves ~15% "
+            "of the time for ~0.1% yield. The large jump is <i>below</i> 0.1, where "
+            "4x the time buys 0.1% yield.<br><br>"
+            "<b>Tip:</b> set this to your machine's precision tolerance "
+            "({router_tolerance} for a router). Below ~0.25 it stops being worth "
+            "the time unless a part has fine internal detail."
+        )
+        # The measured table above is quoted in millimetres because that is what
+        # it was measured in, and it is left that way deliberately: the figures
+        # are a record of an experiment, not a live readout. Only the tip's
+        # recommendation follows the document's units.
+
 
     def _build_minkowski_ga_fields(self):
         """The three GA dials: population, generations, and a sheet target.
