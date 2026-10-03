@@ -344,6 +344,42 @@ Two further properties, because either would silently change what a run uses:
 Note that `setVisible` is the right call for the hiding and `setEnabled` is not:
 a hidden widget still reports its real checked state.
 
+### Where each control sits
+
+Everything above asserts *state*: a checkbox reads back as checked, a
+`LengthField` holds millimetres, a section is collapsed. None of it asserts
+*position*, so a control parented into the wrong container passes all of it.
+`probe_gui_layout_positions.py` covers that, and it needs `freecad` rather than
+`freecadcmd` because it builds the panel.
+
+Three properties:
+
+- **Containment.** Each tracked control is located by walking its parents up to
+  the enclosing `CollapsibleSection`, and the section's title is asserted:
+  Nesting Settings 3, Optimizations 8, Physics 11, Helpers 8, Logging 2, panel
+  level 14. A control that drifts into a neighbouring section fails here.
+- **Parentage.** Every tracked control must have a non-None `parentWidget()`.
+  Created but never added to a layout, a widget keeps a null parent — so it
+  exists on `self`, satisfies every containment check above, and is simply not
+  on screen.
+- **Main layout order.** The seven items in the panel's own layout, in order:
+  form, shape table, table buttons, action buttons, progress bar, status label,
+  stretch. A stretch that migrated above the progress bar passes every other
+  check in the file.
+
+**Two files now know the panel's structure.** Moving a control from one section
+to another fails here *and* in `probe_unit_panel`, because `EXPECTED` in the
+probe is a table of which control belongs where — a second source of truth to
+keep in step with the panel. That is deliberate: the two assert different things
+(containment versus grid cell order, which stays in `probe_unit_panel`), and
+neither can be derived from the other. But it does mean a section move is a
+two-file edit, and finding that out from a failing test is the wrong way.
+
+What this probe cannot see: a control in the right section but the wrong
+*cell*, and two transposed rows — `probe_unit_panel`'s `_two_column_grid`
+assertions cover that. Together they cover position. Neither covers whether
+the result *looks* right, which is what a human is for.
+
 ### GA field persistence
 
 `Generations` and `Population Size` round-trip through preferences, exercised
