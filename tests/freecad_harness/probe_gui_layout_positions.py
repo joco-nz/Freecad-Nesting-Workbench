@@ -37,6 +37,14 @@ the code misbehaved. A check that cannot fail is not a check; the observable
 consequence of a double-add is that the first layout silently loses a widget,
 which shows up as a containment failure rather than as a count.
 
+**Main layout order.** The panel's own layout holds seven items in a fixed
+order: the form, the shape table, the table buttons, the action buttons, the
+progress bar, the status label, and a trailing stretch. The sections sit inside
+the form and are covered by containment, but their order relative to the table
+and the buttons is not -- so the top level is asserted directly. A stretch that
+migrates above the progress bar, or a table that lands after the buttons,
+would pass every other check here.
+
 A note on what this cannot see: it cannot tell you a widget is in the right
 section but the wrong cell, nor that two rows are transposed. `_two_column_grid`
 order is asserted separately in probe_unit_panel. Together they cover position;
@@ -229,6 +237,36 @@ def main():
         check(f"the {title} section is in the panel's layout", placed,
               "built but never added")
     check("the panel has a main layout", main_layout is not None)
+
+    # -- the panel's own layout, in order -----------------------------------
+    # The three nested layouts are locals of _setup_ui, so they can only be
+    # identified as "a layout". That is still enough to pin the sequence: the
+    # named widgets and the stretch are what would move if the assembly were
+    # reordered.
+    def describe(item):
+        if item is None:
+            return "none"
+        if item.spacerItem() is not None:
+            return "stretch"
+        widget = item.widget()
+        if widget is not None:
+            for name in ("shape_table", "progressBar", "status_label"):
+                if widget is getattr(panel, name, None):
+                    return name
+            return f"widget:{type(widget).__name__}"
+        if item.layout() is not None:
+            return "layout"
+        return "unknown"
+
+    order = [describe(main_layout.itemAt(i))
+             for i in range(main_layout.count())]
+    expected_order = ["layout", "shape_table", "layout", "layout",
+                      "progressBar", "status_label", "stretch"]
+    check("the main layout holds seven items", len(order) == 7,
+          f"got {len(order)}: {order}")
+    check("the main layout is in order: form, table, table buttons, action "
+          "buttons, progress, status, stretch",
+          order == expected_order, f"got {order}")
 
     panel.dispose()
     panel.deleteLater()
