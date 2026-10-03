@@ -178,19 +178,13 @@ class NestingPanel(QtWidgets.QWidget):
         return True
 
     def _setup_ui(self):
-        main_layout = QtWidgets.QVBoxLayout()
-        form_layout = QtWidgets.QFormLayout()
         
         # Algorithm Selection
         self.algorithm_dropdown = QtWidgets.QComboBox()
         self.algorithm_dropdown.addItems(["Minkowski", "Physics"])
         self.algorithm_dropdown.setCurrentIndex(0) # Default to Minkowski
         self.algorithm_dropdown.currentTextChanged.connect(self._on_algorithm_change)
-        form_layout.addRow("Nesting Algorithm:", self.algorithm_dropdown)
 
-        font_layout = QtWidgets.QHBoxLayout()
-        table_button_layout = QtWidgets.QHBoxLayout()
-        action_button_layout = QtWidgets.QHBoxLayout()
 
         self._build_length_fields()
 
@@ -318,9 +312,7 @@ class NestingPanel(QtWidgets.QWidget):
         # children are hidden but alive, so _collect_ui_params still reads
         # them and refresh_unit_display can still re-render their fields.
         self.helpers_group = CollapsibleSection("Helpers", expanded=False)
-        helpers_layout = QtWidgets.QVBoxLayout()
         self.logging_group = CollapsibleSection("Logging", expanded=False)
-        logging_box_layout = QtWidgets.QVBoxLayout()
 
         self._set_initial_section_visibility()
 
@@ -330,6 +322,70 @@ class NestingPanel(QtWidgets.QWidget):
         self.font_select_button = QtWidgets.QPushButton("Select Font")
         self.font_label = QtWidgets.QLabel("No Font Selected")
         self.font_label.setWordWrap(True)
+        self._assemble_panel_layout()
+
+        # Connect signals
+
+        # Link label inputs to the add labels checkbox
+        def toggle_label_inputs(state):
+            enabled = state == QtCore.Qt.Checked
+            self.label_size_input.widget().setEnabled(enabled)
+            self.label_height_input.widget().setEnabled(enabled)
+
+        self.add_labels_checkbox.stateChanged.connect(toggle_label_inputs)
+        toggle_label_inputs(QtCore.Qt.Checked if self.add_labels_checkbox.isChecked() else QtCore.Qt.Unchecked)
+
+        # Connect the nesting controller
+        from .nesting_controller import NestingController
+        self.controller = NestingController(self)
+        self.nest_button.clicked.connect(self.controller.execute_nesting)
+        self.cancel_button.clicked.connect(self.controller.request_cancel)
+        self.font_select_button.clicked.connect(self.select_font_file)
+        self.show_bounds_checkbox.stateChanged.connect(self.controller.toggle_bounds_visibility)
+        self.add_parts_button.clicked.connect(self.controller.add_selected_shapes)
+        self.remove_parts_button.clicked.connect(self.controller.remove_selected_shapes)
+
+        self.load_persisted_settings()
+
+        # Render the fields and the unit-bearing tooltips for the document as
+        # it stands now. Done after the settings load so the first thing the
+        # user sees is already in their units.
+        self.refresh_unit_display(force=True)
+
+        # Ensure initial labels are correct
+        self._update_rotation_label()
+
+        # Load initial selection
+        self.controller.load_selection()
+
+    def _assemble_panel_layout(self):
+        """Create the panel's layouts and parent every control built above.
+
+        Takes no arguments. form_layout and main_layout are used only here and
+        by the algorithm row, which is also placed here -- the dropdown itself
+        is created and connected in _setup_ui, immediately before the fields,
+        so the order in which a signal can first fire is unchanged.
+
+        The order of the seven items in main_layout is asserted in
+        probe_gui_layout_positions: form, shape table, table buttons, action
+        buttons, progress bar, status label, stretch. Which section each control
+        ended up in is asserted there too.
+        """
+        main_layout = QtWidgets.QVBoxLayout()
+        form_layout = QtWidgets.QFormLayout()
+
+        form_layout.addRow("Nesting Algorithm:", self.algorithm_dropdown)
+
+        font_layout = QtWidgets.QHBoxLayout()
+        table_button_layout = QtWidgets.QHBoxLayout()
+        action_button_layout = QtWidgets.QHBoxLayout()
+
+        # Built here rather than in _setup_ui: both are consumed only by the
+        # helpers and logging forms below, so as locals they cannot be left
+        # behind by a future edit to the field builders.
+        helpers_layout = QtWidgets.QVBoxLayout()
+        logging_box_layout = QtWidgets.QVBoxLayout()
+
         font_layout.addWidget(self.font_select_button)
         font_layout.addWidget(self.font_label)
         
@@ -417,39 +473,6 @@ class NestingPanel(QtWidgets.QWidget):
         
         self.setLayout(main_layout)
 
-        # Connect signals
-
-        # Link label inputs to the add labels checkbox
-        def toggle_label_inputs(state):
-            enabled = state == QtCore.Qt.Checked
-            self.label_size_input.widget().setEnabled(enabled)
-            self.label_height_input.widget().setEnabled(enabled)
-
-        self.add_labels_checkbox.stateChanged.connect(toggle_label_inputs)
-        toggle_label_inputs(QtCore.Qt.Checked if self.add_labels_checkbox.isChecked() else QtCore.Qt.Unchecked)
-
-        # Connect the nesting controller
-        from .nesting_controller import NestingController
-        self.controller = NestingController(self)
-        self.nest_button.clicked.connect(self.controller.execute_nesting)
-        self.cancel_button.clicked.connect(self.controller.request_cancel)
-        self.font_select_button.clicked.connect(self.select_font_file)
-        self.show_bounds_checkbox.stateChanged.connect(self.controller.toggle_bounds_visibility)
-        self.add_parts_button.clicked.connect(self.controller.add_selected_shapes)
-        self.remove_parts_button.clicked.connect(self.controller.remove_selected_shapes)
-
-        self.load_persisted_settings()
-
-        # Render the fields and the unit-bearing tooltips for the document as
-        # it stands now. Done after the settings load so the first thing the
-        # user sees is already in their units.
-        self.refresh_unit_display(force=True)
-
-        # Ensure initial labels are correct
-        self._update_rotation_label()
-
-        # Load initial selection
-        self.controller.load_selection()
 
     def _build_direction_grid(self, minkowski_dial_widget, mink_rot_layout):
         """The three-control arrangement at the top of Nesting Settings.
