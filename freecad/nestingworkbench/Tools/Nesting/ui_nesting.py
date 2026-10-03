@@ -15,7 +15,13 @@ from ... import FONTS_DIR, DEFAULT_FONT
 from ...freecad_helpers import set_visibility
 from ...length_field import LengthField
 from ... import units
-from ...ui_helpers import CollapsibleSection
+from ...ui_helpers import (
+    MARGINS_NONE,
+    CollapsibleSection,
+    make_checkbox,
+    make_double_spinbox,
+    make_int_spinbox,
+)
 
 _MINKOWSKI_DIR_MAX = 359
 
@@ -24,11 +30,6 @@ _MINKOWSKI_DIR_MAX = 359
 # default row gap starts to dominate once the labels are short.
 _GRID_COLUMN_SPACING = 12
 _GRID_ROW_SPACING = 6
-
-# QFormLayout adds a margin of its own, which inside a section stacks with the
-# content area's frame and indents the controls twice over. The content area
-# already has the frame; the layout does not need a second one.
-_MARGINS_NONE = (0, 0, 0, 0)
 
 # Fixed width for the dial's column in the Nesting Settings grid. A QDial is a
 # circle and has no reason to grow with the panel, and pinning it stops the
@@ -214,12 +215,11 @@ class NestingPanel(QtWidgets.QWidget):
         
         # Deflection is now specified as an angle (degrees) for more intuitive control
         # Internally converted to linear deflection: deflection_mm = angle / 200.0
-        self.deflection_input = QtWidgets.QDoubleSpinBox()
-        self.deflection_input.setRange(1, 90)
-        self.deflection_input.setValue(_DEFAULTS["deflection_angle"])  # 30° default for faster processing
-        self.deflection_input.setSingleStep(1)
-        self.deflection_input.setDecimals(0)
-        self.deflection_input.setSuffix("°")
+        # 30 degrees by default, for faster processing than the 0.05mm linear
+        # deflection this replaced.
+        self.deflection_input = make_double_spinbox(
+            _DEFAULTS["deflection_angle"], 1, 90, step=1, decimals=0,
+            suffix="°")
         self.deflection_input.setToolTip(
             "<b>Curve Angle (Tessellation Quality):</b><br>"
             "Maximum angular deviation when approximating curves.<br><br>"
@@ -289,34 +289,29 @@ class NestingPanel(QtWidgets.QWidget):
             self._build_direction_control()
 
         # Random Direction Checkbox for Minkowski
-        self.minkowski_random_checkbox = QtWidgets.QCheckBox("Use Random Direction")
+        self.minkowski_random_checkbox = make_checkbox(
+            "Use Random Direction")
         self.minkowski_random_checkbox.setToolTip("If checked, each part will use a randomized placement weighting.")
         self.minkowski_random_checkbox.stateChanged.connect(
             lambda state: self._set_direction_control_enabled(
                 not self.minkowski_random_checkbox.isChecked()))
 
-        self.clear_cache_checkbox = QtWidgets.QCheckBox("Clear NFP Cache")
-        self.clear_cache_checkbox.setChecked(False)
+        self.clear_cache_checkbox = make_checkbox("Clear NFP Cache")
         self.clear_cache_checkbox.setToolTip("Forces recalculation of No-Fit Polygons. Slower, but resolves potential caching issues.")
 
         # Genetic options for Minkowski
-        self.minkowski_population_size_input = QtWidgets.QSpinBox()
-        self.minkowski_population_size_input.setRange(1, 500)
-        self.minkowski_population_size_input.setValue(1)
+        self.minkowski_population_size_input = make_int_spinbox(1, 1, 500)
         self.minkowski_population_size_input.setToolTip("Set to 1 for a single pass. Increase with generations for Genetic Algorithm.")
         
-        self.minkowski_generations_input = QtWidgets.QSpinBox()
-        self.minkowski_generations_input.setRange(1, 1000)
-        self.minkowski_generations_input.setValue(1) # Default to 1 (No Genetic Loop)
+        # 1 is the default: no genetic loop.
+        self.minkowski_generations_input = make_int_spinbox(1, 1, 1000)
         self.minkowski_generations_input.setToolTip("Set to 1 for a single pass. Increase to optimize using Genetic Algorithm.")
 
         # Deliberately not persisted, like Generations and Population Size:
         # it is meaningless without a GA configuration next to it, and a stale
         # target armed against a default single-pass run is a surprise.
         # 0 = off, following the Rotation Threads "Auto" convention.
-        self.minkowski_target_sheets_input = QtWidgets.QSpinBox()
-        self.minkowski_target_sheets_input.setRange(0, 100)
-        self.minkowski_target_sheets_input.setValue(0)
+        self.minkowski_target_sheets_input = make_int_spinbox(0, 0, 100)
         self.minkowski_target_sheets_input.setSpecialValueText("Off")
         self.minkowski_target_sheets_input.setToolTip(
             "Stop the run as soon as one layout places every part on this "
@@ -338,17 +333,16 @@ class NestingPanel(QtWidgets.QWidget):
             "Only affects GA runs (population/generations > 1)."
         )
 
-        self.candidate_geometry_cache_checkbox = QtWidgets.QCheckBox("Candidate Geometry Cache")
-        self.candidate_geometry_cache_checkbox.setChecked(_DEFAULTS["candidate_geometry_cache"])
+        self.candidate_geometry_cache_checkbox = make_checkbox(
+            "Candidate Geometry Cache",
+            checked=_DEFAULTS["candidate_geometry_cache"])
         self.candidate_geometry_cache_checkbox.setToolTip(
             "Caches translated candidate polygons within one nesting run. "
             "Collision and validity checks are still performed for every candidate."
         )
 
-        self.minkowski_compactness_input = QtWidgets.QDoubleSpinBox()
-        self.minkowski_compactness_input.setRange(0.0, 10.0)
-        self.minkowski_compactness_input.setSingleStep(0.1)
-        self.minkowski_compactness_input.setValue(0.0)
+        self.minkowski_compactness_input = make_double_spinbox(
+            0.0, 0.0, 10.0, step=0.1)
         self.minkowski_compactness_input.setToolTip(
             "Weight of the compactness fitness term (0 = off).\n"
             "Rewards GA layouts that leave one large contiguous open area on "
@@ -390,9 +384,7 @@ class NestingPanel(QtWidgets.QWidget):
             "are unchanged before keeping the change."
         )
 
-        self.minkowski_rotation_workers_input = QtWidgets.QSpinBox()
-        self.minkowski_rotation_workers_input.setRange(0, 64)
-        self.minkowski_rotation_workers_input.setValue(0)
+        self.minkowski_rotation_workers_input = make_int_spinbox(0, 0, 64)
         self.minkowski_rotation_workers_input.setSpecialValueText("Auto")
         self.minkowski_rotation_workers_input.setToolTip(
             "How many rotations are checked at the same time.\n\n"
@@ -459,7 +451,7 @@ class NestingPanel(QtWidgets.QWidget):
         direction_grid = QtWidgets.QGridLayout()
         direction_grid.setHorizontalSpacing(_GRID_COLUMN_SPACING)
         direction_grid.setVerticalSpacing(_GRID_ROW_SPACING)
-        direction_grid.setContentsMargins(*_MARGINS_NONE)
+        direction_grid.setContentsMargins(*MARGINS_NONE)
 
         # Column 0 is the whole left side -- the checkbox above, the rotation
         # angle below -- and the dial owns column 1 across both rows. The
@@ -469,7 +461,7 @@ class NestingPanel(QtWidgets.QWidget):
         # underneath the dial, because a slider has a large sizeHint and the
         # grid gives one cell whatever width it asks for.
         rotation_angle_column = QtWidgets.QVBoxLayout()
-        rotation_angle_column.setContentsMargins(*_MARGINS_NONE)
+        rotation_angle_column.setContentsMargins(*MARGINS_NONE)
         rotation_angle_column.setSpacing(2)
         rotation_angle_label = QtWidgets.QLabel("Rotation Angle:")
         rotation_angle_label.setAlignment(
@@ -542,7 +534,7 @@ class NestingPanel(QtWidgets.QWidget):
         physics_dial_widget, self.physics_direction_dial, self.physics_direction_label = \
             self._build_direction_control()
 
-        self.physics_random_checkbox = QtWidgets.QCheckBox("Use Random Direction")
+        self.physics_random_checkbox = make_checkbox("Use Random Direction")
         self.physics_random_checkbox.stateChanged.connect(
             lambda state: self._set_direction_control_enabled(
                 not self.physics_random_checkbox.isChecked(),
@@ -551,20 +543,23 @@ class NestingPanel(QtWidgets.QWidget):
         self.physics_step_size_input = LengthField(mm_min=0.1, mm_max=100)
         self.physics_step_size_input.set_mm(_DEFAULTS["physics_step_size"])
         self._length_fields.append(self.physics_step_size_input)
-        self.physics_max_spawn_input = QtWidgets.QSpinBox(); self.physics_max_spawn_input.setRange(1, 1000); self.physics_max_spawn_input.setValue(100)
-        self.physics_max_nesting_steps_input = QtWidgets.QSpinBox(); self.physics_max_nesting_steps_input.setRange(1, 5000); self.physics_max_nesting_steps_input.setValue(500)
+        self.physics_max_spawn_input = make_int_spinbox(100, 1, 1000)
+        self.physics_max_nesting_steps_input = make_int_spinbox(500, 1, 5000)
         
         # Annealing controls
-        self.physics_anneal_steps_input = QtWidgets.QSpinBox(); self.physics_anneal_steps_input.setRange(0, 500); self.physics_anneal_steps_input.setValue(25)
-        self.anneal_rotate_checkbox = QtWidgets.QCheckBox("Anneal Rotate"); self.anneal_rotate_checkbox.setChecked(True)
-        self.anneal_translate_checkbox = QtWidgets.QCheckBox("Anneal Translate"); self.anneal_translate_checkbox.setChecked(True)
-        self.anneal_random_shake_checkbox = QtWidgets.QCheckBox("Random Shake Direction")
+        self.physics_anneal_steps_input = make_int_spinbox(25, 0, 500)
+        self.anneal_rotate_checkbox = make_checkbox(
+            "Anneal Rotate", checked=True)
+        self.anneal_translate_checkbox = make_checkbox(
+            "Anneal Translate", checked=True)
+        self.anneal_random_shake_checkbox = make_checkbox(
+            "Random Shake Direction")
 
-        self.physics_anneal_rot_steps = QtWidgets.QSpinBox(); self.physics_anneal_rot_steps.setRange(0, 500); self.physics_anneal_rot_steps.setValue(10)
+        self.physics_anneal_rot_steps = make_int_spinbox(10, 0, 500)
         self.physics_anneal_rot_curve_type = QtWidgets.QComboBox()
         self.physics_anneal_rot_curve_type.addItems(["Logarithmic", "Linear", "Power 1.5", "Quadratic", "Exponential"])
-        self.physics_anneal_rot_min = QtWidgets.QDoubleSpinBox(); self.physics_anneal_rot_min.setRange(0.0, 360.0); self.physics_anneal_rot_min.setValue(1.0)
-        self.physics_anneal_rot_max = QtWidgets.QDoubleSpinBox(); self.physics_anneal_rot_max.setRange(0.0, 360.0); self.physics_anneal_rot_max.setValue(90.0)
+        self.physics_anneal_rot_min = make_double_spinbox(1.0, 0.0, 360.0)
+        self.physics_anneal_rot_max = make_double_spinbox(90.0, 0.0, 360.0)
         
         self.physics_anneal_curve_type = QtWidgets.QComboBox()
         self.physics_anneal_curve_type.addItems(["Logarithmic", "Linear", "Power 1.5", "Quadratic", "Exponential"])
@@ -576,11 +571,8 @@ class NestingPanel(QtWidgets.QWidget):
         self.physics_anneal_max_amp.set_mm(_DEFAULTS["physics_anneal_max_amp"])
         self._length_fields.append(self.physics_anneal_max_amp)
         
-        self.physics_improvement_threshold_input = QtWidgets.QDoubleSpinBox()
-        self.physics_improvement_threshold_input.setRange(0.000001, 1.0)
-        self.physics_improvement_threshold_input.setValue(0.01)
-        self.physics_improvement_threshold_input.setSingleStep(0.01)
-        self.physics_improvement_threshold_input.setDecimals(6)
+        self.physics_improvement_threshold_input = make_double_spinbox(
+            0.01, 0.000001, 1.0, step=0.01, decimals=6)
         self.physics_improvement_threshold_input.setToolTip("Minimum score improvement required to reset simulation cycle. Prevents infinite loops from noise.")
 
         physics_form_layout.addRow("Gravity Direction:", physics_dial_widget)
@@ -669,8 +661,9 @@ class NestingPanel(QtWidgets.QWidget):
         self.physics_settings_group.setVisible(False)
 
 
-        self.show_bounds_checkbox = QtWidgets.QCheckBox("Show Bounds"); self.show_bounds_checkbox.setChecked(True)
-        self.add_labels_checkbox = QtWidgets.QCheckBox("Add Identifier Labels"); self.add_labels_checkbox.setChecked(_DEFAULTS["add_labels"])
+        self.show_bounds_checkbox = make_checkbox("Show Bounds", checked=True)
+        self.add_labels_checkbox = make_checkbox(
+            "Add Identifier Labels", checked=_DEFAULTS["add_labels"])
         self.label_height_input = LengthField(mm_min=0, mm_max=1000)
         self.label_height_input.set_mm(_DEFAULTS["label_height"])
         self.label_height_input.widget().setToolTip("The height (Z-offset) for the identifier labels.")
@@ -679,13 +672,18 @@ class NestingPanel(QtWidgets.QWidget):
         self.label_size_input.set_mm(_DEFAULTS["label_size"])
         self.label_size_input.widget().setToolTip("The text size for identifier labels.")
         self._length_fields.append(self.label_size_input)
-        self.simulate_nesting_checkbox = QtWidgets.QCheckBox("Simulate Nesting (slower)"); self.simulate_nesting_checkbox.setChecked(_DEFAULTS["simulate_nesting"])
-        self.verbose_logging_checkbox = QtWidgets.QCheckBox("Verbose Logging"); self.verbose_logging_checkbox.setChecked(_DEFAULTS["verbose_logging"])
+        self.simulate_nesting_checkbox = make_checkbox(
+            "Simulate Nesting (slower)",
+            checked=_DEFAULTS["simulate_nesting"])
+        self.verbose_logging_checkbox = make_checkbox(
+            "Verbose Logging", checked=_DEFAULTS["verbose_logging"])
         self.verbose_logging_checkbox.setToolTip("Enables detailed logging of the nesting process in the FreeCAD console.")
-        self.performance_logging_checkbox = QtWidgets.QCheckBox("Performance Logging")
-        self.performance_logging_checkbox.setChecked(_DEFAULTS["performance_logging"])
+        self.performance_logging_checkbox = make_checkbox(
+            "Performance Logging",
+            checked=_DEFAULTS["performance_logging"])
         self.performance_logging_checkbox.setToolTip("Enables performance and timing diagnostics in the FreeCAD console.")
-        self.sound_checkbox = QtWidgets.QCheckBox("Play sound on completion"); self.sound_checkbox.setChecked(True)
+        self.sound_checkbox = make_checkbox(
+            "Play sound on completion", checked=True)
         
         self.nest_button = QtWidgets.QPushButton("Run Nesting")
         self.cancel_button = QtWidgets.QPushButton("Cancel Nesting")

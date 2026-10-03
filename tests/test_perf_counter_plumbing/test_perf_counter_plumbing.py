@@ -557,11 +557,23 @@ class TestPerformanceDialsAreReachable:
                     f"the previous behaviour")
                 written = f'self.{widget}.{accessor}(_DEFAULTS["{key}"])'
             else:
-                written = f"self.{widget}.{accessor}({expected})"
-            assert _flat(written) in _flat(_PANEL_SRC), (
-                f"{widget} is never initialised to {expected} ({written} not "
-                f"found), so leaving the panel alone does not reproduce the "
-                f"previous behaviour")
+                # Any of three spellings sets the same initial value: an
+                # explicit setValue, or a ui_helpers factory whose first
+                # argument is the value. The docstring above says this check is
+                # on the resolved default rather than a spelling, and until the
+                # factories existed there was only one spelling to accept.
+                # Rotating the field to a factory is exactly the kind of change
+                # this test must not fail on.
+                candidates = [
+                    f"self.{widget}.{accessor}({expected})",
+                    f"make_int_spinbox({expected},",
+                    f"make_double_spinbox({expected},",
+                ]
+                flat = _flat(_PANEL_SRC)
+                assert any(_flat(c) in flat for c in candidates), (
+                    f"{widget} is never initialised to {expected} (none of "
+                    f"{candidates} found), so leaving the panel alone does not "
+                    f"reproduce the previous behaviour")
 
     def test_fields_are_in_the_minkowski_group(self):
         """They must land in a Minkowski group, not the Physics one.

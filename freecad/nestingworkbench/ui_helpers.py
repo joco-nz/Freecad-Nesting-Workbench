@@ -4,13 +4,75 @@
 """
 Shared Qt widget helpers for the Nesting Workbench.
 
-Currently one class, `CollapsibleSection`, replacing the
-`QGroupBox` + `_set_group_collapsed` pattern that `ui_nesting.py` used
-inline. The structure is upstream's; the reasoning in the comments is ours,
-because upstream's version solves the same problem without recording why.
+Widget factories, one composite section widget, and dialog helpers.
+
+Why factories rather than inline construction
+----------------------------------------------
+The Nesting panel built ~26 spin boxes and checkboxes by hand, each as
+construction followed by a slightly different pile of `setRange` / `setValue` /
+`setSingleStep` / `setDecimals` / `setToolTip` calls. None of that differs
+enough to justify 26 separate spellings of the same idea, and none of it is
+worth a reader's attention at the call site.
+
+This is a line-count and reuse argument, not a behaviour one: the factories do
+exactly what the inline code did. `LengthField` is deliberately NOT served by
+`make_double_spinbox` -- it is a wrapper that owns a spin box and exposes
+`.widget()`, and routing it through here would put a unit-unaware factory in
+front of the one widget in the panel that knows what a unit is.
 """
 
 from PySide import QtCore, QtWidgets
+
+
+# QFormLayout adds a margin of its own, which stacks with a section's content
+# area frame and indents the controls twice over. The frame is already there;
+# the layout does not need a second one.
+MARGINS_NONE = (0, 0, 0, 0)
+
+
+def make_double_spinbox(value, minimum, maximum, step=None, decimals=None,
+                        suffix="", tooltip=None):
+    """A QDoubleSpinBox with the usual configuration applied.
+
+    Every argument is optional except the range and the initial value, so a
+    caller configures only what it actually means to. Callers that need
+    something this cannot express -- a range that depends on another field, a
+    value read from a setting -- set it afterwards on the returned widget
+    rather than growing a keyword for it.
+    """
+    spin = QtWidgets.QDoubleSpinBox()
+    spin.setRange(minimum, maximum)
+    spin.setValue(value)
+    if step is not None:
+        spin.setSingleStep(step)
+    if decimals is not None:
+        spin.setDecimals(decimals)
+    if suffix:
+        spin.setSuffix(suffix)
+    if tooltip:
+        spin.setToolTip(tooltip)
+    return spin
+
+
+def make_int_spinbox(value, minimum, maximum, step=None, tooltip=None):
+    """A QSpinBox with the usual configuration applied."""
+    spin = QtWidgets.QSpinBox()
+    spin.setRange(minimum, maximum)
+    spin.setValue(value)
+    if step is not None:
+        spin.setSingleStep(step)
+    if tooltip:
+        spin.setToolTip(tooltip)
+    return spin
+
+
+def make_checkbox(text, checked=False, tooltip=None):
+    """A QCheckBox with the usual configuration applied."""
+    box = QtWidgets.QCheckBox(text)
+    box.setChecked(checked)
+    if tooltip:
+        box.setToolTip(tooltip)
+    return box
 
 
 class CollapsibleSection(QtWidgets.QWidget):
