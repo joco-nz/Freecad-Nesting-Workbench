@@ -24,17 +24,20 @@ outermost dressup, and both are covered under `freecadcmd` against real dressup
 modules. Step 8's fixture validates and replays end to end — 7 operations, 7
 dressups, 48 parts, all verified.
 
-The four harness checks, all wired into `run.sh`:
+Four harness checks, three of them wired into `run.sh`:
 
-- `test_replay_flatten.py`: 187 checks — geometry and topology survive
-  flattening, and the full pipeline runs.
-- `test_replay_dressups.py`: 60 checks — a CAM setup built headless from the
+- `test_replay_flatten.py`: 230 checks — geometry and topology survive
+  flattening, and the full pipeline runs. **Wired in.**
+- `test_replay_dressups.py`: 163 checks — a CAM setup built headless from the
   fixture's `SourceShapes`, with a bare operation, a LeadInOut, a Dogbone and a
-  two-deep stack.
-- `test_replay_identity.py`: 39 checks — proves the identity cross-check can
-  fail. Not wired in: it asserts a fixture is wrong, so a gate would report a
+  two-deep stack. **Wired in.**
+- `test_replay_order.py`: 432 checks — operation ordering, including the negative
+  controls that refuse to proceed if the gate is removed. **Wired in.** This is
+  the largest of the four and was missing from this list when it was written.
+- `test_replay_identity.py`: 59 checks — proves the identity cross-check can
+  fail. **Not** wired in: it asserts a fixture is wrong, so a gate would report a
   broken build over a deliberately broken fixture.
-- 429 pytest.
+- 537 pytest.
 
 `Tools/Cam/cam_replay.py` holds two halves:
 
