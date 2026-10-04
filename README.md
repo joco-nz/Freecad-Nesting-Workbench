@@ -30,18 +30,35 @@ everything stays in millimetres regardless of what is displayed.
 *   **Simplify:** Tolerance for reducing determining points on a polygon. Higher values (1.0+) speed up nesting by removing tiny details.
 
 #### Minkowski Nester Settings
-*   **Packing Direction:** Choose the primary direction to gravity-pack parts (Down, Left, Up, Right).
+These live in the panel's `Optimizations` section, except **Nesting Direction** and **Rotation Angle**, which are under `Nesting Settings` below. They are hidden entirely when the `Physics` algorithm is selected.
+
 *   **Use Random Direction:** If checked, randomizes placement heuristics for potentially better (or worse) results.
 *   **Clear NFP Cache:** Forces recalculation of No-Fit Polygons. Useful if you suspect caching issues, but slower.
 *   **Candidate Step:** Spacing between candidate positions when sampling a No-Fit Polygon. The main control over run time.
 *   **Rotation Threads:** How many candidate rotations are checked concurrently. `Auto` uses one per CPU core.
 *   **Generations / Population Size:** Settings for the Genetic Algorithm optimizer. Both default to 1, which is a single pass with no search. Crossover only begins at a population of 3 — below that the loop carries the best layout forward plus one random layout, and never combines genes. Both values are remembered between sessions.
+*   **Stop At Sheets:** Stop the run as soon as everything fits on this many sheets, with nothing left over. `0` (the default) turns it off and the run continues on its own rules. A run that reaches the target stops on that layout and is reported as a success, not a cancellation, so the fill phase and the completion message still run. A target that is never reached is reported as such when the run finishes, rather than being silently ignored. Deliberately not remembered between sessions, so a target set for one run cannot silently apply to the next.
+
+#### Panel Sections
+The panel is five collapsible sections. Click a title to expand or collapse it; three start collapsed and two start open.
+
+| section | starts | holds |
+|---|---|---|
+| `Nesting Settings` | collapsed | the direction dial, **Use Random Direction**, **Rotation Angle** |
+| `Optimizations` | open | **Generations**, **Population Size**, **Stop At Sheets**, **Candidate Step**, **Rotation Threads**, **Compactness**, and the candidate-geometry and NFP-cache switches |
+| `Physics Nesting Settings` | open | the Physics nester's dials — gravity direction, step size, spawn and nesting-step limits, rotation and anneal curve settings, and its own random-direction and shake options |
+| `Helpers` | collapsed | identifier labels, font, label size and height, simulate/show-bounds/sound switches |
+| `Logging` | collapsed | the verbose and performance switches |
+
+The first three follow the selected algorithm: switching to `Physics` hides `Nesting Settings` and `Optimizations` and shows `Physics Nesting Settings` instead, and switching back restores them. `Helpers` and `Logging` are always present, because their controls apply to whichever algorithm is running.
+
+Collapsing a section hides its contents rather than disabling them, so a control inside a collapsed section still contributes to a run exactly as it would when open.
 
 #### Helpers and Logging
 Diagnostic controls, collapsed by default to keep the panel short. The `Helpers` group holds the identifier font, label size and height, and the simulate/show-bounds/sound switches; `Logging` holds the verbose and performance switches.
 
 #### Nesting Settings
-Collapsed by default, along with `Helpers` and `Logging`. Click a group title to expand it.
+Collapsed by default, and hidden when the `Physics` algorithm is selected. Click a group title to expand it — see **Panel Sections** above for all five.
 
 *   **Nesting Direction:** The direction the nester searches from. The dial steps in 15° increments; the readout below it gives the direction the run will actually use, which is not the same as the dial's angle. All four cardinals are reachable. Remembered between sessions, as is the **Use Random Direction** checkbox.
 *   **Rotation Angle:** How many orientations of each part the nester may try.
