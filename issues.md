@@ -61,8 +61,34 @@ the symbol when you edit the entry.
 | [NEST-006](#nest-006) | Deflection tooltip states unmeasured ranges | open | low | docs |
 | [NEST-007](#nest-007) | Nesting converts analytic source geometry to B-splines to centre it | open | medium | geometry |
 | [NEST-008](#nest-008) | Hole-nesting detection costs 148 ms per part on real geometry | open | medium | performance |
+| [NEST-009](#nest-009) | a replayed Boundary dressup clips against the SOURCE job's stock | open | high | CAM replay |
+| [NEST-010](#nest-010) | the flattened parts could not be removed: the job's clones were links | resolved | medium | CAM replay |
+| [NEST-011](#nest-011) | two toolbar buttons had the same icon | resolved | low | UI |
+| [NEST-012](#nest-012) | the replay took 43 seconds | resolved | medium | performance |
+| [NEST-013](#nest-013) | FreeCAD's Profile is superlinear in its number of base targets | open | medium | performance |
+| [NEST-014](#nest-014) | a compensated profile of a face at the stock top collapses to a line | open | high | geometry |
+| [NEST-015](#nest-015) | hole-nesting reordering left every dressup unlisted | resolved | high | CAM replay |
+| [NEST-016](#nest-016) | position ordering put each spacer's boundary before its own holes | resolved | medium | CAM replay |
+| [NEST-017](#nest-017) | the per-stage timing table was missing the largest cost, and 60% of the run | resolved | medium | diagnostics |
+| [NEST-018](#nest-018) | Tasks panel progress, and cancellation did not exist | resolved | medium | UI |
+| [NEST-019](#nest-019) | the Tasks panel never appeared, and cancelling never worked | open | medium | UI |
+| [NEST-020](#nest-020) | the default 5 mm endmill was present for the whole replay | resolved | medium | CAM replay |
+| [NEST-021](#nest-021) | the Draft `ReferenceError` flood | resolved | low | diagnostics |
 | [NEST-022](#nest-022) | Logging is 230 ad-hoc call sites and 165 exception handlers that record nothing | open | medium | diagnostics |
 | [NEST-023](#nest-023) | "Stop At Sheets" was a dead control: read by nobody, never reached the engine | resolved | high | UI wiring |
+
+Statuses for NEST-009 through NEST-021 were derived from each entry's own
+prose, cross-checked where a later entry supersedes an earlier one: NEST-018's
+"Still to verify" is closed by the GUI verification recorded in NEST-020, and
+NEST-015 is fixed by `ReplayResult.entry_of`. Two of those entries carried no
+status field at all before this pass, which is why thirteen of them were
+missing from this table.
+
+**NEST-012 appears twice.** The entry marked *superseded draft* is the pre-fix
+investigation; the one this table links to records the same investigation after
+the fix. Both are kept because the draft holds a per-stage event-count table and
+a note on why `Document.recompute` can only be timed by subtraction, neither of
+which the later entry repeats. **They should be merged** -- see the task list.
 
 ---
 
@@ -365,6 +391,8 @@ simply not been built.
 
 ## NEST-009 — a replayed Boundary dressup clips against the SOURCE job's stock
 
+`status: open` · `severity: high` · `area: CAM replay`
+
 Found by extending `test_replay_dressups.py` to a three-deep stack
 (LeadInOut -> Dogbone -> Boundary), the shape FreeCAD's own `dressuptest.FCStd`
 uses. It is a defect, not a limitation, and it is **not fixed** — the two
@@ -418,6 +446,8 @@ constructor's own `CreateFromBase` stock clips the contour away entirely,
 because that stock is barely larger than the part.
 
 ## NEST-010 — the flattened parts could not be removed: the job's clones were links
+
+`status: resolved` · `severity: medium` · `area: CAM replay`
 
 **RESOLVED.** The link was the whole problem, and it was removable.
 
@@ -505,6 +535,8 @@ object`. Only asking the document for its live object names works.
 
 ## NEST-011 — two toolbar buttons had the same icon
 
+`status: resolved` · `severity: low` · `area: UI`
+
 `command_create_cam_job.py` and `command_replay_cam.py` both declared
 `Nesting_CNC_Icon.svg`, and the two commands are adjacent in both the menu and
 the toolbar (`init_gui.py:52-53`). Six distinct icons for seven commands.
@@ -555,7 +587,16 @@ so the real toolbar looks softer than the nearest-neighbour previews, and a
 disabled command desaturates the icon, which is worth knowing about for a
 palette carrying a saturated green and yellow. Both read correctly.
 
-## NEST-012 — the replay takes 43 seconds, and 42 of them are the ordering step
+## NEST-012 — the replay takes 43 seconds, and 42 of them are the ordering step (superseded draft)
+
+`status: superseded` · `severity: medium` · `area: performance`
+
+**Superseded by the second NEST-012 below**, which records the same
+investigation after the fix and is the entry to read. This one is the
+pre-fix draft and is kept only because its per-stage event counts and its
+note on why the recompute can only be timed by subtraction are not
+repeated there. They should be merged; see the note under the Summary
+table.
 
 Raised as "the command has no progress feedback while it works". Investigating
 that found a much better answer.
@@ -610,6 +651,8 @@ The work worth doing is in `find_hole_nestings` and in not recomputing when
 `order_operations` changed nothing.
 
 ## NEST-012 — the replay took 43 seconds
+
+`status: resolved` · `severity: medium` · `area: performance`
 
 Raised as "the command has no progress feedback while it works". Two thirds of
 the time turned out to be doing the same work twice.
@@ -671,6 +714,8 @@ to the operation beneath it. Both the profiles and the dressups are touched, and
 the profiles are where the 24 s goes.
 
 ## NEST-013 — FreeCAD's Profile is superlinear in its number of base targets
+
+`status: open` · `severity: medium` · `area: performance`
 
 Raised as "the remaining 24 s of toolpath computation might be the replay making
 FreeCAD's work harder". It is not, and there is a 15x win available that costs
@@ -764,6 +809,8 @@ choice, offered as an option, rather than done silently.
 
 ## NEST-014 — a compensated profile of a face at the stock top collapses to a line
 
+`status: open` · `severity: high` · `area: geometry`
+
 Found by the per-part split, and **not caused by it**. Recorded because the
 split turned an invisible defect into a visible one, which is how it was found.
 
@@ -801,6 +848,8 @@ root-causing the projection, which needs a fixture whose top face is *not* on
 the stock top, to tell "Z frame" apart from "face on the stock top".
 
 ## NEST-015 — hole-nesting reordering left every dressup unlisted
+
+`status: resolved` · `severity: high` · `area: CAM replay`
 
 **Pre-existing. Found while starting the position-ordering work (Q3), which is
 blocked until it is fixed.**
@@ -848,6 +897,8 @@ entry is its dressup" was verified in three places, all of which exercised a
 path that never writes. The bug lived in the one path that does.
 
 ## NEST-016 — position ordering put each spacer's boundary before its own holes
+
+`status: resolved` · `severity: medium` · `area: CAM replay`
 
 **Found by measuring the ordering on the committed fixture, not by reading the
 code. Both fixes below were wrong on the first attempt and the measurement is
@@ -949,6 +1000,8 @@ are contiguous. Both fixes were proved to bite by reverting each in turn.
 
 ## NEST-017 — the per-stage timing table was missing the largest cost, and 60% of the run
 
+`status: resolved` · `severity: medium` · `area: diagnostics`
+
 **Found while adding per-stage timings to the command's report. The timing table
 that had been finding the expensive stages was itself wrong by more than half
 the run.**
@@ -1022,6 +1075,8 @@ worse.
 
 ## NEST-018 — Tasks panel progress, and cancellation did not exist
 
+`status: resolved` · `severity: medium` · `area: UI`
+
 The `Progress` seam had a callback and no consumer. Worse, it had no notion of
 being stopped at all: **a Cancel button would have been a control that did
 nothing.** Cancelling is an engine feature and the engine did not have one.
@@ -1089,6 +1144,8 @@ The panel has not been seen in a running FreeCAD. `ReplayProgressView` is tested
 and the engine paths are tested against real FreeCAD objects; the Qt half is not.
 
 ## NEST-019 — the Tasks panel never appeared, and cancelling never worked
+
+`status: open` · `severity: medium` · `area: UI`
 
 **All three bugs found by the user running it, from the console log. None of
 them was visible to any test in this repository, because all three are Qt.**
@@ -1160,6 +1217,8 @@ attribute 'Label' of deleted object` — which is the next issue, and *was* ours
 
 ## NEST-020 — the default 5 mm endmill was present for the whole replay
 
+`status: resolved` · `severity: medium` · `area: CAM replay`
+
 Reported by the user: the new job still carried the `TC: 5mm Endmill` controller
 and the SetupSheet's tool dialog kept triggering.
 
@@ -1218,6 +1277,8 @@ Both would have caught the `setRange` and property bugs. They are probes rather
 than gate tests because they need a display.
 
 ## NEST-021 — the Draft `ReferenceError` flood (resolved)
+
+`status: resolved` · `severity: low` · `area: diagnostics`
 
 **The user reported it as an unusable error popup. It was resolved, and the
 count matches their log exactly: 96 before, 0 after.**
@@ -1397,7 +1458,7 @@ consequences worth keeping:
 
 ## NEST-023 — "Stop At Sheets" was a dead control (resolved)
 
-**`status: resolved`** · `severity: high` · `area: UI wiring`
+`status: resolved` · `severity: high` · `area: UI wiring`
 
 Reported as "the early-finish flag does not seem to be working". It was not
 working at all: the dial was read by nobody, so the feature was permanently off
