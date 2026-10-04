@@ -44,7 +44,135 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   dial spanning both rows on the right and the checkbox and rotation angle
   stacked to its left.
 
+
+#### Replay CAM Setup
+
+A new command, beside `Create CAM Job`. Select a CAM job and the nesting workbench
+carries **your** setup across to the nested copies: your Profile and Drilling
+operations, your LeadInOut and other dressups, your per-feature settings, in your
+order. It classifies nothing -- which features belong in which operation was
+already decided by you, in the CAM workbench, before nesting ran. Everything else
+(parts, operations, order) comes from your job and the layout, so the dialog only
+asks what the job cannot say. One job per sheet, every sheet replayed.
+
+- The reader walks the job the way a user builds one. It reads through the
+  dressup stack to the operation underneath -- a dressed operation is not *in*
+  `Operations`, it is reached through its dressup's link -- so a job whose every
+  operation is dressed up reads correctly rather than appearing empty.
+- Nested parts are flattened to top-level objects first. CAM cannot see a part's
+  placement while it sits inside an `App::Part`: an operation pointing at a child
+  inside one produced a toolpath at the child's local coordinates, `[-22.5, 22.5]`
+  where the container placement put it at `~[118, 160]`. The transform is a
+  `Placement`, never `transformGeometry`.
+- The new job is built with the sheet as its stock, so depths re-derive against
+  the sheet rather than the source part's stock box.
+- Operations are ordered so a nested part is cut before the hole holding it --
+  the one ordering exception, and a physical one: the inner part is held only by
+  the ring of material around it, so cutting the hole first drops it.
+- The result is **verified**: an operation whose base selection resolves to
+  nothing computes three commands, raises nothing, and would otherwise post
+  plausible G-code that removes less material than intended. Checks are reported
+  at two severities by the quality of the evidence.
+- The flattened parts are the job's geometry rather than clones of it. A `Clone`
+  is a link, so the flattened parts had to outlive the job -- which is why they
+  could never be removed and every sheet left a 48-object group at the document
+  root.
+- `Replay CAM Setup` has its own icon (`Nesting_Replay_Icon.svg`), matching the
+  house style: 1448 rectangles, one `<path>` per colour, no curves or strokes.
+
+#### Other additions
+
+- All five panel headings are now collapsible sections: `Nesting Settings`,
+  `Optimizations`, `Physics Nesting Settings`, `Helpers` and `Logging`. The three
+  diagnostic and set-and-forget groups start collapsed; `Optimizations` and
+  `Physics Nesting Settings` start open, because they were plain group boxes
+  before and making them collapsible must not also tuck them away.
+  The first three follow the selected algorithm -- switching to `Physics` swaps
+  `Nesting Settings` and `Optimizations` for `Physics Nesting Settings`. `Helpers`
+  and `Logging` always apply, so they are never hidden.
+  Collapsing **hides** contents rather than disabling them: a checkable
+  `QGroupBox` only greys its children out and reclaims no space, and disabling
+  them would silently change what a run uses. `probe_unit_panel.py` pins both
+  halves -- children stay hidden, and the run params still see through it.
+- A Tasks panel for a replay, with a working **Cancel**. Cancelling is an engine
+  feature, so the engine got one; the button would otherwise have been a control
+  that did nothing. The panel shows no overall percentage, because there is no
+  honest one -- ordering is 35% of the run and the rest is a handful of events.
+- Per-stage timings in the replay's report. The figures that took this feature
+  from 43.5s to 10.6s had all come out of the fixture validator, which a user
+  never runs.
+
+
+### Changed
+
+- A replayed source step is now cut **once per target part** rather than once over
+  all of them. FreeCAD's Profile is superlinear in the number of Base entries it
+  holds, so a single 23-target operation was paying for 23 targets and achieving
+  one. Each part keeps the source operation's whole selection, so the user's
+  per-part recipe is reproduced intact; what is multiplied is how many times,
+  which is the one thing a single-part source job could not express an opinion
+  about.
+- Replayed operations are ordered by **where the parts sit**, nearest-neighbour
+  from the sheet origin, instead of by source step. One-operation-per-part made
+  the list 98 entries long, still grouped by source step, so a part's two steps
+  sat 23 entries apart and the torch crossed the sheet between them. Within a
+  part, source order is a hard constraint rather than a tie-break preference --
+  hole nesting holds a spacer's hole steps back until the nested parts are
+  finished.
+- Simulate mode now shares master shapes across layouts, as headless mode already
+  did. Previously the pool was written and read unconditionally, so in Simulate
+  mode -- which builds every layout for real -- layouts 2..N found their
+  predecessors' masters and silently took the headless path.
+- A rotation-pool width of `0` now means no pool, so serial evaluation can be
+  measured rather than argued about.
+
+
+### Performance
+
+- Simulate's trial repaints are coalesced onto the placement pump instead of
+  repainting the whole sheet once per trial layout. Measured on the Simulate
+  drawing path: **150.60s -> 127.90s**, a 22.7s / 15.1% saving, with an identical
+  result (6 sheets, 18 placed, 0.35397) and every placement still drawn. The
+  animations were checked by eye, since the saving is in frames a counter does
+  not see.
+- A replay of the committed fixture went **43.5s -> 27.5s -> 10.6s** across two
+  changes: caching the footprint slices that were being recomputed for shapes
+  already in hand (21 calls over 3 distinct shapes, 11.40s of an 11.71s stage),
+  and the per-target-part split above. 98 operations, all 98 with cutting motion,
+  0 failures. (A later measurement of the same run reads 10.7s; the box is four
+  CPUs and these figures move by a few tenths between runs.)
+
 ### Fixed
+
+- **"Stop At Sheets" did nothing at all.** The dial was read by nobody:
+  `_collect_ui_params` never read the spinbox and `_prepare_algo_kwargs` never
+  set `algo_kwargs['target_sheets']`, so `GACoordinator` was handed no target,
+  defaulted it to 0, and every run went to completion -- silently, with no error,
+  warning or log line. The engine was never wrong; only the wiring was, and every
+  test covering the target passed it in directly and so bypassed the panel. Two
+  lines of fix. Guarded end to end by `probe_target_sheets.py`, which drives a
+  real GA run from panel-derived kwargs.
+- Hole-nesting reordering replaced **every dressup** in the job with a bare
+  operation. `order_operations` was handed the base operations and wrote that list
+  straight into `Operations.Group`, which is supposed to hold the outermost
+  dressup. All 105 dressups were built, linked and never listed, so the user's
+  LeadInOut radii silently vanished from the toolpath -- while every structural
+  check still passed, because the checks were looking at the base operations that
+  *were* listed. Fixed with `ReplayResult.entry_of`.
+- The Tasks panel never appeared, cancelling never worked, and the default
+  `TC: 5mm Endmill` controller was present for the whole replay.
+- The Tasks panel had no content, because the method was called `open`.
+- 96 Draft `ReferenceError`s and an error popup, on every replay. Draft's
+  `make_clone` defers `format_object` by one event-loop turn and guards it with
+  `if not target: return`, which does not cover a *deleted* object.
+- Cancel deleted a replayed operation. The flattened parts are the job's geometry
+  and must stay.
+- A replayed job copied four named settings rather than every setting the source
+  job carried.
+- The replayed job and its operations had no view provider, and the failure was
+  silent -- the tree rendered flat, the Machine was lost, and the dialog was
+  inventing the post.
+
 - A document switch while the panel is open no longer leaves it resolving
   against the previous document, which could nest one document's shapes into
   another. The fields also re-render for the newly active document, and a
