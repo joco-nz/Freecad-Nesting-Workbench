@@ -47,10 +47,11 @@ tests/freecad_harness/.last_status_panel
 tests/freecad_harness/.last_status_units
 tests/freecad_harness/.last_status_unit_panel
 tests/freecad_harness/.last_status_bench_cache
-tests/freecad_harness/.last_status_bench_cache
 tests/freecad_harness/.last_status_replay
 tests/freecad_harness/.last_status_dressup
+tests/freecad_harness/.last_status_order
 tests/freecad_harness/.last_status_identity
+tests/freecad_harness/.last_status_startpoint
 
 opencode.json
 
