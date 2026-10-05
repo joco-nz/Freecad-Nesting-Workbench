@@ -76,6 +76,7 @@ the symbol when you edit the entry.
 | [NEST-021](#nest-021) | the Draft `ReferenceError` flood | resolved | low | diagnostics |
 | [NEST-022](#nest-022) | Logging is 230 ad-hoc call sites and 165 exception handlers that record nothing | open | medium | diagnostics |
 | [NEST-023](#nest-023) | "Stop At Sheets" was a dead control: read by nobody, never reached the engine | resolved | high | UI wiring |
+| [NEST-024](#nest-024) | the replay did not carry a Profile's StartPoint onto the nested copy | resolved | medium | CAM replay |
 
 Statuses for NEST-009 through NEST-021 were derived from each entry's own
 prose, cross-checked where a later entry supersedes an earlier one: NEST-018's
@@ -1551,3 +1552,290 @@ trap for any future probe or headless caller. Pass a null or console sink, as
     # and confirm the guard bites
     git stash push freecad/nestingworkbench/Tools/Nesting/nesting_controller.py
     # -> 8/13, exit 1; then git stash pop
+
+---
+
+## NEST-024 — the replay did not carry a Profile's StartPoint onto the nested copy
+
+`status: resolved` · `severity: medium` · `area: CAM replay`
+
+A user sets `StartPoint` on a Profile in the CAM workbench, before nesting runs —
+that is the premise `cam_replay` exists on (module docstring). The nesting
+workbench then moves the part. The point that says *where on the contour the feed
+starts* does not move with it.
+
+### The break, in four links
+
+| link | state |
+|---|---|
+| `Path/Op/Gui/PathShape.py:113-125` — `StartPoint`, `App::PropertyVectorDistance`, absolute | exists on every operation (`Path/Op/Base.py:412`, via the `opFeatures` default at `:625-633`) |
+| `Path/Op/Area.py:282-283` and `:378-379` — `pathParams["start"] = obj.StartPoint` | honoured exactly |
+| `cam_replay.capture_properties` (`:863`) | captures it verbatim — it is an `App::Property*` and not in `NON_REPLAYABLE_PROPERTIES` (`:799`, which is only `Base`, `Path`, `Proxy`, `ExpressionEngine`, `Label`, `Label2`, `Visibility`) |
+| `cam_replay.apply_properties` (`:2583-2593`) | assigns it verbatim; the only `remap` built is `{"ToolController": …}` (`:2733-2736`) |
+
+Meanwhile the geometry it names **is** moved: `flatten_container` (`:1240`) applies
+`combined_placement(container, part)` (`:1178`, position *and* rotation), then a Z
+normalisation, then `translate_to_sheet_local` (`:446`) shifts by the sheet origin.
+
+Structurally this is NEST-009 — a link carried across a job boundary without
+remapping — except that `Stock` at least got a warning, and this gets nothing.
+
+### Measured
+
+`tests/freecad_harness/test_replay_startpoint.py`, 27 checks. Source plate at
+`(35, -12)` yaw 15, top face Z 0, start point a vertex of the top face's outer
+wire. Two nested copies, so both a pure translation and a rotation are covered.
+
+| | copy 1 (container `(140, 110)` yaw 0, child yaw 12) | copy 2 (container `(430, 260)` yaw 37) |
+|---|---:|---:|
+| source `StartPoint` | `(0.8458, -0.4461, 0)` | same |
+| distance from its **own** contour | 0.000000 mm | 0.000000 mm |
+| where it should land | `(106.497, 123.326, …)` | `(394.005, 257.918, …)` |
+| distance from **that** contour | 0.000000 mm | 0.000000 mm |
+| where it actually lands | `(0.8458, -0.4461, 0)` | `(0.8458, -0.4461, 0)` |
+| distance from **that** contour | **141.963 mm** | **470.453 mm** |
+| error | **162.7319 mm** | **470.4529 mm** |
+
+`UseStartPoint` survives correctly — it is a bool, and a bool needs no frame. Only
+the point is lost.
+
+### Two symptoms, and only one is reliably visible
+
+**The rapid is always wrong.** The stale coordinate goes into the toolpath
+verbatim, ahead of the real positioning move. Stock measures X 0..700, Y 0..400,
+so `Y -0.446` is **off the sheet**:
+```
+replayed copy 1                  after the transform is applied
+  G0 [ Z:5 ]                       G0 [ Z:5 ]
+  G0 [ X:0.846 Y:-0.446 ]  <- off  G0 [ X:106.497 Y:123.326 ]
+  G0 [ X:114.814 Y:84.200 ]        G0 [ Z:3 ]
+  G0 [ X:114.814 Y:84.2 Z:3 ]      G1 [ X:106.497 Y:123.326 … ]
+  G1 [ X:114.814 Y:84.2 … ]        G1 [ … ]
+  …                                …
+                                 12 commands
+```
+
+The tool is told to rapid somewhere with no material under it, then told to rapid
+again to where it was always going. 13 commands become 12.
+
+**The contour start vertex is wrong only sometimes.** The stale point selects the
+*nearest point on the wire*, so on a symmetric outline it can hit the intended
+vertex by accident:
+
+```
+copy 1  began (114.814, 84.200), should be (106.497, 123.326)   40.0000 mm
+copy 2  began (394.005, 257.918), should be (394.005, 257.918)    0.0000 mm  <- coincidence
+```
+
+Copy 2 is a rectangle, and a rectangle's four corners are interchangeable under
+its own symmetry. **This is why the harness asserts on the property and reports
+the toolpath**: a test keyed on the toolpath would pass on copy 2 for the wrong
+reason, and would be right by luck on any symmetric part.
+
+### Nothing warns
+
+`verify_replay` on the same run: 2 operations checked, 0 failures, 2 warnings,
+`ok=True`. Both warnings are the stock Z frame. Neither mentions the start point,
+and the replay's own warning list is empty.
+
+### The fix, and what is already established
+
+The rigid motion from the source job's geometry frame to a nested copy's is
+
+    clone.Shape.Placement * inverse(source_entry.Shape.Placement)
+
+because `flatten_container` folds the container placement, the part's own
+placement, the Z normalisation and the sheet-origin shift into the flattened
+object's placement, and a nested copy is the same underlying geometry rigidly
+moved (module docstring constraints 5 and 6).
+
+**`Shape.Placement`, not `Placement`.** `PathJob.Create` puts a
+`draftobjects.clone.Clone` in the Model, and Draft's Clone restores
+`obj.Placement` *after* assigning a Shape that already carries the original's
+placement (`draftobjects/clone.py:122-148`), so the two are not guaranteed to
+agree.
+
+Measured, not assumed:
+
+* every factor of that transform is non-identity in the harness fixture, so it
+  cannot be right by accident — a transform missing the source-side inverse fails
+  six checks;
+* applying it to the replayed operation puts the start point **0.000000 mm** from
+  the part and makes the toolpath begin exactly where the source's did, with the
+  off-sheet rapid gone and one command fewer.
+
+**Measured on an uncompensated profile, and the choice matters.** With
+`UseComp = False` the source operation's first cutting move *is* the StartPoint,
+so "the transform is right" is an exact statement. With `UseComp = True` the cut
+runs on the offset wire and the first cutting move is the nearest point on the
+**offset**, not the StartPoint:
+
+    UseComp=False   first cutting move (0.8458, -0.4461)  == StartPoint
+    UseComp=True    first cutting move (-1.5690, -1.0931)  1.91 mm off it
+
+1.91 mm is the default 5 mm endmill's radius projected onto the corner. The
+*selection* is identical either way — both arms replay with the same defect and
+the same ~470 mm error — but a fix verified against a compensated arm has to
+compare against the offset contour, not the raw one. NEST-014 also lives on that
+arm: a compensated profile of a face exactly on the stock top collapses to a line.
+
+### Resolved
+
+`status: resolved` · fixed in `cam_replay.py`: `GEOMETRY_FRAME_POINTS`,
+`GEOMETRY_FRAME_POINT_FLAGS`, `geometry_frame_point_in_use`,
+`source_to_clone_placement`, `carried_geometry_frame_points`,
+`unmapped_geometry_frame_points`, `point_outside_targets`, plus pass one of
+`replay_recipe` and one warning in `verify_replay`. Gated by
+`tests/freecad_harness/test_replay_startpoint.py`, 58 checks.
+
+Each of the six decisions above, and how it was settled:
+
+**1. Where the transform comes from.** `base_value` now holds
+`(clone, subs, geometry)` triples instead of `(clone, subs)` pairs, so each split
+copy knows the one source object it came from.
+
+That change broke the whole-step path, which assigned `base_value` straight to
+`Base` and then failed with
+
+    Could not set Base on 'Profile_replay': Expects sequence of items of type
+    DocObj, (DocObj,SubName), or (DocObj, (SubName,...))
+
+The whole unit rebuilds its `Base` as pairs. Caught by the new harness's unsplit
+check; without it this would have shipped as "no Boundary step produces any
+operations".
+
+**2. `remap` is per unit now.** The tool controller is still hoisted and shared
+across a step's copies -- it does not depend on which part a copy targets. The
+point remap is added per unit into a copy of that dict.
+
+**3. No single transform -> reported, not guessed.** `unmapped_geometry_frame_points`
+names the points a step reads; when no unit resolves to one source object the
+replay warns, once per step:
+
+    Operation 'Profile' reads StartPoint, but it was left whole over 3 part(s),
+    so no single transform applies and was left in the source job's frame.
+    Check the toolpath before running it. See issues.md NEST-024.
+
+The value is left verbatim, as NEST-009 leaves `Stock`. `verify_replay` says so
+independently, so the report does not depend on anyone reading it.
+
+**4. Gated on CAM's own flag, read not inferred.** `geometry_frame_point_in_use`
+asks `UseStartPoint` where the operation has it and `SortingMode` where it does
+not, because the flags are not uniform. Measured by creating one operation of
+each kind:
+
+    op           StartPoint  UseStartPoint  EndPoint  UseEndPoint  SortingMode
+    Profile      yes         False           --        --            Automatic
+    PocketShape  yes         False           --        --            Automatic
+    Slot         yes         False           --        --            --
+    Waterline    yes         False           --        --            --
+    Surface      yes         False           --        --            --
+    Engrave      yes         -- (absent)     yes      False         Automatic
+    Drilling     yes         -- (absent)     yes      False         Automatic
+    Helix        yes         -- (absent)     yes      False         Automatic
+    Adaptive     -- (absent) --              --       --            --
+
+**Without the gate this would be 97 false alarms** on the committed fixture, which
+is 98 operations of which exactly one has `UseStartPoint` True.
+
+`Helix` carries `StartPoint`/`EndPoint` too and they are *not* part-frame values
+-- they place the helix in machine coordinates, and a Helix belongs to the tool,
+not to a part. **No per-operation exception is needed**, because a Helix names no
+part geometry, so no unit ever resolves it to a source object and the transform is
+never formed. `Surface` is left to the same rule rather than special-cased.
+
+**5. Z: XY rides the rigid motion, Z does not.** I first implemented a plain rigid
+motion on the whole vector, on the grounds that a start point is a point in the
+geometry's frame so the whole vector should move. **That was wrong, and the
+committed fixture said so.**
+
+A `StartPoint`'s Z is a *derived* value, not an authored coordinate:
+`CommandSetStartPoint` writes `obj.StartPoint.z = obj.ClearanceHeight.Value`
+(`Path/Op/Gui/Base.py:1716-1719`). On the fixture, `Profile005` has
+`StartPoint.z = 5.000` and `ClearanceHeight = 5.000` -- the same number. So
+riding Z moved a derived value into a frame it was never authored in:
+
+    Z ridden rigidly   StartPoint.z 5.000 -> 6.000, Z levels [0, 3, 5, **6**]
+    Z from ClearanceHeight             StartPoint.z = 5.000, Z levels [0, 3, 5]
+
+The 6.000 is a millimetre above the operation's own clearance height and it
+**reaches the toolpath**. Z is emitted whenever it exceeds the operation's
+heights -- on that same operation, z of 0, 3 and 5 leave the levels at `[0, 3, 5]`
+while z of 6 and z of 40 each add one.
+
+And Z has no say in where the cut begins, which is the only thing the point is
+for: same operation, same XY, z swept 0 -> 40, the first cutting move is
+`(42.6, 166.408)` every time. `Path.fromShapes` uses the XY to pick the point on
+the wire.
+
+So the Z is taken from the target operation's own `ClearanceHeight` -- the rule
+the GUI itself writes, so a job set up in the CAM workbench round-trips unchanged
+-- and the transform's Z is the fallback for an operation with no
+`ClearanceHeight`. The source/replay Z-frame disagreement is reported by
+`compare_stock_frames`, which is where it belongs rather than patched here.
+
+**6. The verification check is a bounding box, not a distance.** Measured on the
+committed fixture's 48 parts (1567 edges, 613 faces):
+
+    Shape.distToShape   5.59 ms per part on the contour, 9.62 ms off it
+                        -> 548-943 ms across the fixture's 98 operations
+    bounding box        0.31 ms per part -> 31 ms across the same 98
+
+The precise version costs **5-9% of a 10.5 s replay, on every replay**, to answer
+a question a box answers exactly as well: on that fixture a carried point is
+inside 48 of 48 boxes and a stale one inside 0 of 48. Reuses
+`COVERAGE_MARGIN_MM = 2.0` rather than inventing a threshold, for the same reason
+`uncovered_targets` uses it. It warns rather than fails -- the cut still happens,
+from the wrong vertex, and only the user can say whether that matters for their
+part.
+
+### Effect on the committed fixture, measured
+
+`Profile005` is the one operation there with a real user-set start point, and it
+**was** being carried wrongly. Before and after, same document, same replay:
+
+| | copy 1 | copy 2 |
+|---|---|---|
+| `StartPoint` before | `(164.408, 209.573, 5.0)` | `(164.408, 209.573, 5.0)` |
+| `StartPoint` after | `(44.449, 166.408, 5.0)` | `(555.551, 52.592, 5.0)` |
+| first cutting move before | `(164.408, 183.9)` | `(386.116, 184.722)` |
+| first cutting move after | `(42.6, 166.408)` | `(557.4, 52.592)` |
+| path bounds max-Y before | **209.573** | **209.573** |
+| path bounds max-Y after | 186.369 | 186.368 |
+
+Both copies previously received **the same coordinate**, 511 mm from one of them,
+and both toolpaths extended to Y 209.573 -- the stale source coordinate leaking
+into the G-code, the off-material rapid this entry predicted. Neither copy's part
+reaches Y 210.
+
+The order test's 432 checks did not move. That is worth stating rather than
+leaving as luck: nothing it asserts depends on where a contour begins, and it is
+`test_replay_startpoint` that now covers this.
+
+### Open: Drilling and Engrave
+
+`Path/Op/CircularHoleBase.py:249-252` uses `StartPoint`/`EndPoint` as absolute XY
+seeds for the hole TSP sort. Both are now in `GEOMETRY_FRAME_POINTS` and gated on
+`SortingMode == "Automatic"`, which is how they are read -- so **the exposure is
+closed by the same change**, and a Drilling operation with a user-set seed now gets
+one moved onto each nested copy.
+
+**The effect on the emitted hole order is still not established.** The fixture used
+to look for it found only one of its nine holes (`CircularHoleBase` warns "Hole
+diameter may be inaccurate due to tessellation on face" and drills one), so there
+was no order to compare. A fixture that detects all its holes is still needed
+before anyone claims this helped or hurt. Engrave carries an `EndPoint` too, gated
+on `UseEndPoint`, unmeasured for the same reason.
+
+### Reproducing
+
+    FREECAD=/home/james/freecad_env/usr/bin/freecadcmd
+    $FREECAD tests/freecad_harness/test_replay_startpoint.py
+
+    # and confirm the assertions bite, all three ways
+    # A: remove the carrying from replay_recipe
+    #    -> 58 checks, 30 failures, exit 1
+    # B: make the Z rule `if False` so Z rides the rigid motion
+    #    -> the ClearanceHeight assertion fires on both copies, exit 1
+    # C: START_POINT_IS_COPIED_VERBATIM = True in the harness
+    #    -> asserts the pre-fix behaviour instead, exit 0

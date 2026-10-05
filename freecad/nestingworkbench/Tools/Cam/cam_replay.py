@@ -2544,6 +2544,201 @@ def expression_bound(obj):
 DRESSUP_JOB_LINKS = {}
 
 
+# -- points in the geometry's frame ----------------------------------------
+#
+# The other thing `capture_properties` takes verbatim that is not a plain value:
+# a property whose value is a **point in the frame of the geometry the
+# operation's `Base` names**. Copy such a value across to a nested copy and it
+# still reads in the source part's frame, while the geometry it was chosen
+# against has been rigidly moved -- so it names a place that is no longer on the
+# part. See issues.md NEST-024.
+#
+# `StartPoint` is the case that matters. `Path.Op.Area` hands it straight to
+# `Path.fromShapes` as `pathParams["start"]`
+# (`Path/Op/Area.py:282-283` and `:378-379`), which takes the point's XY as a
+# hint for where to begin and cuts from the nearest point on the wire. Measured
+# on the harness fixture, uncompensated:
+#
+#     correct start on the nested part -> begins there, 0.000000 mm from it
+#     stale start, copy at (140, 110)   -> begins 40.0000 mm away, wrong corner
+#     stale start, copy at (430, 260)   -> begins 0.0000 mm away, by luck
+#
+# The last line is why this is not detectable from a toolpath: a rectangle's four
+# corners are interchangeable under its own symmetry, so the nearest point to a
+# coordinate 470 mm wrong still came out at the right one. The stale coordinate
+# also reaches the G-code as a rapid, which on a sheet whose origin is a corner
+# puts the tool off the stock entirely.
+#
+# `EndPoint` is the same kind of value on the operations that have one.
+#
+# **Deliberately NOT in this table**, and the reason is the point: `Helix`
+# carries `StartPoint`/`EndPoint` too, and they are *not* part-frame values --
+# they describe where the helix sits in machine coordinates, and a Helix is tied
+# to the tool, not to a part. No per-operation exception is needed, because a
+# Helix names no part geometry and so never reaches the transform: see
+# `carried_geometry_frame_points`, whose caller has already resolved which
+# single source object this copy came from, and there is none.
+#
+# `Surface` is left to the same rule rather than special-cased. It has a `Base`,
+# so when that Base names a part its start point *is* part-relative and is
+# carried; when it does not, there is no transform to apply.
+GEOMETRY_FRAME_POINTS = ("StartPoint", "EndPoint")
+
+#: Which property says whether a `GEOMETRY_FRAME_POINTS` entry is one the
+#: operation actually reads, where the flag is named consistently.
+#:
+#: Measured by creating one operation of each kind and reading `PropertiesList`,
+#: because the flag is not uniform and guessing it would be a silent behaviour
+#: change:
+#:
+#:   op           StartPoint  UseStartPoint  EndPoint  UseEndPoint  SortingMode
+#:   Profile      yes         False           --        --            Automatic
+#:   PocketShape  yes         False           --        --            Automatic
+#:   Slot         yes         False           --        --            --
+#:   Waterline    yes         False           --        --            --
+#:   Surface      yes         False           --        --            --
+#:   Engrave      yes         -- (absent)     yes      False         Automatic
+#:   Drilling     yes         -- (absent)     yes      False         Automatic
+#:   Helix        yes         -- (absent)     yes      False         Automatic
+#:   Adaptive     -- (absent) --              --       --            --
+#:
+#: So: `EndPoint` always has `UseEndPoint`. `StartPoint` has `UseStartPoint` on
+#: the operations built on `Path.Op.Base`, and on the rest it is consumed as the
+#: seed of a nearest-neighbour sort, which `SortingMode == "Automatic"` turns on.
+#: An operation with neither flag does not read the point at all.
+GEOMETRY_FRAME_POINT_FLAGS = {"StartPoint": "UseStartPoint", "EndPoint": "UseEndPoint"}
+
+#: The fallback flag for a `StartPoint` on an operation that has no
+#: `UseStartPoint`. `SortingMode` gates the TSP sort that consumes it, and
+#: `"Automatic"` is the mode that does the sorting; `"Manual"` uses the order the
+#: user listed in `Base`.
+GEOMETRY_FRAME_POINT_SORT_FLAG = ("SortingMode", "Automatic")
+
+
+def geometry_frame_point_in_use(obj, name):
+    """Whether `obj` actually reads `name`, or merely carries it.
+
+    FreeCAD gives nearly every operation a `StartPoint`, and it defaults to
+    `(0, 0, 0)` with `UseStartPoint` False. Transforming a point nothing reads
+    would be churn on every replay, and warning about one would be noise: the
+    committed fixture is 98 operations and exactly one has `UseStartPoint` True,
+    so an ungated check reports 97 false alarms. The flags are CAM's own, read
+    rather than inferred, so this stays right as CAM changes which operation has
+    which.
+    """
+    flag = GEOMETRY_FRAME_POINT_FLAGS.get(name)
+    if flag is not None and hasattr(obj, flag):
+        return bool(getattr(obj, flag))
+    if name == "StartPoint" and hasattr(obj, GEOMETRY_FRAME_POINT_SORT_FLAG[0]):
+        return getattr(obj, GEOMETRY_FRAME_POINT_SORT_FLAG[0]) == \
+            GEOMETRY_FRAME_POINT_SORT_FLAG[1]
+    return False
+
+
+def source_to_clone_placement(clone, source_geometry):
+    """The rigid motion taking `source_geometry`'s frame to `clone`'s.
+
+    `flatten_container` folds the container placement, the part's own placement,
+    the Z normalisation and the sheet-origin shift into the flattened object's
+    placement, and a nested copy is the same underlying geometry rigidly moved
+    (module docstring constraints 5 and 6). So this is the whole transform and
+    nothing else is needed.
+
+    **`Shape.Placement`, not `Placement`.** `PathJob.Create` puts a
+    `draftobjects.clone.Clone` in the Model, and Draft's Clone restores
+    `obj.Placement` *after* assigning a Shape that already carries the original's
+    placement (`draftobjects/clone.py:122-148`), so the two are not guaranteed
+    to agree.
+
+    Returns None when either side has no shape to read, which is the only case
+    where this cannot be formed.
+    """
+    source_shape = getattr(source_geometry, "Shape", None)
+    clone_shape = getattr(clone, "Shape", None)
+    if source_shape is None or clone_shape is None:
+        return None
+    if source_shape.isNull() or clone_shape.isNull():
+        return None
+    return clone_shape.Placement.multiply(source_shape.Placement.inverse())
+
+
+def carried_geometry_frame_points(source_op, transform, target_op=None):
+    """Map `GEOMETRY_FRAME_POINTS` to their values moved by `transform`.
+
+    Only the points `source_op` actually reads, so an operation with
+    `UseStartPoint` False contributes nothing. A point the source does not carry,
+    or carries but does not read, is absent from the result rather than mapped to
+    `None` -- `apply_properties` treats a `None` remap as "skip this property",
+    which would drop a value the replay should have left alone.
+
+    **XY rides the rigid motion. Z does not**, and that is measured rather than
+    preferred.
+
+    A `StartPoint`'s Z is a *derived* value, not an authored coordinate:
+    `CommandSetStartPoint` writes `obj.StartPoint.z = obj.ClearanceHeight.Value`
+    (`Path/Op/Gui/Base.py:1716-1719`), so on the committed fixture the source
+    operation's Z is 5.000 mm and its `ClearanceHeight` is 5.000 mm -- the same
+    number. Transforming it moves a derived value into a frame it was never
+    authored in.
+
+    What that costs, measured on the fixture's `Profile005`:
+
+        Z ridden rigidly   StartPoint.z 5.000 -> 6.000, Z levels [0, 3, 5, **6**]
+        Z from ClearanceHeight            StartPoint.z = 5.000, Z levels [0, 3, 5]
+
+    The 6.000 is a millimetre above the operation's own clearance height, and it
+    reaches the toolpath. Z is emitted whenever it exceeds the operation's heights
+    -- measured on that same operation, z of 0, 3 and 5 leave the levels at
+    `[0, 3, 5]` while z of 6 and 40 add a level each.
+
+    And Z has no say in *where* the cut begins, which is what the point is for.
+    Same operation, same XY, z swept 0 -> 40: the first cutting move is
+    `(42.6, 166.408)` every single time. `Path.fromShapes` uses the XY to pick
+    the point on the wire.
+
+    So the Z is taken from the target operation's own `ClearanceHeight` -- the
+    same rule the GUI writes, so a job set up in the CAM workbench round-trips
+    unchanged -- and the transform's Z is used only when the target has no
+    `ClearanceHeight` to read. `compare_stock_frames` already reports the source
+    and replay Z frames disagreeing, which is the honest place for that.
+    """
+    carried = {}
+    if transform is None:
+        return carried
+    for name in GEOMETRY_FRAME_POINTS:
+        if not hasattr(source_op, name):
+            continue
+        if not geometry_frame_point_in_use(source_op, name):
+            continue
+        try:
+            carried[name] = transform.multVec(FreeCAD.Vector(getattr(source_op, name)))
+        except Exception:
+            # A point that will not transform is reported by the caller's
+            # verification, not silently carried wrong. Leaving it out means it
+            # is copied verbatim, which is the pre-fix behaviour and visible.
+            continue
+        if name == "StartPoint" and target_op is not None:
+            clearance = getattr(target_op, "ClearanceHeight", None)
+            if clearance is not None:
+                try:
+                    carried[name] = FreeCAD.Vector(
+                        carried[name].x, carried[name].y, float(clearance.Value))
+                except Exception:
+                    pass
+    return carried
+
+
+def unmapped_geometry_frame_points(source_op):
+    """Names of `GEOMETRY_FRAME_POINTS` that `source_op` reads.
+
+    Used by the report for the cases where no transform can be formed -- an
+    operation left whole over many parts, or one naming no geometry. The value is
+    then still in the source job's frame and the caller has to say so.
+    """
+    return [name for name in GEOMETRY_FRAME_POINTS
+            if hasattr(source_op, name) and geometry_frame_point_in_use(source_op, name)]
+
+
 def unmapped_job_links(dressup, properties):
     """Return captured job-local link properties that the replay did not remap.
 
@@ -2683,6 +2878,13 @@ def replay_recipe(recipe, job, clones, tool_cache=None,
         # every selection to every clone would be wrong as soon as one
         # operation spans two part types: a selection of Face1 on a Bracket and
         # Face5 on a Spacer would put Face5 on the brackets.
+        #
+        # **The source object travels with each entry.** The geometry a point in
+        # the geometry's frame is expressed relative to *is* this object, so a
+        # copy needs to know which one it came from to move such a point. That
+        # used to be discarded here, when `(geometry, subs)` became
+        # `(clone, subs)`, and discarding it is what made NEST-024 unfixable
+        # without a second pass over the recipe.
         base_value = []
         for geometry, subs in item.base_entries:
             targets = clones_for_source(clones, geometry) if clones else []
@@ -2693,7 +2895,7 @@ def replay_recipe(recipe, job, clones, tool_cache=None,
                 )
                 continue
             if not subs or "" in subs:
-                base_value.extend((clone, [""]) for clone in targets)
+                base_value.extend((clone, [""], geometry) for clone in targets)
                 continue
             missing, detail = check_subnames_against_clones(subs, targets)
             for name, note in detail.items():
@@ -2709,9 +2911,10 @@ def replay_recipe(recipe, job, clones, tool_cache=None,
                        "resolves on only some of the nested parts")
                 )
                 continue
-            base_value.extend((clone, subs) for clone in targets)
+            base_value.extend((clone, subs, geometry) for clone in targets)
 
-        # What to build. Each unit is `(label_for, base_entries_to_assign)`.
+        # What to build. Each unit is `(label_for, base_entries_to_assign,
+        # source_geometry)`.
         #
         # Split: one unit per target, each holding a single-entry Base, and
         # named after its part so the job is diagnosable at 98 operations.
@@ -2720,23 +2923,66 @@ def replay_recipe(recipe, job, clones, tool_cache=None,
         # measured rather than guessed.
         # Neither: one unit with no Base at all, for a source operation that
         # carries no base selection, replayed exactly as it always was.
+        #
+        # `source_geometry` is None whenever the unit does not resolve to exactly
+        # one source object, which is what makes the point-carrying below
+        # well-defined rather than a guess: a whole unit covers many parts, so
+        # there is no single frame to move a point out of.
+        #
+        # The whole unit's Base is rebuilt as `(clone, subs)` pairs. `base_value`
+        # holds triples, and assigning that straight to `Base` fails --
+        # `Expects sequence of items of type DocObj, (DocObj,SubName)`, caught by
+        # the unsplit-start-point check in the harness.
         if not split_is_safe(item):
-            units = [(None, base_value or None)]
+            units = [(None,
+                      [(clone, subs) for clone, subs, _g in base_value] or None,
+                      None)]
         elif base_value:
-            units = [(clone, [(clone, subs)]) for clone, subs in base_value]
+            units = [(clone, [(clone, subs)], geometry)
+                     for clone, subs, geometry in base_value]
         else:
-            units = [(None, None)]
+            units = [(None, None, None)]
+
+        # -- the cases where a carried point cannot be moved --
+        #
+        # A unit with `source_geometry` None reads a point in the source job's
+        # frame and there is no single frame to move it out of: either the step
+        # was left whole over many parts, or it named no geometry at all. That
+        # is reported rather than patched, on the same reasoning as
+        # `DRESSUP_JOB_LINKS` -- see its note for why the obvious fix is wrong.
+        #
+        # Reported **once per source step**, not once per unit: a whole step
+        # builds one unit anyway, and a split step always has its transform, so
+        # this cannot fire 98 times on the committed fixture.
+        if all(unit[0] is None for unit in units):
+            stranded = unmapped_geometry_frame_points(item.source)
+            if stranded:
+                plural = len(stranded) > 1
+                result.warnings.append(
+                    "Operation '%s' reads %s, but it %s, so no single transform "
+                    "applies and %s left in the source job's frame. Check the "
+                    "toolpath before running it. See issues.md NEST-024."
+                    % (item.label, " and ".join(stranded),
+                       ("was left whole over %d part(s)"
+                        % len(units[0][1] or []))
+                       if units[0][1] else "names no geometry",
+                       "were" if plural else "was")
+                )
 
         # Hoisted out of the split loop: one tool controller per source
         # operation, shared by every copy. `copy_tool_controller` caches on the
         # source, so this is the same controller asked once rather than N times.
+        #
+        # **The tool controller is shared; the point remap cannot be.** A carried
+        # point depends on which clone the copy targets, so it is added per unit
+        # below into a copy of this dict rather than into this dict itself.
         remap = {}
         new_tc = copy_tool_controller(item.source, job, tool_cache)
         if new_tc is not None:
             remap["ToolController"] = new_tc
 
         created = []
-        for label_for, base_entries in units:
+        for label_for, base_entries, source_geometry in units:
             if obsolete_tools:
                 # The controllers this job arrived with, removed *before* the
                 # first operation object exists.
@@ -2773,7 +3019,20 @@ def replay_recipe(recipe, job, clones, tool_cache=None,
                 )
                 continue
 
-            apply_properties(new_op, item.properties, remap=remap or None)
+            # Move any point that is expressed in the source geometry's frame
+            # into this copy's frame. Per unit, not hoisted: the same source
+            # operation becomes one copy per part and each copy sits somewhere
+            # different, so a point carried once would be right for one of them.
+            #
+            # `label_for` is the clone this unit targets, and None for a unit that
+            # was left whole -- see the note on `units`.
+            unit_remap = dict(remap)
+            if label_for is not None and source_geometry is not None:
+                transform = source_to_clone_placement(label_for, source_geometry)
+                unit_remap.update(
+                    carried_geometry_frame_points(item.source, transform, new_op))
+
+            apply_properties(new_op, item.properties, remap=unit_remap or None)
 
             if base_entries is not None:
                 try:
@@ -3662,6 +3921,62 @@ class Verification:
         )
 
 
+def point_outside_targets(operation, name, margin=COVERAGE_MARGIN_MM):
+    """Return True if `operation`'s `name` lies outside every target's footprint.
+
+    The check for a point in the geometry's frame that did not make the move --
+    `GEOMETRY_FRAME_POINTS`. Approximate in the same way and for the same reason
+    as `uncovered_targets`: bounding boxes, grown by `margin`, because a precise
+    test is not worth its cost here.
+
+    Measured on the committed fixture's 48 parts, 1567 edges and 613 faces:
+
+        `Shape.distToShape`   5.59 ms per part on the contour, 9.62 ms off it
+                              -> 548-943 ms across the fixture's 98 operations
+        this bounding-box test 0.31 ms per part -> 31 ms across the same 98
+
+    So the precise version costs 5-9% of a 10.5s replay, on every replay, to
+    answer a question a box answers exactly as well: on that fixture a carried
+    point is inside 48 of 48 boxes and a stale one inside 0 of 48. `margin`
+    absorbs the same slack `uncovered_targets` uses it for.
+
+    Only asks about a point the operation actually reads, so the 97 of 98
+    operations on the fixture with `UseStartPoint` False cost nothing and say
+    nothing.
+    """
+    if not hasattr(operation, name):
+        return False
+    if not geometry_frame_point_in_use(operation, name):
+        return False
+    try:
+        point = FreeCAD.Vector(getattr(operation, name))
+    except Exception:
+        return False
+
+    base = getattr(operation, "Base", None)
+    targets = []
+    if base and isinstance(base, (list, tuple)):
+        for entry in base:
+            try:
+                targets.append(entry[0])
+            except (TypeError, IndexError):
+                continue
+    if not targets:
+        # Nothing to be inside of. An operation naming no geometry cannot be
+        # checked this way, and the replay already reports that case separately.
+        return False
+
+    for target in targets:
+        box = shape_bounds(target)
+        if box is None:
+            continue
+        x0, y0, x1, y1 = box
+        if (x0 - margin <= point.x <= x1 + margin
+                and y0 - margin <= point.y <= y1 + margin):
+            return False
+    return True
+
+
 def verify_replay(result, extra_warnings=(), clones=None, stock=None):
     """Check a `ReplayResult` and return a `Verification`.
 
@@ -3711,6 +4026,22 @@ def verify_replay(result, extra_warnings=(), clones=None, stock=None):
                 % (label, len(uncovered),
                    len(operation.Base) if getattr(operation, "Base", None) else 0,
                    ", ".join(sorted(uncovered)[:5]))
+            )
+
+        # A point in the geometry's frame that is not on any of the parts this
+        # operation targets. It was either not carried, or carried for a unit
+        # with no single transform -- and either way the toolpath starts from
+        # whatever the wire nearest it happens to be. See NEST-024.
+        stranded = [name for name in GEOMETRY_FRAME_POINTS
+                    if point_outside_targets(operation, name)]
+        if stranded:
+            verification.warnings.append(
+                "Operation '%s' reads %s, but %s not on any part it targets. "
+                "It is still in the source job's frame, so the toolpath begins "
+                "at the nearest point on the wire to a coordinate that has "
+                "nothing to do with this part. Check it before running."
+                % (label, " and ".join(stranded),
+                   "it is" if len(stranded) == 1 else "they are")
             )
 
     for name, note in sorted(result.subname_detail.items()):

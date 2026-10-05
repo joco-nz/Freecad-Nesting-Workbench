@@ -144,6 +144,23 @@ asks what the job cannot say. One job per sheet, every sheet replayed.
 
 ### Fixed
 
+- **`Replay CAM` did not carry a `StartPoint` onto the nested copies.** Every other
+  setting on an operation is carried verbatim, which is right for values and wrong
+  for a point: `StartPoint` is an absolute coordinate saying where on the contour
+  the feed begins, and the part moved while the point did not. The contour then
+  began at the nearest point on the wire to a coordinate that had nothing to do
+  with it -- 40 mm along an edge on one copy, and *correctly* on another by
+  accident, because a rectangle's four corners are interchangeable under its own
+  symmetry. The toolpath also carried a rapid to the stale coordinate, which on a
+  sheet whose origin is the corner is off the stock entirely: on the committed
+  fixture, two copies 511 mm apart were both sent the same coordinate and both
+  toolpaths reached out to it.
+  Each copy now gets the start point moved by the same rigid motion that moved its
+  geometry, and the replay **warns** when a point is off every part it targets --
+  so this is caught rather than posted. Only points the operation actually reads
+  are moved, which on the committed fixture is one operation of 98. See
+  [NEST-024](issues.md#nest-024).
+
 - **"Stop At Sheets" did nothing at all.** The dial was read by nobody:
   `_collect_ui_params` never read the spinbox and `_prepare_algo_kwargs` never
   set `algo_kwargs['target_sheets']`, so `GACoordinator` was handed no target,
@@ -183,6 +200,11 @@ asks what the job cannot say. One job per sheet, every sheet replayed.
   with the radius actually in use.
 
 ### Notes
+- A step left **whole** rather than split -- one operation covering every part it
+  targets, which happens when it carries an unsplittable dressup -- cannot have a
+  `StartPoint` carried, because there is no single frame to move it out of. The
+  replay now says so by name instead of leaving the point where it was. Set your
+  own start point on those, or let CAM pick.
 - `Population Size` deliberately still defaults to 1. Measured on the heavy
   corpus at a contested sheet size and on the n70 customer part, populations of
   1, 3, 4 and 10 all returned the same sheet count, placed count and density,

@@ -36,9 +36,10 @@ PYTEST_STATUS="$HARNESS_DIR/.last_status_pytest"
 REPLAY_STATUS="$HARNESS_DIR/.last_status_replay"
 DRESSUP_STATUS="$HARNESS_DIR/.last_status_dressup"
 ORDER_STATUS="$HARNESS_DIR/.last_status_order"
+STARTPOINT_STATUS="$HARNESS_DIR/.last_status_startpoint"
 rm -f "$BENCH_STATUS" "$TEST_STATUS" "$GA_STATUS" "$PANEL_STATUS" \
       "$UNITS_STATUS" "$PYTEST_STATUS" "$REPLAY_STATUS" "$DRESSUP_STATUS" \
-      "$ORDER_STATUS"
+      "$ORDER_STATUS" "$STARTPOINT_STATUS"
 
 cd "$REPO_ROOT"
 "$FREECADCMD" "$HARNESS_DIR/nest_benchmark.py" || true
@@ -60,9 +61,18 @@ cd "$REPO_ROOT"
 "$FREECADCMD" "$HARNESS_DIR/test_replay_flatten.py" || true
 "$FREECADCMD" "$HARNESS_DIR/test_replay_dressups.py" || true
 "$FREECADCMD" "$HARNESS_DIR/test_replay_order.py" || true
+# A characterisation test, and the only gated file whose subject is currently
+# wrong: it asserts that the replay copies a Profile's StartPoint verbatim onto
+# the nested copy, measured, so that an unintended change fails here. It is in
+# the gate for the same reason `test_replay_dressups.py` is -- the warning
+# asserted there is the mitigation, and here there is not even that. Flipping
+# START_POINT_IS_COPIED_VERBATIM in that file is the whole of the change when
+# the replay is fixed.
+"$FREECADCMD" "$HARNESS_DIR/test_replay_startpoint.py" || true
 
 for f in "$BENCH_STATUS" "$TEST_STATUS" "$GA_STATUS" "$PANEL_STATUS" \
-         "$UNITS_STATUS" "$REPLAY_STATUS" "$DRESSUP_STATUS" "$ORDER_STATUS"; do
+         "$UNITS_STATUS" "$REPLAY_STATUS" "$DRESSUP_STATUS" "$ORDER_STATUS" \
+         "$STARTPOINT_STATUS"; do
     if [ ! -f "$f" ]; then
         echo "harness did not write $f -- it probably did not run" >&2
         exit 3
@@ -140,6 +150,12 @@ fi
 ORDER=$(cat "$ORDER_STATUS")
 if [ "$ORDER" -ne 0 ]; then
     echo "replay-order regression test FAILED (status $ORDER)" >&2
+    [ "$STATUS" -eq 0 ] && STATUS=1
+fi
+
+STARTPOINT=$(cat "$STARTPOINT_STATUS")
+if [ "$STARTPOINT" -ne 0 ]; then
+    echo "replay-start-point regression test FAILED (status $STARTPOINT)" >&2
     [ "$STATUS" -eq 0 ] && STATUS=1
 fi
 
