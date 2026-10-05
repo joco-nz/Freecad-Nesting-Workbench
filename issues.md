@@ -430,6 +430,51 @@ boundary, which is the point of a replay, and avoids the degeneracy because a
 `CreateFromBase` stock spans z -3..1 with the cut strictly inside. Costs a copy
 per sheet and needs the sheet origin, which the replay already has.
 
+**When exactly does the clipping degenerate? Now measured, not inferred.** Found
+while building NEST-024's unsplit-step check, which needs a Boundary that
+actually cuts so there is a working toolpath to reason about.
+
+`PathBoundary` clips with `edge.common(shape)`, and it produces an **empty path**
+whenever the contour is not strictly inside the clip solid's Z band. One
+operation, one contour cut at Z 0, five clip solids of identical XY extent
+(700x400) differing only in Z:
+
+| clip solid Z band | ZMax | cuts after Boundary | cuts before |
+|---|---:|---:|---:|
+| -2 .. 4 — straddles the contour | 4.00 | **5** | 5 |
+| 0 .. 6 — top face above the contour | 6.00 | **4** | 5 |
+| **-6 .. 0 — top face AT the contour** | 0.00 | **0** | 5 |
+| -6 .. -2 — band entirely below it | -2.00 | **0** | 5 |
+| 0.5 .. 6.5 — band entirely above it | 6.50 | **1** | 5 |
+
+The count varies across the working rows because `Inside=True` clips against a
+700x400 box and the part sits at X -30..30, so part of the contour falls outside
+in XY. That is the XY story and is not what this table is about. The Z story is
+the two zero rows.
+
+Three things this changes:
+
+* **The rule is "strictly inside the Z band", not "not coincident".** Fix 2 above
+  said the `CreateFromBase` stock avoids the degeneracy "because a
+  `CreateFromBase` stock spans z -3..1 with the cut strictly inside". That is the
+  working condition, and it is now a stated rule rather than one observation.
+* **Fix 1 is dead on arrival, not merely worse.** `DRESSUP_JOB_LINKS = {}` is
+  where the fix goes, and repointing `Stock` at the replay stock will *always*
+  produce an empty path: that stock spans `-thickness .. 0` and the contour is cut
+  at Z 0, so its top face is the contour's Z by construction.
+* **The constraint on any fix is checkable in one assertion**: the boundary
+  solid's `ZMax` must be strictly greater than the contour's Z. That belongs
+  beside whatever the fix does — it is the same kind of check
+  `compare_stock_frames` already makes about the stock frame.
+
+One trap this cost while measuring it, worth not repeating: a Boundary built
+against the **replay sheet stock** cuts nothing, so a check written against it
+"passes" while testing nothing at all. NEST-024's unsplit-step check had to use a
+solid spanning Z through the contour instead.
+
+Worth noting alongside NEST-024: this is the same failure shape one dressup over.
+A value carried verbatim that names the wrong thing, with nothing to say so.
+
 **Current state: reported, not fixed.** `unmapped_job_links` finds any job-local
 link the replay carried across without remapping, and the sheet outcome carries
 a warning naming the replayed dressup, the property and the object.
