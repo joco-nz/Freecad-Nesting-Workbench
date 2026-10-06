@@ -161,6 +161,23 @@ asks what the job cannot say. One job per sheet, every sheet replayed.
   are moved, which on the committed fixture is one operation of 98. See
   [NEST-024](issues.md#nest-024).
 
+- **A Boundary dressup no longer clips against the wrong stock.** A replayed
+  Boundary was clipping every nested copy against a solid belonging to the source
+  job -- fitted to one part, in one Z frame, at one position. Measured against a
+  part-fitted boundary, that produced **no cutting motion at all** where the
+  unclipped figure is 88, and the sheet still reported success.
+  Boundary is now dropped from the replay with the rest of the step's dressups
+  kept, and reported once per dressup. It is not silently dropped, and it is not
+  silently patched: a nested sheet cannot tell whether the solid meant the part,
+  the sheet, or an exclusion mask, and guessing would produce a plausible
+  toolpath that cuts the wrong thing. The replayed job is an ordinary FreeCAD job
+  you own, so a Boundary fitted to the sheet can be added and checked there.
+  Two side effects: the unsplittable-dressup guard is now empty -- its only entry
+  was Boundary, and it existed because of this defect -- and the leaked stock
+  object each Boundary constructor left behind (3 per two sheets, 17 if split) is
+  gone.
+  See [NEST-009](issues.md#nest-009).
+
 - **A layout did not record the algorithm that produced it.** Reopening a Physics
   layout brought up Minkowski, with the wrong algorithm's whole settings section --
   and with the direction to match, because `NestingDirection` was written from the

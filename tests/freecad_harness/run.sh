@@ -37,10 +37,12 @@ REPLAY_STATUS="$HARNESS_DIR/.last_status_replay"
 DRESSUP_STATUS="$HARNESS_DIR/.last_status_dressup"
 ORDER_STATUS="$HARNESS_DIR/.last_status_order"
 STARTPOINT_STATUS="$HARNESS_DIR/.last_status_startpoint"
+BOUNDARY_STATUS="$HARNESS_DIR/.last_status_boundary"
 PERSIST_STATUS="$HARNESS_DIR/.last_status_persist"
 rm -f "$BENCH_STATUS" "$TEST_STATUS" "$GA_STATUS" "$PANEL_STATUS" \
       "$UNITS_STATUS" "$PYTEST_STATUS" "$REPLAY_STATUS" "$DRESSUP_STATUS" \
-      "$ORDER_STATUS" "$STARTPOINT_STATUS" "$PERSIST_STATUS"
+      "$ORDER_STATUS" "$STARTPOINT_STATUS" "$BOUNDARY_STATUS" \
+      "$PERSIST_STATUS"
 
 cd "$REPO_ROOT"
 "$FREECADCMD" "$HARNESS_DIR/nest_benchmark.py" || true
@@ -70,6 +72,9 @@ cd "$REPO_ROOT"
 # START_POINT_IS_COPIED_VERBATIM in that file is the whole of the change when
 # the replay is fixed.
 "$FREECADCMD" "$HARNESS_DIR/test_replay_startpoint.py" || true
+# Boundary is unsupported: dropped from the replay and reported once per source
+# dressup. The write half of layout persistence is below.
+"$FREECADCMD" "$HARNESS_DIR/test_replay_boundary.py" || true
 # The write half of layout persistence: a layout records the algorithm that ran,
 # the direction that algorithm's dial held, whether that direction was used, and
 # each part's raw rotation override. The reload half needs a panel and lives in
@@ -78,7 +83,7 @@ cd "$REPO_ROOT"
 
 for f in "$BENCH_STATUS" "$TEST_STATUS" "$GA_STATUS" "$PANEL_STATUS" \
          "$UNITS_STATUS" "$REPLAY_STATUS" "$DRESSUP_STATUS" "$ORDER_STATUS" \
-         "$STARTPOINT_STATUS" "$PERSIST_STATUS"; do
+         "$STARTPOINT_STATUS" "$BOUNDARY_STATUS" "$PERSIST_STATUS"; do
     if [ ! -f "$f" ]; then
         echo "harness did not write $f -- it probably did not run" >&2
         exit 3
@@ -162,6 +167,12 @@ fi
 STARTPOINT=$(cat "$STARTPOINT_STATUS")
 if [ "$STARTPOINT" -ne 0 ]; then
     echo "replay-start-point regression test FAILED (status $STARTPOINT)" >&2
+    [ "$STATUS" -eq 0 ] && STATUS=1
+fi
+
+BOUNDARY=$(cat "$BOUNDARY_STATUS")
+if [ "$BOUNDARY" -ne 0 ]; then
+    echo "replay-boundary regression test FAILED (status $BOUNDARY)" >&2
     [ "$STATUS" -eq 0 ] && STATUS=1
 fi
 

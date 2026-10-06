@@ -419,6 +419,24 @@ def check_read(job, steps):
     return recipe
 
 
+def expected_chain(op, dressups):
+    """The chain a replay should produce for this step, as proxy class names.
+
+    **Unsupported dressups are skipped, because the replay skips them.**
+    `Path.Dressup.Boundary` is one, and it was the outermost layer on the
+    three-deep step, so a step dressed `LeadInOut -> Dogbone -> Boundary` now
+    replays as `LeadInOut -> Dogbone`.
+
+    Derived from `dressup_kind` rather than written out, so it stays right if
+    another dressup moves to `DRESSUP_UNSUPPORTED`. The previous version took
+    `dressups[-1]` unconditionally, and after the drop it reported the
+    three-deep step as missing its `DressupPathBoundary` layer.
+    """
+    supported = [d for d in dressups
+                 if cam_replay.dressup_kind(d)[0] != "unsupported"]
+    return list(chain_kinds(supported[-1] if supported else op))
+
+
 def check_write(recipe, outcomes, steps, source_job):
     """The write half, on the jobs `replay_layout` produced."""
     emit("\n-- write --")
@@ -467,10 +485,8 @@ def check_write(recipe, outcomes, steps, source_job):
                     "a copy's target")
 
         expected = []
-        unsplit = []
         for index, (op, dressups) in enumerate(steps):
-            entry = dressups[-1] if dressups else op
-            chain = list(chain_kinds(entry))
+            chain = expected_chain(op, dressups)
             base = getattr(op, "Base", None) or []
             try:
                 geometry = base[0][0]
@@ -479,21 +495,20 @@ def check_write(recipe, outcomes, steps, source_job):
             targets = cam_replay.clones_for_source(clones, geometry) \
                 if geometry is not None else []
             # A step carrying an unsplittable dressup stays whole -- see
-            # cam_replay.UNSPLITTABLE_DRESSUPS. The Boundary step therefore
-            # contributes ONE entry covering all its parts, not one per part.
+            # cam_replay.UNSPLITTABLE_DRESSUPS, which is empty now that Boundary
+            # is unsupported. Kept because it is the product's rule rather than
+            # this test's: if the tuple grows, this tracks it without being
+            # rewritten.
             blocked = any(
                 cam_replay.dressup_kind(d)[1]
                 in cam_replay.UNSPLITTABLE_DRESSUPS
                 for d in dressups)
             if blocked and len(targets) > 1:
-                unsplit.append(entry.Label)
                 # One entry for all of them, so the expected target is the set
                 # rather than any single part.
                 expected.append((chain, frozenset(label_of(t) for t in targets)))
             else:
                 expected.extend((chain, label_of(t)) for t in targets)
-        if unsplit:
-            emit("  left whole (unsplittable dressup): %s" % ", ".join(unsplit))
 
         emit("%s: %d list entr(ies) for %d step(s)"
              % (label, len(group), len(recipe)))
@@ -573,25 +588,22 @@ def check_write(recipe, outcomes, steps, source_job):
 
 
 def check_source_links_are_reported(outcomes, source_job, steps):
-    """A dressup link into the SOURCE job must be REPORTED, not carried quietly.
+    """No replayed dressup may hold a link into the job it was copied from.
 
-    The rule: a replayed object may not hold a link into the job it was copied
-    from. `ToolController` is handled -- captured only so the write half knows a
-    tool was chosen, then remapped onto the new job's copy by
-    `copy_tool_controller`. Every other job-local link has to be dealt with the
-    same way.
+    The rule: a replayed object may not depend on the source job surviving.
+    `ToolController` is handled -- captured only so the write half knows a tool
+    was chosen, then remapped onto the new job's copy by `copy_tool_controller`.
 
-    Boundary's `Stock` is the one that is not, and it is **known wrong rather
-    than fixed**: carried verbatim it clips against the source job's stock, and
-    repointing it at the replay job's stock is worse (see
-    `DRESSUP_JOB_LINKS` for the measurement). So the contract this asserts is
-    that the replay says so -- a warning naming the property and the object --
-    rather than producing a job that looks fine and cuts to the wrong boundary.
+    **This used to be the opposite assertion**: that any job-local link found was
+    *reported*. `Path.Dressup.Boundary.Stock` was the only thing that produced
+    one, Boundary is now unsupported rather than replayed, and the check had
+    nothing left to find -- it failed with "the Boundary branch stopped being
+    built".
 
-    The consequence, which is the point of the assertion: the Boundary dressup
-    is NOT safe to post from a replayed job until that is resolved. The
-    warning is the mitigation, and this check is what stops the mitigation
-    being quietly removed.
+    Inverting it is the stronger statement, and it is now checkable everywhere
+    rather than on one dressup: **zero** replayed dressups may carry a link into
+    the source job. `unmapped_job_links` stays as the report for whatever is
+    added next, but nothing should be reaching it.
     """
     source_held = {id(o) for o in source_job.OutListRecursive}
     for entry in source_job.Operations.Group:
@@ -602,11 +614,13 @@ def check_source_links_are_reported(outcomes, source_job, steps):
                 source_held.add(id(operation))
 
     examined = 0
-    reported = 0
+    seen_dressups = 0
+    leaking = []
     for outcome in outcomes:
         if outcome.replay_job is None or outcome.result is None:
             continue
         for dressup in outcome.result.dressups:
+            seen_dressups += 1
             for name in dressup.PropertiesList:
                 if not dressup.getTypeIdOfProperty(name).startswith(
                         "App::PropertyLink"):
@@ -618,21 +632,50 @@ def check_source_links_are_reported(outcomes, source_job, steps):
                     continue
                 examined += 1
                 if id(value) in source_held:
-                    # Still pointing into the source job. That is the open
-                    # question, and it must be visible.
-                    text = "\n".join(outcome.result.warnings)
-                    check(dressup.Label in text and name in text,
-                          "%s: replayed %s.%s points into the source job and "
-                          "nothing warned about it" % (outcome.sheet_label,
-                                                       dressup.Label, name))
-                    reported += 1
-    check(examined > 0,
-          "no job-local link was found on any replayed dressup, so this check "
-          "examined nothing -- the Boundary branch stopped being built")
-    check(reported > 0,
-          "no job-local link into the source job was found, so the warning path "
-          "is untested. If Boundary's Stock is ever fixed, this assertion is "
-          "the one to revisit.")
+                    leaking.append("%s.%s -> %r"
+                                   % (dressup.Label, name, value.Label))
+    check_equal(leaking, [],
+                "replayed dressups holding a link into the source job")
+    emit("  %d replayed dressup(s) walked, %d job-local link(s) found on them, "
+         "%d leaked" % (seen_dressups, examined, len(leaking)))
+
+    # **The non-vacuity guard is on the dressups walked, not on links found.**
+    # The first version of this asserted `examined > 0` and could not pass: with
+    # Boundary gone, no replayed dressup *has* a job-local link beyond `Base` and
+    # `ToolController`, so zero is the correct and desired answer. Asserting it
+    # was non-zero would have been asserting the bug back into existence.
+    check(seen_dressups > 0,
+          "no replayed dressup was walked, so this check examined nothing")
+
+    # The hazard has to be shown to have existed, or "nothing leaked" is
+    # vacuous in a different way: if the source job had no Boundary, or its Stock
+    # were not a link into the source job, there was never anything to leak.
+    boundary_stocks = []
+    for _op, dressups in steps:
+        for d in dressups:
+            if cam_replay.dressup_kind(d)[0] == "unsupported" \
+                    and "Boundary" in str(cam_replay.dressup_kind(d)[1]):
+                boundary_stocks.append(getattr(d, "Stock", None))
+    check(len(boundary_stocks) == 1 and boundary_stocks[0] is not None
+          and id(boundary_stocks[0]) in source_held,
+          "the source Boundary's Stock is not a job-local link into the source "
+          "job, so there was no hazard for this check to guard against")
+
+    # And the Boundary really was met and reported, rather than quietly absent
+    # from the recipe -- a read that missed it would make every check above pass.
+    reported = [(kind, label)
+                for outcome in outcomes
+                if outcome.result is not None
+                for kind, label, _reason in outcome.result.unsupported_dressups
+                if "Boundary" in str(kind) or "Boundary" in str(label)]
+    check(len(reported) > 0,
+          "the Boundary dressup was never reported as unsupported, so the drop "
+          "is not being exercised")
+    # Once per source dressup, not once per copy: a split step over 8 nested
+    # parts would otherwise tell the user the same thing eight times.
+    check_equal(len(reported), 1,
+                "the Boundary was reported as unsupported more than once")
+
 
 
 def check_settings_survived(outcomes, recipe, steps):

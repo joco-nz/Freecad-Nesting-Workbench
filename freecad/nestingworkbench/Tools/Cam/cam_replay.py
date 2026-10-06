@@ -1788,8 +1788,10 @@ DRESSUP_VIEWPROVIDERS = {
                                    "ViewProviderDressup"),
     "Path.Dressup.DogboneII": ("Path.Dressup.Gui.DogboneII", "ViewProviderDressup"),
     "Path.Dressup.Array": ("Path.Dressup.Gui.Array", "DressupArrayViewProvider"),
-    "Path.Dressup.Boundary": ("Path.Dressup.Gui.Boundary",
-                              "DressupPathBoundaryViewProvider"),
+    # No Boundary entry. It is not built, so it never needs a view provider --
+    # `tests/test_cam_replay.py::TestDressupTablesAgree` checks that every entry
+    # here is a dressup `DRESSUP_BUILDERS` can build, and leaving Boundary in
+    # place failed that once the entry moved to `DRESSUP_UNSUPPORTED`.
     "Path.Dressup.Tags": ("Path.Dressup.Gui.Tags", "PathDressupTagViewProvider"),
 }
 
@@ -2013,20 +2015,27 @@ def is_dressup_object(obj):
 
 #: Dressups that make splitting unsafe, with the measured reason.
 #:
-#: `Path.Dressup.Boundary` clips an operation's toolpath against a `Stock`
-#: **link**, and after the replay that link still points at the SOURCE job's
-#: stock -- a known defect, NEST-009, reported as a warning rather than fixed.
-#: One Boundary over a whole step clips every copy in one pass, so a partly
-#: wrong stock leaves *some* motion behind. Eight Boundaries each clip
-#: independently, and measured on the dressup fixture, **6 of 8 copies produced
-#: a 4-command path with no cutting motion at all**. A forced recompute does not
-#: recover them. So splitting a Boundary step multiplies a known-wrong reference
-#: and turns "clipped slightly wrong" into "cut nothing", which is exactly the
-#: kind of quiet failure this feature exists to prevent.
+#: **Empty, and `Path.Dressup.Boundary` was the only entry until NEST-009 was
+#: resolved.** It is here no longer because it is never built at all -- see its
+#: entry in `DRESSUP_UNSUPPORTED`.
+#:
+#: The reason it was here is worth keeping, because it is the reason not to add a
+#: guard carelessly. A Boundary's `Stock` is a link to a solid in the source job,
+#: so splitting a Boundary step gave every copy its own dressup clipping against
+#: *one* region, fitted to one part: measured **0 of 8 copies cutting anything**
+#: where the unsplit step managed 2 of 8. That reads as "splitting a Boundary is
+#: unsafe", and the fix was to stop splitting it.
+#:
+#: But the guard was treating a symptom. Splitting is what the workbench is for --
+#: an operation becomes one per matching nested part -- and one whole dressup over
+#: eight parts cannot have been right either: it clips all eight against a single
+#: region, which is **0 cutting moves where the unclipped figure is 88**. Neither
+#: arrangement worked, so the entry was holding up a broken behaviour rather than
+#: protecting a good one.
 #:
 #: The guard is deliberately narrow. It is not "dressups are risky" -- LeadInOut,
-#: Dogbone and Tags all split correctly and are verified to.
-UNSPLITTABLE_DRESSUPS = ("Path.Dressup.Boundary",)
+#: Dogbone and Tags all replicate per part and are verified to.
+UNSPLITTABLE_DRESSUPS = ()
 
 
 def split_is_safe(item):
@@ -2293,18 +2302,60 @@ def _build_tags(obj, base, module, job):
 #: reported as unsupported rather than silently skipped, because a user who
 #: relied on Z correction would otherwise get a job that cuts at the wrong
 #: height with nothing said about it.
+#:
+#: `Path.Dressup.Boundary` is absent for a different reason. It *is* a dressup
+#: over an operation and it used to be in this table; see its entry in
+#: `DRESSUP_UNSUPPORTED` for why it is not, which is the long one.
 DRESSUP_BUILDERS = {
     "Path.Dressup.Gui.LeadInOut": _build_object_dressup,
     "Path.Dressup.Gui.Mirror": _build_object_dressup,
     "Path.Dressup.Gui.RampEntry": _build_object_dressup,
     "Path.Dressup.DogboneII": _build_dogbone,
-    "Path.Dressup.Boundary": _build_with_job_constructor,
     "Path.Dressup.Array": _build_with_job_constructor,
     "Path.Dressup.Tags": _build_tags,
 }
 
 #: Dressups known to exist but deliberately not replayable, with the reason.
 #: Reported rather than dropped -- see `DRESSUP_BUILDERS`.
+#:
+#: **`Path.Dressup.Boundary` clips an operation's toolpath against a solid, and
+#: the replay cannot know which solid it means.** That is the reason, and it is
+#: about the user's intent rather than about a link going missing.
+#:
+#: `Stock` is a link to a solid in the source job, and the workbench replicates
+#: operations to each matching nested part -- so the boundary has to mean "the
+#: same region of that part", which means moving it with the part. That part was
+#: measured and it works: on the dressup fixture, 8 of 8 copies cutting against a
+#: per-copy carried stock, where 0 of 8 cut against the source job's.
+#:
+#: What it does not settle is **which region the user meant**, and the readings do
+#: not agree:
+#:
+#:   * a region fitted to the part -- "don't cut outside this" -- is part data, so
+#:     it moves with the part;
+#:   * the job's own stock -- "don't run off the material" -- is sheet data, and
+#:     moving it to each part gives the same answer only because a stock fitted to
+#:     one part contains that part;
+#:   * `Inside=False` -- "don't cut here" -- is an exclusion mask, and replicated
+#:     per part it excludes that part's own cuts. Measured 1 cutting move per copy
+#:     against a source of 1, from a region that already clipped the source.
+#:
+#: There is no reliable way to tell them apart. Classifying by comparing the
+#: stock's footprint against the job's stock and against the part was considered
+#: and rejected: it is a guess, and a wrong guess yields a plausible toolpath that
+#: cuts the wrong thing, which is the failure this workbench exists to prevent.
+#:
+#: So the dressup is dropped, and said out loud. **Dropping is safe, and better
+#: than what it replaces, because the clipping is what was silently wrong.**
+#: Carried verbatim -- what the replay used to do -- a Boundary clipped against
+#: the source job's stock; measured against a part-fitted boundary that is **0
+#: cutting moves where the unclipped figure is 88**, with the sheet still
+#: reporting `ok=True`. A job that cuts nothing and says nothing is worse than a
+#: job that cuts everything and says why. The replayed job is an ordinary
+#: FreeCAD job the user owns, so a Boundary fitted to the sheet can be added and
+#: checked there.
+#:
+#: See issues.md NEST-009.
 DRESSUP_UNSUPPORTED = {
     "Path.Dressup.Gui.Dragknife": "dragknife compensation is a job setting, not "
                                   "a dressup over an operation",
@@ -2312,6 +2363,12 @@ DRESSUP_UNSUPPORTED = {
                                 "dressup over an operation",
     "Path.Dressup.Gui.ZCorrect": "Z correction is a job setting, not a "
                                  "dressup over an operation",
+    "Path.Dressup.Boundary": "it clips the toolpath against a solid in the "
+                             "source job, and a nested sheet cannot tell whether "
+                             "that solid means the part, the sheet or an "
+                             "exclusion mask. The operation below it was replayed "
+                             "without it, so this cut is unclipped -- add a "
+                             "Boundary to the replayed job if you need one.",
 }
 
 
@@ -2523,24 +2580,28 @@ def expression_bound(obj):
 #: `ToolController` is handled separately, on the operations, by remapping onto
 #: the copied controller.
 #:
-#: **`Stock` is deliberately NOT in this map, and is the one open question.**
-#: It is Boundary's -- the solid the dressup clips against -- and carried
-#: verbatim it clips against the SOURCE job's stock: fitted to the source part,
-#: in the source Z frame, at the source part's position. That is wrong on any
-#: sheet but the first, where parts are at the origin, and on the first it
-#: nearly coincides with the right answer, which is what makes it easy to miss.
+#: **`Stock` was deliberately NOT in this map while it was the open question.
+#: It is moot now**: `Path.Dressup.Boundary` is in `DRESSUP_UNSUPPORTED`, so no
+#: Boundary is built and there is no `Stock` link to carry. The map stays empty,
+#: and `unmapped_job_links` keeps its job for whatever is added next.
 #:
-#: The obvious fix is wrong. Repointing `Stock` at the replay job's own stock
-#: looks right -- the sheet IS the boundary, and decision 3 already makes the
-#: job's stock the sheet -- but the sheet stock spans `-thickness .. 0` while
-#: the contour is cut at z 0, so the cut edge lies exactly on the stock's top
-#: face and `edge.common(shape)` degenerates. Measured: 30 cutting moves
-#: before, 0 after.
+#: The finding is kept, because the two obvious fixes are both wrong and the
+#: reason is not obvious from the symptom:
 #:
-#: So the state is that the link is wrong and REPORTED, not silently wrong and
-#: not silently patched. Resolving it means choosing between copying the
-#: user's stock into the sheet's frame and giving Boundary a boundary that is
-#: not the stock at all. Neither is mechanical. See issues.md.
+#:   * carried verbatim, `Stock` clips against the SOURCE job's stock -- fitted to
+#:     the source part, in the source Z frame, at the source part's position.
+#:     Measured on a part-fitted boundary: **0 cutting moves where the unclipped
+#:     figure is 88**, reported `ok=True`.
+#:   * repointed at the replay job's own stock, which looks right because the
+#:     sheet *is* the boundary and decision 3 makes the job's stock the sheet --
+#:     but that stock spans `-thickness .. 0` while the contour is cut at z 0, so
+#:     the cut edge lies exactly on its top face and `edge.common(shape)`
+#:     degenerates. Also 0.
+#:
+#: And the fix that does work mechanically -- carrying the stock per copy by the
+#: rigid motion that moved the part, 8 of 8 copies cutting -- does not settle it,
+#: because a nested sheet cannot tell whether the solid means the part, the sheet
+#: or an exclusion mask. See `DRESSUP_UNSUPPORTED` and issues.md NEST-009.
 DRESSUP_JOB_LINKS = {}
 
 
@@ -2982,6 +3043,9 @@ def replay_recipe(recipe, job, clones, tool_cache=None,
             remap["ToolController"] = new_tc
 
         created = []
+        # Deduplicating set for `unsupported_dressups`, which is recorded from
+        # inside the unit loop below and would otherwise fire once per copy.
+        reported_unsupported = set()
         for label_for, base_entries, source_geometry in units:
             if obsolete_tools:
                 # The controllers this job arrived with, removed *before* the
@@ -3102,13 +3166,26 @@ def replay_recipe(recipe, job, clones, tool_cache=None,
             copy_suffix = _split_suffix_of(new_op)
             layer = new_op
             outermost = new_op
-            built_any = False
             for spec in item.dressups:
                 kind, module_name = dressup_kind(spec.source)
                 if kind == "unsupported":
-                    result.unsupported_dressups.append(
-                        (module_name or "?", spec.label, DRESSUP_UNSUPPORTED[module_name])
-                    )
+                    # **Once per source dressup, not once per copy.** The loop
+                    # below runs once per unit, and a split step has one unit per
+                    # nested part, so recording here reported the same dropped
+                    # dressup once per copy: measured 8 identical warnings and 8
+                    # identical console lines for a single Boundary over 8 parts.
+                    # Repeating a warning does not make it more likely to be read;
+                    # it makes the report look like a malfunction.
+                    #
+                    # Same reasoning as the carried-points report further down,
+                    # which says "reported once per source step".
+                    key = (module_name or "?", spec.label)
+                    if key not in reported_unsupported:
+                        reported_unsupported.add(key)
+                        result.unsupported_dressups.append(
+                            (module_name or "?", spec.label,
+                             DRESSUP_UNSUPPORTED[module_name])
+                        )
                     continue
                 if kind == "unknown":
                     result.failures.append(
@@ -3166,14 +3243,35 @@ def replay_recipe(recipe, job, clones, tool_cache=None,
                 result.dressups.append(new_dressup)
                 layer = new_dressup
                 outermost = new_dressup
-                built_any = True
 
-            if built_any or not item.dressups:
-                ordered.append(outermost)
-                # What belongs in `Operations.Group` for this copy. Recorded
-                # rather than left implicit, because the ordering step is handed
-                # the BASE operations and has to write these instead.
-                result.entry_of[id(new_op)] = outermost
+            # `outermost` starts as the base operation and is only reassigned when
+            # a dressup is actually built, so it is the right entry either way.
+            #
+            # **This used to be guarded by `if built_any or not item.dressups`**, on
+            # the reasoning that a step whose every dressup was dropped should not
+            # be listed at all. Measured before removing it: the guard was
+            # **harmless on the normal path**, and the first claim made for it was
+            # wrong.
+            #
+            # `order_operations` walks every base operation and substitutes
+            # `entry_of.get(id(op), op)`, falling back to the bare operation -- so
+            # the list is rebuilt from `result.operations` regardless of what this
+            # loop appended, and `entry_of` only decides whether a step is listed
+            # as its dressup or as the bare operation underneath. Restoring the
+            # guard left `tests/freecad_harness/test_replay_boundary.py` green,
+            # which is how that was established rather than assumed.
+            #
+            # The narrow exposure that is real: **the cancel path skips ordering**,
+            # so this loop's `set_operation_order` is the final state, and there a
+            # step with nothing left would go unlisted. Not covered by the harness,
+            # which does not cancel mid-sheet. Kept simple rather than guarded --
+            # an entry that is correct and later re-derived is not worth a
+            # conditional that can only be wrong.
+            ordered.append(outermost)
+            # What belongs in `Operations.Group` for this copy. Recorded
+            # rather than left implicit, because the ordering step is handed
+            # the BASE operations and has to write these instead.
+            result.entry_of[id(new_op)] = outermost
 
     # One write, in recipe order. See `set_operation_order`.
     set_operation_order(job, ordered)
@@ -3200,9 +3298,16 @@ def describe_replay_result(result):
         % (len(result.operations), len(result.dressups))
     ]
     for kind, label, reason in result.unsupported_dressups:
+        # "replayed bare" is only true when the dropped dressup was the whole
+        # stack. A Boundary commonly sits over LeadInOut and Dogbone, and those
+        # were built, so saying "bare" would understate what the user got and
+        # overstate what went wrong. The user needs to know what is *missing*,
+        # which is the dressup named above, and not to be told the stack is
+        # empty when it is not.
         lines.append(
-            "WARNING: dressup '%s' (%s) was not replayed -- %s. Its operation "
-            "was replayed bare, so this cut has no dressup applied."
+            "WARNING: dressup '%s' (%s) was not replayed -- %s The rest of this "
+            "step's stack was replayed without it, so this cut is missing that "
+            "clipping."
             % (label, kind, reason)
         )
     partial = {n: d for n, d in result.subname_detail.items() if d != "ok"}

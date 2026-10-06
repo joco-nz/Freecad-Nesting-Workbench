@@ -253,6 +253,7 @@ downstream of them stays in millimetres. Two files, two interpreters:
 | file | covers | runs under |
 |---|---|---|
 | `test_document_units.py` | `units.py` — schema resolution, length/area formatting, `parse_length`, `length_mm` | `freecadcmd`, wired into `run.sh` |
+| `test_replay_boundary.py` | `Path.Dressup.Boundary` is unsupported — dropped from the replay, the rest of the step's stack kept, reported once per dressup | `freecadcmd`, wired into `run.sh` |
 | `test_layout_persistence.py` | the write half of layout persistence — `Algorithm`, `NestingDirection`, `RandomDirection`, and each part's raw rotation override, on a real document, with a save/reopen round trip | `freecadcmd`, wired into `run.sh` |
 | `probe_layout_restore.py` | the reload half — the controller reading the right dial, and the panel coming back showing what the layout recorded | `freecad` (GUI), run by hand |
 | `probe_unit_panel.py` | `length_field.py` and the real `NestingPanel` | `freecad` (GUI), run by hand |
@@ -448,6 +449,26 @@ the result *looks* right, which is what a human is for.
 through `_collect_ui_params` (the path a real run takes) rather than a direct
 `save_settings` call that could drift from it. The default is asserted to stay
 1; see the measurement in the changelog for why it is not higher.
+
+## Identifying dressups, and the two traps that make it easy to get wrong
+
+A replayed chain's *shape* is reported by `chain_kinds`, which returns the proxy's
+**class name** — and for two of the dressups that string is useless as a label:
+`Path.Dressup.DogboneII`'s proxy class is `Proxy`, and `Path.Dressup.Gui.LeadInOut`'s
+is `ObjectDressup`. Neither contains "Dogbone" or "LeadInOut", so a check that
+filters on it finds nothing and reports the dressup as absent.
+
+**Match on the object label** (`DressupDogbone_replay_...`), which is what a user
+reads in the tree and what `describe_*` and the sibling checks work in.
+
+Similarly, an operation's `Base` points at the replay job's **flattened part**,
+called `CAMPart_57` — the part type is only in the nested label
+`nested_BarePlate_9`. Use `cam_replay.nested_label_of(target)` to recover it.
+Reading `target.Label` matches nothing.
+
+Both traps bit `test_replay_boundary.py` on its first run, and both failed the way
+a vacuous check fails: as "no Dogbone chain in the list" and "no BarePlate
+operation", against documents that contained eight of each.
 
 ## Layout persistence, and the two vacuity traps behind it
 

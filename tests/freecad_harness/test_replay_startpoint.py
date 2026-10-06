@@ -555,11 +555,23 @@ def check_verification_bites(doc, outcome, stale_value):
 def check_unsplit_step_is_reported(doc):
     """A step left whole over many parts is REPORTED, not guessed at.
 
-    `UNSPLITTABLE_DRESSUPS` keeps a Boundary-dressed step as one operation
+    `UNSPLITTABLE_DRESSUPS` names dressups whose step must stay one operation
     covering every part it targets. One start point cannot be right for all of
     them -- there is no single frame to move it out of -- so the replay must say
-    so rather than silently pick one. This is the same decision as NEST-009's
-    `Stock`: wrong and reported beats wrong and quiet.
+    so rather than silently pick one. Same decision as NEST-009's `Stock`: wrong
+    and reported beats wrong and quiet.
+
+    **The tuple is empty as of NEST-009**, because `Path.Dressup.Boundary` was its
+    only entry and Boundary is now unsupported rather than replayed. So this check
+    puts Boundary back for the duration, to exercise the policy itself.
+
+    That is deliberate and not a workaround: `split_is_safe` and the stranded
+    report are product behaviour that a future dressup could reach, and the
+    alternative -- deleting this check because nothing reaches it today -- would
+    leave the only code that says "I could not carry this" untested, at exactly
+    the moment someone is most likely to need it. The dressup is still dropped,
+    so no Boundary object is built either way; only the *step* is marked
+    unsplittable, which is what drives the whole-unit path.
     """
     from Path.Main import Job as PathJob
     from Path.Op import Profile as PathProfile
@@ -593,13 +605,14 @@ def check_unsplit_step_is_reported(doc):
 
     dressup = unsplit_doc.addObject("Path::FeaturePython", "DressupPathBoundary")
     dressup.Proxy = DressupPathBoundary(dressup, op, job)
-    # A solid, and deliberately NOT the sheet: Boundary clips with
-    # `edge.common(shape)`, and the sheet stock spans `-thickness .. 0` while the
+    # A solid, and deliberately NOT the sheet. Measured: Boundary clips with
+    # `edge.common(shape)`, the sheet stock spans `-thickness .. 0` while the
     # contour is cut at Z 0, so the cut edge lies exactly on the stock's top face
     # and the common degenerates -- 0 cutting moves where there should be some.
-    # That is the measured reason NEST-009's `Stock` cannot simply be repointed
-    # at the replay stock, so this test does not walk into it. Centred, spanning
-    # Z through 0, so the contour is genuinely inside it.
+    # That is the reason NEST-009's `Stock` could not simply be repointed at the
+    # replay stock. Centred and spanning Z through 0, so the contour is inside
+    # it. Kept even though the dressup is now dropped, because the step has to
+    # carry one for `split_is_safe` to see it.
     stock = unsplit_doc.addObject("Part::Feature", "ClipSolid")
     stock.Shape = Part.makeBox(700.0, 400.0, 4,
                                FreeCAD.Vector(-350.0, -200.0, -2))
@@ -635,11 +648,23 @@ def check_unsplit_step_is_reported(doc):
             FreeCAD.Rotation(FreeCAD.Vector(0, 0, 1), 0.0))
     unsplit_doc.recompute()
 
-    outcomes = cam_replay.replay_layout(unsplit_doc, layout, job)
+    # **The tuple is patched for the replay and restored immediately.** Empty as
+    # of NEST-009, so without this the step splits into three operations and
+    # nothing reaches the whole-unit branch under test. Restored in a `finally`
+    # because the rest of the run -- and every other harness file -- reads it.
+    _saved_unsplittable = cam_replay.UNSPLITTABLE_DRESSUPS
+    cam_replay.UNSPLITTABLE_DRESSUPS = ("Path.Dressup.Boundary",)
+    try:
+        outcomes = cam_replay.replay_layout(unsplit_doc, layout, job)
+    finally:
+        cam_replay.UNSPLITTABLE_DRESSUPS = _saved_unsplittable
+
     check(len(outcomes) == 1, "expected one outcome, got %d" % len(outcomes))
     if not outcomes:
         FreeCAD.closeDocument(unsplit_doc.Name)
         return
+    check(cam_replay.UNSPLITTABLE_DRESSUPS == _saved_unsplittable,
+          "the unsplittable tuple was not restored")
     result = outcomes[0].result
     if not result.operations:
         emit("  the unsplit step built nothing; failures: %s" % result.failures)
@@ -648,12 +673,12 @@ def check_unsplit_step_is_reported(doc):
           "the unsplit step failed to replay: %s" % result.failures)
 
     # One operation covering all three parts -- the unsplittable dressup. This is
-    # also the assertion that the Boundary step really was left whole, so the
-    # branch under test is reached rather than assumed; the earlier version
-    # probed `split_is_safe` with a stand-in and was satisfied by a predicate it
-    # had fed itself.
+    # also the assertion that the step really was left whole, so the branch under
+    # test is reached rather than assumed; the earlier version probed
+    # `split_is_safe` with a stand-in and was satisfied by a predicate it had fed
+    # itself.
     check(len(result.operations) == 1,
-          "expected the Boundary step left whole as 1 operation, got %d"
+          "expected the step left whole as 1 operation, got %d"
           % len(result.operations))
     if len(result.operations) == 1:
         check(len(result.operations[0].Base) == 3,
