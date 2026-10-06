@@ -24,6 +24,44 @@ front of the one widget in the panel that knows what a unit is.
 from PySide import QtCore, QtWidgets
 
 
+def tooltip_with_image(html, image_path, width):
+    """Return `html` followed by a diagram, in a popup `width` pixels wide.
+
+    Two things here that a bare `<img src='...'>` in a tooltip string would not
+    do, both measured rather than assumed (Qt 6.8.3, offscreen):
+
+    **The path goes through `QUrl.fromLocalFile`.** Qt resolves a rich-text
+    image against a base URL, and a tooltip has no base, so it has to be
+    absolute. A bare absolute POSIX path does load unaided -- measured, the
+    document grew by the image's full 160px -- but Qt parses `C:/x/y.svg` with
+    **scheme** `c` rather than as a path, so on Windows a bare path is a URL
+    with an unknown scheme and loads nothing. Backslashes fail too, *even when
+    the file exists*, so a hand-written Windows path is wrong twice over.
+    `fromLocalFile` is Qt's own conversion and gets all of it right without this
+    code knowing which platform it is on. What that costs is untestable here:
+    this box is Linux, so the Windows behaviour is inferred from the parsing,
+    not observed.
+
+    **The width is pinned with a one-cell table.** Qt sizes a rich tooltip from
+    its text, not from its image, so a diagram otherwise sits in a popup as wide
+    as the prose above it. Inherited from the Nightly branch's `rich_tooltip`,
+    which carries the same observation; kept here as one function because that
+    is all of that helper that still earns its place -- its existence check and
+    its width-from-file read are replaced by a gated check that the asset exists
+    and that its `width` matches the number passed in.
+
+    No existence check by design. A missing asset would leave a broken-image
+    box that nobody notices until a user hovers the field, which is the wrong
+    place to find out; `test_tooltip_assets.py` fails the build instead.
+    """
+    src = QtCore.QUrl.fromLocalFile(image_path).toString()
+    return (
+        "<table width='%d' cellspacing='0' cellpadding='0'><tr><td>%s"
+        "<p style='margin:6px 0 0 0'><img src='%s'></p>"
+        "</td></tr></table>" % (width, html, src)
+    )
+
+
 # QFormLayout adds a margin of its own, which stacks with a section's content
 # area frame and indents the controls twice over. The frame is already there;
 # the layout does not need a second one.

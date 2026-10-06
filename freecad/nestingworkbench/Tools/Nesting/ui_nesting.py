@@ -11,7 +11,7 @@ import FreeCAD
 import FreeCADGui
 import os
 from ...constants import *
-from ... import FONTS_DIR, DEFAULT_FONT
+from ... import FONTS_DIR, DEFAULT_FONT, TOOLTIPS_DIR
 from ...freecad_helpers import set_visibility
 from ...length_field import LengthField
 from ... import units
@@ -21,7 +21,22 @@ from ...ui_helpers import (
     make_checkbox,
     make_double_spinbox,
     make_int_spinbox,
+    tooltip_with_image,
 )
+
+#: The diagram in the Candidate Step tooltip, and the popup width to pin it to.
+#:
+#: Two constants rather than reading the width back out of the SVG at panel
+#: build time, which is what the Nightly branch's `rich_tooltip` does. The
+#: duplication is deliberate and is the point: Qt sizes a tooltip from its text
+#: and not from its image, so the popup needs an explicit width, and the only
+#: thing that could make the two numbers disagree is somebody editing the SVG.
+#: `test_tooltip_assets.py` asserts they agree, and that the image actually
+#: loads, so that costs a gate run rather than a runtime read on every panel
+#: build -- and unlike a runtime read, it fails before a user ever hovers the
+#: field.
+_CANDIDATE_STEP_DIAGRAM = "NestingWorkbench_CandidateStep.svg"
+_CANDIDATE_STEP_DIAGRAM_WIDTH = 320
 
 _MINKOWSKI_DIR_MAX = 359
 
@@ -979,6 +994,10 @@ class NestingPanel(QtWidgets.QWidget):
             "sheet border, the extra positions are tested and discarded and "
             "changing this has no visible effect on the result. Where parts "
             "interlock or have curved or closely spaced features, it does.<br><br>"
+            "Below: the same part offered to the same L-shaped neighbour. Left, "
+            "candidate points every 5 mm and the part fits the corner. Right, "
+            "every 20 mm, too few land inside the corner, and the part "
+            "overhangs instead.<br><br>"
             "If you raise it, check that the packing and the number of sheets "
             "are unchanged before keeping the change."
         )
@@ -1035,7 +1054,15 @@ class NestingPanel(QtWidgets.QWidget):
                 self._simplification_tooltip.format(
                     router_tolerance=units.format_length(1.0, schema)))
             self.minkowski_step_size_input.widget().setToolTip(
-                self._step_size_tooltip)
+                # Built here rather than at construction, because this tooltip
+                # is re-set on every unit change and a string captured once
+                # would go stale against whatever else this method does. The
+                # diagram goes through `tooltip_with_image` for its path
+                # handling and popup width; the prose is unchanged.
+                tooltip_with_image(
+                    self._step_size_tooltip,
+                    os.path.join(TOOLTIPS_DIR, _CANDIDATE_STEP_DIAGRAM),
+                    _CANDIDATE_STEP_DIAGRAM_WIDTH))
         except RuntimeError:
             pass  # Panel closed; the widgets are gone.
 

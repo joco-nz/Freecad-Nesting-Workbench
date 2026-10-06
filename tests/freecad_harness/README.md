@@ -521,6 +521,56 @@ measured difference as a **fraction of its tolerance** rather than as a raw
 number, because a check sitting at 0.1% of its budget and one at 99% are not the
 same check and the reader should be able to see which this is.
 
+## Tooltips: rich text is Qt, the image path is not
+
+`QWidget.setToolTip()` takes rich text. Qt auto-detects HTML via
+`Qt::mightBeRichText` and renders it through `QTextDocument`, which handles
+`<b>`, `<i>`, `<br>`, `<table>` and `<img>`. The Simplify tooltip in
+`ui_nesting.py` already has a `<table>` of measured timings in it, so this is not
+a capability a change introduces — it is one already load-bearing.
+
+**Nightly's `rich_tooltip` is not a Qt API.** It is 25 lines of workbench code
+(`origin/Nightly:.../ui_helpers.py:19`), and three of its four jobs do not apply
+here: this branch has **0** `QT_TRANSLATE_NOOP` against Nightly's 187, and its
+tooltips are already HTML with `<br><br>`, so there are no `\n`s to convert and
+nothing to translate. What remains is the width pin, which is a workaround for
+Qt behaviour rather than a Qt feature — Nightly's own comment: *"Qt sizes a rich
+tooltip from its text, not its image, so a diagram sits in a wide popup."*
+Hence `ui_helpers.tooltip_with_image` — the width pin and the path handling,
+nothing else.
+
+**The path rules are measured, not assumed** (Qt 6.8.3, offscreen). Qt resolves
+a rich-text image against a base URL, and a tooltip has none, so the path must be
+absolute:
+
+| `src` form | loads? |
+|---|---|
+| bare absolute POSIX (`/home/.../x.svg`) | **yes** — document grew by the image's full 160px |
+| `file://` URL | yes |
+| relative | yes, *but only because the probe's cwd was the image directory* — not a solution |
+| **backslash separators** | **no**, and the file exists |
+| **`C:/tmp/x.svg`** | **no** — `QUrl` parses scheme **`c`**, not a path |
+
+That last row is why the helper uses `QUrl.fromLocalFile(...).toString()`
+rather than a hand-written path: Qt's own conversion is right on both platforms
+without the code knowing which it is on. **The Windows behaviour is inferred
+from the URL parsing, not observed** — this box is Linux.
+
+**Neither failure is visible from the file existing.** So
+`test_tooltip_assets.py` (gated, `freecadcmd`) does not check that the asset is
+there; it builds the tooltip with the product's own `tooltip_with_image`, renders
+it through a real `QTextDocument` offscreen, and asserts the document **grew by
+the image's height**. Injection-verified six ways, the sixth being the
+backslash path, which reproduces the Windows failure on Linux: growth drops from
+172px to 28px and the check fires.
+
+**Two judgement calls worth knowing about.** The width is a constant rather than
+re-read from the SVG at panel build time (Nightly's approach) — the check
+asserts the two agree, so a typo fails the gate instead of showing up as a
+mis-sized popup. And there is deliberately **no runtime existence check**: that
+would only fire when a user hovers the field, which is the wrong place to find
+out.
+
 ## Measuring the nester's output, and three ways to get it wrong
 
 `test_tool_clearance.py` (gated, `freecadcmd`) measures the gap between part

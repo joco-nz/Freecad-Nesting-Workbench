@@ -70,3 +70,4 @@ tests/freecad_harness/.last_status_boundary
 tests/freecad_harness/.last_status_rigid
 tests/freecad_harness/.last_status_subnames
 tests/freecad_harness/.last_status_clearance
+tests/freecad_harness/.last_status_tooltip

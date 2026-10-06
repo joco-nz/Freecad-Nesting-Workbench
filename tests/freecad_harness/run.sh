@@ -41,11 +41,13 @@ BOUNDARY_STATUS="$HARNESS_DIR/.last_status_boundary"
 RIGID_STATUS="$HARNESS_DIR/.last_status_rigid"
 SUBNAME_STATUS="$HARNESS_DIR/.last_status_subnames"
 CLEARANCE_STATUS="$HARNESS_DIR/.last_status_clearance"
+TOOLTIP_STATUS="$HARNESS_DIR/.last_status_tooltip"
 PERSIST_STATUS="$HARNESS_DIR/.last_status_persist"
 rm -f "$BENCH_STATUS" "$TEST_STATUS" "$GA_STATUS" "$PANEL_STATUS" \
       "$UNITS_STATUS" "$PYTEST_STATUS" "$REPLAY_STATUS" "$DRESSUP_STATUS" \
       "$ORDER_STATUS" "$STARTPOINT_STATUS" "$BOUNDARY_STATUS" \
-      "$RIGID_STATUS" "$SUBNAME_STATUS" "$CLEARANCE_STATUS" "$PERSIST_STATUS"
+      "$RIGID_STATUS" "$SUBNAME_STATUS" "$CLEARANCE_STATUS" \
+      "$TOOLTIP_STATUS" "$PERSIST_STATUS"
 
 cd "$REPO_ROOT"
 "$FREECADCMD" "$HARNESS_DIR/nest_benchmark.py" || true
@@ -89,6 +91,10 @@ cd "$REPO_ROOT"
 # `spacing` and the CAM tool are independent controls and nothing related them:
 # a nest tighter than the tool is wide would be cut through without a word.
 "$FREECADCMD" "$HARNESS_DIR/test_tool_clearance.py" || true
+# The Candidate Step tooltip's diagram: the file can exist and the string can
+# name it and Qt still draws a broken-image box, so this renders the real
+# tooltip offscreen and measures it. NEST-030's tooltip work.
+"$FREECADCMD" "$HARNESS_DIR/test_tooltip_assets.py" || true
 # The write half of layout persistence: a layout records the algorithm that ran,
 # the direction that algorithm's dial held, whether that direction was used, and
 # each part's raw rotation override. The reload half needs a panel and lives in
@@ -98,7 +104,8 @@ cd "$REPO_ROOT"
 for f in "$BENCH_STATUS" "$TEST_STATUS" "$GA_STATUS" "$PANEL_STATUS" \
          "$UNITS_STATUS" "$REPLAY_STATUS" "$DRESSUP_STATUS" "$ORDER_STATUS" \
          "$STARTPOINT_STATUS" "$BOUNDARY_STATUS" "$RIGID_STATUS" \
-         "$SUBNAME_STATUS" "$CLEARANCE_STATUS" "$PERSIST_STATUS"; do
+         "$SUBNAME_STATUS" "$CLEARANCE_STATUS" "$TOOLTIP_STATUS" \
+         "$PERSIST_STATUS"; do
     if [ ! -f "$f" ]; then
         echo "harness: DID NOT RUN -- did not write $f" >&2
         exit 3
@@ -206,6 +213,12 @@ fi
 CLEARANCE=$(cat "$CLEARANCE_STATUS")
 if [ "$CLEARANCE" -ne 0 ]; then
     echo "tool-clearance regression test FAILED (status $CLEARANCE)" >&2
+    [ "$STATUS" -eq 0 ] && STATUS=1
+fi
+
+TOOLTIP=$(cat "$TOOLTIP_STATUS")
+if [ "$TOOLTIP" -ne 0 ]; then
+    echo "tooltip-assets regression test FAILED (status $TOOLTIP)" >&2
     [ "$STATUS" -eq 0 ] && STATUS=1
 fi
 
