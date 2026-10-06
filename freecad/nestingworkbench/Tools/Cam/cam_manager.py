@@ -8,7 +8,7 @@ and managing CAM jobs from the nested layouts.
 
 import FreeCAD
 from ...constants import *
-from ...freecad_helpers import get_nested_containers, set_visibility
+from ...freecad_helpers import get_nested_containers, set_visibility, bake_rigid
 from ... import units
 
 class CAMManager:
@@ -93,18 +93,30 @@ class CAMManager:
             # Find the part_*, label_*, and outline_* shapes inside the container
             for child in nested_part.Group:
                 if hasattr(child, 'Shape') and child.Shape and not child.Shape.isNull():
-                    # Transform shape to global coordinates
+                    # Transform shape to global coordinates. `bake_rigid`, not
+                    # `transformGeometry`: this is a rigid motion, and
+                    # `transformGeometry` RE-FITS, turning every analytic face
+                    # into a B-spline approximation. CAM offsets its toolpath
+                    # from the faces of these shapes, so the machine would follow
+                    # an approximation of the geometry the user drew. The
+                    # placement is zeroed first so the container and child
+                    # placements are not applied twice -- see
+                    # `freecad_helpers.bake_rigid` for the measurements.
                     combined_placement = container_placement.multiply(child.Placement)
                     transformed_shape = child.Shape.copy()
                     transformed_shape.Placement = FreeCAD.Placement()
-                    transformed_shape = transformed_shape.transformGeometry(combined_placement.toMatrix())
+                    transformed_shape = bake_rigid(
+                        transformed_shape, combined_placement,
+                        "placing %s for CAM" % child.Label)
                     
                     if include_parts and child.Label.startswith("part_"):
                         # Adjust Z so bottom is at Z = -sheet_thickness
                         z_min = transformed_shape.BoundBox.ZMin
                         z_offset = -sheet_thickness - z_min
                         z_placement = FreeCAD.Placement(FreeCAD.Vector(-sheet_origin.x, -sheet_origin.y, z_offset), FreeCAD.Rotation())
-                        transformed_shape = transformed_shape.transformGeometry(z_placement.toMatrix())
+                        transformed_shape = bake_rigid(
+                            transformed_shape, z_placement,
+                            "seating %s on the stock" % child.Label)
                         if abs(transformed_shape.BoundBox.ZLength - sheet_thickness) > 0.01:
                             thickness_mismatches.append(child.Label)
                         parts_shapes.append(transformed_shape)
@@ -114,12 +126,16 @@ class CAMManager:
                         z_min = transformed_shape.BoundBox.ZMin
                         z_offset = -z_min
                         z_placement = FreeCAD.Placement(FreeCAD.Vector(-sheet_origin.x, -sheet_origin.y, z_offset), FreeCAD.Rotation())
-                        transformed_shape = transformed_shape.transformGeometry(z_placement.toMatrix())
+                        transformed_shape = bake_rigid(
+                            transformed_shape, z_placement,
+                            "lifting %s to Z 0" % child.Label)
                         labels_shapes.append(transformed_shape)
                     
                     elif include_outlines and child.Label.startswith("outline_"):
                         shift = FreeCAD.Placement(FreeCAD.Vector(-sheet_origin.x, -sheet_origin.y, 0), FreeCAD.Rotation())
-                        transformed_shape = transformed_shape.transformGeometry(shift.toMatrix())
+                        transformed_shape = bake_rigid(
+                            transformed_shape, shift,
+                            "shifting %s to sheet-local X0 Y0" % child.Label)
                         outlines_shapes.append(transformed_shape)
         
         if thickness_mismatches:

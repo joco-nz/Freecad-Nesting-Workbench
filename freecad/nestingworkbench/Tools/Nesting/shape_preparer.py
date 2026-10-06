@@ -15,41 +15,8 @@ from ...freecad_helpers import (
     create_part_feature,
     get_view_object,
     set_visibility,
+    is_rigid_matrix,
 )
-
-#: Tolerance for the rigidity test below. Loose enough for the accumulated
-#: rounding of a composed matrix, tight enough that a real scale -- the smallest
-#: anyone would type into a placement, and `Placement` cannot express one at all
-#: -- is many orders of magnitude outside it.
-_RIGID_TOLERANCE = 1e-9
-
-
-def _is_rigid(matrix):
-    """True if `matrix` is a rotation plus a translation, with no scale or shear.
-
-    Guards `transformShape`, which **requires** a rigid matrix and applies a
-    non-rigid one as though it were exact. `transformGeometry` would have
-    re-fitted the geometry and so tolerated anything; that is precisely why it
-    was wrong here, and replacing it with `transformShape` makes the assumption
-    load-bearing enough to check rather than trust.
-
-    Two parts, and both are needed:
-
-    * `hasScale()` is FreeCAD's own scale flag -- measured 0 for a rigid matrix,
-      3 for a uniform scale, and **-1 for a shear**, so a non-zero result covers
-      both kinds of distortion. `isOrthogonal()` is *not* used: it returns 0.0
-      for a rigid, a scaled and a sheared matrix alike in FreeCAD 26.3, so it
-      would pass everything and its name invites relying on it.
-    * `determinant()` catches a reflection, which preserves lengths and so
-      reports no scale, but has determinant -1 and mirrors the part.
-
-    Both predicates were exercised against all three counter-examples before
-    being used; see `tests/test_shape_preparer_rigid/test_shape_preparer_rigid.py`.
-    """
-    if matrix.hasScale() != 0:
-        return False
-    return abs(matrix.determinant() - 1.0) <= _RIGID_TOLERANCE
-
 
 class ShapePreparer:
     """
@@ -637,7 +604,7 @@ class ShapePreparer:
         # translation and a `Placement` has no scale by construction. Asserted
         # rather than assumed, because the assumption is the entire justification
         # for not using `transformGeometry`.
-        if not _is_rigid(combined_mat):
+        if not is_rigid_matrix(combined_mat):
             raise ValueError(
                 "_center_3d_shape was handed a non-rigid matrix; transformShape "
                 "would apply it as an exact transform and silently distort the "

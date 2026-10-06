@@ -59,7 +59,7 @@ the symbol when you edit the entry.
 | [NEST-004](#nest-004) | Synthetic heavy corpus is calibrated to a piece count production no longer produces | open | medium | benchmark |
 | [NEST-005](#nest-005) | Simplification destroys the rotational symmetry of part outlines | limitation | low | geometry |
 | [NEST-006](#nest-006) | Deflection tooltip states unmeasured ranges | open | low | docs |
-| [NEST-007](#nest-007) | Nesting converts analytic source geometry to B-splines to centre it | open (partly resolved) | medium | geometry |
+| [NEST-007](#nest-007) | Nesting converts analytic source geometry to B-splines to centre it | resolved | medium | geometry |
 | [NEST-008](#nest-008) | Hole-nesting detection costs 148 ms per part on real geometry | open | medium | performance |
 | [NEST-009](#nest-009) | a replayed Boundary dressup clips against the SOURCE job's stock | resolved | high | CAM replay |
 | [NEST-010](#nest-010) | the flattened parts could not be removed: the job's clones were links | resolved | medium | CAM replay |
@@ -453,7 +453,7 @@ actually known.
 
 **Nesting converts analytic source geometry to B-splines to centre it**
 
-`status: open` · `severity: medium` · `area: geometry`
+`status: resolved` · `severity: medium` · `area: geometry`
 
 Every 3D part that goes into a nest arrives at the layout as a B-spline solid
 even when the user modelled it from planes and cylinders. Measured on the
@@ -511,11 +511,55 @@ preserve topology for a rigid motion where `transformGeometry` may not, which
 is the reason to prefer it, but it should be confirmed against the n70 corpus
 rather than assumed.
 
-### Partly resolved — `_center_3d_shape` only
+### Resolved — both halves, in two commits
 
-**Done: the nester's centring.** `transformGeometry` → `transformShape`, with a
-rigidity guard. **Not done: the four `cam_manager` call sites**, so this entry
-stays `open`; they are the same substitution and the same argument applies.
+**Done: the nester's centring** (`43003e1`), and **done: the four `cam_manager`
+call sites**. Both were the same substitution and the same argument; the second
+was the more consequential of the two, because `cam_manager`'s output *is* the
+geometry the CAM job offsets its toolpath from.
+
+`transformGeometry` → `transformShape`, once per call site, behind a shared
+`freecad_helpers.bake_rigid(shape, placement)`. `_is_rigid` moved out of
+`shape_preparer` to `freecad_helpers.is_rigid_matrix` so both modules share one
+implementation rather than two copies of a predicate that has to be right.
+
+**The four `cam_manager` matrices are rigid by construction, not by luck.** Each
+comes from `Placement.toMatrix()`, and a `Placement` is a rotation and a
+translation with no scale to express. So there is no hand-composed matrix to
+guard here as there was in `_center_3d_shape` -- the guard moved *into*
+`bake_rigid`, which accepts a `Matrix` as readily as a `Placement` and checks
+whichever it is given. That is the version worth having: the check fires where
+the type system stops guaranteeing anything.
+
+**`cam_manager` does not have NEST-028.** Line 99 zeroes the shape's placement
+before transforming, so the container and child placements are applied exactly
+once. Worth recording because it is the difference between that code being a
+drop-in for this fix and being a trap.
+
+**Verified through the real method, not the helper.** `CAMManager._create_job_for_sheet`
+on a sheet holding a plate with a hole, rotated 33° in its container, produces
+`CAM_Parts_Sheet_1` with surface types `['Cylinder', 'Plane']`. Reverting a
+single one of the four call sites to `transformGeometry` flips that to
+`['BSplineSurface']` and fails the check -- so the assertion is on the shape CAM
+actually receives, and it fails when the fix is undone. The compounds are built
+before the GUI-dependent job creation, which is what makes this inspectable
+headless (`freecadcmd` cannot import `PathGui`; the collection does not need it).
+
+**`transformShape` modifies its input in place and returns the same object.**
+Measured, because the first version of `bake_rigid`'s docstring claimed the
+opposite -- written from an assumption about what `copy=True` means rather than
+from a measurement of it. `copy=True` does **not** mean "leave the original
+alone": the input's bounding box moves by the full transform (measured 15.553 mm
+for a 29° rotation plus a 12/-7/3 mm offset) and its `Placement` becomes the
+applied one. `transformGeometry` *does* leave the original alone. So the
+docstring now states the measured contract, **pass a copy the caller owns**, and
+the test pins it -- including that the same object comes back. No product bug
+results, because every call site already hands over a disposable `.copy()`;
+there is deliberately no internal copy in `bake_rigid`, as that would be a
+second copy of every part in every nest for nothing.
+
+Gate: 12 freecadcmd suites, 1012 checks, 0 failures, plus 543 pytest.
+`test_shape_preparer_rigid.py` covers 38 of them, 12 new in this half.
 
 **The open question above is answered — face ordering is preserved.** Measured on
 the committed fixture's own `PartDesign` bodies, through the real

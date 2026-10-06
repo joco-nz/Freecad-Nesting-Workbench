@@ -277,3 +277,86 @@ def create_part_feature(doc, name, shape, group=None, visible=True):
     return obj
 
 
+#: Tolerance for `is_rigid_matrix`. Loose enough for the accumulated rounding of
+#: a composed matrix, tight enough that a real scale -- the smallest anyone would
+#: type into a placement, and `Placement` cannot express one at all -- is many
+#: orders of magnitude outside it.
+RIGID_TOLERANCE = 1e-9
+
+
+def is_rigid_matrix(matrix):
+    """True if `matrix` is a rotation plus a translation, with no scale or shear.
+
+    Exists because `Shape.transformShape` **requires** a rigid matrix and applies
+    a non-rigid one as though it were exact. `transformGeometry` re-fits geometry
+    and so tolerated anything -- which is exactly why it was the wrong call
+    wherever a rigid motion was wanted, and replacing it makes that assumption
+    load-bearing enough to check rather than trust.
+
+    Two parts, and both are needed:
+
+    * `hasScale()` is FreeCAD's own scale flag -- measured 0 for a rigid matrix, 3
+      for a uniform scale, and **-1 for a shear**, so a non-zero result covers
+      both kinds of distortion. `isOrthogonal()` is deliberately *not* used: it
+      returns 0.0 for a rigid, a scaled and a sheared matrix alike in FreeCAD
+      26.3, so it would pass everything, and its name invites relying on it.
+    * `determinant()` catches a reflection, which preserves lengths and so reports
+      no scale, but has determinant -1 and mirrors the part.
+
+    Both predicates were exercised against all three counter-examples -- a scale, a
+    shear and a reflection -- before being relied on; see
+    `tests/freecad_harness/test_shape_preparer_rigid.py`.
+    """
+    if matrix.hasScale() != 0:
+        return False
+    return abs(matrix.determinant() - 1.0) <= RIGID_TOLERANCE
+
+
+def bake_rigid(shape, placement, what="this geometry"):
+    """Return `shape` moved rigidly, without re-fitting its surfaces.
+
+    The one place the workbench applies a rigid motion to geometry for its own
+    sake, so the reason is stated once rather than at every call site:
+
+    * `transformGeometry` **re-fits** -- it converts analytic surfaces into
+      B-splines, so a `Cylinder` face the user modelled came back approximated.
+      Measured on a plate with a hole: every face became a `BSplineSurface`, the
+      top face's area moved 921.4602 -> 921.7994 and the cylinder's 188.4956 ->
+      189.0014 (+0.2684%, and systematic -- identical at cylinder radius 1 mm and
+      50 mm), and the solid's volume moved 5528.7611 -> 5524.6221. CAM offsets a
+      toolpath from the real surface, so this makes the machine follow an
+      approximation of what was drawn. It is also ~10x slower and makes
+      `shape.slice()` ~1.8x slower.
+    * `transformShape` moves the geometry and keeps the surfaces. It requires a
+      rigid matrix, which is what the check here is for.
+
+    **Why not assign `shape.Placement`**, which is the obvious first answer for a
+    rigid motion. Because the transform has to be *baked*: callers reset the
+    placement afterwards -- `shape_preparer._handle_new_master` sets it to
+    `(0, 0, 0)` plus the up-direction rotation -- and a centring left in the
+    placement is discarded by that. Measured: a Placement-assigned centring moves
+    5.000 mm when that reset runs, and the baked one does not move at all.
+
+    `placement` may be a `FreeCAD.Placement` or a `FreeCAD.Matrix`; both are
+    checked, because `Placement` guarantees rigidity and a `Matrix` does not.
+
+    **The shape is modified in place and returned** -- measured: the input's
+    bounding box moves by the full transform and its `Placement` becomes the
+    applied one. `transformShape`'s `copy=True` does *not* mean "leave the
+    original alone"; `transformGeometry` does leave it alone, which is the
+    opposite, and the difference was worth measuring rather than assuming. So
+    **pass a copy the caller owns**, which is what every call site does.
+
+    Not copying internally on purpose: all three call sites already hand over a
+    shape they made for the purpose, so an internal copy would be a second copy
+    of every part in every nest for nothing.
+    """
+    matrix = placement.toMatrix() if hasattr(placement, "toMatrix") else placement
+    if not is_rigid_matrix(matrix):
+        raise ValueError(
+            "%s needs a rigid transform (rotation and translation only) but was "
+            "given a matrix that scales or shears. transformShape would apply it "
+            "as though exact and silently distort the geometry." % what)
+    return shape.transformShape(matrix, True)
+
+

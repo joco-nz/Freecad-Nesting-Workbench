@@ -70,9 +70,14 @@ _STATUS_FILE = os.path.join(_HERE, ".last_status_rigid")
 import FreeCAD
 import Part
 
-from freecad.nestingworkbench.Tools.Nesting.shape_preparer import (
-    ShapePreparer, _is_rigid,
-)
+from freecad.nestingworkbench.Tools.Nesting.shape_preparer import ShapePreparer
+from freecad.nestingworkbench.freecad_helpers import is_rigid_matrix, bake_rigid
+
+#: The local name `_is_rigid` was moved out to `freecad_helpers` when
+#: `cam_manager` needed the same check. Aliased so the calls below read the same
+#: and so an import that silently reverted to a local copy would fail here rather
+#: than passing against two implementations.
+_is_rigid = is_rigid_matrix
 
 _failures = []
 _checks = [0]
@@ -377,12 +382,154 @@ def check_function_centres_and_refuses():
     FreeCAD.closeDocument(doc.Name)
 
 
+def check_bake_rigid_refuses_and_matches():
+    """`bake_rigid` -- the helper both modules now use.
+
+    NEST-007's second half: `cam_manager` applied the same rigid motion with
+    `transformGeometry` in four places. It now goes through this, so the reason
+    the transform has to be rigid is stated once instead of at four call sites,
+    and a caller that passes a raw `Matrix` is checked where a `Placement` cannot
+    be.
+    """
+    emit("")
+    emit("-- bake_rigid --")
+    shape = plate_shape()
+    placement = FreeCAD.Placement(FreeCAD.Vector(12.0, -7.0, 3.0),
+                                  FreeCAD.Rotation(FreeCAD.Vector(0, 0, 1), 29.0))
+
+    from_matrix = bake_rigid(shape.copy(), placement)
+    check_equal(surface_types(from_matrix), surface_types(shape),
+                "surface types after bake_rigid")
+    check(abs(from_matrix.Volume - shape.Volume) < 1e-9,
+          "bake_rigid changed the volume by %.3e"
+          % abs(from_matrix.Volume - shape.Volume))
+
+    # A raw Matrix must be accepted when rigid and refused when not, so the
+    # helper's contract holds for both argument types.
+    rigid_matrix = placement.toMatrix()
+    via_matrix = bake_rigid(shape.copy(), rigid_matrix)
+    check(max_bbox_delta(from_matrix, via_matrix) < 1e-12,
+          "passing a Placement and passing its Matrix gave different results")
+
+    refused = False
+    scaled = FreeCAD.Matrix()
+    scaled.move(placement.Base.negative())
+    scaled.scale(1.1, 1.1, 1.1)
+    try:
+        bake_rigid(shape.copy(), scaled, "the scaled thing")
+    except ValueError as exc:
+        refused = True
+        check("scaled" in str(exc) or "rigid" in str(exc),
+              "the refusal does not say what was wrong: %s" % exc)
+    check(refused, "bake_rigid accepted a scaling matrix")
+
+    # The shape is modified in place and returned -- measured, and the opposite
+    # of what `transformGeometry` does. This check pins that, because the first
+    # version of this file asserted the reverse ("shape is not modified") and
+    # failed: the docstring claim was written from an assumption about
+    # `copy=True` rather than from a measurement of it.
+    moved = plate_shape()
+    before = bbox_of(moved)
+    result = bake_rigid(moved, placement)
+    after = bbox_of(moved)
+    check(after != before,
+          "bake_rigid left the input where it was, so the documented in-place "
+          "contract no longer holds")
+    check(result is moved,
+          "bake_rigid returned a different object than it was given")
+    emit("  input bbox moved %.3f mm in place; same object returned: %s"
+         % (max(abs(x - y) for x, y in zip(before, after)), result is moved))
+    check(abs(moved.Volume - plate_shape().Volume) < 1e-9,
+          "moving in place distorted the volume")
+
+
+def check_cam_manager_keeps_surfaces_analytic():
+    """The `cam_manager` collection path, end to end.
+
+    Driven through the real method rather than the helper, because what matters
+    is that the shapes handed to the CAM job are analytic -- the job offsets its
+    toolpath from them. The compounds are built before the GUI-dependent job
+    creation, so this is inspectable headless.
+    """
+    emit("")
+    emit("-- cam_manager collection --")
+    doc = FreeCAD.newDocument("cammanager")
+    thickness = 3.0
+
+    layout = doc.addObject("App::DocumentObjectGroup", "Layout_CM")
+    for name, value in (("SheetWidth", 300.0), ("SheetHeight", 200.0),
+                        ("SheetThickness", thickness)):
+        layout.addProperty("App::PropertyLength", name, "Layout", "")
+        setattr(layout, name, value)
+    sheet = doc.addObject("App::DocumentObjectGroup", "Sheet_1")
+    layout.addObject(sheet)
+    shapes = doc.addObject("App::DocumentObjectGroup", "Shapes_1")
+    sheet.addObject(shapes)
+    boundary = doc.addObject("Part::Feature", "Sheet_Boundary_1")
+    boundary.Shape = Part.makePlane(300, 200)
+    sheet.addObject(boundary)
+
+    # A plate with a hole, so the collected shape carries a Cylinder as well as
+    # Planes -- a test that only used boxes could not see a cylinder re-fitted.
+    # Its thickness is the SHEET thickness: the collection seats a part by
+    # translating it in Z, which cannot change how thick it is, so a 4 mm plate on
+    # a 3 mm sheet is a fixture fault and the product reports it as
+    # `thickness_mismatches`. The first version of this fixture did exactly that
+    # and the check below failed on the product's correct behaviour.
+    plate = Part.makeBox(40, 25, thickness, FreeCAD.Vector(-20, -12.5, -thickness)).cut(
+        Part.makeCylinder(5, thickness, FreeCAD.Vector(-10, 0, -thickness)))
+    container = doc.addObject("App::Part", "nested_Plate_1")
+    shapes.addObject(container)
+    child = doc.addObject("Part::Feature", "part_Plate_1")
+    child.Shape = plate
+    child.Placement = FreeCAD.Placement()
+    container.addObject(child)
+    container.Placement = FreeCAD.Placement(
+        FreeCAD.Vector(120.0, 80.0, 0.0),
+        FreeCAD.Rotation(FreeCAD.Vector(0, 0, 1), 33.0))
+    doc.recompute()
+
+    from freecad.nestingworkbench.Tools.Cam.cam_manager import CAMManager
+    CAMManager(layout)._create_job_for_sheet(
+        sheet, include_parts=True, include_labels=True, include_outlines=True)
+
+    collected = [o for o in doc.Objects
+                 if o.Label.startswith("CAM_Parts_")
+                 or o.Label.startswith("CAM_Labels_")
+                 or o.Label.startswith("CAM_Outlines_")]
+    check(len(collected) > 0,
+          "cam_manager collected no shapes, so nothing was checked")
+
+    for obj in collected:
+        kinds = sorted(set(type(f.Surface).__name__ for f in obj.Shape.Faces))
+        emit("  %-34s faces=%-3d types=%s" % (obj.Label, len(obj.Shape.Faces), kinds))
+        check("BSplineSurface" not in kinds,
+              "%s was handed to the CAM job as B-splines: %s"
+              % (obj.Label, kinds))
+
+    parts = [o for o in collected if o.Label.startswith("CAM_Parts_")]
+    if parts:
+        box = parts[0].Shape.BoundBox
+        emit("  parts bbox Z %.3f..%.3f (sheet thickness %.1f)"
+             % (box.ZMin, box.ZMax, thickness))
+        check(abs(box.ZLength - thickness) < 0.01,
+              "the collected part is %.3f mm thick, expected %.1f"
+              % (box.ZLength, thickness))
+        check(box.XMin > 1.0,
+              "the part did not move to its container position: XMin=%.3f"
+              % box.XMin)
+
+    FreeCAD.closeDocument(doc.Name)
+
+
 def run():
     check_rigid_guard()
     check_centre_matches_transform_geometry()
     check_geometry_is_not_refitted()
     check_survives_the_placement_reset()
     check_function_centres_and_refuses()
+    check_bake_rigid_refuses_and_matches()
+    check_cam_manager_keeps_surfaces_analytic()
 
 
 if __name__ in ("__main__", "test_shape_preparer_rigid"):
