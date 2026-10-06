@@ -254,6 +254,7 @@ downstream of them stays in millimetres. Two files, two interpreters:
 |---|---|---|
 | `test_document_units.py` | `units.py` — schema resolution, length/area formatting, `parse_length`, `length_mm` | `freecadcmd`, wired into `run.sh` |
 | `test_replay_boundary.py` | `Path.Dressup.Boundary` is unsupported — dropped from the replay, the rest of the step's stack kept, reported once per dressup | `freecadcmd`, wired into `run.sh` |
+| `test_shape_preparer_rigid.py` | `ShapePreparer._center_3d_shape` centres with `transformShape`, not `transformGeometry`, and `_is_rigid` refuses a non-rigid matrix | `freecadcmd`, wired into `run.sh` |
 | `test_layout_persistence.py` | the write half of layout persistence — `Algorithm`, `NestingDirection`, `RandomDirection`, and each part's raw rotation override, on a real document, with a save/reopen round trip | `freecadcmd`, wired into `run.sh` |
 | `probe_layout_restore.py` | the reload half — the controller reading the right dial, and the panel coming back showing what the layout recorded | `freecad` (GUI), run by hand |
 | `probe_unit_panel.py` | `length_field.py` and the real `NestingPanel` | `freecad` (GUI), run by hand |

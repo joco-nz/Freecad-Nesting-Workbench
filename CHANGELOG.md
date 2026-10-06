@@ -178,6 +178,20 @@ asks what the job cannot say. One job per sheet, every sheet replayed.
   gone.
   See [NEST-009](issues.md#nest-009).
 
+- **Nesting no longer turns your geometry into B-splines.** Centring a part used
+  `transformGeometry`, the one Part operation that re-fits geometry rather than
+  moving it. Every analytic face came back as a `BSplineSurface`, so a cylinder you
+  modelled became an approximation of one -- measured a face area of 314.1593
+  against 315.0023, a +0.27% shift from a transform that should have been exact,
+  and CAM then offsets the toolpath from that approximation. It was also about ten
+  times slower than the operation that was wanted, and it made sectioning ~1.8x
+  slower, which is most of the nesting-time cost.
+  Centring now uses `transformShape`. Same motion -- bounding boxes agree to 0.000
+  -- but surfaces stay analytic and the per-face areas now match the source
+  exactly. Face numbering is unchanged, which is what the CAM replay relies on to
+  address the right feature on every nested copy. See
+  [NEST-007](issues.md#nest-007).
+
 - **A layout did not record the algorithm that produced it.** Reopening a Physics
   layout brought up Minkowski, with the wrong algorithm's whole settings section --
   and with the direction to match, because `NestingDirection` was written from the

@@ -17,6 +17,40 @@ from ...freecad_helpers import (
     set_visibility,
 )
 
+#: Tolerance for the rigidity test below. Loose enough for the accumulated
+#: rounding of a composed matrix, tight enough that a real scale -- the smallest
+#: anyone would type into a placement, and `Placement` cannot express one at all
+#: -- is many orders of magnitude outside it.
+_RIGID_TOLERANCE = 1e-9
+
+
+def _is_rigid(matrix):
+    """True if `matrix` is a rotation plus a translation, with no scale or shear.
+
+    Guards `transformShape`, which **requires** a rigid matrix and applies a
+    non-rigid one as though it were exact. `transformGeometry` would have
+    re-fitted the geometry and so tolerated anything; that is precisely why it
+    was wrong here, and replacing it with `transformShape` makes the assumption
+    load-bearing enough to check rather than trust.
+
+    Two parts, and both are needed:
+
+    * `hasScale()` is FreeCAD's own scale flag -- measured 0 for a rigid matrix,
+      3 for a uniform scale, and **-1 for a shear**, so a non-zero result covers
+      both kinds of distortion. `isOrthogonal()` is *not* used: it returns 0.0
+      for a rigid, a scaled and a sheared matrix alike in FreeCAD 26.3, so it
+      would pass everything and its name invites relying on it.
+    * `determinant()` catches a reflection, which preserves lengths and so
+      reports no scale, but has determinant -1 and mirrors the part.
+
+    Both predicates were exercised against all three counter-examples before
+    being used; see `tests/test_shape_preparer_rigid/test_shape_preparer_rigid.py`.
+    """
+    if matrix.hasScale() != 0:
+        return False
+    return abs(matrix.determinant() - 1.0) <= _RIGID_TOLERANCE
+
+
 class ShapePreparer:
     """
     Handles the preparation of shapes for nesting.
@@ -543,12 +577,73 @@ class ShapePreparer:
         return original_shape
 
     def _center_3d_shape(self, master_obj, original_shape, center_point):
-        """Centers regular Part objects using combined transformGeometry (Placement + centering)."""
+        """Centers a 3D part with one combined rigid transform.
+
+        **A rigid motion, applied as `transformShape` and not
+        `transformGeometry`.** The two differ only in whether they re-fit the
+        geometry, and re-fitting is not wanted: `transformGeometry` converts
+        every analytic surface into a `BSplineSurface`, so a `Cylinder` face the
+        user modelled came back approximated. Measured on this function's own
+        input, a plate with a hole:
+
+            surface types   transformGeometry -> BSplineSurface x7
+                            transformShape    -> Plane x6, Cylinder x1
+            face area       top 921.4602 -> 921.7994  (+0.2684%)
+                            cylinder 188.4956 -> 189.0014  (+0.2684%)
+            volume          5528.7611 -> 5524.6221
+
+        The +0.2684% is systematic, not noise: it is identical at cylinder radius
+        1 mm and 50 mm, and it is why CAM then offsets a toolpath from an
+        approximation of the surface rather than the surface itself. It also makes
+        `shape.slice()` ~1.8x slower, which is most of NEST-008.
+
+        `transformShape` is a drop-in for the geometry: measured against
+        `transformGeometry` on the same matrix, bounding boxes agree to 0.000
+        (identity placement) and 7.1e-15 (rotated), volume to 2.7e-12, and the
+        result survives `_handle_new_master`'s placement reset identically.
+
+        **Why not simply assign a `Placement`.** That looks like the natural
+        choice -- a rigid motion needs no scale, and `Placement` cannot carry any
+        -- and it was the first thing tried. It does not work here because
+        `_handle_new_master` resets the master's placement immediately
+        afterwards, to `(0, 0, 0)` plus the up-direction rotation. A centring left
+        in the placement is discarded by that reset and the part lands back where
+        it started. Measured: the baked result is unchanged by the reset, the
+        placement-assigned one moves by the full centring offset. The transform
+        has to be baked into the geometry, which is what both of these do and what
+        `Placement` alone cannot.
+
+        **The transform is baked, so the shape comes back with its placement
+        unchanged** -- identical to what `transformGeometry` did, and the reason
+        the next line can reset it without moving the part.
+
+        **Known and separate: this is a no-op when the part arrives with a
+        non-identity placement.** The matrix is applied to the local geometry and
+        then the object's own placement is applied on top, cancelling it -- input
+        and output bounding boxes are identical. That is pre-existing, it affects
+        `transformGeometry` and `transformShape` equally, and it is why the
+        centring is verified against identity-placement parts only. Tracked
+        separately rather than fixed here, because fixing it would move parts and
+        that is a behaviour change, not a fidelity one. See issues.md.
+        """
         combined_mat = FreeCAD.Matrix()
         combined_mat.move(center_point.negative())
         if master_obj.Placement and not master_obj.Placement.isIdentity():
             combined_mat = combined_mat.multiply(master_obj.Placement.Matrix)
-        return original_shape.transformGeometry(combined_mat)
+
+        # The whole point of `transformShape` is that it requires a rigid matrix,
+        # and a silently non-rigid one -- a scale or a shear -- would be applied
+        # as if it were exact. Nothing here can supply either: `move` is a pure
+        # translation and a `Placement` has no scale by construction. Asserted
+        # rather than assumed, because the assumption is the entire justification
+        # for not using `transformGeometry`.
+        if not _is_rigid(combined_mat):
+            raise ValueError(
+                "_center_3d_shape was handed a non-rigid matrix; transformShape "
+                "would apply it as an exact transform and silently distort the "
+                "part. Centring only ever needs a translation and a rotation.")
+
+        return original_shape.transformShape(combined_mat, True)
 
     def _create_boundary_object(self, master_container, master_shape_obj, temp_shape_wrapper, verbose):
         """Creates the boundary shape object from the temp_shape_wrapper and adds it to the master_container."""

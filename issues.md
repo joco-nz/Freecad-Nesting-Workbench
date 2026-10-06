@@ -59,7 +59,7 @@ the symbol when you edit the entry.
 | [NEST-004](#nest-004) | Synthetic heavy corpus is calibrated to a piece count production no longer produces | open | medium | benchmark |
 | [NEST-005](#nest-005) | Simplification destroys the rotational symmetry of part outlines | limitation | low | geometry |
 | [NEST-006](#nest-006) | Deflection tooltip states unmeasured ranges | open | low | docs |
-| [NEST-007](#nest-007) | Nesting converts analytic source geometry to B-splines to centre it | open | medium | geometry |
+| [NEST-007](#nest-007) | Nesting converts analytic source geometry to B-splines to centre it | open (partly resolved) | medium | geometry |
 | [NEST-008](#nest-008) | Hole-nesting detection costs 148 ms per part on real geometry | open | medium | performance |
 | [NEST-009](#nest-009) | a replayed Boundary dressup clips against the SOURCE job's stock | resolved | high | CAM replay |
 | [NEST-010](#nest-010) | the flattened parts could not be removed: the job's clones were links | resolved | medium | CAM replay |
@@ -80,6 +80,7 @@ the symbol when you edit the entry.
 | [NEST-025](#nest-025) | `rotation_params` is threaded through six call sites and read by nobody | open | low | dead code |
 | [NEST-026](#nest-026) | `Array.Centre` and `Tags.Positions` are points on the part, carried verbatim | open | medium (unmeasured) | CAM replay |
 | [NEST-027](#nest-027) | a sub-element name that resolves to a different face is invisible | open | unknown (unmeasured) | CAM replay |
+| [NEST-028](#nest-028) | centring does nothing for a part that arrives pre-positioned | open | medium (unmeasured) | geometry |
 
 Statuses for NEST-009 through NEST-021 were derived from each entry's own
 prose, cross-checked where a later entry supersedes an earlier one: NEST-018's
@@ -509,6 +510,71 @@ both depend on stable sub-element names -- `transformShape` is documented to
 preserve topology for a rigid motion where `transformGeometry` may not, which
 is the reason to prefer it, but it should be confirmed against the n70 corpus
 rather than assumed.
+
+### Partly resolved — `_center_3d_shape` only
+
+**Done: the nester's centring.** `transformGeometry` → `transformShape`, with a
+rigidity guard. **Not done: the four `cam_manager` call sites**, so this entry
+stays `open`; they are the same substitution and the same argument applies.
+
+**The open question above is answered — face ordering is preserved.** Measured on
+the committed fixture's own `PartDesign` bodies, through the real
+`prepare_parts`, comparing each master shape against its source body face by face
+**by index**:
+
+| body | faces | source types | master types | worst face-area change by index |
+|---|---:|---|---|---:|
+| `SimpleSpacer` | 42 → 42 | `Cylinder`, `Plane` | `Cylinder`, `Plane` | 2.8e-14 |
+| `BottomStrap` | 12 → 12 | `Cylinder`, `Plane` | `Cylinder`, `Plane` | **0.000** |
+| `TopStrap` | 11 → 11 | `Cylinder`, `Plane` | `Cylinder`, `Plane` | 1.4e-14 |
+
+Volumes are now identical to source (`SimpleSpacer` 62097.5172 → 62097.5172;
+before, 62097.5172 → **62090.9305**). Face *N* is the same face by index, not
+merely the same count -- which is the property `cam_replay` and `cam_manager`
+depend on, and the reason NEST-027's face-agreement check can be exact rather than
+tolerance-based.
+
+**Same motion, measured rather than assumed.** Against `transformGeometry` on the
+same matrix: bounding boxes agree to **0.000** (identity placement) and 7.1e-15
+(rotated), volume to 2.7e-12, and the result survives `_handle_new_master`'s
+placement reset identically. Timing on a cylinder: **19x** faster, 1.5 ms against
+28 ms per call.
+
+**Why not a bare `Placement`, which was the obvious first attempt.** A rigid motion
+needs no scale and `Placement` cannot carry any, so it looks like the right tool --
+and it is not, here. `_handle_new_master` resets the master's placement to
+`(0, 0, 0)` immediately afterwards, discarding a centring left in the placement.
+Measured: a `Placement`-assigned centring moves 5.000 mm when that reset runs, and
+the baked one does not move at all. The transform has to be baked into the
+geometry.
+
+**The guard, and why it exists at all.** `transformShape` *requires* a rigid matrix
+and applies a non-rigid one as though exact -- where `transformGeometry` would have
+re-fitted and so tolerated anything, which is precisely why it was wrong.
+Replacing it made the assumption load-bearing, so `_is_rigid` checks it and
+`_center_3d_shape` refuses a non-rigid matrix rather than distorting a part. It
+uses `hasScale()` (measured 0 for rigid, 3 for a uniform scale, **-1 for a
+shear**) plus `determinant()` to catch a reflection, which preserves lengths and
+so reports no scale. **`Matrix.isOrthogonal()` is deliberately not used**: it
+returns `0.0` for a rigid, a scaled *and* a sheared matrix alike in FreeCAD 26.3,
+and its name invites exactly that reliance.
+
+**Coverage.** `tests/freecad_harness/test_shape_preparer_rigid.py`, 26 checks,
+gated and wired into `run.sh`. Injection-checked both ways: reverting to
+`transformGeometry` fails 2 checks, and weakening `_is_rigid` to a
+determinant-only test fails the shear check -- which is the case a
+determinant-only guard provably cannot see, since that shear's determinant is
+exactly 1.0.
+
+**A latent defect found on the way, deliberately not fixed here.** With a
+**non-identity placement** on the master object, `_center_3d_shape` is a **no-op**:
+the matrix is applied to the local geometry and then the object's own placement is
+applied on top, cancelling it, so input and output bounding boxes are identical. A
+part that arrives pre-positioned is never centred.
+
+True of `transformGeometry` and `transformShape` equally, so it is pre-existing and
+orthogonal to this change, and fixing it would **move parts** -- a behaviour
+change, not a fidelity one. Filed as NEST-028 rather than bundled here.
 
 ---
 
@@ -1403,6 +1469,52 @@ sub-element name that resolves to a *different* face is invisible to every check
 in the replay, and the consequence is a job that cuts the wrong feature -- the
 NEST-015 shape. Its reach outside a fixture is unmeasured.
 
+
+## NEST-028 — centring silently does nothing for a part that arrives pre-positioned
+
+`status: open` · `severity: medium (unmeasured)` · `area: geometry`
+
+Found while fixing NEST-007, and deliberately not fixed there: it would **move
+parts**, which is a behaviour change, not the fidelity fix that was in hand.
+
+`ShapePreparer._center_3d_shape` builds a matrix of *translate by −centroid* and
+multiplies it by the master object's own `Placement`. It then applies that matrix
+to a shape **which already carries that placement**:
+
+    combined = translate(-centroid) * Placement
+    result   = shape.transformShape(combined)     # shape.Placement IS `Placement`
+
+The placement is therefore applied twice — once inside `combined`, once factored
+out of the shape — and the two cancel. Measured with a placement of `(5, 7, 11)`
+and yaw 30°:
+
+    input bounding box  (-15.722, 13.428, 20.000)..(6.598, 32.088, 50.000)
+    output bounding box (-15.722, 13.428, 20.000)..(6.598, 32.088, 50.000)
+
+Identical. The part does not move, so it is never centred. With an **identity**
+placement — which is what the committed fixture and the harness fixtures all have
+— the multiply is skipped, `combined` is a pure translation, and the function works
+correctly. That is why it has gone unnoticed.
+
+**Not fixed, because the right answer is a judgement and not an obvious one.**
+Dropping the `Placement` multiply would make the centring work, but the existing
+multiply may be *deliberate* for parts that carry a placement: it may be there to
+bake a rotation into the geometry so the master shape starts axis-aligned for the
+2D nester. Nothing in the function or its docstring says which. The first step is
+therefore to find out whether anything depends on the current behaviour, and that
+is a question about the nester rather than about this function.
+
+**Reach is unmeasured.** It needs establishing whether real parts arrive with a
+non-identity placement — anything positioned in the tree by the user rather than
+created from a file would. If they do not, this is latent; if they do, every such
+part is nested off-centre.
+
+**Fix direction.** Determine whether the `Placement` multiply is load-bearing. If
+not, drop it and the centring works. If it is, the function needs to separate the
+two intents — bake the rotation, translate the geometry — rather than composing
+them into a single matrix that then gets applied twice.
+
+---
 
 ## NEST-027 — a sub-element name that resolves to a different face is invisible
 
