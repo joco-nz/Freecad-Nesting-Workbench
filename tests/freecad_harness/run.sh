@@ -40,11 +40,12 @@ STARTPOINT_STATUS="$HARNESS_DIR/.last_status_startpoint"
 BOUNDARY_STATUS="$HARNESS_DIR/.last_status_boundary"
 RIGID_STATUS="$HARNESS_DIR/.last_status_rigid"
 SUBNAME_STATUS="$HARNESS_DIR/.last_status_subnames"
+CLEARANCE_STATUS="$HARNESS_DIR/.last_status_clearance"
 PERSIST_STATUS="$HARNESS_DIR/.last_status_persist"
 rm -f "$BENCH_STATUS" "$TEST_STATUS" "$GA_STATUS" "$PANEL_STATUS" \
       "$UNITS_STATUS" "$PYTEST_STATUS" "$REPLAY_STATUS" "$DRESSUP_STATUS" \
       "$ORDER_STATUS" "$STARTPOINT_STATUS" "$BOUNDARY_STATUS" \
-      "$RIGID_STATUS" "$SUBNAME_STATUS" "$PERSIST_STATUS"
+      "$RIGID_STATUS" "$SUBNAME_STATUS" "$CLEARANCE_STATUS" "$PERSIST_STATUS"
 
 cd "$REPO_ROOT"
 "$FREECADCMD" "$HARNESS_DIR/nest_benchmark.py" || true
@@ -85,6 +86,9 @@ cd "$REPO_ROOT"
 # fewer faces than the source answered fine and profiled the wrong feature.
 # Compared against the source geometry; NEST-027.
 "$FREECADCMD" "$HARNESS_DIR/test_replay_subnames.py" || true
+# `spacing` and the CAM tool are independent controls and nothing related them:
+# a nest tighter than the tool is wide would be cut through without a word.
+"$FREECADCMD" "$HARNESS_DIR/test_tool_clearance.py" || true
 # The write half of layout persistence: a layout records the algorithm that ran,
 # the direction that algorithm's dial held, whether that direction was used, and
 # each part's raw rotation override. The reload half needs a panel and lives in
@@ -94,9 +98,9 @@ cd "$REPO_ROOT"
 for f in "$BENCH_STATUS" "$TEST_STATUS" "$GA_STATUS" "$PANEL_STATUS" \
          "$UNITS_STATUS" "$REPLAY_STATUS" "$DRESSUP_STATUS" "$ORDER_STATUS" \
          "$STARTPOINT_STATUS" "$BOUNDARY_STATUS" "$RIGID_STATUS" \
-         "$SUBNAME_STATUS" "$PERSIST_STATUS"; do
+         "$SUBNAME_STATUS" "$CLEARANCE_STATUS" "$PERSIST_STATUS"; do
     if [ ! -f "$f" ]; then
-        echo "harness did not write $f -- it probably did not run" >&2
+        echo "harness: DID NOT RUN -- did not write $f" >&2
         exit 3
     fi
 done
@@ -196,6 +200,12 @@ fi
 SUBNAME=$(cat "$SUBNAME_STATUS")
 if [ "$SUBNAME" -ne 0 ]; then
     echo "replay-subname-agreement regression test FAILED (status $SUBNAME)" >&2
+    [ "$STATUS" -eq 0 ] && STATUS=1
+fi
+
+CLEARANCE=$(cat "$CLEARANCE_STATUS")
+if [ "$CLEARANCE" -ne 0 ]; then
+    echo "tool-clearance regression test FAILED (status $CLEARANCE)" >&2
     [ "$STATUS" -eq 0 ] && STATUS=1
 fi
 

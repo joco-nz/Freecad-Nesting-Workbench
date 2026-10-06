@@ -82,6 +82,7 @@ the symbol when you edit the entry.
 | [NEST-027](#nest-027) | a sub-element name that resolves to a different face is invisible | resolved | medium | CAM replay |
 | [NEST-028](#nest-028) | centring does nothing for a part that arrives pre-positioned | open | medium (unmeasured) | geometry |
 | [NEST-029](#nest-029) | the committed nested fixture predates NEST-007, so the gate cannot see that fix | open | medium (unmeasured) | test fixture |
+| [NEST-030](#nest-030) | nesting `spacing` and the CAM tool diameter are unrelated controls | resolved | low | CAM replay |
 
 Statuses for NEST-009 through NEST-021 were derived from each entry's own
 prose, cross-checked where a later entry supersedes an earlier one: NEST-018's
@@ -2754,6 +2755,157 @@ and those are the numbers that would move. The tempting cheaper move, a check
 that fails when a nested part has non-analytic surfaces, does not avoid this: it
 fails against the fixture as committed, so the fixture still has to be rebuilt.
 
+**A second, independent piece of the same evidence.** Measured on real geometry
+via `flatten_sheet` -- not on reconstructed outlines -- all **15** of the
+fixture's hole nestings have a part sitting **0.0000 mm** from the wall of the
+opening it occupies. Nesting the same three part types through current code puts
+nested parts **2.0000 mm** off that wall at the same `PartSpacing = 4.0`, and
+the user reports correct stand-off nesting in the GUI. So the fixture's hole
+nestings were produced by code that no longer exists, exactly like its B-splines.
+
+That second figure is **not** claimed as exact: it comes from a `dist == 0` that
+cannot distinguish *touching* from *overlapping*. What is established is the
+direction -- the fixture is flush where current code is not -- which is all the
+staleness argument needs. See NEST-030's "Not covered" section.
+
 **Also unmeasured:** whether a stale fixture is a general hazard here. It was
 committed once and read by four suites; nothing checks that a fixture's geometry
-matches what current code produces.
+matches what current code produces. The answer now looks like yes, twice over.
+
+---
+
+## NEST-030 — nesting `spacing` and the CAM tool diameter are unrelated controls
+
+`status: resolved` · `severity: low` · `area: CAM replay`
+
+Carried in `plan.md:305` as the highest-consequence open item and never filed.
+Found by starting here because every other open item was either a known dead end
+or somebody else's judgement call, and this one had a destructive failure mode:
+a flat cutter of radius `r` sweeps `r` beyond the outline it follows, so cut
+paths around two parts `g` apart overlap whenever `g < 2r` -- the tool diameter.
+
+**Verified by reading the code, before measuring anything:**
+
+* `shape_processor.py:289` buffers each outline by `spacing / 2.0`. That is the
+  whole of `spacing`: nothing else in the nester uses it.
+* There is **no reference to a tool anywhere under `Tools/Nesting/`** -- no
+  diameter, no endmill, no cutter. The nester never learns what is cutting.
+* The replay copies the user's **real** tool into the new job (NEST-020), so a
+  wide tool now faithfully reaches a nest laid out for a narrow one.
+* Nothing in `cam_replay` related `spacing` to that tool, and the
+  `part_spacing_input` field had **no tooltip at all**.
+
+**Measured: the reference nest is healthy, and the risk is user-reachable rather
+than default-reachable.** On the committed fixture -- `PartSpacing = 4.0`, a
+1.2 mm plasma kerf, 48 parts, 1128 pairs:
+
+| | measured |
+|---|---:|
+| tightest gap between part outlines | **3.6316 mm** |
+| as a fraction of `spacing` | **0.908** |
+| pairs sitting at exactly `spacing` | 11 of 1128 |
+| pairs closer than the tool | **0** |
+| clearance on the tightest pair | **2.43 mm** |
+
+The 0.908 is outline simplification and discretisation, not a different rule.
+So the minimum gap does track `spacing`, and the mechanism is exactly what
+`buffer(spacing / 2)` per outline says it should be. Severity **low**: at the
+12.5 mm default a 5 mm tool has 7.5 mm of headroom, and the hazard needs the user
+to tighten `spacing` below their tool diameter.
+
+### Resolved -- a tooltip and a warning, and nothing else
+
+**Not** tool-aware nesting. Changing the nester to buffer by
+`max(spacing, tool diameter)` would alter every layout for every user to defend
+against a mistake the user can avoid once told, and it needs a new control the
+user did not ask for. The change here changes no layout and blocks nothing.
+
+* **`part_spacing_input` gets a tooltip** saying it is clearance between part
+  *outlines*, that it has no knowledge of the tool, and that it should be at
+  least the widest tool's diameter.
+* **`check_tool_clearance` warns** when the tightest pair of outlines is closer
+  together than the job's **widest** tool. It reuses the sheet's existing
+  `FootprintCache`, so it slices nothing extra, and it runs in `replay_sheet`
+  after `replay_recipe`, which is what puts the *user's* tool on the job --
+  judging it earlier reads the 5 mm endmill `PathJob.Create` brings with it, and
+  reported the reference nest as a warning against a tool nobody will use.
+
+Judged on the widest tool rather than the one the first operation happens to use:
+a narrower tool in use today does not make the layout safe for the wider one
+already sitting in the job. Deliberately a warning and not a refusal, because
+the fix is one control the user can see.
+
+**Cost: 1.8-2.0 ms** for a 48-part sheet on a warm cache, measured. The
+bounding-box prune is what makes it affordable -- the full pairwise sweep is
+29.6 us per pair, so 1128 pairs is ~33 ms -- and it is skipped entirely for pairs
+whose boxes cannot beat the best found so far.
+
+### Three measurement errors, recorded so they are not repeated
+
+All three produced confident wrong answers before being caught, and the first
+would have been filed as a serious defect in the nester.
+
+1. **The `part_*` objects carry local geometry.** They sit inside `nested_*`
+   containers with `Placement = identity`, and the container holds the position.
+   Measured: `part_BottomStrap_1`, `_2` and `_3` all have shape bbox
+   X -12..10, Y -39.3..41.1 while their containers sit at (557.3, 288.0),
+   (42.7, 288.0) and (303.3, 12.0). Measuring them as placed reported **1036
+   overlapping pairs** and a 31057 mm2 intersection between two spacers --
+   parts appearing to occupy the same space. The objects that carry world
+   placement are the **flattened** parts, via `flatten_sheet`. This is a third
+   instance of the trap the harness README records twice already (proxy class
+   names that are not labels; `Base` pointing at `CAMPart_N`), and the loudest,
+   because it fails spectacularly rather than quietly.
+2. **A positive Shapely buffer GROWS a polygon and SHRINKS its holes.** I had
+   it backwards, and it inverted the whole hole-nesting analysis: the outer
+   part's buffered hole is `H eroded by d`, so a nested part with a full
+   `spacing` of stand-off has its buffered outline exactly *touching* the
+   buffered hole. Reconstructing the hole and eroding it a second time made a
+   correct placement measure 0.0000 mm -- and the user, nesting in the GUI,
+   saw correct stand-off. **The fix needs no reconstruction at all**: the
+   buffered hole ring is already in `shape.polygon.interiors`.
+3. **`nest()` deep-copies the parts unless `simulate=True`,** so placements land
+   on copies and not on the caller's objects. The returned sheets hold them, at
+   `sheet.parts[j].shape`.
+
+A fourth is worth recording because the self-check caught it: the world
+transform is the **product** `nester_placement * master.Placement`, because
+`datatypes/sheet.py:249` puts the nesting placement on the container and leaves
+the part's own placement alone. Composing it by hand from the wrong factor put
+parts at Y -38.31 on a 300 mm sheet.
+
+### Not covered, stated rather than implied
+
+**Part-to-hole-wall clearance.** A kerf can land on a neighbouring part through
+a hole wall as well as through a part boundary, and this check does not look.
+Not because it was judged unimportant: the measurement is not established. A
+nested part *does* stand off the hole wall -- the user confirmed that in the GUI
+against `replay-fixture-CAM.FCStd`, and a headless nest of the same parts puts
+nested parts 2.0000 mm off it at `spacing = 4.0` -- but that 2.0 comes from a
+`dist == 0` that cannot separate *touching* from *overlapping*, so the figure is
+not confirmed and no claim is made about it.
+
+### Injection-verified
+
+Seven ways, and two found real holes in the tests:
+
+| injection | caught by |
+|---|---|
+| never warn | 3 checks |
+| warn unconditionally | 4 checks |
+| narrowest tool instead of widest | 2 pytest tests |
+| never prune | correctly *passes* -- the prune is an optimisation, so removing it must not change the answer |
+| prune against a loose fixed bound | correctly passes -- see below |
+| `_bounds_gap` overestimates | 3 pytest tests |
+| `_bounds_gap` not clamped at zero | 2 pytest tests |
+
+The fifth injection exposed that the prune test **could not fail**, and why: with
+axis-aligned boxes the bounding-box gap *equals* the true distance, so any
+uniform perturbation leaves the ordering unchanged. The prune is safe by
+construction -- a footprint lies inside its own box, so the box gap is a true
+lower bound -- and no injection of that shape can break it. The property worth
+testing is therefore that precondition directly, over 400 rotated and
+overlapping shapes, which is what now catches injections six and seven.
+
+Gate: 14 freecadcmd suites, 1265 checks, 0 failures; 571 pytest. 25 of those
+checks are the new gated `test_tool_clearance.py`, plus 16 new pytest cases.

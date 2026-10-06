@@ -521,6 +521,46 @@ measured difference as a **fraction of its tolerance** rather than as a raw
 number, because a check sitting at 0.1% of its budget and one at 99% are not the
 same check and the reader should be able to see which this is.
 
+## Measuring the nester's output, and three ways to get it wrong
+
+`test_tool_clearance.py` (gated, `freecadcmd`) measures the gap between part
+outlines in a nest. Everything below was got wrong first, confidently, and each
+would have been filed as a defect in the nester.
+
+**The `part_*` objects are in LOCAL coordinates.** They sit inside `nested_*`
+containers with `Placement = identity`; the container holds the position.
+Measured: `part_BottomStrap_1`, `_2` and `_3` all have shape bbox
+X -12..10, Y -39.3..41.1 while their containers sit at (557.3, 288.0),
+(42.7, 288.0) and (303.3, 12.0). Measuring them as placed reports **1036
+overlapping pairs** and a 31057 mm² intersection between two spacers — parts
+apparently occupying the same space. Use the **flattened** parts
+(`flatten_sheet` -> `create_replay_job` -> `replay.clones`), which is what
+`cam_replay.py:4813` does. This is a third instance of the trap this file
+records twice already, and the loudest.
+
+**A positive Shapely buffer GROWS the polygon and SHRINKS its holes.** Having it
+backwards inverts any hole-clearance analysis: the outer part's buffered hole is
+`H eroded by d`, so a nested part with full `spacing` of stand-off has its
+buffered outline exactly *touching* the buffered hole. Reconstructing that hole
+and eroding it again measures a correct placement as 0.0000 mm flush. **No
+reconstruction is needed** — the buffered hole ring is already in
+`shape.polygon.interiors`, and true clearance is
+`spacing / 2 + dist(inner.polygon, outer_buffered_hole_ring)`.
+
+**`nest()` deep-copies unless `simulate=True`,** so placements land on copies and
+not on your objects. They are on the returned sheets, at `sheet.parts[j].shape`.
+And `nest()` returns `(sheets, unplaced, steps, elapsed)`.
+
+**The world transform is a product, `nester_placement * master.Placement`,**
+because `datatypes/sheet.py:249` puts the nesting placement on the container and
+leaves the part's own placement alone. Composing it from the wrong factor put
+parts at Y -38.31 on a 300 mm sheet.
+
+Which is the argument for the self-check in that probe: it asserts the measured
+part-to-part gap lands near `spacing`, a number already established
+independently. The transform is the one step that can be wrong in a way that
+flatters the answer, so it gets an assertion rather than a comment.
+
 ## Layout persistence, and the two vacuity traps behind it
 
 `test_layout_persistence.py` (gated, `freecadcmd`) covers the *write* half of what a

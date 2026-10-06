@@ -35,6 +35,8 @@ from freecad.nestingworkbench.Tools.Cam.cam_replay import (
     ReplayResult,
     apply_properties,
     check_subnames_against_clones,
+    check_tool_clearance,
+    tool_diameters,
     clones_for_source,
     create_dressup_in,
     create_operation_in,
@@ -574,3 +576,222 @@ class TestConstructionGuards:
 
     def test_dressup_without_a_proxy_is_not_created(self):
         assert create_dressup_in(_Original("x"), _Original("base"), None) is None
+
+
+# -- tool clearance --------------------------------------------------------
+
+class _Quantity:
+    def __init__(self, value):
+        self.Value = value
+
+
+class _Tool:
+    def __init__(self, diameter):
+        self.Diameter = _Quantity(diameter)
+
+
+class _Controller:
+    def __init__(self, label, diameter):
+        self.Label = label
+        self.Tool = _Tool(diameter)
+
+
+class _ToolsGroup:
+    def __init__(self, controllers):
+        self.Group = controllers
+
+
+class _Job:
+    def __init__(self, controllers):
+        self.Tools = _ToolsGroup(controllers)
+
+
+class _BoxFootprint:
+    """A footprint that is an axis-aligned box, with a real `distance`.
+
+    The geometry is not the point of this tier -- the freecadcmd suite measures
+    that. What matters here is that the bounding-box prune does not change the
+    answer, so `distance` has to behave like Shapely's for disjoint and
+    overlapping boxes.
+    """
+
+    def __init__(self, x0, y0, x1, y1):
+        self.bounds = (x0, y0, x1, y1)
+        self.is_empty = False
+
+    def distance(self, other):
+        dx = max(0.0, max(self.bounds[0] - other.bounds[2],
+                          other.bounds[0] - self.bounds[2]))
+        dy = max(0.0, max(self.bounds[1] - other.bounds[3],
+                          other.bounds[1] - self.bounds[3]))
+        return (dx * dx + dy * dy) ** 0.5
+
+
+class _BoxPart:
+    """A part carrying only a footprint, which is all `tightest_part_gap` reads.
+
+    `Shape` is present and null because `_footprint_for` falls back to
+    `part_footprint` when there is no cache -- so a stand-in that has a Shape
+    attribute at all must not accidentally be sliced.
+    """
+
+    def __init__(self, label, footprint):
+        self.Label = label
+        self._footprint = footprint
+        self.Shape = None
+
+
+def _box_part(label, x0, y0, x1, y1):
+    return _BoxPart(label, _BoxFootprint(x0, y0, x1, y1))
+
+
+class TestToolDiameters:
+    def test_reads_the_widest_first(self):
+        job = _Job([_Controller("small", 3.0), _Controller("big", 12.0)])
+        assert tool_diameters(job) == [("big", 12.0), ("small", 3.0)]
+
+    def test_a_job_with_no_tools_yields_nothing(self):
+        assert tool_diameters(_Job([])) == []
+
+    def test_a_controller_with_no_tool_is_skipped_not_fatal(self):
+        broken = _Controller("broken", 0.0)
+        broken.Tool = None
+        assert tool_diameters(_Job([broken])) == []
+
+    def test_a_zero_diameter_is_not_a_clearance(self):
+        # 0 would warn about everything, and a tool that measures nothing wide
+        # is not something to warn about.
+        assert tool_diameters(_Job([_Controller("zero", 0.0)])) == []
+
+
+class TestCheckToolClearance:
+    def _run(self, parts, diameters):
+        cache = {id(p): p._footprint for p in parts}
+
+        class _Cache:
+            def get(self, part):
+                return cache[id(part)]
+
+        job = _Job([_Controller(label, value) for label, value in diameters])
+        return check_tool_clearance(parts, job, _Cache())
+
+    def test_silent_when_the_tool_fits_between_the_parts(self):
+        parts = [_box_part("a", 0, 0, 10, 10), _box_part("b", 20, 0, 30, 10)]
+        assert self._run(parts, [("t", 5.0)]) is None
+
+    def test_warns_when_the_parts_are_closer_than_the_tool(self):
+        parts = [_box_part("a", 0, 0, 10, 10), _box_part("b", 13, 0, 23, 10)]
+        warning = self._run(parts, [("t", 5.0)])
+        assert warning is not None
+        assert "13.0000" in warning or "3.0000" in warning
+
+    def test_the_warning_names_both_parts(self):
+        parts = [_box_part("bracket_1", 0, 0, 10, 10),
+                 _box_part("bracket_2", 13, 0, 23, 10)]
+        warning = self._run(parts, [("endmill", 5.0)])
+        assert "bracket_1" in warning and "bracket_2" in warning
+
+    def test_the_warning_states_the_shortfall_and_the_fix(self):
+        parts = [_box_part("a", 0, 0, 10, 10), _box_part("b", 13, 0, 23, 10)]
+        warning = self._run(parts, [("endmill", 5.0)])
+        assert "2.0000" in warning, "shortfall not stated: %s" % warning
+        assert "PartSpacing" in warning, "no remedy offered: %s" % warning
+
+    def test_silent_at_exactly_one_tool_diameter(self):
+        # The cutter only just grazes its neighbour there and removes nothing,
+        # so reporting it would be noise.
+        parts = [_box_part("a", 0, 0, 10, 10), _box_part("b", 15, 0, 25, 10)]
+        assert self._run(parts, [("t", 5.0)]) is None
+
+    def test_judged_against_the_widest_tool_not_the_first(self):
+        parts = [_box_part("a", 0, 0, 10, 10), _box_part("b", 13, 0, 23, 10)]
+        assert self._run(parts, [("narrow", 1.0), ("wide", 20.0)]) is not None
+
+    def test_no_warning_without_a_tool(self):
+        parts = [_box_part("a", 0, 0, 10, 10), _box_part("b", 1, 0, 11, 10)]
+        assert self._run(parts, []) is None
+
+    def test_a_single_part_cannot_be_too_close_to_anything(self):
+        assert self._run([_box_part("only", 0, 0, 10, 10)], [("t", 99.0)]) is None
+
+    def test_the_bound_prune_does_not_hide_the_closest_pair(self):
+        # The tight pair (far_b/near, 3 mm) is not the first pair examined --
+        # far_a/far_b is, at 490 mm. A prune that stopped tightening its bound
+        # after the first hit would keep 490 and skip the 3.
+        parts = [_box_part("far_a", 0, 0, 10, 10),
+                 _box_part("far_b", 500, 0, 510, 10),
+                 _box_part("near", 513, 0, 523, 10)]
+        warning = self._run(parts, [("t", 5.0)])
+        assert warning is not None
+        assert "far_b" in warning and "near" in warning
+
+    def test_the_bounds_gap_never_exceeds_the_true_distance(self):
+        """The prune's precondition, tested directly rather than by proxy.
+
+        `tightest_part_gap` skips a pair when `_bounds_gap` says it is at least
+        as far as the best found so far. That is only sound if `_bounds_gap` is
+        a true **lower** bound -- a footprint lies inside its own bounding box,
+        so the boxes cannot be closer than the shapes are. Get that wrong and a
+        prune can skip the very pair it should have measured, and the warning
+        would then quote a comfortable neighbour instead of the tight one: the
+        quietest way to be wrong.
+
+        Tried and failed to catch this through `tightest_part_gap`, because with
+        axis-aligned boxes the bound equals the true distance exactly, so any
+        uniform perturbation leaves the ordering unchanged. So it is asserted
+        here, over rotated and overlapping shapes as well, which is where a box
+        bound and a true distance genuinely differ.
+        """
+        import random
+
+        from shapely.affinity import rotate
+        from shapely.geometry import Polygon, box
+
+        rng = random.Random(20260907)
+        worst = None
+        for trial in range(400):
+            ax0, ay0 = rng.uniform(0, 100), rng.uniform(0, 100)
+            a = box(ax0, ay0, ax0 + rng.uniform(0.5, 60), ay0 + rng.uniform(0.5, 60))
+            if trial % 3 == 0:
+                a = rotate(a, rng.uniform(0, 90), origin="centroid")
+            bx0, by0 = rng.uniform(0, 100), rng.uniform(0, 100)
+            b = box(bx0, by0, bx0 + rng.uniform(0.5, 60), by0 + rng.uniform(0.5, 60))
+            if trial % 4 == 0:
+                b = rotate(b, rng.uniform(0, 90), origin="centroid")
+            bound = cam_replay._bounds_gap(a.bounds, b.bounds)
+            truth = a.distance(b)
+            if bound > truth + 1e-12 and (worst is None or bound - truth > worst[0]):
+                worst = (bound - truth, bound, truth, trial)
+        assert worst is None, (
+            "_bounds_gap exceeded the true distance by %.6f mm "
+            "(bound %.6f, truth %.6f, trial %d)" % worst)
+
+    def test_the_bounds_gap_agrees_for_axis_aligned_boxes(self):
+        from shapely.geometry import box
+        a = box(0, 0, 10, 10)
+        b = box(23, 4, 33, 14)
+        assert abs(cam_replay._bounds_gap(a.bounds, b.bounds) - 13.0) < 1e-12
+
+    def test_the_bounds_gap_is_zero_for_a_box_inside_another(self):
+        from shapely.geometry import box
+        outer = box(0, 0, 100, 100)
+        inner = box(40, 40, 60, 60)
+        assert cam_replay._bounds_gap(outer.bounds, inner.bounds) == 0.0
+
+    def test_the_bound_prune_agrees_with_brute_force(self):
+        parts = [_box_part("a", 0, 0, 10, 10),
+                 _box_part("b", 100, 0, 110, 10),
+                 _box_part("c", 200, 0, 210, 10),
+                 _box_part("d", 13, 0, 23, 10),
+                 _box_part("e", 150, 0, 160, 10)]
+        from freecad.nestingworkbench.Tools.Cam import cam_replay as cr
+        best = None
+        for i in range(len(parts)):
+            for j in range(i + 1, len(parts)):
+                d = parts[i]._footprint.distance(parts[j]._footprint)
+                if best is None or d < best:
+                    best = d
+        got = cr.tightest_part_gap(
+            parts, type("C", (), {"get": lambda _s, p: p._footprint})())
+        assert got is not None
+        assert abs(got[0] - best) < 1e-12, "%r vs %r" % (got[0], best)

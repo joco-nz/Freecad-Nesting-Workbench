@@ -3773,6 +3773,157 @@ def find_hole_nestings(parts, cache=None):
     return nestings
 
 
+def tool_diameters(job):
+    """Every tool diameter in `job`, widest first. Empty when it has no tools.
+
+    Read from the controllers rather than from any operation, so a tool the job
+    carries but does not currently use is still accounted for: it is one
+    property away from being used, and the warning is about the layout rather
+    than about today's recipe.
+    """
+    out = []
+    tools = getattr(job, "Tools", None)
+    for controller in (getattr(tools, "Group", None) or []):
+        tool = getattr(controller, "Tool", None)
+        diameter = getattr(tool, "Diameter", None)
+        if diameter is None:
+            continue
+        try:
+            value = float(diameter.Value)
+        except Exception:
+            continue
+        if value > 0:
+            out.append((getattr(controller, "Label", "?"), value))
+    out.sort(key=lambda row: -row[1])
+    return out
+
+
+#: Slack on the tool-clearance comparison, so a layout whose parts sit exactly
+#: one tool diameter apart -- where the cutter only just grazes its neighbour and
+#: removes nothing -- is not reported as interference. Purely floating-point
+#: guard; the quantity is a millimetre-scale distance built from a
+#: discretised outline.
+TOOL_CLEARANCE_EPSILON = 1e-9
+
+
+def _bounds_gap(first, second):
+    """Lower bound on the distance between two footprints, from their bounds.
+
+    Valid because a footprint lies within its own bounding box, so the boxes
+    cannot be closer than the shapes are. Used to skip `distance()` on pairs
+    that cannot beat the best found so far, which is what keeps this cheap
+    enough to run on every sheet.
+    """
+    ax0, ay0, ax1, ay1 = first
+    bx0, by0, bx1, by1 = second
+    dx = ax0 - bx1
+    if dx < 0:
+        dx = bx0 - ax1
+        if dx < 0:
+            dx = 0.0
+    dy = ay0 - by1
+    if dy < 0:
+        dy = by0 - ay1
+        if dy < 0:
+            dy = 0.0
+    return (dx * dx + dy * dy) ** 0.5
+
+
+def tightest_part_gap(parts, cache=None):
+    """Return `(distance, label_a, label_b)` for the closest pair of outlines.
+
+    `None` when fewer than two usable footprints were produced. Distance is
+    between the part outlines in the XY plane, which is what a flat cutter
+    sweeps across.
+
+    The pairs are pruned on bounding boxes before any `distance()` call, because
+    the full pairwise sweep is otherwise the most expensive thing in the
+    replay's geometry stage: measured 29.6 us per pair, so 1128 pairs over a
+    48-part sheet is ~33 ms, and most of those pairs are nowhere near the
+    minimum.
+    """
+    usable = []
+    for part in parts:
+        footprint = _footprint_for(part, cache)
+        if footprint is None or footprint.is_empty:
+            continue
+        usable.append((display_label_of(part), footprint, footprint.bounds))
+    if len(usable) < 2:
+        return None
+
+    best = None
+    best_d2 = None
+    for i in range(len(usable)):
+        _label_a, _fp_a, bounds_a = usable[i]
+        for j in range(i + 1, len(usable)):
+            label_b = usable[j][0]
+            d2 = _bounds_gap(bounds_a, usable[j][2]) ** 2
+            if best_d2 is not None and d2 >= best_d2:
+                continue
+            try:
+                distance = usable[i][1].distance(usable[j][1])
+            except Exception:
+                continue
+            if best is None or distance < best[0]:
+                best = (distance, usable[i][0], label_b)
+                best_d2 = distance * distance
+    return best
+
+
+def check_tool_clearance(parts, job, cache=None):
+    """Warn when two parts are closer together than the tool is wide.
+
+    A flat cutter of radius `r` sweeps `r` beyond the outline it follows, so
+    cut paths around two parts `g` apart overlap whenever `g < 2r`, which is the
+    tool diameter. Nothing in the workbench relates the nesting `spacing` to the
+    CAM tool: `shape_processor.py:289` buffers each outline by `spacing / 2`
+    with no knowledge of a tool -- there is no reference to a tool anywhere under
+    `Tools/Nesting/` -- and the replay copies the user's real tool into the new
+    job (NEST-020). They are independent controls with no constraint between
+    them, and nothing reported the interaction.
+
+    **Measured on the committed fixture before this existed**, at
+    `PartSpacing = 4.0` with a 1.2 mm plasma kerf: 1128 part pairs, the tightest
+    **3.6316 mm**, i.e. 0.908 of the spacing and clear of the tool by 2.43 mm.
+    So the reference nest is healthy and this stays quiet on it, which is the
+    point -- it is a warning about a layout the user built, not a new complaint
+    about every nest.
+
+    The shortfall is reported against the **widest** tool the job carries, not
+    the tool the first operation happens to use: a narrower tool in use today
+    does not make the layout safe for the wider one already sitting in the job.
+
+    Deliberately a warning and not a refusal. Refusing would block a nest the
+    user built deliberately, and the fix is one control they can see and change.
+
+    **Does not cover part-to-hole-wall clearance**, which is the other way a
+    kerf can land on a neighbouring part. Measured unconfirmed: a nested part
+    does stand off the hole wall, but the figure is not established, so nothing
+    is claimed about it here. See NEST-029.
+    """
+    diameters = tool_diameters(job)
+    if not diameters:
+        return None
+    widest_label, widest = diameters[0]
+
+    gap = tightest_part_gap(parts, cache)
+    if gap is None:
+        return None
+    distance, label_a, label_b = gap
+    if distance + TOOL_CLEARANCE_EPSILON >= widest:
+        return None
+
+    return (
+        "Parts %s and %s are %.4f mm apart at their closest, and the job's "
+        "widest tool (%s) is %.4f mm across, so the cutter overlaps its "
+        "neighbour by %.4f mm. Spacing is applied as clearance between part "
+        "outlines, and it has no knowledge of the tool: raise PartSpacing to "
+        "at least %.4f mm, or use a tool no wider than %.4f mm."
+        % (label_a, label_b, distance, widest_label, widest,
+           widest - distance, widest, distance)
+    )
+
+
 def operation_touches_hole(operation, part, cache=None):
     """Return True if `operation` would cut one of `part`'s holes.
 
@@ -4661,6 +4812,17 @@ def replay_sheet(doc, layout_group, sheet_group, source_job, post_processor=None
             # over 3 distinct shapes.
             footprints = FootprintCache()
             nestings = find_hole_nestings(replay.clones, footprints)
+
+            # Does the layout leave the tool room to swing? Asked here because
+            # this is where the footprints already exist -- the sweep reuses the
+            # cache and so slices nothing extra. `spacing` and the tool are
+            # independent controls and nothing else relates them; see
+            # `check_tool_clearance`.
+            clearance_warning = check_tool_clearance(
+                replay.clones, replay.job, footprints)
+            if clearance_warning:
+                result.warnings.append(clearance_warning)
+                FreeCAD.Console.PrintWarning(clearance_warning + "\n")
 
             # Built unconditionally, not under `if nestings`. Ordering by where
             # the parts sit needs to know which part each operation cuts, and
