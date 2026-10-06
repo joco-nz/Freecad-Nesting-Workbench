@@ -2822,7 +2822,9 @@ user did not ask for. The change here changes no layout and blocks nothing.
 
 * **`part_spacing_input` gets a tooltip** saying it is clearance between part
   *outlines*, that it has no knowledge of the tool, and that it should be at
-  least the widest tool's diameter.
+  least the widest tool's diameter. **This first shipped broken** -- see the
+  regression note below -- and is correct only after `.widget()` was put in front
+  of the call.
 * **`check_tool_clearance` warns** when the tightest pair of outlines is closer
   together than the job's **widest** tool. It reuses the sheet's existing
   `FootprintCache`, so it slices nothing extra, and it runs in `replay_sheet`
@@ -2884,6 +2886,57 @@ against `replay-fixture-CAM.FCStd`, and a headless nest of the same parts puts
 nested parts 2.0000 mm off it at `spacing = 4.0` -- but that 2.0 comes from a
 `dist == 0` that cannot separate *touching* from *overlapping*, so the figure is
 not confirmed and no claim is made about it.
+
+### Regression: the tooltip broke the panel, and the gate could not see it
+
+Found by the user running the workbench, not by the gate. `setToolTip` was called
+on the `LengthField` rather than on the widget inside it:
+
+    self.part_spacing_input.setToolTip(...)           # AttributeError, every click
+    self.part_spacing_input.widget().setToolTip(...)  # correct
+
+`AttributeError: 'LengthField' object has no attribute 'setToolTip'`, raised in
+`_build_length_fields`, so **`NestingPanel()` stopped constructing entirely** and
+the workbench's main entry point failed on every invocation. Lines 748 and 752
+get this right on `label_height_input` and `label_size_input`; the new call was
+the only one of its kind in the file.
+
+**The gate could not have caught it, and that is the finding.** Nothing gated
+builds the panel:
+
+* `test_panel_teardown.py` mentions `NestingPanel` but allocates it with
+  `NestingPanel.__new__(NestingPanel)`, skipping `__init__` on purpose, because it
+  tests `reject()`/`dispose()` and does not need a built panel.
+* `freecadcmd` **cannot** build the panel at all -- `LengthField` makes
+  `Gui::QuantitySpinBox` through `FreeCADGui.UiLoader()`, and `freecadcmd` has no
+  `UiLoader`. Measured: `AttributeError: module 'FreeCADGui' has no attribute
+  'UiLoader'`.
+* `test_tooltip_assets.py`, added later for the Candidate Step diagram, checks
+  the panel wiring by reading `inspect.getsource`. Source text that says
+  `tooltip_with_image` while the code around it raises is still source text that
+  says `tooltip_with_image`.
+
+So a one-line typo could stop the workbench opening and the gate stay green. That
+is the same failure as having no gate.
+
+**Fixed by gating panel construction.** `test_panel_construction.py` builds the
+real `NestingPanel()` and is the first gated check to do so. It has to run on the
+**`freecad` GUI binary**, not `freecadcmd`, for the `UiLoader` reason above; no
+Xvfb is needed, FreeCAD 26.3 starts a live GUI on no display at all. Costs
+**5.2 s**, against 1.0 s for a typical `freecadcmd` suite. `run.sh` now requires
+`GUI_FREECAD` with the same usage-error contract as `FREECADCMD` -- deliberately
+not optional, because a gate that quietly skips a check is the same as no gate.
+
+Beyond "it does not raise", it asserts the tooltips are readable **off the widget
+the panel owns**, so a wrapper used by mistake cannot pass by leaving the string
+somewhere unreachable, and it states the trap outright: `LengthField` has no
+`setToolTip`, while the plain spin boxes from `make_double_spinbox` do take it
+directly. The correct call differs between two adjacent kinds of field and
+nothing in the type says so.
+
+Injection-verified: reintroducing the original call reproduces
+`AttributeError: 'LengthField' object has no attribute 'setToolTip'` and fails
+the gate with status 1.
 
 ### Injection-verified
 

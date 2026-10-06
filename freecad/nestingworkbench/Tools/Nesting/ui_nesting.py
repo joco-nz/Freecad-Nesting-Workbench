@@ -808,7 +808,7 @@ class NestingPanel(QtWidgets.QWidget):
         self.sheet_height_input = LengthField(mm_min=1, mm_max=10000)
         self.sheet_thickness_input = LengthField(mm_min=0.1, mm_max=1000)
         self.part_spacing_input = LengthField(mm_min=0, mm_max=1000)
-        self.part_spacing_input.setToolTip(
+        self.part_spacing_input.widget().setToolTip(
             "<b>Part Spacing:</b><br>"
             "Clearance between part <b>outlines</b>.<br><br>"
             "Each outline is grown by half this value, so the gap left between "

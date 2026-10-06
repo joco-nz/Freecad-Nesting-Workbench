@@ -22,6 +22,18 @@ if [ ! -x "$FREECADCMD" ]; then
     exit 2
 fi
 
+# The GUI binary, for the one check that has to build the panel: `freecadcmd`
+# has no `FreeCADGui.UiLoader`, so `Gui::QuantitySpinBox` cannot be made there.
+# Required rather than optional, because a gate that quietly skips a check is
+# the same failure as having no gate at all.
+GUI_FREECAD=${GUI_FREECAD:-/home/james/freecad_env/usr/bin/freecad}
+if [ ! -x "$GUI_FREECAD" ]; then
+    echo "freecad (GUI) not found at $GUI_FREECAD" >&2
+    echo "set GUI_FREECAD to your FreeCAD GUI binary" >&2
+    echo "it needs no display: FreeCAD 26.3 starts with a live GUI on none" >&2
+    exit 2
+fi
+
 # Default to gating against the committed baseline so a bare invocation is the
 # useful one rather than a bare print.
 : "${NEST_BENCH_BASELINE:=$HARNESS_DIR/baseline/synthetic_v1.json}"
@@ -42,12 +54,13 @@ RIGID_STATUS="$HARNESS_DIR/.last_status_rigid"
 SUBNAME_STATUS="$HARNESS_DIR/.last_status_subnames"
 CLEARANCE_STATUS="$HARNESS_DIR/.last_status_clearance"
 TOOLTIP_STATUS="$HARNESS_DIR/.last_status_tooltip"
+PANELBUILD_STATUS="$HARNESS_DIR/.last_status_panelbuild"
 PERSIST_STATUS="$HARNESS_DIR/.last_status_persist"
 rm -f "$BENCH_STATUS" "$TEST_STATUS" "$GA_STATUS" "$PANEL_STATUS" \
       "$UNITS_STATUS" "$PYTEST_STATUS" "$REPLAY_STATUS" "$DRESSUP_STATUS" \
       "$ORDER_STATUS" "$STARTPOINT_STATUS" "$BOUNDARY_STATUS" \
       "$RIGID_STATUS" "$SUBNAME_STATUS" "$CLEARANCE_STATUS" \
-      "$TOOLTIP_STATUS" "$PERSIST_STATUS"
+      "$TOOLTIP_STATUS" "$PANELBUILD_STATUS" "$PERSIST_STATUS"
 
 cd "$REPO_ROOT"
 "$FREECADCMD" "$HARNESS_DIR/nest_benchmark.py" || true
@@ -95,6 +108,12 @@ cd "$REPO_ROOT"
 # name it and Qt still draws a broken-image box, so this renders the real
 # tooltip offscreen and measures it. NEST-030's tooltip work.
 "$FREECADCMD" "$HARNESS_DIR/test_tooltip_assets.py" || true
+# The panel constructing at all. This is the only gated check that builds it,
+# and it has to run on the GUI binary: LengthField makes Gui::QuantitySpinBox
+# through FreeCADGui.UiLoader, which freecadcmd does not have. It exists because
+# a one-line setToolTip on the wrapper instead of the widget shipped in a commit
+# whose gate was green -- nothing gated built the panel. No Xvfb needed.
+"$GUI_FREECAD" "$HARNESS_DIR/test_panel_construction.py" || true
 # The write half of layout persistence: a layout records the algorithm that ran,
 # the direction that algorithm's dial held, whether that direction was used, and
 # each part's raw rotation override. The reload half needs a panel and lives in
@@ -105,7 +124,7 @@ for f in "$BENCH_STATUS" "$TEST_STATUS" "$GA_STATUS" "$PANEL_STATUS" \
          "$UNITS_STATUS" "$REPLAY_STATUS" "$DRESSUP_STATUS" "$ORDER_STATUS" \
          "$STARTPOINT_STATUS" "$BOUNDARY_STATUS" "$RIGID_STATUS" \
          "$SUBNAME_STATUS" "$CLEARANCE_STATUS" "$TOOLTIP_STATUS" \
-         "$PERSIST_STATUS"; do
+         "$PANELBUILD_STATUS" "$PERSIST_STATUS"; do
     if [ ! -f "$f" ]; then
         echo "harness: DID NOT RUN -- did not write $f" >&2
         exit 3
@@ -219,6 +238,12 @@ fi
 TOOLTIP=$(cat "$TOOLTIP_STATUS")
 if [ "$TOOLTIP" -ne 0 ]; then
     echo "tooltip-assets regression test FAILED (status $TOOLTIP)" >&2
+    [ "$STATUS" -eq 0 ] && STATUS=1
+fi
+
+PANELBUILD=$(cat "$PANELBUILD_STATUS")
+if [ "$PANELBUILD" -ne 0 ]; then
+    echo "panel-construction regression test FAILED (status $PANELBUILD)" >&2
     [ "$STATUS" -eq 0 ] && STATUS=1
 fi
 

@@ -256,6 +256,9 @@ downstream of them stays in millimetres. Two files, two interpreters:
 | `test_replay_boundary.py` | `Path.Dressup.Boundary` is unsupported — dropped from the replay, the rest of the step's stack kept, reported once per dressup | `freecadcmd`, wired into `run.sh` |
 | `test_shape_preparer_rigid.py` | `ShapePreparer._center_3d_shape` centres with `transformShape`, not `transformGeometry`, and `_is_rigid` refuses a non-rigid matrix | `freecadcmd`, wired into `run.sh` |
 | `test_layout_persistence.py` | the write half of layout persistence — `Algorithm`, `NestingDirection`, `RandomDirection`, and each part's raw rotation override, on a real document, with a save/reopen round trip | `freecadcmd`, wired into `run.sh` |
+| `test_panel_construction.py` | the real `NestingPanel()` **builds** | `freecad` (GUI), wired into `run.sh` |
+| `test_tooltip_assets.py` | the Candidate Step tooltip's diagram actually loads, measured by rendering it | `freecadcmd`, wired into `run.sh` |
+| `test_tool_clearance.py` | the nest leaves the tool room to swing | `freecadcmd`, wired into `run.sh` |
 | `probe_layout_restore.py` | the reload half — the controller reading the right dial, and the panel coming back showing what the layout recorded | `freecad` (GUI), run by hand |
 | `probe_unit_panel.py` | `length_field.py` and the real `NestingPanel` | `freecad` (GUI), run by hand |
 | `probe_target_sheets.py` | the "Stop At Sheets" dial, panel → coordinator → a real GA run | `freecad` (GUI), run by hand |
@@ -264,6 +267,30 @@ The split is forced: `freecadcmd` has no `FreeCADGui.UiLoader`, so
 `Gui::QuantitySpinBox` cannot be constructed there at all
 (`AttributeError: module 'FreeCADGui' has no attribute 'UiLoader'`). No Xvfb
 needed — see above.
+
+**Which left the panel itself unbuilt by anything gated, and a one-line typo
+shipped.** `self.part_spacing_input.setToolTip(...)` instead of
+`self.part_spacing_input.widget().setToolTip(...)` raised during
+`_build_length_fields`, so `NestingPanel()` stopped constructing and the
+workbench's main entry point failed on every click — with a green gate, because:
+
+* `test_panel_teardown.py` mentions `NestingPanel` but allocates it with
+  `NestingPanel.__new__(NestingPanel)`, skipping `__init__` on purpose;
+* `test_document_units.py` does not touch it;
+* `test_tooltip_assets.py` checks the wiring by reading `inspect.getsource`,
+  which says `tooltip_with_image` just as happily while the code around it
+  raises.
+
+`test_panel_construction.py` is the fix, and it is why `run.sh` now has a
+`GUI_FREECAD` variable alongside `FREECADCMD`. Measured cost **5.2 s** against
+1.0 s for a typical `freecadcmd` suite. It is **required**, not optional — a gate
+that quietly skips a check is the same failure as having no gate.
+
+The trap worth remembering, because two adjacent kinds of field differ: a
+`LengthField` is a *wrapper* exposing `.widget()`, and has no `setToolTip`; the
+plain spin boxes from `make_double_spinbox` take `setToolTip` directly. Nothing
+in the type says which is which, so the new suite asserts the property outright
+and reads every tooltip back off the widget the panel actually owns.
 
 ### Panel controls that reach the run
 
