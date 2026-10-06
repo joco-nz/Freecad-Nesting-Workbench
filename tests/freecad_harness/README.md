@@ -268,6 +268,48 @@ The split is forced: `freecadcmd` has no `FreeCADGui.UiLoader`, so
 (`AttributeError: module 'FreeCADGui' has no attribute 'UiLoader'`). No Xvfb
 needed — see above.
 
+### Rebuilding the nested fixture
+
+`replay-fixture-CAM-Nested.FCStd` is the only fixture in
+`tests/Test_Files/` that a gated suite opens for a replay. It is committed, so its
+nested parts were built **once**, by whatever code existed then — and after
+NEST-029 that code is current again. When it needs rebuilding (new nesting
+behaviour, a fixture that has drifted from what the nester now produces), the
+route is measured and is **not** the panel:
+
+* **Headless, via `GACoordinator.run()`** directly, as `test_ga_loop.py` drives
+  it. Input is `replay-fixture-CAM.FCStd` — the file with the CAM on the source
+  bodies, so its structure matches the nested fixture's. `replay-fixture.FCStd`
+  alone has 3 source objects and no job and cannot drive a replay.
+* **`GACoordinator` must be imported after a document is open.** Imported into a
+  bare `freecadcmd` it segfaults 3/3 with *no output whatsoever*; with a document
+  open first, fine 2/2. The import belongs below `openDocument`.
+* **`freecadcmd` takes no positional argument.** One is taken as a document to
+  open, and it segfaults before the script's first line runs — which looks exactly
+  like a crash in the script. Pass run tags through the environment.
+* **`deflection` is linear millimetres**, converted by the panel as
+  `deflection_mm = deflection_angle / 200.0` (`nesting_controller.py:1058`).
+  Passing the angle raw, or `0.0`, fails every part with
+  `ValueError: Unsupported object '<name>' or no valid 2D geometry found`.
+* **Zero the sources' placements first**, as
+  `NestingController._prepare_source_parts` does. `BottomStrap` arrives at
+  `base=(-42, 0, 0)`; skipping this produced **2031.32 mm³ of genuinely shared
+  solid** between two parts in the first re-nests. The coordinator does not
+  require it — it just happens to matter.
+* **`search_direction` is not `None`** unless the random-direction box is ticked.
+  `None` is what that box produces (`nesting_controller.py:1296`); a dial reading
+  converts to a bearing vector (`:1298-1300`). Getting this wrong took hole
+  nestings from 14 down to 1 and 5.
+* **`flatten_sheet` output is the only geometry to measure.** `part_*` objects
+  carry *local* geometry inside their `nested_*` containers, so measuring them
+  reports pairs as 11 mm apart with no shared volume when they in fact share
+  2031 mm³. This has now produced a confident wrong answer three times.
+
+**A re-nest is not a reproduction.** Two runs of the identical job put **0 of 48**
+containers at the same `Placement`, and hole nestings came out 1 and 5 on one
+pair of runs and 14 on another. That is NEST-031, and it is why a rebuilt fixture
+is committed as a fresh nest rather than as a regenerated original.
+
 **Which left the panel itself unbuilt by anything gated, and a one-line typo
 shipped.** `self.part_spacing_input.setToolTip(...)` instead of
 `self.part_spacing_input.widget().setToolTip(...)` raised during

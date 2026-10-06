@@ -2713,7 +2713,7 @@ on `UseEndPoint`, unmeasured for the same reason.
 
 ## NEST-029 — the committed nested fixture predates NEST-007, so the gate cannot see that fix
 
-`status: open` · `severity: medium (unmeasured)` · `area: test fixture`
+`status: resolved` · `severity: medium (measured)` · `area: test fixture`
 
 Found while measuring [NEST-027](#nest-027)'s prerequisite, and filed separately
 on purpose: rebuilding the fixture shifts numbers in four gated suites, and doing
@@ -2748,12 +2748,27 @@ tolerance can be loose. NEST-027 therefore **does not** accommodate the stale
 fixture, and nothing trips over that today only because the fixture selects no
 face names.
 
-**Fix direction, not yet a plan.** Re-nest `replay-fixture.FCStd` with current
-code and commit the result, then re-measure whatever the four replay suites
-report -- `test_replay_order.py` asserts operation counts and 15 hole-nestings,
-and those are the numbers that would move. The tempting cheaper move, a check
-that fails when a nested part has non-analytic surfaces, does not avoid this: it
-fails against the fixture as committed, so the fixture still has to be rebuilt.
+**Fixed: the fixture is re-nested with current code and committed.** Input is
+`replay-fixture-CAM.FCStd` (the file that has the CAM on the source bodies, so its
+structure matches #3's); `replay-fixture.FCStd` alone has 3 source objects and no
+job, so it cannot drive a replay on its own. Measured before and after:
+
+| | committed | re-nested |
+|---|---|---|
+| nested part face surfaces | **613 `BSplineSurface`**, 0 analytic | **310 `Plane` + 303 `Cylinder`** |
+| overlapping material | none | none (see below) |
+| sheets | 1 | 1 |
+| parts | 48 | 48 |
+| hole nestings | 15 | 14 |
+
+So NEST-007's centring fix is now *in* the fixture, and a regression of `43003e1`
+would stop being invisible. **It is not a reproduction of the original nest** -- see
+[NEST-031](#nest-031), and the commit message says so explicitly. It is a fresh
+nest from the same source document with the same recorded parameters.
+
+The tempting cheaper move, a check that fails when a nested part has non-analytic
+surfaces, does not avoid this: it fails against the fixture as committed, so the
+fixture still had to be rebuilt.
 
 **A second, independent piece of the same evidence.** Measured on real geometry
 via `flatten_sheet` -- not on reconstructed outlines -- all **15** of the
@@ -2768,9 +2783,108 @@ cannot distinguish *touching* from *overlapping*. What is established is the
 direction -- the fixture is flush where current code is not -- which is all the
 staleness argument needs. See NEST-030's "Not covered" section.
 
-**Also unmeasured:** whether a stale fixture is a general hazard here. It was
-committed once and read by four suites; nothing checks that a fixture's geometry
-matches what current code produces. The answer now looks like yes, twice over.
+**Also measured:** whether a stale fixture is a general hazard here. It was
+committed once and read by four gated suites; nothing checked that a fixture's
+geometry matched what current code produces. The answer is yes, twice over -- the
+B-splines and the flush hole nestings above.
+
+### What re-nesting measured, and two things it caught
+
+**Reproducibility: no, confirmed.** Two runs of the identical job, no seed set:
+
+| | run 1 | run 2 |
+|---|---|---|
+| sheets | 2 | 2 |
+| hole nestings | **1** | **5** |
+| tightest gap | 3.653626 mm | 3.585688 mm |
+
+**0 of 48** nested containers had identical `Placement` in any pair of runs. This is
+NEST-031's prediction, reached independently.
+
+**A real overlap, and it was mine to introduce.** The first re-nests produced
+`part_SimpleSpacer_1` sharing **2031.32 mm^3** of actual solid with
+`part_BottomStrap_2`, at 0.000000 mm. The cause is **not** the nester:
+`BottomStrap` arrives at `base=(-42, 0, 0)`, and
+`NestingController._prepare_source_parts` (`nesting_controller.py:323`) zeroes every
+source placement before nesting and restores it after. A re-nest that skips that
+step overlaps material. Zeroing placements -- as the panel does -- removed the
+overlap from every subsequent run. **The coordinator does not require zeroed
+placements; it happened to matter.** Recorded because the headless route to a nest
+is now known, and it has a step in it that is easy to miss.
+
+**A second measurement error, caught.** Measuring `part_*` objects reported those
+same two solids as 11.016441 mm apart with zero shared volume -- reassuring, and
+wrong. `part_*` carries **local** geometry inside its `nested_*` container; the
+placed solids are what `flatten_sheet` hands the replay. Every geometry claim above
+was re-measured on the placed parts. This is the third time this trap has produced a
+confident wrong answer, and the reason `volume2.py` exists as a separate probe.
+
+**`search_direction` is not `None`.** The first re-nests passed
+`search_direction=None`, which is what the *random* checkbox produces
+(`nesting_controller.py:1296`). `NestingDirection=90` with that box off converts the
+dial to a bearing vector (`:1298-1300`). Correcting it took hole nestings from
+1 and 5 to **14**, against the committed 15.
+
+### Pinned numbers vs properties: measured, and the suites held
+
+The four gated suites that read the fixture, run against a re-nest with the
+parameters corrected:
+
+| suite | on committed | on re-nest | failures |
+|---|---|---|---|
+| `test_replay_order` | 432 checks | **431** | 0 |
+| `test_replay_dressups` | 181 | 181 | 0 |
+| `test_replay_startpoint` | 59 | 59 | 0 |
+| `test_tool_clearance` | 25 | 25 | 0 |
+
+**All four pass unmodified.** `test_replay_order` yields one *fewer* check: it
+iterates per hole nesting somewhere, and the re-nest has 14 rather than 15. Every
+assertion that exists still holds.
+
+So the answer to the question this was blocking: **the suites assert invariants that
+survive a re-draw, not a single random draw's coordinates.** Rewriting them into
+property assertions was considered and is *not* recommended -- it would be churn
+without a measured gain, and the evidence says little would be lost.
+
+For contrast, a re-nest with the wrong `search_direction` produced **2 failures in
+`test_replay_order` and 3 in `test_tool_clearance`**. The suites do catch a bad nest.
+
+### How the fixture was rebuilt, so the next person does not have to rediscover it
+
+Headless, through `GACoordinator` directly (the route `test_ga_loop.py` uses), not
+the panel. Three things that cost time and are worth writing down:
+
+* **`GACoordinator` must be imported after a document is open.** Importing it into
+  a bare `freecadcmd` segfaults 3/3 with no output at all; with a document open
+  first it is fine 2/2. The import sits below `openDocument` deliberately.
+* **`freecadcmd` takes no positional argument** -- it treats one as a document to
+  open and segfaults before the script runs. The run tag comes from the
+  environment.
+* **`deflection` is linear millimetres**: the panel converts with
+  `deflection_mm = deflection_angle / 200.0` (`:1058`). Passing the angle straight
+  through, or 0.0, makes every part fail with
+  `ValueError: Unsupported object '<name>' or no valid 2D geometry found`.
+
+Parameters taken from what the layout records: sheet 600x300x2 mm, `PartSpacing`
+4 mm, `DeflectionAngle` 20 deg, `Generations` 4, `PopulationSize` 10,
+`GlobalRotationSteps` 4, `Simplification` 0.3, `NestingDirection` 90, quantities
+BottomStrap 23 / TopStrap 23 / SimpleSpacer 2.
+
+### Gate-scope correction
+
+Only **four** gated suites read the fixture -- `test_replay_order`,
+`test_replay_dressups`, `test_replay_startpoint`, `test_tool_clearance` -- which is
+697 of 1293 checks. `test_replay_flatten` and `test_replay_boundary` build their
+geometry with `FreeCAD.newDocument` and open no file, so they are unaffected by
+fixture staleness; an earlier estimate here put the figure at ~70% by counting
+them. `test_replay_identity` also reads the fixture but is **not** in the gate.
+
+### Fixture inputs are now committed
+
+`.gitignore` previously excluded `tests/Test_Files/*` with a single re-admission,
+so `replay-fixture.FCStd` -- which gated `test_replay_subnames.py` (63 checks)
+opens -- was not in the repository, and a fresh clone would have failed that suite
+rather than skipping it. All three fixture inputs are now tracked.
 
 ---
 
@@ -2962,3 +3076,76 @@ overlapping shapes, which is what now catches injections six and seven.
 
 Gate: 14 freecadcmd suites, 1265 checks, 0 failures; 571 pytest. 25 of those
 checks are the new gated `test_tool_clearance.py`, plus 16 new pytest cases.
+
+---
+
+## NEST-031 — `random_seed` is plumbed and printed, but three drawing sites never receive it
+
+`status: open` · `severity: medium (unmeasured)` · `area: nesting / GA`
+
+Found while scoping [NEST-029](#nest-029): rebuilding the committed fixture needs to
+know whether a nest can be reproduced at all, and the answer is **no, not
+reliably**, so the two are related even though the fixes are separate.
+
+### What the seed does reach
+
+`ga_coordinator.py:535-539` reads `algo_kwargs['random_seed']`, falling back to
+`random.randrange(2**32)`, and builds a private instance:
+
+    self.rng = random.Random(seed)
+    FreeCAD.Console.PrintMessage(f"GA random seed: {seed}\n")
+
+That instance is threaded down through `layout_manager.py:118`,
+`nesting_strategy.py:338`, `minkowski_engine.py:251` and all of `genetic_utils.py`.
+Mutation (`:1374-1375`), crossover, tournament selection, tie-breaking (`:805`) and
+the part shuffle (`:1391`) all draw from it. **The GA layer is genuinely seeded.**
+
+### What it misses
+
+Three sites use the bare global `random` module instead:
+
+| site | draws |
+|---|---|
+| `physics_nester.py:24,31,32,45` | `angle`, `target_x`, `target_y`, `angle_rad` |
+| `base_nester.py:128,156,176` | `initial_side`, `rand_angle`, rotation `jitter` |
+| `nesting_strategy.py:338` | `self.rng = rng or random` -- **silently discards the seed** when `rng` is falsy |
+
+**`random.seed(` appears nowhere in the repository** -- not in `freecad/`, not in
+`tests/`. The global module runs off OS entropy on every process, seeded by nothing.
+
+`physics_nester` is not dead code: `nesting_logic.py:285` constructs
+`PhysicsNester` on the live path.
+
+### The plumbing is inert
+
+`nesting_controller.py:1323` reads `algo_kwargs['random_seed'] =
+ui_params.get('random_seed')`, and **there is no `random_seed` anywhere in
+`ui_nesting.py`** -- the user cannot set one. So it is `None`, and
+`ga_coordinator.py:537` draws the seed itself from the unseeded global module. The
+seed is a random draw from an unseeded source.
+
+### Consequence, stated no more strongly than measured
+
+A user who reads `GA random seed: 3812746` off the console, notes it, and re-runs the
+same job **does not get the same nest.** The GA decisions would replay; the physics
+jitter and the `rng or random` fallback would not.
+
+**Unmeasured:** whether `Physics` and the default algorithm both take the affected
+paths, and whether `rotation_workers` threading perturbs draw order even once the
+rng is threaded through. Neither is established, so the size of the divergence
+between two same-seed runs is not known. A claim like "two runs differ by 3 parts"
+would be invented; what is measured is only that three sites cannot see the seed.
+
+### Fix direction, not yet a plan
+
+Thread the coordinator's `random.Random` through `physics_nester` and `base_nester`,
+close the `rng or random` fallback so a seeded run cannot silently degrade, expose
+the seed in the UI (or state plainly that runs are not reproducible), then measure
+whether two same-seed runs are identical before and after. The fallback at
+`nesting_strategy.py:338` is the sharpest single point: it is a one-line change that
+converts a silent loss of reproducibility into a loud one.
+
+Kept separate from NEST-029 because this is a product change with its own
+measurements, and because it bears on **what NEST-029 can honestly pin** -- a
+fixture regenerated from a seed the code does not honour is a different artefact
+than one regenerated deterministically.
