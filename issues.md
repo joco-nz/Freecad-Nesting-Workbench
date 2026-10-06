@@ -53,8 +53,8 @@ the symbol when you edit the entry.
 
 | ID | title | status | severity | area |
 |---|---|---|---|---|
-| [NEST-001](#nest-001) | Nesting direction is recorded from the Minkowski dial whatever algorithm ran | open | high | persistence |
-| [NEST-002](#nest-002) | Per-part rotation override is read but never written | open | medium | persistence |
+| [NEST-001](#nest-001) | Nesting direction is recorded from the Minkowski dial whatever algorithm ran | resolved | high | persistence |
+| [NEST-002](#nest-002) | Per-part rotation override is read but never written | resolved | medium | persistence |
 | [NEST-003](#nest-003) | Workbench and benchmark disagree on the simplification default | open | medium | benchmark |
 | [NEST-004](#nest-004) | Synthetic heavy corpus is calibrated to a piece count production no longer produces | open | medium | benchmark |
 | [NEST-005](#nest-005) | Simplification destroys the rotational symmetry of part outlines | limitation | low | geometry |
@@ -77,6 +77,7 @@ the symbol when you edit the entry.
 | [NEST-022](#nest-022) | Logging is 230 ad-hoc call sites and 165 exception handlers that record nothing | open | medium | diagnostics |
 | [NEST-023](#nest-023) | "Stop At Sheets" was a dead control: read by nobody, never reached the engine | resolved | high | UI wiring |
 | [NEST-024](#nest-024) | the replay did not carry a Profile's StartPoint onto the nested copy | resolved | medium | CAM replay |
+| [NEST-025](#nest-025) | `rotation_params` is threaded through six call sites and read by nobody | open | low | dead code |
 
 Statuses for NEST-009 through NEST-021 were derived from each entry's own
 prose, cross-checked where a later entry supersedes an earlier one: NEST-018's
@@ -97,21 +98,25 @@ which the later entry repeats. **They should be merged** -- see the task list.
 
 **Nesting direction is recorded from the Minkowski dial whatever algorithm ran**
 
-`status: open` · `severity: high` · `area: persistence`
+`status: resolved` · `severity: high` · `area: persistence`
 
-Set the Physics direction dial, run the Physics algorithm, and the layout saves
+Set the Physics direction dial, run the Physics algorithm, and the layout saved
 a direction that is not the one that produced the nest.
+
+**The entry below recorded this as one defect. It was three**, and the one written
+down was the smallest. What the investigation found is in *Resolved* at the foot
+of this entry; the original text is kept as it was written.
 
 Three places that should agree do not:
 
 | role | location | dial used |
 |---|---|---|
-| direction a Physics run actually uses | `nesting_controller.py:919` | `physics_direction_dial` |
-| direction written onto the layout | `nesting_controller.py:805` | `minkowski_direction_dial` |
-| direction restored on reopen | `nesting_controller.py:263` | `minkowski_direction_dial` |
+| direction a Physics run actually uses | `nesting_controller._prepare_algo_kwargs` | `physics_direction_dial` |
+| direction written onto the layout | `nesting_controller._collect_ui_params` | `minkowski_direction_dial`, unconditionally |
+| direction restored on reopen | `nesting_controller._load_params_from_layout` | `minkowski_direction_dial`, unconditionally |
 
-The write is `nesting_job.py:231` (`PROP_NESTING_DIRECTION`), which is populated
-from the unconditional read at `:805`.
+The write is `nesting_job.NestingJob._apply_properties` (`PROP_NESTING_DIRECTION`),
+populated from the unconditional read.
 
 The asymmetry behind it: the Minkowski dial is over-persisted — it is written
 even for Physics runs — and the Physics dial is under-persisted, with no
@@ -124,11 +129,72 @@ visible while both dials defaulted to the same value, because the wrong dial
 usually held the right answer by coincidence.
 
 **Fix direction.** Record the value that was actually used — branch on the
-algorithm at `:805` the way `:807` already does for `use_random_direction` —
-and give the Physics dial its own persisted property so a Physics layout
-round-trips. Both halves are needed: fixing only the read still leaves the
-Physics setting unrecoverable, and fixing only the storage still writes the
-wrong value.
+algorithm at the read, the way `use_random_direction` already does — and give the
+Physics dial its own persisted property so a Physics layout round-trips. Both
+halves are needed: fixing only the read still leaves the Physics setting
+unrecoverable, and fixing only the storage still writes the wrong value.
+
+### Resolved
+
+**Three defects, not one.** Characterised against a real document before changing
+anything, with the two dials at deliberately different readings (`Minkowski 90`,
+`Physics 270`) — a single dial lets a write that always takes the Minkowski one
+pass by coincidence.
+
+| # | defect | evidence |
+|---|---|---|
+| a | **`Algorithm` was read on reload and written by nothing.** | `getattr(layout_group, "Algorithm", "Minkowski")` was the *only* occurrence of that string in `freecad/` or `tests/`. A Physics layout reopened as Minkowski, showing the wrong algorithm's entire settings section. This is the root of the direction confusion, and a bigger bug than the direction. |
+| b | **The algorithm restore was gated on an unrelated property.** | It sat inside `if steps > 0:`, where `steps = getattr(layout_group, PROP_GLOBAL_ROTATION_STEPS, 0)`. A layout without a rotation-step property never restored the algorithm at all. |
+| c | **Two independent paths to the direction bug.** | `_collect_ui_params` filled the params key from the Minkowski dial, *and* `save_settings` persisted preferences straight from `self.ui.minkowski_direction_dial`, bypassing `settings` entirely. Fixing only the first would have left the preferences wrong — a half-fix the fix direction below did not mention. |
+
+Plus two smaller ones: the layout recorded **no random flag**, so a random run
+recorded a dial reading that was never consulted; and the restore set the Minkowski
+dial from `NestingDirection` **before** the algorithm was known.
+
+**Measured, before:** a Physics run with `Minkowski=90 Physics=270` recorded
+`NestingDirection=90`, with no `Algorithm` and no `RandomDirection` on the layout
+at all.
+
+**What changed.**
+
+* `PROP_ALGORITHM` and `PROP_STRING` added to `constants.py`; `PROP_PHYSICS_DIRECTION`
+  added for the preferences, where both dials are remembered separately —
+  matching the `PhysicsRandomDirection` / `PhysicsRotationSteps` pair that already
+  worked that way, and the dial was the one omission.
+* `_apply_properties` records `Algorithm`, branches `NestingDirection` on it, and
+  records `RandomDirection`.
+* `_collect_ui_params` branches `nesting_direction` on the algorithm — the same
+  shape `use_random_direction` already used — and carries both dial readings so
+  `save_settings` has one source instead of two that can disagree.
+* `_load_params_from_layout` restores the algorithm **first** and **outside** the
+  rotation-steps gate, then hands the direction to a new
+  `_load_direction_from_layout`, which restores that algorithm's dial from its own
+  property and re-applies the random flag, so a random run comes back with the dial
+  greyed out rather than enabled and consulted.
+* `load_persisted_settings` restores the Physics dial, and its
+  `_set_direction_control_enabled` call now names the active algorithm's dial
+  instead of falling back to the Minkowski one. That function's docstring claimed
+  "the one whose checkbox is connected without arguments", which had stopped being
+  true when the Physics checkbox began passing its own.
+
+**After:** `Algorithm='Physics'`, `NestingDirection=270`, `RandomDirection=False`,
+and a new session restores both dials at 90 and 270.
+
+Old layouts still open. With no `Algorithm` the fallback is `DEFAULT_ALGORITHM`,
+which is the panel's own default and what those files were in fact run with; with
+no `RandomDirection` the dial is left as the session had it. A layout records
+**one** direction, because it records one algorithm and that says which dial the
+number came from — the other dial is not that layout's business.
+
+**Coverage.** `tests/freecad_harness/test_layout_persistence.py` (37 checks, gated)
+for the write half on a real document, including a save/reopen round trip.
+`tests/freecad_harness/probe_layout_restore.py` (28 checks, GUI) for the reload
+half: the panel cannot be built under `freecadcmd`, so that tier is the only one
+that can see it. `tests/test_layout_persistence/` guards the read/write *pairing*
+structurally, under plain CPython.
+
+Injection-checked: reverting the branch in `_collect_ui_params` fails two probe
+checks, both traceable to that one line.
 
 ---
 
@@ -136,25 +202,133 @@ wrong value.
 
 **Per-part rotation override is read but never written**
 
-`status: open` · `severity: medium` · `area: persistence`
+`status: resolved` · `severity: medium` · `area: persistence`
 
-`nesting_controller.py:323` reads a per-part override:
+`nesting_controller._load_shapes_from_layout` reads a per-part override:
 
 ```python
 steps_map[label] = getattr(master, "PartRotationSteps", 0)
 ```
 
-No `addProperty("PartRotationSteps", ...)` exists anywhere in the codebase, so
-the attribute is never present and the read always yields `0`. A user who sets
-a rotation override for one part type in the shape table gets a nest that
-honours it, and a reopened layout that silently reverts to the global value.
+No `addProperty("PartRotationSteps", ...)` existed anywhere in the codebase, so
+the attribute was never present and the read always yielded `0`. A user who sets
+a rotation override for one part type in the shape table got a nest that honoured
+it, and a reopened layout that silently reverted to the global value.
 
 A control that appears wired and is not is worse than one that is absent, which
-is what the shape table's "Override" column amounts to today.
+is what the shape table's "Override" column amounted to today.
 
 **Fix direction.** Either write the property in the same place the quantity and
-`FillSheet` metadata are written (`shape_preparer.py:421-437`), or stop reading
-it. Writing it is the better outcome since the control already exists.
+`FillSheet` metadata are written (`shape_preparer._create_master_container`), or
+stop reading it. Writing it is the better outcome since the control already
+exists.
+
+### Resolved
+
+**Two missing writes, not one.** `PartRotationOverride` — read on the line above —
+had the identical defect and was not in this entry.
+
+| property | read at | written at, before |
+|---|---|---|
+| `Quantity` | `_load_shapes_from_layout` | `shape_preparer.py` ✓ |
+| `UpDirection` | same | ✓ |
+| `FillSheet` | same | ✓ |
+| `PartRotationOverride` | same | **nowhere** |
+| `PartRotationSteps` | same | **nowhere** |
+
+`PartRotationOverride` was worse than merely missing: it defaulted to `[]` on the
+read side — a **list** — and was handed straight to
+`add_part_row(override_rotation=...)`, where a list is falsy by accident rather
+than by being off. It is now an `App::PropertyBool`, written and read as one.
+
+**The read half was correct all along** and simply had nothing to read:
+`_load_shapes_from_layout` already split the pair properly (`steps` to the spinbox,
+`override` to the checkbox) and `add_part_row` already accepted both. No change was
+needed there beyond the default's type.
+
+**The nest already honoured the override**, which is why this was only ever a
+reopen bug: `part_params['rotation_steps']` is the *resolved* count
+(`rot_val if override else global_rot`), and `shape_preparer` feeds it to the
+nester.
+
+**Which is also what fixes what to store.** The resolved value cannot be persisted
+as the override: an override of 8 and a global of 8 are the same number, so writing
+it would reload the checkbox wrong. The raw pair now travels beside it as
+`rotation_steps_override` / `rotation_override`, inside the `part_params` dict
+whose four-key contract was already documented on `shape_preparer.prepare_parts`.
+
+**After:** a part overridden to 12 records `PartRotationSteps=12,
+PartRotationOverride=True`; an un-overridden part holding 4 in its spinbox records
+`4, False`. Both survive a save/reopen.
+
+**Coverage.** `test_layout_persistence.py` asserts the values and types on a real
+document; `probe_layout_restore.py` drives the real panel through
+`controller.load_layout()` and asserts the shape table's two columns came back.
+Injection-checked: writing the *resolved* count instead of the raw one fails two
+checks, one of which exists only to keep the fixture able to tell them apart.
+
+### The guard, which is the real point
+
+`tests/test_layout_persistence/` checks that **every property either reload path
+reads is one that gets written**, for the master container and for the layout
+group. It found both halves of NEST-002 and NEST-001's `Algorithm` at once, and it
+is the general answer rather than four more one-off assertions.
+
+Two things about it are worth recording, because both happened:
+
+* **Its first version was silently vacuous.** `NestingJob._apply_properties` writes
+  property names as *constants* — `self._set_prop(target_layout, PROP_LENGTH,
+  PROP_SHEET_WIDTH, ...)` — so a helper recognising only string literals matched
+  *nothing* in the write half. `_set_prop_names` returned an empty set, every
+  written property looked unwritten, and the layout guard passed for the wrong
+  reason. Fixed by resolving `constants.py`, with
+  `test_the_constant_map_is_not_empty` added so a future change to that file fails
+  loudly rather than quietly narrowing the guard's scope.
+* **The matching GUI probe had the same class of fault, and worse.** `check` was
+  declared `check(condition, message, detail)` while every call site was written in
+  `probe_unit_panel.py`'s `check(label, condition, detail)` order — so `condition`
+  received the *label string*, a non-empty string is truthy, and **all 28 checks
+  passed unconditionally**. Caught only by reverting the fix and watching the probe
+  stay green. It now declares `label` first and tests `condition is True`, so a
+  non-boolean cannot slip through the same way.
+
+---
+
+## NEST-025 — `rotation_params` is threaded through six call sites and read by nobody
+
+`status: open` · `severity: low` · `area: dead code`
+
+Found while fixing NEST-002, and **deliberately not fixed there**: it is a signature
+change to a method with nine call sites, two of them in gated tests, and bundling
+that into a persistence fix would make the fix harder to review and harder to
+revert.
+
+`NestingController._collect_job_parameters` builds a fourth dict alongside
+`quantities`:
+
+```python
+rotation_params[label] = (rot_val, override)
+```
+
+and returns it. It is passed down through `nesting_controller` (four sites) into
+`GACoordinator.run(..., rotation_params, algo_kwargs, ...)`
+(`ga_coordinator.py:502`), where it appears **once, in the signature, and is
+referenced nowhere in the body**. The run reads `rotation_steps` from `ui_params`
+instead.
+
+It is the fourth instance of this shape, after NEST-023's dead "Stop At Sheets"
+control, and it predates them: the per-part override reached the nester by a
+different route (`part_params['rotation_steps']`) and `rotation_params` was left
+behind when that route was added.
+
+It is now redundant as well as dead: `part_params` carries
+`rotation_steps_override` / `rotation_override`, which is the same pair.
+
+**Fix direction.** Delete the parameter from `GACoordinator.run` and its four
+call sites, plus the two harness callers (`bench_ga.py`, `test_ga_loop.py`) and the
+two probes. Or, if it is deliberately kept as a seam for per-part rotation work,
+give it a docstring saying what it is for — a parameter nobody reads reads as a bug
+to the next person either way.
 
 ---
 

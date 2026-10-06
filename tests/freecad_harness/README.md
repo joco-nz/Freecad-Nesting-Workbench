@@ -253,6 +253,8 @@ downstream of them stays in millimetres. Two files, two interpreters:
 | file | covers | runs under |
 |---|---|---|
 | `test_document_units.py` | `units.py` — schema resolution, length/area formatting, `parse_length`, `length_mm` | `freecadcmd`, wired into `run.sh` |
+| `test_layout_persistence.py` | the write half of layout persistence — `Algorithm`, `NestingDirection`, `RandomDirection`, and each part's raw rotation override, on a real document, with a save/reopen round trip | `freecadcmd`, wired into `run.sh` |
+| `probe_layout_restore.py` | the reload half — the controller reading the right dial, and the panel coming back showing what the layout recorded | `freecad` (GUI), run by hand |
 | `probe_unit_panel.py` | `length_field.py` and the real `NestingPanel` | `freecad` (GUI), run by hand |
 | `probe_target_sheets.py` | the "Stop At Sheets" dial, panel → coordinator → a real GA run | `freecad` (GUI), run by hand |
 
@@ -446,6 +448,47 @@ the result *looks* right, which is what a human is for.
 through `_collect_ui_params` (the path a real run takes) rather than a direct
 `save_settings` call that could drift from it. The default is asserted to stay
 1; see the measurement in the changelog for why it is not higher.
+
+## Layout persistence, and the two vacuity traps behind it
+
+`test_layout_persistence.py` (gated, `freecadcmd`) covers the *write* half of what a
+layout records about the run that made it. `probe_layout_restore.py` (GUI, by hand)
+covers the *reload* half, because the panel cannot be built under `freecadcmd` --
+`Gui::QuantitySpinBox` is unavailable there, so `NestingPanel()` raises before a
+single assertion runs.
+
+`tests/test_layout_persistence/` guards the *pairing* -- every property either
+reload path reads must be one that gets written -- and runs under plain CPython,
+because it reads the sources as text and imports nothing.
+
+Two traps this area has already sprung, both worth knowing before writing the next
+check here. **A guard that cannot fail is worse than no guard**, because it reads
+like evidence.
+
+1. **Property names are constants, not literals.** `NestingJob._apply_properties`
+   writes `self._set_prop(target_layout, PROP_LENGTH, PROP_SHEET_WIDTH, ...)`. A
+   helper matching only string literals finds *nothing* in the write half, so every
+   written property looks unwritten. The resolver in
+   `tests/test_layout_persistence/test_layout_persistence.py` reads `constants.py`
+   to fix that, and `test_the_constant_map_is_not_empty` fails loudly if that stops
+   working.
+
+2. **A `check(label, condition)` argument order is a trap.** `probe_layout_restore.py`
+   originally declared `check(condition, message, detail)` while every call site was
+   written in `probe_unit_panel.py`'s `check(label, condition, detail)` order -- so
+   `condition` received the label string, a non-empty string is truthy, and all 28
+   checks passed unconditionally. It was caught only by reverting the fix and
+   watching the probe stay green. It now declares `label` first and tests
+   `condition is True`, so a non-boolean cannot slip through the same way.
+
+The lesson generalises: **inject the defect and watch the check go red** before
+believing it. Both of these were green through a full `run.sh` pass.
+
+One more trap specific to probes: they write to the **user's real preferences**.
+`probe_layout_restore.py` clears the keys it touches before every case and again at
+the end, because a panel reads preferences at construction -- so one case's write
+decides what the next case starts with, and leaving a probe's `PhysicsDirection` at
+270 is a setting the user never chose.
 
 ## The direction dial
 

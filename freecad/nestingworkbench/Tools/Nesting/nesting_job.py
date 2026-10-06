@@ -218,8 +218,15 @@ class NestingJob:
         self._set_prop(target_layout, PROP_INTEGER, PROP_GENERATIONS, p.get('generations', 1))
         self._set_prop(target_layout, PROP_INTEGER, PROP_POPULATION_SIZE, p.get('population_size', 1))
 
-        # Save Nesting Direction as a vector/tuple if possible, or just the dial value
-        # For simplicity and transparency in the UI, we'll save the dial value (degrees)
+        # Which algorithm ran, and the direction *that* algorithm used.
+        #
+        # Both were needed and neither was here. `Algorithm` was read on reload
+        # (`nesting_controller._load_params_from_layout`) and written by nothing,
+        # so a Physics layout reopened as Minkowski. `NestingDirection` was written
+        # from one params key, which the controller filled from the Minkowski dial
+        # whatever ran -- so a Physics run recorded a number from a dial the
+        # Physics search never read. `physics_direction` sits beside it in
+        # `settings_dict` for exactly that reason. See issues.md NEST-001.
         #
         # The fallback must match the panel's default (ui_nesting
         # ._DEFAULT_DIRECTION_DIAL, 90 = Left). It previously fell back to 0,
@@ -227,8 +234,21 @@ class NestingJob:
         # a different direction from the one the run actually used -- and the
         # recorded value is what _load_params_from_layout restores, so the
         # error would outlive the run that made it.
-        dial_val = p.get('nesting_direction', DEFAULT_DIRECTION_DIAL)
+        self._set_prop(target_layout, PROP_STRING, PROP_ALGORITHM,
+                       p.get('algorithm', DEFAULT_ALGORITHM))
+
+        physics = p.get('algorithm', DEFAULT_ALGORITHM) == 'Physics'
+        dial_val = p.get('physics_direction' if physics else 'nesting_direction',
+                         DEFAULT_DIRECTION_DIAL)
         self._set_prop(target_layout, PROP_INTEGER, PROP_NESTING_DIRECTION, dial_val)
+
+        # The dial reading above is what the control *held*, which is not the
+        # same as what the run used: with "Use Random Direction" ticked the
+        # search direction is None and the dial is ignored. Recording the flag
+        # separately is what lets a reopened layout restore a greyed-out dial
+        # instead of an enabled one that was never consulted.
+        self._set_prop(target_layout, PROP_BOOL, PROP_RANDOM_DIRECTION,
+                       bool(p.get('use_random_direction', False)))
 
     def _set_prop(self, obj, type_str, name, val):
         if not hasattr(obj, name):

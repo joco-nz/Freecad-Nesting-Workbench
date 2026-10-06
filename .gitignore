@@ -64,3 +64,5 @@ tests/Test_Files/*
 tests/freecad_harness/.last_status_probe_gui_collapsible
 tests/freecad_harness/.last_status_probe_gui_layout
 tests/freecad_harness/.last_status_target_sheets
+tests/freecad_harness/.last_status_persist
+tests/freecad_harness/.last_status_restore

@@ -161,6 +161,25 @@ asks what the job cannot say. One job per sheet, every sheet replayed.
   are moved, which on the committed fixture is one operation of 98. See
   [NEST-024](issues.md#nest-024).
 
+- **A layout did not record the algorithm that produced it.** Reopening a Physics
+  layout brought up Minkowski, with the wrong algorithm's whole settings section --
+  and with the direction to match, because `NestingDirection` was written from the
+  Minkowski dial whatever ran, so a Physics run saved a number the Physics search
+  never read. A layout now records the algorithm, the direction *that* algorithm's
+  dial held, and whether that direction was used at all, so a random run comes back
+  with its dial greyed out rather than enabled and consulted.
+  The Physics direction dial is now remembered between sessions too. It had no
+  preference key at all, so its position was recorded nowhere -- while
+  `PhysicsRandomDirection` and `PhysicsRotationSteps` were remembered all along.
+  See [NEST-001](issues.md#nest-001).
+
+- **A per-part rotation override was lost on reopen.** The shape table's
+  "Rotations" and "Override" columns produced a correct nest and then a layout that
+  silently reverted to the global value, because neither was ever written onto the
+  part's master shape. Both now round-trip, as a number and a flag separately -- an
+  override of 8 and a global of 8 are the same number, so the flag is what tells
+  them apart. See [NEST-002](issues.md#nest-002).
+
 - **"Stop At Sheets" did nothing at all.** The dial was read by nobody:
   `_collect_ui_params` never read the spinbox and `_prepare_algo_kwargs` never
   set `algo_kwargs['target_sheets']`, so `GACoordinator` was handed no target,

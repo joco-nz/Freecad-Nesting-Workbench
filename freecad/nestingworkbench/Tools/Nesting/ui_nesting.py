@@ -1161,9 +1161,10 @@ class NestingPanel(QtWidgets.QWidget):
     def _set_direction_control_enabled(self, enabled, dial=None):
         """Enable or disable a direction control as a unit.
 
-        Called by both "Use Random Direction" checkboxes. Defaults to the
-        Minkowski control, which is the one whose checkbox is connected without
-        arguments; the Physics one passes its own.
+        Called by both "Use Random Direction" checkboxes, each passing its own
+        dial, and by the two restore paths. `dial` is effectively required now:
+        the only caller that used to omit it was the preference restore, and it
+        therefore greyed out the Minkowski dial whatever algorithm was selected.
 
         There used to be a button list here as well. Greying out the dial alone
         is not enough while the surrounding buttons stayed live, because a user
@@ -1335,18 +1336,34 @@ class NestingPanel(QtWidgets.QWidget):
         # Snapped to the step, because a stored value from a build with a
         # different step would otherwise land between notches and silently
         # disagree with the readout the user is looking at.
+        #
+        # **Both dials, each from its own key.** The Physics dial had no key and
+        # so was never restored -- its position was recorded nowhere at all, while
+        # `PhysicsRandomDirection` and `PhysicsRotationSteps` were remembered all
+        # along. See issues.md NEST-001.
         self.minkowski_direction_dial.setValue(
             _snap_to_step(prefs.GetInt(PROP_NESTING_DIRECTION,
+                                       _DEFAULT_DIRECTION_DIAL)))
+        self.physics_direction_dial.setValue(
+            _snap_to_step(prefs.GetInt(PROP_PHYSICS_DIRECTION,
                                        _DEFAULT_DIRECTION_DIAL)))
         self.minkowski_random_checkbox.setChecked(
             prefs.GetBool(PROP_RANDOM_DIRECTION, False))
         self.physics_random_checkbox.setChecked(
             prefs.GetBool("PhysicsRandomDirection", False))
-        # Restored after the checkbox, because checking it disables the dial and
-        # the order matters: the reverse would leave the dial enabled under a
-        # "random" run whose direction was then ignored.
-        self._set_direction_control_enabled(
-            not self.minkowski_random_checkbox.isChecked())
+        # Restored after both checkboxes, and against the **active** algorithm's
+        # checkbox rather than the Minkowski one as it did before: this call was
+        # made with no dial, so `_set_direction_control_enabled` fell back to the
+        # Minkowski dial whichever algorithm was selected. Harmless at startup,
+        # where the algorithm defaults to Minkowski -- and wrong for every session
+        # that opens with Physics selected from a layout.
+        active_random = (self.physics_random_checkbox.isChecked()
+                         if self.algorithm_dropdown.currentText() == 'Physics'
+                         else self.minkowski_random_checkbox.isChecked())
+        active_dial = (self.physics_direction_dial
+                       if self.algorithm_dropdown.currentText() == 'Physics'
+                       else self.minkowski_direction_dial)
+        self._set_direction_control_enabled(not active_random, dial=active_dial)
 
         # Load Rotation Steps (Isolated)
         # Minkowski

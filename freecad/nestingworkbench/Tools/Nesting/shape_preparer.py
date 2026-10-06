@@ -82,7 +82,13 @@ class ShapePreparer:
         
         Args:
             ui_global_settings (dict): { 'spacing': float, 'deflection': float, 'simplification': float, 'rotation_steps': int, 'add_labels': bool, 'font_path': str, 'verbose': bool }
-            quantities (dict): { label: {'quantity': int, 'rotation_steps': int, 'up_direction': str, 'fill_sheet': bool} }
+            quantities (dict): { label: {'quantity': int, 'rotation_steps': int, 'up_direction': str, 'fill_sheet': bool, 'rotation_steps_override': int, 'rotation_override': bool} }
+                `rotation_steps` is the resolved count the nester uses.
+                `rotation_steps_override` / `rotation_override` are the raw
+                spinbox reading and the checkbox, written to the master
+                container as `PartRotationSteps` / `PartRotationOverride` so a
+                reopened layout restores the control rather than a number.
+                See issues.md NEST-002.
             master_shapes_map (dict): { label: FreeCADObject }
             layout_obj (App::DocumentObjectGroup): The layout group.
             parts_group (App::DocumentObjectGroup): The PartsToPlace group to add temp instances to.
@@ -428,25 +434,57 @@ class ShapePreparer:
         return master_shape_obj, temp_shape_wrapper
 
     def _create_master_container(self, label, quantities, source_centroid):
-        """Creates the App::Part container and populates it with metadata properties."""
+        """Creates the App::Part container and populates it with metadata properties.
+
+        **Every property written here is one `_load_shapes_from_layout` reads
+        back** when the layout is reopened. That pairing used to be incomplete in
+        one direction: `PartRotationSteps` and `PartRotationOverride` were read
+        and never written, so a per-part rotation override produced a correct nest
+        and a layout that silently reverted to the global value on reopen. See
+        issues.md NEST-002, and `tests/test_layout_persistence/` for the guard
+        that keeps the pairing complete.
+
+        `PartRotationSteps` holds the **raw** spinbox reading, not the resolved
+        step count. `part_params['rotation_steps']` is already resolved --
+        `rot_val if override else global_rot` -- so persisting it would write the
+        global value as though the user had typed it, and an override of 8 could
+        not be told from a global of 8 on the way back. The raw pair travels
+        beside it as `rotation_steps_override` / `rotation_override`.
+        """
         master_container = self.doc.addObject("App::Part", f"master_{label}")
         self._perf_inc('lm_master_containers_created')
-        
+
         part_params = quantities.get(label, {'quantity': 1, 'up_direction': 'Z+', 'fill_sheet': False})
         if isinstance(part_params, tuple):
             quantity, up_direction, fill_sheet = part_params[0], 'Z+', False
+            rotation_steps_override, rotation_override = 0, False
         else:
             quantity = part_params.get('quantity', 1)
             up_direction = part_params.get('up_direction', 'Z+')
             fill_sheet = part_params.get('fill_sheet', False)
-        
+            rotation_steps_override = part_params.get('rotation_steps_override', 0)
+            rotation_override = part_params.get('rotation_override', False)
+
         master_container.addProperty("App::PropertyInteger", "Quantity", "Nest", "Number of instances").Quantity = quantity
         master_container.addProperty("App::PropertyString", "UpDirection", "Nest", "Up direction for 2D projection").UpDirection = up_direction
         master_container.addProperty("App::PropertyBool", "FillSheet", "Nest", "Use to fill remaining space").FillSheet = fill_sheet
         master_container.addProperty("App::PropertyVector", "SourceCentroid", "Nesting", "Original geometry center").SourceCentroid = source_centroid
+        # 0 means "no per-part override", matching the spinbox's own 0..360 range
+        # and its tooltip's "0 or 1 means no rotation". `PartRotationOverride` is
+        # a **Bool**: the reload path used to read it with a `[]` default and hand
+        # it straight to `add_part_row(override_rotation=...)`, where a list is
+        # falsy by accident rather than by being off.
+        master_container.addProperty(
+            "App::PropertyInteger", "PartRotationSteps", "Nest",
+            "Raw rotation steps typed for this part. 0 when not overridden."
+        ).PartRotationSteps = int(rotation_steps_override or 0)
+        master_container.addProperty(
+            "App::PropertyBool", "PartRotationOverride", "Nest",
+            "Whether PartRotationSteps overrides the global rotation steps."
+        ).PartRotationOverride = bool(rotation_override)
 
         set_visibility(master_container, True)
-            
+
         return master_container, up_direction
 
     def _rebuild_2d_shape(self, master_obj, original_shape, center_point, plc, offset, verbose, label):

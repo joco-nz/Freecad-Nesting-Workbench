@@ -10,6 +10,7 @@ PROP_FLOAT = "App::PropertyFloat"
 PROP_BOOL = "App::PropertyBool"
 PROP_INTEGER = "App::PropertyInteger"
 PROP_FILE = "App::PropertyFile"
+PROP_STRING = "App::PropertyString"
 
 # -- Layout Property Names --
 PROP_SHEET_WIDTH = "SheetWidth"
@@ -28,6 +29,28 @@ PROP_GENERATIONS = "Generations"
 PROP_POPULATION_SIZE = "PopulationSize"
 PROP_NESTING_DIRECTION = "NestingDirection"
 PROP_RANDOM_DIRECTION = "RandomDirection"
+
+#: Which algorithm produced the layout. Read by
+#: `NestingController._load_params_from_layout` and, before this was written,
+#: read by nothing else -- so a Physics layout reopened as Minkowski and showed
+#: the wrong algorithm's entire settings section. See issues.md NEST-001.
+#:
+#: It exists because `NestingDirection` is ambiguous on its own: the same dial
+#: reading means a different search direction under each algorithm, because each
+#: has its own dial. Recording the direction without recording which dial it came
+#: from records a number that cannot be interpreted.
+PROP_ALGORITHM = "Algorithm"
+
+#: The Physics algorithm's own direction dial, as a **preference** key.
+#:
+#: Deliberately not `PROP_NESTING_DIRECTION`-with-a-different-name on the layout
+#: side: a layout records one direction, because it records one algorithm, and the
+#: algorithm says which dial the number came from. Preferences have no such
+#: constraint -- both controls exist on the panel at once, and a user may have
+#: configured either -- so both are remembered separately, matching the
+#: `PhysicsRandomDirection` / `PhysicsRotationSteps` pair that already worked this
+#: way. See issues.md NEST-001.
+PROP_PHYSICS_DIRECTION = "PhysicsDirection"
 
 # -- FreeCAD Preferences Path --
 PREFS_PATH = "User parameter:BaseApp/Preferences/NestingWorkbench"
@@ -55,6 +78,12 @@ MINKOWSKI_ROTATION_PRESETS = [360, 180, 120, 90, 45, 30, 15, 10, 5, 1]
 # to read a number.
 DIRECTION_LABELS = {0: "Down", 90: "Left", 180: "Up", 270: "Right"}
 DEFAULT_DIRECTION_DIAL = 90
+
+#: The algorithm a layout is assumed to have been produced by when it does not
+#: say. Matches the panel's own default (`ui_nesting.algorithm_dropdown`,
+#: index 0), which is what an old layout -- written before `PROP_ALGORITHM
+#: existed -- was in fact run with.
+DEFAULT_ALGORITHM = "Minkowski"
 
 # Degrees the dial moves per click. 15 gives 24 positions, which is finer than
 # the four cardinals the dial used to snap to and finer than most parts'

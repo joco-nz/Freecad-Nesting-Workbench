@@ -11,6 +11,10 @@ from PySide import QtWidgets
 from PySide.QtCore import QThread, Signal
 from ...datatypes.shape import Shape
 from .shape_preparer import ShapePreparer
+# For `_load_direction_from_layout`'s snapping. A layout's dial reading is
+# snapped on load rather than on store, for the same reason the preference
+# restore snaps -- see the docstring there.
+from .ui_nesting import _snap_to_step
 from .algorithms import minkowski_utils
 from .layout_manager import LayoutManager, Layout
 from .ga_coordinator import GACoordinator
@@ -384,7 +388,31 @@ class NestingController:
         a Quantity. float() on one of those is its millimetre figure, which is
         the unit the fields want -- there is no schema anywhere in this path,
         and none is needed.
+
+        **Order matters, and it used to be wrong in three ways.** All of it is
+        NEST-001.
+
+        The algorithm is restored *first*, because two things below depend on
+        which one ran. It used to be restored near the end, and only inside
+        `if steps > 0:` -- so a layout without a rotation-step property never
+        restored it at all, and a Physics layout reopened as Minkowski whichever
+        way you looked at it.
+
+        The direction is restored to *that algorithm's* dial.
+        `PROP_NESTING_DIRECTION` used to be in `props_map` bound to the Minkowski
+        dial, unconditionally, and `props_map` ran before the algorithm was known.
+
+        The random flag is restored with its dial, so a run that ignored the dial
+        comes back with the dial greyed out rather than enabled and consulted.
         """
+        # -- the algorithm, before anything that depends on it --
+        algo = getattr(layout_group, PROP_ALGORITHM, DEFAULT_ALGORITHM)
+        if self.ui.algorithm_dropdown.currentText() != algo:
+            # Triggers `_on_algorithm_change`, which only toggles group visibility
+            # and the rotation label -- it resets no control, so setting the dials
+            # after this is safe.
+            self.ui.algorithm_dropdown.setCurrentText(algo)
+
         props_map = {
             PROP_SHEET_WIDTH: self.ui.sheet_width_input,
             PROP_SHEET_HEIGHT: self.ui.sheet_height_input,
@@ -394,7 +422,6 @@ class NestingController:
             PROP_LABEL_SIZE: self.ui.label_size_input,
             PROP_GENERATIONS: self.ui.minkowski_generations_input,
             PROP_POPULATION_SIZE: self.ui.minkowski_population_size_input,
-            PROP_NESTING_DIRECTION: self.ui.minkowski_direction_dial,
         }
 
         for prop, widget in props_map.items():
@@ -425,12 +452,15 @@ class NestingController:
             self.ui.selected_font_path = font_path
             self.ui.font_label.setText(os.path.basename(font_path))
 
+        self._load_direction_from_layout(layout_group, algo)
+
+        # The rotation-step slider belongs to the algorithm, so choosing the right
+        # slider needs `algo` -- which used to be read here, from a literal
+        # "Algorithm" string, inside this gate.
         steps = getattr(layout_group, PROP_GLOBAL_ROTATION_STEPS, 0)
         if steps > 0:
             target_angle = 360.0 / steps
-            algo = getattr(layout_group, "Algorithm", "Minkowski")
-            self.ui.algorithm_dropdown.setCurrentText(algo)
-            
+
             angles = PHYSICS_ROTATION_PRESETS if algo == "Physics" else self.ui.rotation_angles
             slider = self.ui.physics_rotation_steps_slider if algo == "Physics" else self.ui.minkowski_rotation_steps_slider
             
@@ -441,6 +471,47 @@ class NestingController:
                 if diff < min_diff:
                     min_diff, closest_idx = diff, i
             slider.setValue(closest_idx)
+
+    def _load_direction_from_layout(self, layout_group, algo):
+        """Restore the direction dial and its random flag, for `algo`'s controls.
+
+        The layout records **one** direction, under `PROP_NESTING_DIRECTION`,
+        because it records one algorithm and that says which dial the number came
+        from. A layout never carries the other dial's reading: it is not that
+        layout's business, and the session's value for the inactive control is
+        left alone.
+
+        The layout's random flag is likewise one property,
+        `PROP_RANDOM_DIRECTION`, disambiguated the same way. Note it shares a
+        *name* with the preference key of that name, which is Minkowski-specific:
+        the preference pair is `RandomDirection` / `PhysicsRandomDirection`. Two
+        stores, one name in each, and which side is being read is what tells them
+        apart.
+
+        Snapped to the step for the reason the preference restore snaps: a layout
+        saved by a build with a different step would otherwise land between notches
+        and disagree with the readout the user is looking at.
+        """
+        if algo == 'Physics':
+            dial = self.ui.physics_direction_dial
+            random_checkbox = self.ui.physics_random_checkbox
+        else:
+            dial = self.ui.minkowski_direction_dial
+            random_checkbox = self.ui.minkowski_random_checkbox
+
+        direction = getattr(layout_group, PROP_NESTING_DIRECTION, None)
+        if direction is not None:
+            dial.setValue(_snap_to_step(int(direction)))
+
+        random_direction = getattr(layout_group, PROP_RANDOM_DIRECTION, None)
+        if random_direction is None:
+            return
+        random_checkbox.setChecked(bool(random_direction))
+        # Each checkbox's own handler already toggles its dial when `setChecked`
+        # fires, and both are connected with their own dial. Stated explicitly as
+        # well, so the state is right by this function rather than by a signal
+        # arriving from somewhere else.
+        self.ui._set_direction_control_enabled(not bool(random_direction), dial=dial)
 
     def _load_shapes_from_layout(self, layout_group):
         """Identifies master shapes and their quantities/overrides."""
@@ -463,8 +534,14 @@ class NestingController:
                 label = shape_obj.Label
                 
                 quantities[label] = getattr(master, "Quantity", 1)
-                
-                overrides[label] = getattr(master, "PartRotationOverride", [])
+
+                # Defaults are typed to match the properties: `PartRotationOverride`
+                # is a Bool written by `shape_preparer._create_master_container`,
+                # and it used to default to `[]` here. A list is falsy, so it
+                # happened to work -- but it was right for the wrong reason, and
+                # a truthy list would have come back as "override on". See
+                # issues.md NEST-002.
+                overrides[label] = getattr(master, "PartRotationOverride", False)
                 steps_map[label] = getattr(master, "PartRotationSteps", 0)
                 up_dirs[label] = getattr(master, "UpDirection", "Z+")
                 fill_map[label] = getattr(master, "FillSheet", False)
@@ -1007,7 +1084,28 @@ class NestingController:
             'verbose': self.ui.verbose_logging_checkbox.isChecked(),
             'performance_logging': self.ui.performance_logging_checkbox.isChecked(),
             'candidate_geometry_cache': self.ui.candidate_geometry_cache_checkbox.isChecked(),
-            'nesting_direction': self.ui.minkowski_direction_dial.value(),
+            # **Branched on the algorithm**, which this key never was. It was read
+            # from the Minkowski dial unconditionally, so a Physics run recorded a
+            # direction it never used -- and `_apply_properties` then wrote that
+            # onto the layout, which is the number `_load_params_from_layout`
+            # restores. `physics_direction` is carried alongside for the same
+            # reason `use_random_direction` below already branches: the write half
+            # needs both, and the pair is read together. See issues.md NEST-001.
+            'nesting_direction': (
+                self.ui.physics_direction_dial.value()
+                if self.ui.algorithm_dropdown.currentText() == 'Physics'
+                else self.ui.minkowski_direction_dial.value()),
+            # The *other* dial, for `save_settings` to persist and for the layout
+            # write to fall back on. Read unconditionally: preferences remember
+            # both, since both controls exist and a user may switch algorithms
+            # between sessions.
+            'physics_direction': self.ui.physics_direction_dial.value(),
+            'minkowski_direction': self.ui.minkowski_direction_dial.value(),
+            # Read for `save_settings` rather than from the widgets there, so the
+            # preferences have one source. See the note on the direction keys
+            # below.
+            'minkowski_random': self.ui.minkowski_random_checkbox.isChecked(),
+            'physics_random': self.ui.physics_random_checkbox.isChecked(),
             'algorithm': self.ui.algorithm_dropdown.currentText(),
             'use_random_direction': (self.ui.physics_random_checkbox.isChecked() if self.ui.algorithm_dropdown.currentText() == 'Physics' else self.ui.minkowski_random_checkbox.isChecked()),
             'stability_tolerance': self.ui.physics_improvement_threshold_input.value(),
@@ -1073,12 +1171,26 @@ class NestingController:
         # dial_to_bearing converts; storing the bearing here would need a
         # second inverse conversion and would break the step, since a bearing
         # snapped to 15 is a different reading than a reading snapped to 15.
+        #
+        # **Both dials, under their own keys.** This used to read the Minkowski
+        # widget directly rather than from `settings`, which is a second path to
+        # the NEST-001 bug: fixing the read in `_collect_ui_params` alone would
+        # have left the preference wrong. Reading from `settings` also means one
+        # source rather than two that can disagree.
+        #
+        # Both are stored rather than only the active one because both controls
+        # exist and either may be the one a user set up. `PhysicsRandomDirection`
+        # and `PhysicsRotationSteps` already worked this way; the Physics
+        # direction dial was the one omission.
         prefs.SetInt(PROP_NESTING_DIRECTION,
-                     int(self.ui.minkowski_direction_dial.value()))
+                     int(settings.get('minkowski_direction',
+                                      DEFAULT_DIRECTION_DIAL)))
+        prefs.SetInt(PROP_PHYSICS_DIRECTION,
+                     int(settings.get('physics_direction', DEFAULT_DIRECTION_DIAL)))
         prefs.SetBool(PROP_RANDOM_DIRECTION,
-                      bool(self.ui.minkowski_random_checkbox.isChecked()))
+                      bool(settings.get('minkowski_random', False)))
         prefs.SetBool("PhysicsRandomDirection",
-                      bool(self.ui.physics_random_checkbox.isChecked()))
+                      bool(settings.get('physics_random', False)))
         prefs.SetFloat(PROP_LABEL_HEIGHT, float(settings['label_height']))
         prefs.SetFloat(PROP_LABEL_SIZE, float(settings['label_size']))
         prefs.SetFloat("PhysicsStabilityTolerance", float(settings.get('stability_tolerance', 0.01)))
@@ -1117,7 +1229,18 @@ class NestingController:
                 
                 quantities[label] = {
                     'quantity': qty,
+                    # Resolved: what the nester should use. `shape_preparer`
+                    # reads this, which is why an override already honours the
+                    # run today.
                     'rotation_steps': rot_val if override else global_rot,
+                    # The raw pair, for the master container's own metadata --
+                    # `PartRotationSteps` / `PartRotationOverride`. Needed
+                    # separately because the resolved value cannot tell an
+                    # override of 8 from a global of 8, so writing it would lose
+                    # which of the two the user chose and reload the checkbox
+                    # wrong. See issues.md NEST-002.
+                    'rotation_steps_override': rot_val,
+                    'rotation_override': override,
                     'up_direction': up_direction,
                     'fill_sheet': fill_sheet
                 }
