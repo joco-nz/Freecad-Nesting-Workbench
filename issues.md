@@ -61,12 +61,12 @@ the symbol when you edit the entry.
 | [NEST-006](#nest-006) | Deflection tooltip states unmeasured ranges | open | low | docs |
 | [NEST-007](#nest-007) | Nesting converts analytic source geometry to B-splines to centre it | open | medium | geometry |
 | [NEST-008](#nest-008) | Hole-nesting detection costs 148 ms per part on real geometry | open | medium | performance |
-| [NEST-009](#nest-009) | a replayed Boundary dressup clips against the SOURCE job's stock | open | high | CAM replay |
+| [NEST-009](#nest-009) | a replayed Boundary dressup clips against the SOURCE job's stock | resolved | high | CAM replay |
 | [NEST-010](#nest-010) | the flattened parts could not be removed: the job's clones were links | resolved | medium | CAM replay |
 | [NEST-011](#nest-011) | two toolbar buttons had the same icon | resolved | low | UI |
 | [NEST-012](#nest-012) | the replay took 43 seconds | resolved | medium | performance |
 | [NEST-013](#nest-013) | FreeCAD's Profile is superlinear in its number of base targets | open | medium | performance |
-| [NEST-014](#nest-014) | a compensated profile of a face at the stock top collapses to a line | open | high | geometry |
+| [NEST-014](#nest-014) | a compensated profile of a face at the stock top collapses to a line | resolved | low (was high) | test fixture |
 | [NEST-015](#nest-015) | hole-nesting reordering left every dressup unlisted | resolved | high | CAM replay |
 | [NEST-016](#nest-016) | position ordering put each spacer's boundary before its own holes | resolved | medium | CAM replay |
 | [NEST-017](#nest-017) | the per-stage timing table was missing the largest cost, and 60% of the run | resolved | medium | diagnostics |
@@ -78,6 +78,8 @@ the symbol when you edit the entry.
 | [NEST-023](#nest-023) | "Stop At Sheets" was a dead control: read by nobody, never reached the engine | resolved | high | UI wiring |
 | [NEST-024](#nest-024) | the replay did not carry a Profile's StartPoint onto the nested copy | resolved | medium | CAM replay |
 | [NEST-025](#nest-025) | `rotation_params` is threaded through six call sites and read by nobody | open | low | dead code |
+| [NEST-026](#nest-026) | `Array.Centre` and `Tags.Positions` are points on the part, carried verbatim | open | medium (unmeasured) | CAM replay |
+| [NEST-027](#nest-027) | a sub-element name that resolves to a different face is invisible | open | unknown (unmeasured) | CAM replay |
 
 Statuses for NEST-009 through NEST-021 were derived from each entry's own
 prose, cross-checked where a later entry supersedes an earlier one: NEST-018's
@@ -566,13 +568,17 @@ simply not been built.
 
 ## NEST-009 — a replayed Boundary dressup clips against the SOURCE job's stock
 
-`status: open` · `severity: high` · `area: CAM replay`
+`status: resolved` · `severity: high` · `area: CAM replay`
+
+**RESOLVED — by not replaying it.** `Path.Dressup.Boundary` is now in
+`DRESSUP_UNSUPPORTED`: dropped from the replay, the rest of the step's stack kept,
+and the user told once per dressup. Not patched, because there is no patch that is
+right for all the cases; the reasoning is at the foot of this entry and the
+measurement that rules out the alternatives is above.
 
 Found by extending `test_replay_dressups.py` to a three-deep stack
 (LeadInOut -> Dogbone -> Boundary), the shape FreeCAD's own `dressuptest.FCStd`
-uses. It is a defect, not a limitation, and it is **not fixed** — the two
-obvious fixes are both wrong, which is why it is written down rather than
-patched.
+uses.
 
 **What is wrong.** Boundary's `Stock` is an `App::PropertyLink` to a solid, and
 `capture_properties` takes it verbatim. The replayed Boundary therefore clips
@@ -649,21 +655,277 @@ solid spanning Z through the contour instead.
 Worth noting alongside NEST-024: this is the same failure shape one dressup over.
 A value carried verbatim that names the wrong thing, with nothing to say so.
 
+### Measured, and what it changed
+
+Characterised against real documents before changing anything, on a fixture
+built from plain boxes so the nested positions are known exactly
+(`tests/freecad_harness/test_replay_boundary.py`). Three of the entry's claims
+did not survive measurement.
+
+**The defect is worse than recorded.** The entry says 6 of 8 split copies
+produced "a 4-command path with no cutting motion". With a boundary fitted to
+the part — the realistic case, and what `CreateFromBase` gives — the replay
+produces **no cutting motion at all**, and still reports `ok=True` with clean
+verification:
+
+    source Boundary, one part                11 cutting moves
+    replayed, whole, 8 matching parts          0
+    the unclipped ceiling                    88
+
+On the dressup fixture's *sheet-fitted* boundary the same defect reads 23 cutting
+moves against an 88 ceiling. So the figure depends entirely on what the boundary
+is fitted to, and the part-fitted case is the empty one.
+
+**The Z rule is one predicate, not three.** The entry records the contour must be
+"strictly inside the clip solid's Z band", which reads as a two-sided condition.
+It is one-sided. Sweeping the boundary's band with sheet XY held fixed, in the
+real replay, where the contour sits at Z 0 and the replay stock's top face is Z 0
+by construction:
+
+| boundary Z band | ZMax | cutting moves |
+|---|---:|---:|
+| −2.0 … 0.0 | 0.0 | **0** |
+| −1.0 … 0.0 | 0.0 | **0** |
+| −6.0 … 0.0 | 0.0 | **0** |
+| −2.0 … 0.0005 | 0.0005 | 93 |
+| 0.0 … 1.0 | 1.0 | 93 |
+| −0.001 … 0.001 | 0.001 | 93 |
+
+**`ZMax` must be strictly greater than the contour's Z. `ZMin` is irrelevant** —
+a contour lying exactly in the boundary's *bottom* face is fine. This is what
+makes Fix 1 dead by construction rather than merely worse: the replay stock's top
+face is Z 0 and the contour is at Z 0, so repointing `Stock` at it always
+produces an empty path. The entry's rule was directionally right and would have
+led to an implementation that checked both sides.
+
+**Why a part-fitted boundary fails at all**, which the entry leaves as "barely
+larger than the part": tool compensation. A 5 mm endmill on `Side=Outside` puts
+the tool centre 2.5 mm beyond the nominal edge, so the path for a 120 × 50 part
+spans **125 × 55**. `CreateFromBase` fits 122 × 102, which is larger than the
+part and smaller than the path:
+
+| boundary half-width in X (Y fixed at 26) | cutting moves |
+|---:|---:|
+| 60.0 / 61.0 / 62.0 | 0 |
+| 62.5 | 8 |
+| 63.0 … 70.0 | 8 |
+| 62.5 in X **and** 27.5 in Y | 11 (full) |
+
+So a Boundary must exceed the part by **twice the tool radius**, and FreeCAD's
+own default does not. This is measured in the source job, with no replay
+involved, which is why it survived being read as a replay problem.
+
+**`UNSPLITTABLE_DRESSUPS` is a band-aid over this defect.** Its docstring gives
+the reason for leaving a Boundary whole: splitting "multiplies a known-wrong
+reference and turns 'clipped slightly wrong' into 'cut nothing'". That is this
+defect, so the guard could not be evaluated without it. With the stock carried
+correctly per copy, measured on the same fixture:
+
+| boundary | stock as-is | stock carried per copy |
+|---|---|---|
+| part-level 200 × 120 | 0 of 8, total 0 | **8 of 8, total 93** |
+| sheet-level, containing the part | 2 of 8, total 23 | **8 of 8, total 93** |
+
+**The residual in carried counts is upstream, and the carry is not implicated.**
+Per copy the carried figures read 6–7 where the source gives 8, which looked like
+an unfaithful carry. It is not. The fixture's grid angles are
+`(column*23 + row*11) % 90`, so one of the eight copies sits at **angle 0** — a
+pure translation, the case where a correct carry and a wrong carry cannot differ:
+
+    source           10 cutting moves entering the Boundary, 6 leaving
+    angle-0 copy     10 entering, 6 leaving      <- the carry is faithful
+    rotated copies   10 or 11 entering, 6 or 7 leaving
+
+The path *below* the Boundary already differs on a rotated copy, so LeadInOut and
+Dogbone recompute differently on a rotated part. That is a separate pre-existing
+replay fidelity issue, and it is why the carried totals are 53 rather than 64.
+
+**Two things nobody had looked at.**
+
+*The committed fixture exercises none of this.* `replay-fixture-CAM-Nested.FCStd`
+has 7 recipe steps and **zero** Boundary dressups. The replay is tuned against a
+fixture that never reaches the defect.
+
+*`verify_replay` cannot see it.* It walks `result.operations` — 40 base
+operations — while `result.dressups` is 56, so the Boundary chains are in
+neither. With all 8 Boundary entries producing **0 cutting moves** it returned
+`ok=True, failures=0`; after the stock was carried, 8 of 8 and 93 moves, it
+returned `ok=True, failures=0`. An identical verdict for "clips everything away"
+and "clips correctly". `test_replay_dressups.py` asserts `has_cutting_motion` per
+list entry, but that is a test, not the product's own check, which is why this
+went unnoticed.
+
+**And a leak found on the way.** Each Boundary's constructor calls
+`PathStock.CreateFromBase`, which `apply_properties` then overwrites; nothing
+removes the object. Measured on two sheets with one Boundary step: **3 orphaned
+stocks unsplit, 17 split.** FreeCAD's `onDelete` would clean this up for a
+dressup that is deleted, but nothing deletes these.
+
+**Cost of replicating** (two sheets, one Boundary step, 8 copies each): wall clock
+4 s → 5 s, document objects 2166 → 2306, dressups 70 → 112. Carrying a stock
+across documents measures **1.91 ms** per copy, so ~30 ms, and the copy keeps
+its `IsBoundary` flag and survives the source document being closed — which
+matters because a replay already requires the source job to be open, since the
+recipe is read from it.
+
+**The rule the fix implements.** The Boundary sits in a *part's* operation stack,
+so whatever solid its `Stock` names is that part's boundary, and replicating
+operations to each matching nested part is what the workbench is for. The stock
+therefore moves with the part, by the same rigid motion that moved the geometry
+— `source_to_clone_placement`, which NEST-024 already uses for `StartPoint`.
+
+This was first written as "everything expressed in the source geometry's frame
+rides the geometry", which over-claims: it is justified for `StartPoint` because
+the user types that coordinate while looking at the part, and it was *not*
+established for the Boundary — which is why the original plan then wrongly claimed
+no classification was needed. The argument that actually holds is the one above:
+the tool's own data model settles it, not a geometric guess about whether the
+boundary is sheet-fitted or part-fitted.
+
 **Current state: reported, not fixed.** `unmapped_job_links` finds any job-local
 link the replay carried across without remapping, and the sheet outcome carries
 a warning naming the replayed dressup, the property and the object.
 `test_replay_dressups.py` asserts the warning is emitted, which is the
 mitigation — a Boundary dressup is **not safe to post from a replayed job**
 until this is resolved, and the assertion is what stops the mitigation being
-quietly deleted. `DRESSUP_JOB_LINKS` is the empty map that would hold the fix.
+quietly deleted. `DRESSUP_JOB_LINKS` is the empty map that would hold the fix, and
+`UNSPLITTABLE_DRESSUPS` is the band-aid that would go with it.
+
+### Resolved — by dropping it
+
+**Why not by fixing it.** Carrying the stock per copy works mechanically: measured
+8 of 8 copies cutting where 0 of 8 cut against the source job's. What it does not
+settle is **which region the user meant**, and the readings disagree:
+
+| what `Stock` names | reading | correct per-copy answer |
+|---|---|---|
+| a region fitted to the part | "don't cut outside this" | move it with the part |
+| the job's own stock | "don't run off the material" | leave it on the sheet — moving it happens to give the same answer only because a stock fitted to one part contains that part |
+| `Inside=False` | "don't cut here" | replicated per part it excludes that part's own cuts; measured 1 cutting move per copy from a region that already clipped the source |
+
+A source job machines one part, so nothing in the document distinguishes these.
+Classifying by comparing the stock's footprint against the job's stock and
+against the part was considered and rejected: it is a guess, and a wrong guess
+yields a plausible toolpath that cuts the wrong thing — the failure this workbench
+exists to prevent.
+
+**Why dropping is an improvement, not a retreat.** The clipping is what was
+silently wrong. Carried verbatim it produced **0 cutting moves where the
+unclipped figure is 88**, with the sheet reporting `ok=True`. A job that cuts
+nothing and says nothing is worse than a job that cuts everything and says why.
+The replayed job is an ordinary FreeCAD job the user owns, so a Boundary fitted
+to the sheet can be added and checked there.
+
+**What changed.**
+
+* `Path.Dressup.Boundary` moved from `DRESSUP_BUILDERS` to
+  `DRESSUP_UNSUPPORTED`, with the reason above as the user-facing text.
+* `UNSPLITTABLE_DRESSUPS` is now **empty**. Its only entry was Boundary, and its
+  stated reason — splitting "multiplies a known-wrong reference" — was this defect.
+  Neither arrangement worked: split gave 0 of 8 cutting, whole gave 2 of 8. The
+  guard was holding up a broken behaviour rather than protecting a good one.
+* The report is deduplicated per source dressup. It fired **once per copy**, so a
+  split step over 8 parts printed the same warning 8 times; repeating a warning
+  does not make it more likely to be read.
+* The wording no longer says the operation "was replayed bare", which is untrue
+  when the Boundary sat over LeadInOut and Dogbone and those *were* built.
+* The constructor's `CreateFromBase` stock leak is **gone as a side effect**,
+  since no Boundary is constructed. That leak was measured at 3 orphans unsplit
+  and 17 split, on two sheets with one Boundary step.
+* `DRESSUP_VIEWPROVIDERS` lost its Boundary entry — never built, so never needs a
+  view. `TestDressupTablesAgree` caught the omission.
+
+**`built_any` removed, and the first claim about it was wrong.** The guard that
+wrote an entry only when a dressup had been built looked like a latent bug: a
+step whose only dressup was dropped would build an operation that never reached
+`Operations.Group`. Restoring the guard left the new test **green**, because
+`order_operations` walks every base operation and substitutes
+`entry_of.get(id(op), op)` — falling back to the bare operation — so the list is
+rebuilt from `result.operations` regardless. The guard is harmless on the normal
+path. The narrow exposure that is real is the **cancel path**, which skips
+ordering, so the replay's own `set_operation_order` is final there. Untested: the
+harness does not cancel mid-sheet.
+
+**Coverage.** `tests/freecad_harness/test_replay_boundary.py` — 29 checks, gated
+and wired into `run.sh`. It asserts classification (in `DRESSUP_UNSUPPORTED`, not
+in `DRESSUP_BUILDERS`, not in `UNSPLITTABLE_DRESSUPS`), that no Boundary object is
+created, that the report appears once per dressup and says what is missing, that
+LeadInOut and Dogbone below it survive, that **no copy has less motion than the
+source's unclipped stack**, and that a Boundary over a bare Profile leaves a
+listed, cutting operation.
+
+Injection-checked: putting Boundary back in `DRESSUP_BUILDERS` fails 11 of its
+checks and reproduces the original symptom — "the whole step produced no cutting
+motion".
+
+Three of that file's own failures were my bugs, worth recording because two are
+the same trap the repo has hit before: it filters chains by label prefix, because
+`chain_kinds` returns proxy *class* names and DogboneII's is `Proxy`; it matches
+targets by `nested_label_of`, because an operation's `Base` points at a flattened
+part named `CAMPart_57`, not at `nested_BarePlate_9`; and its fixture creates
+three Profiles, so `"Profile001" if index else ""` collides.
+
+**`test_replay_dressups.py` and `test_replay_startpoint.py` both asserted the old
+contract** and were updated. The startpoint file's unsplit-step check needed more
+than a mechanical edit: `UNSPLITTABLE_DRESSUPS` is empty, so it now puts Boundary
+back for the duration of that one replay and restores it in a `finally`. That is
+deliberate — `split_is_safe` and the stranded-start-point report are the only code
+that says "I could not carry this", and deleting the check because nothing
+reaches it today would leave them untested at the moment someone is most likely
+to need them.
 
 **Also worth knowing, found while setting the test up.** Boundary clips with
 `edge.common(shape)`, and an edge commoned with a planar *face* in 3D returns
 nothing: 0 cutting moves against a 400x200 face, 11 against a 400x200 box. The
 property is documented as "Solid object", so a face is user error, but it fails
 by producing an empty path rather than an error. And `Inside=True` against the
-constructor's own `CreateFromBase` stock clips the contour away entirely,
-because that stock is barely larger than the part.
+constructor's own `CreateFromBase` stock clips the contour away entirely — not
+because the stock is barely larger than the part, as recorded above, but because
+it is barely larger than the part *plus twice the tool radius*, which the
+compensation in the toolpath adds. Measured in the table further up.
+
+## NEST-026 — `Array.Centre` and `Tags.Positions` are points on the part, carried verbatim
+
+`status: open` · `severity: medium (unmeasured)` · `area: CAM replay`
+
+Raised while fixing NEST-009, by asking the question NEST-009's fix implies:
+*which other values mean a place on the part?* `capture_properties` takes every
+`App::Property*` verbatim, and the only part-relative transformation in the
+replay is `GEOMETRY_FRAME_POINTS`, which is applied to **operations only** — no
+dressup property is transformed at all.
+
+| property | type | FreeCAD's own description |
+|---|---|---|
+| `Path.Dressup.Array.Centre` | `App::PropertyVector` | "The centre of rotation in polar pattern" |
+| `Path.Dressup.Tags.Positions` | `App::PropertyVectorList` | "Locations of inserted holding tags" |
+
+Both are coordinates picked on the part, and both are copied to copies that have
+been moved and rotated. `Array` is the same failure shape as NEST-009's
+`Boundary.Stock` one level along.
+
+**Neither is measured.** Neither appears in the committed fixture, which is the
+same blind spot Boundary had — 7 recipe steps, no Boundary dressups, and by the
+same token no Array or Tags. So this is a list of candidates, not a list of
+defects, and it should not be read as a claim that either is broken.
+
+`Tags` is worth checking first: it is the one of the two the harness already
+touches, so it is the cheaper of the pair to exercise. Note what
+`UNSPLITTABLE_DRESSUPS` says about it — "LeadInOut, Dogbone and Tags all split
+correctly and are verified to" — which is a claim about *replication*, not about
+whether the tag lands on the part. Those are different claims and only the first
+is tested.
+
+**Deliberately not bundled with NEST-009.** A verified fix and an unverified
+third change in one commit are both harder to review and harder to revert, and
+nothing about NEST-009's fix depends on this being settled.
+
+**Fix direction.** The same one NEST-009 establishes — a value the user picks on
+the part moves with the part, by the rigid motion that moved the geometry. The
+mechanism exists (`source_to_clone_placement`, and the per-unit `remap` seam in
+`apply_properties`); what is needed first is a measurement showing the defect is
+real, and a fixture that reaches it.
+
+---
 
 ## NEST-010 — the flattened parts could not be removed: the job's clones were links
 
@@ -1029,10 +1291,15 @@ choice, offered as an option, rather than done silently.
 
 ## NEST-014 — a compensated profile of a face at the stock top collapses to a line
 
-`status: open` · `severity: high` · `area: geometry`
+`status: resolved` · `severity: high (as reported) → low (in fact)` · `area: test fixture`
 
-Found by the per-part split, and **not caused by it**. Recorded because the
-split turned an invisible defect into a visible one, which is how it was found.
+**RESOLVED, and the diagnosis below was wrong.** Not a geometry defect and not a
+Z-frame defect: **the fixture's source job and its layout nested two different
+solids.** The evidence is under *Resolved*; the original report is kept as it was
+written, because the reason it went wrong is the useful part.
+
+Found by the per-part split, and **not caused by it**. The split turned an
+invisible defect into a visible one, which is how it was found.
 
 The harness's synthetic bracket has its top face at exactly Z 0, which is the
 replay stock's top surface, and the replay re-derives a through-cut to Z -6
@@ -1064,8 +1331,125 @@ suspected but not established.
 
 **Worth finding before it reaches a real part.** A flat-line profile over a real
 plate would cut a straight gouge where the outline should be. Fixing it means
-root-causing the projection, which needs a fixture whose top face is *not* on
-the stock top, to tell "Z frame" apart from "face on the stock top".
+root-causing the projection, which needs a fixture whose top face is *not* on the
+stock top, to tell "Z frame" apart from "face on the stock top".
+
+### Resolved — the fixture, not the replay
+
+**`_make_bracket` cut a hole; `_build_layout` rebuilt the part without one.** So
+the source job profiled a 7-face holed bracket while the layout nested a 6-face
+holeless one, and the sub-element `Face3` — the plate top on the source — resolved
+on the nested part to a **side face**:
+
+| | faces | volume | `Face3` is | wires | normal |
+|---|---:|---:|---|---:|---|
+| source job bracket | 7 | 5830.4 | plate top, area 971.7 | 2 | (0, 0, 1) |
+| nested part | 6 | 6000.0 | **side face**, area 240.0 | 1 | (0, −1, 0) |
+
+The replay profiled that side face as though it were the outline, and produced a
+14-command path on a straight line. Measured, same job, only the layout's solid
+differing:
+
+| nested solid | commands | uncovered | path bounds |
+|---|---:|---:|---|
+| different (as committed) | 14 | 1 | (20.0, 25.0, 60.0, **25.0**) |
+| same holed solid | 17 | 0 | (17.5, 25.0, 62.5, 55.0) |
+
+**The Z frame is measured and not involved.** Varying it alone changes nothing:
+lifting the part 2 mm clear of the stock top, setting explicit
+`StartDepth`/`FinalDepth`, turning compensation off, and profiling the bottom
+face instead all produce a correct outline. The original note that the
+"force-the-source-into-the-same-Z-frame probe did not complete" was pointing away
+from the cause entirely.
+
+**The replay behaved correctly and could not have done otherwise.**
+`check_subnames_against_clones` reports `missing=set(), detail={'Face3': 'ok'}` —
+the name resolves, to the wrong face. It detects a sub-element that is *absent*,
+not one that has moved. The replay's stated assumption is in `OperationRecipe`:
+
+> *"a nested copy keeps identical topology and therefore identical sub-element
+> numbering"*
+
+which the fixture violated.
+
+**What changed.** The geometry is now one definition, `_bracket_shape(thickness)`,
+used by `_make_bracket` and by every `_build_layout` caller. `_build_layout` takes
+the shape as a **required argument with no default**, so the two cannot drift
+silently again -- all three call sites had reproduced the mismatch independently,
+and none of them had any reason to notice.
+
+`KNOWN_DEGENERATE` and its by-name exception are **deleted**. The coverage check is
+unexcepted, which is what its own comment said it wanted and could not then claim.
+The hole is kept in the fixture deliberately: it is what makes `Face3` the top on
+one solid and a side face on the other, so the fixture still has teeth.
+
+**Coverage.** 236 checks, up from 230, `0 failure(s)`, gated. Three new checks
+assert the nested part is the same solid the source job profiles -- volume, face
+count and edge count, because it is the *topology* that moves `Face3`, not the
+volume alone.
+
+**Injection-checked.** Making the layout nest a different solid fails **3** checks:
+the fixture guard names the mismatch, and the coverage check fires on both sheets
+with nothing excepted.
+
+One injection attempt is worth recording because it correctly *failed* to bite:
+removing the hole from **both** solids left the two consistent, and a consistent
+fixture is harmless. That is the difference between testing the bug and testing
+the absence of it, and it is why the injection has to introduce the
+*inconsistency* rather than any change at all.
+
+**The real defect this exposed is not fixed here, and is tracked as NEST-027.** A
+sub-element name that resolves to a *different* face is invisible to every check
+in the replay, and the consequence is a job that cuts the wrong feature -- the
+NEST-015 shape. Its reach outside a fixture is unmeasured.
+
+
+## NEST-027 — a sub-element name that resolves to a different face is invisible
+
+`status: open` · `severity: unknown (unmeasured)` · `area: CAM replay`
+
+Found while resolving NEST-014, which turned out to be a fixture bug. **The
+fixture bug is fixed; this is the thing it was accidentally uncovering, and it is
+the larger of the two.**
+
+An operation's `Base` names sub-elements by name — `Face3` — and the replay
+resolves them against each nested copy. `check_subnames_against_clones` reports
+`missing=set(), detail={'Face3': 'ok'}` when the nested part has *fewer* faces
+than the source, because `Face3` still exists. Measured on NEST-014's mismatch:
+
+| | `Face3` resolves to | wires | normal |
+|---|---|---:|---|
+| source job (holed bracket) | the plate top, area 971.7 | 2 | (0, 0, 1) |
+| nested part (holeless box) | a side face, area 240.0 | 1 | (0, −1, 0) |
+
+The replay then profiles the side face as though it were the outline. Nothing
+downstream sees it: the sub-element check says `ok`, and the only symptom was a
+coverage warning about a path that collapsed to a line.
+
+**This is the NEST-015 shape** — a job that looks right and cuts the wrong feature
+— and the replay states the assumption it rests on, in `OperationRecipe`:
+
+> *"a nested copy keeps identical topology and therefore identical sub-element
+> numbering"*
+
+**Reach is unmeasured, and that is the thing to establish first.** Known to
+happen when the nested geometry differs from the CAM source. Not established:
+whether real nesting can produce that, or whether it is confined to fixtures. The
+committed 98-operation fixture passes 98 of 98, so if it happens in practice it
+happens quietly. Also unmeasured: how much legitimate variation there is between
+a source part and its nested copies — geometry that *should* differ, a part edited
+after nesting, B-rep re-tessellation — because that number sets the tolerance any
+check can carry.
+
+**Fix direction, not yet a plan.** The natural check is to compare each captured
+sub-element's face **area and plane normal** on the source against the nested copy,
+and refuse when they differ materially — turning a silent wrong-feature cut into a
+reported failure, which is the workbench's own standard ("wrong and reported beats
+wrong and quiet"). The hard part is the tolerance: too tight and it rejects valid
+jobs, too loose and it misses the case it was added for. Measuring the legitimate
+variation first is the prerequisite, not a detail.
+
+---
 
 ## NEST-015 — hole-nesting reordering left every dressup unlisted
 
@@ -1895,8 +2279,14 @@ runs on the offset wire and the first cutting move is the nearest point on the
 1.91 mm is the default 5 mm endmill's radius projected onto the corner. The
 *selection* is identical either way — both arms replay with the same defect and
 the same ~470 mm error — but a fix verified against a compensated arm has to
-compare against the offset contour, not the raw one. NEST-014 also lives on that
-arm: a compensated profile of a face exactly on the stock top collapses to a line.
+compare against the offset contour, not the raw one.
+
+An earlier draft of this entry also said "NEST-014 also lives on that arm: a
+compensated profile of a face exactly on the stock top collapses to a line."
+**That was wrong**, and investigating it is how NEST-014 was resolved: the
+collapse had nothing to do with compensation or with the stock top. It was the
+flatten fixture nesting a different solid from the one the source job profiled,
+so the replay profiled a side face instead of the plate top. See NEST-014.
 
 ### Resolved
 

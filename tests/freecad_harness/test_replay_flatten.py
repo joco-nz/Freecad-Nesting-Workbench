@@ -971,29 +971,73 @@ def run_verification_checks(doc, replay, result):
     emit("\n".join("  " + line for line in lines))
 
 
-def _make_bracket(doc, thickness):
-    """A bracket with a hole. Created per document -- a document object cannot
-    be handed to a job in another document."""
-    part = doc.addObject("Part::Feature", "Bracket")
-    part.Shape = Part.makeBox(
+def _bracket_shape(thickness):
+    """The bracket solid: one definition, shared by every fixture that needs it.
+
+    **This existed in two places and they disagreed**, which is NEST-014.
+    `_make_bracket` cut a hole; `_build_layout` rebuilt the part with a bare
+    `makeBox` and no cut. So the source job profiled a 7-face holed bracket while
+    the layout nested a 6-face holeless one, and `Face3` -- the plate top on the
+    source -- resolved on the nested part to a 40x25 **side face** (area 240, one
+    wire, normal (0,-1,0)) instead of the plate top (area 971.7, two wires,
+    normal (0,0,1)).
+
+    The replay profiled that side face as though it were the outline, and produced
+    a 14-command path on a straight line: bounds (20.0, 25.0, 60.0, 25.0), where
+    the target box is (20.0, 27.5, 60.0, 52.5). Which is what the entry recorded
+    as a compensated profile "collapsing to a line" and suspected was the Z frame.
+    Nest the same solid and the collapse does not exist -- measured 17 commands,
+    `uncovered=0`, bounds (17.5, 25.0, 62.5, 55.0).
+
+    The hole is kept because it is what makes the point: it is the difference
+    between a part whose `Face3` is the top and one whose `Face3` is a side, so
+    the fixture still has teeth against a future regression of the same shape.
+    """
+    return Part.makeBox(
         40, 25, thickness, FreeCAD.Vector(-20, -12.5, -thickness)
     ).cut(Part.makeCylinder(3, thickness, FreeCAD.Vector(-10, 0, -thickness)))
+
+
+def _make_bracket(doc, thickness):
+    """A bracket as a document object. Created per document -- a document object
+    cannot be handed to a job in another document."""
+    part = doc.addObject("Part::Feature", "Bracket")
+    part.Shape = _bracket_shape(thickness)
     doc.recompute()
     return part
 
 
-def _build_layout(doc, thickness, sheets=1):
-    """Build a layout with `sheets` sheet groups, each holding nested parts."""
+def _same_solid(a, b, tolerance=1e-7):
+    """True if two shapes are the same solid to within `tolerance`.
+
+    The check that should have caught NEST-014 at fixture-build time rather than
+    two hundred lines later in a coverage assertion. Volume alone is not enough
+    to be interesting -- a hole changes both volume and topology, and it is the
+    topology that moves `Face3` -- so both are compared.
+    """
+    return (abs(a.Volume - b.Volume) <= tolerance
+            and len(a.Faces) == len(b.Faces)
+            and len(a.Edges) == len(b.Edges))
+
+
+def _build_layout(doc, thickness, shape, sheets=1):
+    """Build a layout with `sheets` sheet groups, each holding nested parts.
+
+    **`shape` is required, and it must be the solid the source job profiles.**
+
+    It has no default on purpose. This function used to build its own bracket --
+    a holeless one -- and every caller paired it with a source job built from the
+    holed bracket, so all three call sites reproduced NEST-014 independently and
+    the mismatch was invisible until a coverage assertion failed. Making the
+    geometry an argument turns "these two must agree" into something the reader
+    can see, and the `_same_solid` check at the end of `run_pipeline_checks`
+    turns it into something the fixture enforces.
+    """
     layout = doc.addObject("App::DocumentObjectGroup", "Layout_001")
     for name, value in (("SheetWidth", 300.0), ("SheetHeight", 200.0),
                         ("SheetThickness", thickness)):
         layout.addProperty("App::PropertyLength", name, "Layout", "")
         setattr(layout, name, value)
-
-    bracket = doc.addObject("Part::Feature", "Bracket")
-    bracket.Shape = Part.makeBox(40, 25, thickness,
-                                 FreeCAD.Vector(-20, -12.5, -thickness))
-    doc.recompute()
 
     groups = []
     for s in range(1, sheets + 1):
@@ -1015,9 +1059,9 @@ def _build_layout(doc, thickness, sheets=1):
             container = doc.addObject("App::Part", "nested_Bracket_%d" % n)
             shapes.addObject(container)
             part = doc.addObject("Part::Feature", "part_Bracket_%d" % n)
-            shape = bracket.Shape.copy()
-            shape.Placement = FreeCAD.Placement()
-            part.Shape = shape
+            solid = shape.copy()
+            solid.Placement = FreeCAD.Placement()
+            part.Shape = solid
             container.addObject(part)
             container.Placement = FreeCAD.Placement(
                 FreeCAD.Vector(cx + offset, cy, 0),
@@ -1036,9 +1080,7 @@ def run_pipeline_checks(doc):
     from Path.Op import Profile as PathProfile
 
     bracket = doc.addObject("Part::Feature", "Bracket")
-    bracket.Shape = Part.makeBox(
-        40, 25, thickness, FreeCAD.Vector(-20, -12.5, -thickness)
-    ).cut(Part.makeCylinder(3, thickness, FreeCAD.Vector(-10, 0, -thickness)))
+    bracket.Shape = _bracket_shape(thickness)
     doc.recompute()
 
     source_job = PathJob.Create("UserSetup", [bracket], None)
@@ -1058,7 +1100,23 @@ def run_pipeline_checks(doc):
     doc.recompute()
     check(len(op.Path.Commands) > 5, "the source Profile produced no path")
 
-    layout, sheets = _build_layout(doc, thickness, sheets=2)
+    # The layout nests this exact solid. Asserted rather than assumed, because the
+    # two used to disagree and the disagreement only surfaced as a coverage
+    # failure two hundred lines later -- see `_bracket_shape`.
+    check(_same_solid(bracket.Shape, _bracket_shape(thickness)),
+          "the source job's bracket is not the shared fixture solid")
+
+    layout, sheets = _build_layout(doc, thickness, _bracket_shape(thickness),
+                                   sheets=2)
+    for container in layout.OutListRecursive:
+        if container.TypeId != "App::Part":
+            continue
+        for nested_part in container.Group:
+            check(_same_solid(nested_part.Shape, bracket.Shape),
+                  "nested part %s is not the same solid the source job profiles "
+                  "-- sub-element names will resolve to different faces"
+                  % nested_part.Label)
+        break
     check(len(sheets) == 2, "expected 2 sheets, got %d" % len(sheets))
 
     check(cam_replay.is_cam_job(source_job) is True,
@@ -1107,24 +1165,27 @@ def run_pipeline_checks(doc):
 
     # -- and the cut really is there --
     #
-    # **This check found a pre-existing defect when the split landed, and that is
-    # worth stating plainly rather than quietly relaxing.** The synthetic bracket
-    # here has its top face at exactly Z 0, which is the replay stock's top
-    # surface, and the replay re-derives a through-cut to Z -6 against the sheet.
-    # That combination collapses the operation's XY extent to a line: measured,
-    # path bounds (20.0, 25.0, 60.0, 25.0) against a target box of
-    # (20.0, 27.5, 60.0, 52.5).
+    # **This check once had to except one operation by name, and does not any
+    # more.** The exception was labelled NEST-014 and its story was that a
+    # compensated profile of a face at the stock top collapses to a line.
     #
-    # It was there before the split. One operation covered both brackets, so its
-    # bounds spanned both -- (20.0, 16.0, 165.0, 40.1) -- and that aggregate
-    # happened to overlap each target, so the coarse check passed. The split gave
-    # each operation one target, which removed the aggregate that was hiding it.
-    # See issues.md NEST-014; this is not fixed here.
+    # That story was wrong, and the fixture was the cause. The source job profiled
+    # a bracket **with** a hole and the layout nested a bracket **without** one,
+    # so `Face3` -- the plate top on the source -- resolved on the nested part to a
+    # 40x25 side face (area 240, one wire, normal (0,-1,0)) rather than the plate
+    # top (area 971.7, two wires, normal (0,0,1)). The replay profiled that side
+    # face as though it were the outline: 14 commands on a straight line, bounds
+    # (20.0, 25.0, 60.0, 25.0) against a target box of (20.0, 27.5, 60.0, 52.5).
+    # The per-part split had merely removed the aggregate bounding box that had
+    # been hiding it.
     #
-    # So the check stays exactly as strict as it was, and the one known-degenerate
-    # operation is declared by name. Anything else uncovered still fails.
-    KNOWN_DEGENERATE = "nested_Bracket"
-    degenerate = []
+    # The Z frame was measured and is not involved: lifting the part 2 mm clear of
+    # the stock top, setting explicit StartDepth/FinalDepth, turning compensation
+    # off, and profiling the bottom face instead all produce a correct outline.
+    #
+    # So the layout now nests the same solid the source job profiles, the two
+    # definitions are one (`_bracket_shape`), and the check is unexcepted -- which
+    # is what the previous comment was asking for and could not have claimed.
     for outcome in outcomes:
         if outcome.result is None:
             continue
@@ -1132,24 +1193,9 @@ def run_pipeline_checks(doc):
             check(cam_replay.has_cutting_motion(operation),
                   "%s: %s has no cutting motion" % (outcome.sheet_label, operation.Label))
             uncovered = cam_replay.uncovered_targets(operation)
-            if not uncovered:
-                continue
-            # Matched on the operation's label, not on the uncovered parts:
-            # `uncovered_targets` returns LABELS, not objects, so there is no
-            # identity to read a NestedLabel from.
-            if KNOWN_DEGENERATE in operation.Label:
-                degenerate.append("%s / %s" % (outcome.sheet_label,
-                                               operation.Label))
-                continue
-            check(False,
-                  "%s: %s does not reach its targets"
-                  % (outcome.sheet_label, operation.Label))
-    if degenerate:
-        emit("KNOWN DEGENERATE (NEST-014): %s -- compensated profile of a face "
-             "at the stock top collapses to a line when cut through. Pre-existing; "
-             "the split made it visible by removing the aggregate bounding box "
-             "that was hiding it."
-             % "; ".join(degenerate))
+            check(not uncovered,
+                  "%s: %s does not reach its targets %s"
+                  % (outcome.sheet_label, operation.Label, uncovered[:4]))
 
     # -- the containment check catches a part left off the sheet --
     # Deliberately breaks sheet 2 by moving a part past the stock edge, then
@@ -1157,7 +1203,8 @@ def run_pipeline_checks(doc):
     # other check passed while the toolpath ran off the material.
     stray_doc = FreeCAD.newDocument("replay_stray")
     stray_bracket = _make_bracket(stray_doc, thickness)
-    layout2, sheets2 = _build_layout(stray_doc, thickness, sheets=1)
+    layout2, sheets2 = _build_layout(stray_doc, thickness,
+                                     _bracket_shape(thickness), sheets=1)
     stray_source = PathJob.Create("StraySource", [stray_bracket], None)
     stray_doc.recompute()
     stray_op = PathProfile.Create("Profile", None, stray_source)
@@ -1187,8 +1234,9 @@ def run_pipeline_checks(doc):
 
     # -- the UNVERIFIED label, on a real failing run --
     fail_doc = FreeCAD.newDocument("replay_fail")
-    layout3, sheets3 = _build_layout(fail_doc, thickness, sheets=1)
     fail_bracket = _make_bracket(fail_doc, thickness)
+    layout3, sheets3 = _build_layout(fail_doc, thickness,
+                                     _bracket_shape(thickness), sheets=1)
     bad_source = PathJob.Create("BadSource", [fail_bracket], None)
     fail_doc.recompute()
     empty_op = PathProfile.Create("Profile", None, bad_source)
