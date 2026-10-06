@@ -127,36 +127,234 @@ class TestResolveSubnames:
         resolve_subnames(["Face1", "", "nonsense"], _Shape([]))
 
 
+class _Element:
+    """A stand-in sub-element carrying the measures `subelement_signature` reads.
+
+    Real geometry is what proves these numbers mean anything -- see
+    `tests/freecad_harness/test_replay_subnames.py` -- but the comparison logic
+    is pure arithmetic and can be exercised here, which is the point of this
+    tier.
+    """
+
+    def __init__(self, kind, area=0.0, wires=0, edges=0, length=0.0,
+                 closed=False):
+        self.ShapeType = kind
+        self.Area = area
+        self.Wires = [_object() for _ in range(wires)]
+        self.Edges = [_object() for _ in range(edges)]
+        self.Length = length
+        self.Closed = closed
+
+
+class _MeasuredShape:
+    """A shape whose named elements carry `subelement_signature` metrics."""
+
+    def __init__(self, elements):
+        self._elements = dict(elements)
+
+    def isNull(self):  # noqa: N802
+        # Real `Shape` objects carry this and `cam_replay` reads it before
+        # trusting a shape, so the stand-in has to as well -- otherwise a test
+        # would pass only because the fake was more forgiving than the thing.
+        return False
+
+    def getElement(self, name):  # noqa: N802
+        if name in self._elements:
+            return self._elements[name]
+        raise ValueError("no element named %r" % name)
+
+
+class _Source:
+    """An object whose `Shape` is what a sub-element name resolves against."""
+
+    def __init__(self, shape, label="source"):
+        self.Shape = shape
+        self.Label = label
+
+
+class _MeasuredTarget:
+    def __init__(self, label, shape):
+        self.Label = label
+        self.Shape = shape
+
+
+def _object():
+    return object()
+
+
+def _plate_faces():
+    """A holed plate's seven faces, by index -- NEST-014's geometry."""
+    return {
+        "Face1": _Element("Face", area=125.0, wires=1, edges=4),
+        "Face2": _Element("Face", area=200.0, wires=1, edges=4),
+        "Face3": _Element("Face", area=886.9027, wires=2, edges=5),
+        "Face4": _Element("Face", area=200.0, wires=1, edges=4),
+        "Face5": _Element("Face", area=886.9027, wires=2, edges=5),
+        "Face6": _Element("Face", area=125.0, wires=1, edges=4),
+        "Face7": _Element("Face", area=125.0, wires=1, edges=4),
+    }
+
+
+def _box_faces():
+    """A holeless box's six faces -- the same names, different features."""
+    return {
+        "Face1": _Element("Face", area=125.0, wires=1, edges=4),
+        "Face2": _Element("Face", area=125.0, wires=1, edges=4),
+        "Face3": _Element("Face", area=200.0, wires=1, edges=4),
+        "Face4": _Element("Face", area=200.0, wires=1, edges=4),
+        "Face5": _Element("Face", area=1000.0, wires=1, edges=4),
+        "Face6": _Element("Face", area=1000.0, wires=1, edges=4),
+    }
+
+
 class TestCheckSubnamesAgainstClones:
     def test_reports_ok_when_every_name_resolves_everywhere(self):
         clones = [_Target("c1", ["Face1"]), _Target("c2", ["Face1"])]
-        missing, detail = check_subnames_against_clones(["Face1"], clones)
+        missing, mismatched, detail = check_subnames_against_clones(["Face1"], clones)
         assert missing == set()
+        assert mismatched == set()
         assert detail["Face1"] == "ok"
 
     def test_reports_a_name_that_resolves_nowhere(self):
         clones = [_Target("c1", ["Face1"]), _Target("c2", ["Face1"])]
-        missing, detail = check_subnames_against_clones(["Face9"], clones)
+        missing, mismatched, detail = check_subnames_against_clones(["Face9"], clones)
         assert missing == {"Face9"}
+        assert mismatched == set()
         assert "0 of 2" in detail["Face9"]
 
     def test_reports_a_name_that_resolves_on_only_some(self):
         # The alarming case: the same operation would cut a different feature
         # on different parts of one nest.
         clones = [_Target("c1", ["Face1"]), _Target("c2", ["Face2"])]
-        missing, detail = check_subnames_against_clones(["Face1"], clones)
+        missing, mismatched, detail = check_subnames_against_clones(["Face1"], clones)
         assert missing == set()
+        assert mismatched == set()
         assert "1 of 2" in detail["Face1"]
 
     def test_treats_the_empty_string_as_always_present(self):
         clones = [_Target("c1", []), _Target("c2", [])]
-        missing, detail = check_subnames_against_clones([""], clones)
+        missing, mismatched, detail = check_subnames_against_clones([""], clones)
         assert missing == set()
+        assert mismatched == set()
         assert detail[""] == "whole object"
 
     def test_no_clones_means_nothing_resolves(self):
-        missing, _ = check_subnames_against_clones(["Face1"], [])
+        missing, _mismatched, _detail = check_subnames_against_clones(["Face1"], [])
         assert missing == {"Face1"}
+
+
+class TestSubelementSignatureComparison:
+    """NEST-027: a name that resolves is not the same as a name that means the
+    same thing. Existence alone reported "ok" for a name addressing a
+    completely different face."""
+
+    def test_flags_a_name_that_resolves_to_a_different_face(self):
+        source = _Source(_MeasuredShape(_plate_faces()))
+        box = _MeasuredTarget("part_A", _MeasuredShape(_box_faces()))
+        _missing, mismatched, detail = check_subnames_against_clones(
+            ["Face3"], [box], source)
+        assert mismatched == {("Face3", "part_A")}
+        assert "different feature" in detail["Face3"]
+
+    def test_accepts_an_identical_copy(self):
+        source = _Source(_MeasuredShape(_plate_faces()))
+        same = _MeasuredTarget("part_A", _MeasuredShape(_plate_faces()))
+        _missing, mismatched, detail = check_subnames_against_clones(
+            ["Face3"], [same], source)
+        assert mismatched == set()
+        assert detail["Face3"] == "ok"
+
+    def test_catches_a_wire_count_difference_at_equal_area(self):
+        # The area alone would let this through: 886.9027 either way. What
+        # differs is that one is the holed top and the other is not.
+        faces = _plate_faces()
+        faces["Face3"] = _Element("Face", area=886.9027, wires=1, edges=4)
+        source = _Source(_MeasuredShape(_plate_faces()))
+        other = _MeasuredTarget("part_A", _MeasuredShape(faces))
+        _missing, mismatched, _detail = check_subnames_against_clones(
+            ["Face3"], [other], source)
+        assert mismatched == {("Face3", "part_A")}
+
+    def test_flags_a_shape_type_change(self):
+        source = _Source(_MeasuredShape(
+            {"Face1": _Element("Face", area=10.0, wires=1, edges=4)}))
+        other = _MeasuredTarget("part_A", _MeasuredShape(
+            {"Face1": _Element("Edge", length=10.0)}))
+        _missing, mismatched, _detail = check_subnames_against_clones(
+            ["Face1"], [other], source)
+        assert mismatched == {("Face1", "part_A")}
+
+    def test_a_tiny_area_difference_within_tolerance_is_accepted(self):
+        # The nesting moves geometry, so it is never bit-identical; measured
+        # worst case is 1.421e-14 mm2 (NEST-007).
+        faces = _plate_faces()
+        faces["Face3"] = _Element("Face", area=886.9027 + 1e-12, wires=2, edges=5)
+        source = _Source(_MeasuredShape(_plate_faces()))
+        moved = _MeasuredTarget("part_A", _MeasuredShape(faces))
+        _missing, mismatched, _detail = check_subnames_against_clones(
+            ["Face3"], [moved], source)
+        assert mismatched == set()
+
+    def test_a_half_percent_area_difference_is_refused(self):
+        faces = _plate_faces()
+        faces["Face3"] = _Element("Face", area=886.9027 * 1.005, wires=2, edges=5)
+        source = _Source(_MeasuredShape(_plate_faces()))
+        other = _MeasuredTarget("part_A", _MeasuredShape(faces))
+        _missing, mismatched, _detail = check_subnames_against_clones(
+            ["Face3"], [other], source)
+        assert mismatched == {("Face3", "part_A")}
+
+    def test_compares_edges_by_length(self):
+        source = _Source(_MeasuredShape(
+            {"Edge1": _Element("Edge", length=75.398224, closed=True)}))
+        same = _MeasuredTarget("part_A", _MeasuredShape(
+            {"Edge1": _Element("Edge", length=75.398224, closed=True)}))
+        other = _MeasuredTarget("part_B", _MeasuredShape(
+            {"Edge1": _Element("Edge", length=120.0, closed=True)}))
+        _missing, mismatched, detail = check_subnames_against_clones(
+            ["Edge1"], [same, other], source)
+        assert mismatched == {("Edge1", "part_B")}
+        assert "1 of 2" in detail["Edge1"]
+        assert "same feature on 1" in detail["Edge1"]
+
+    def test_counts_both_agreeing_and_mismatching_copies(self):
+        source = _Source(_MeasuredShape(_plate_faces()))
+        clones = [_MeasuredTarget("part_A", _MeasuredShape(_box_faces())),
+                  _MeasuredTarget("part_B", _MeasuredShape(_box_faces())),
+                  _MeasuredTarget("part_C", _MeasuredShape(_plate_faces()))]
+        _missing, mismatched, detail = check_subnames_against_clones(
+            ["Face3"], clones, source)
+        assert mismatched == {("Face3", "part_A"), ("Face3", "part_B")}
+        assert "different feature on 2 of 3" in detail["Face3"]
+        assert "same feature on 1" in detail["Face3"]
+
+    def test_a_source_that_resolves_nothing_does_not_refuse_everything(self):
+        # The source cannot say what the name means, so the copy is not accused
+        # of contradicting it -- only of not existing there, which is `missing`.
+        empty = _Source(_MeasuredShape({}))
+        clone = _MeasuredTarget("part_A", _MeasuredShape(_plate_faces()))
+        _missing, mismatched, detail = check_subnames_against_clones(
+            ["Face3"], [clone], empty)
+        assert mismatched == set()
+        assert detail["Face3"] == "ok"
+
+    def test_without_a_source_only_existence_is_checked(self):
+        clone = _MeasuredTarget("part_A", _MeasuredShape(_box_faces()))
+        _missing, mismatched, detail = check_subnames_against_clones(
+            ["Face3"], [clone])
+        assert mismatched == set()
+        assert detail["Face3"] == "ok"
+
+    def test_a_name_the_source_cannot_explain_is_missing_not_mismatched(self):
+        # Two different failures, and the report must not confuse them. A name
+        # that resolves nowhere on the copies is `missing`; the source's own
+        # inability to resolve it is not additional evidence of a mismatch.
+        source = _Source(_MeasuredShape({}))
+        clone = _MeasuredTarget("part_A", _MeasuredShape(_box_faces()))
+        missing, mismatched, _detail = check_subnames_against_clones(
+            ["Face9"], [clone], source)
+        assert mismatched == set()
+        assert missing == {"Face9"}
 
 
 # -- identity matching ----------------------------------------------------

@@ -79,8 +79,9 @@ the symbol when you edit the entry.
 | [NEST-024](#nest-024) | the replay did not carry a Profile's StartPoint onto the nested copy | resolved | medium | CAM replay |
 | [NEST-025](#nest-025) | `rotation_params` is threaded through six call sites and read by nobody | open | low | dead code |
 | [NEST-026](#nest-026) | `Array.Centre` and `Tags.Positions` are points on the part, carried verbatim | open | medium (unmeasured) | CAM replay |
-| [NEST-027](#nest-027) | a sub-element name that resolves to a different face is invisible | open | unknown (unmeasured) | CAM replay |
+| [NEST-027](#nest-027) | a sub-element name that resolves to a different face is invisible | resolved | medium | CAM replay |
 | [NEST-028](#nest-028) | centring does nothing for a part that arrives pre-positioned | open | medium (unmeasured) | geometry |
+| [NEST-029](#nest-029) | the committed nested fixture predates NEST-007, so the gate cannot see that fix | open | medium (unmeasured) | test fixture |
 
 Statuses for NEST-009 through NEST-021 were derived from each entry's own
 prose, cross-checked where a later entry supersedes an earlier one: NEST-018's
@@ -1562,7 +1563,13 @@ them into a single matrix that then gets applied twice.
 
 ## NEST-027 — a sub-element name that resolves to a different face is invisible
 
-`status: open` · `severity: unknown (unmeasured)` · `area: CAM replay`
+`status: resolved` · `severity: medium` · `area: CAM replay`
+
+> **Severity was recorded as "unknown (unmeasured)" and is now `medium`.** The
+> mechanism is a job that looks right and cuts the wrong feature, which is the
+> NEST-015 shape, but no real job was ever shown doing it -- see "Reach" below,
+> which is measured now and came out fixture-only. Medium on the strength of the
+> consequence if it does happen, not on a demonstrated occurrence.
 
 Found while resolving NEST-014, which turned out to be a fixture bug. **The
 fixture bug is fixed; this is the thing it was accidentally uncovering, and it is
@@ -1597,13 +1604,109 @@ a source part and its nested copies — geometry that *should* differ, a part ed
 after nesting, B-rep re-tessellation — because that number sets the tolerance any
 check can carry.
 
-**Fix direction, not yet a plan.** The natural check is to compare each captured
-sub-element's face **area and plane normal** on the source against the nested copy,
-and refuse when they differ materially — turning a silent wrong-feature cut into a
-reported failure, which is the workbench's own standard ("wrong and reported beats
-wrong and quiet"). The hard part is the tolerance: too tight and it rejects valid
-jobs, too loose and it misses the case it was added for. Measuring the legitimate
-variation first is the prerequisite, not a detail.
+### Resolved
+
+`check_subnames_against_clones` now compares each captured sub-element's
+**geometry** on the source against the same name on every nested copy, and
+leaves out the copies where it means something else. The comparison is on
+area, wire and edge counts for a face; length and closedness for an edge. Every
+one of those is placement-independent, which is the whole requirement: a centre
+of mass, a vertex position or a face normal are all measured from a frame that
+differs between the two shapes.
+
+**Reach, measured: the committed fixture is not affected, and that is the
+answer to the question this entry said to settle first.** Its 7 base operations
+select **56 distinct sub-names and every one is an `Edge`** -- zero `Face` names
+-- so it cannot exercise a face check at all. Its edge lengths agree with the
+source to a relative **3.2e-13** even in the stale fixture of
+[NEST-029](#nest-029), which is why the length tolerance can be loose and the
+area tolerance cannot. It passes 98 of 98 and still passes with this change.
+
+**Legitimate variation, measured, on geometry from current code.** Across all
+three part types of the fixture, every face and every edge, at four nest angles:
+
+| | worst difference | share of the tolerance |
+|---|---:|---:|
+| face area | **4.263e-14** mm2 | **4.3e-05** of 1e-9 |
+| edge length | **0.000e+00** mm | 0 of 1e-6 |
+
+Roughly 23000x of headroom on area. The tolerances are relative, so the test does
+not depend on the part's size -- 1e-9 is the same tolerance on an 886 mm2 face as
+on an 8 mm2 one.
+
+**The plane normal in the original fix direction is not usable, and was dropped
+rather than quietly included.** Measured **90 degrees** and **180 degrees**
+disagreements between faces that are provably the same face: areas equal to
+1.4e-14, every count equal, and *every* `Placement` rotation identity, so the
+relative rotation is provably zero and a rigid translation cannot change a
+normal. The cause is the surface's **parameterisation origin being rotated** --
+`BottomStrap` Face11's u at centre-of-mass is 0.000 in the source and
+**4.712 rad** in the copy; `TopStrap` Face11 is pi apart. `normalAt(u, v)`
+depends on where the parameter lands, which is arbitrary, so it is not an
+invariant. Worth recording because the error is not subtle and both directions
+of the obvious placement-based frame give the same wrong answer.
+
+**The surface type name is not used either, and this one was a judgement call.**
+It is the most direct evidence available -- `Cylinder` against `Plane` -- and it
+reports **0 mismatches** on current code, which is exactly what makes it
+tempting. But on the [NEST-029](#nest-029) fixture it reports **every** face and
+**every** edge different, because they are all `BSplineSurface` and
+`BSplineCurve`. That is a true statement about those copies and a useless one to
+act on, so the numeric measures are compared instead.
+
+**What the check catches, measured.** NEST-014's geometry, a holed plate against
+a holeless box, both names resolving:
+
+| | area | wires | edges |
+|---|---:|---:|---:|
+| `Face2` | 200.0000 vs 125.0000 | 1 vs 1 | 4 vs 4 |
+| `Face3` | 886.9027 vs 200.0000 | 2 vs 1 | 5 vs 4 |
+| `Face5` | 886.9027 vs 1000.0000 | 2 vs 1 | 5 vs 4 |
+
+`Face2` is the one that matters and the one that is easy to leave untested: same
+wire count, same edge count, **area the only discriminator**. That is precisely
+the failure NEST-014 describes -- a side face profiled as though it were the
+outline -- and it is invisible to counts alone.
+
+**One copy is left out, not the whole step.** A Profile selecting `Face3` across
+three copies, one of them a holeless impostor, builds **2** operations and
+reports:
+
+> `Operation 'Profile' selects Face3, which addresses a different feature on
+> part_Bracket_2 than it does on the source. Not replayed there, because it would
+> cut a different feature than intended.`
+
+One bad part in a 23-part nest should not cost the other 22 their recipe.
+
+**The message names the part the user knows, not the replay's own number.** The
+replay's geometry is `CAMPart_57`; the part they placed is `part_Bracket_2`,
+reached through `SourceObject`. A new `display_label_of` does that, preferring
+`SourceObject`, then `nested_label_of`, then the Model entry's own label. The
+per-name roll-up in `subname_detail` deliberately keeps **counts only** -- one
+name is checked against different source geometry for different operations, so a
+label there could name the wrong copy.
+
+**Injection-verified, six ways.** Removing the source geometry, reverting to
+existence-only, zeroing the face area, zeroing the edge length, reporting without
+dropping the copy, and setting the area tolerance to 0: each fails the suite, and
+the last one is the useful one -- it shows the 4.263e-14 drift is real, so the
+1e-9 tolerance is not a round number picked for looks.
+
+**Two of those injections found real holes in the tests rather than in the
+product,** which is the reason they were run. Zeroing the face area left the file
+**green**: `Face3` differed in wire count too and carried the check on its own,
+so nothing was testing area. And choosing the length-only edge case *through*
+`subelement_signature` meant that zeroing the length emptied the candidate list
+and the failure read "no edge differs in length" -- true, and silent about the
+defect. Both fixtures are now chosen from the geometry directly.
+
+**`OperationRecipe`'s docstring no longer asserts the assumption as a fact.** It
+said a nested copy "keeps identical topology and therefore identical
+sub-element numbering". That "therefore" is a claim about geometry, not about
+names, and it is now checked rather than relied on.
+
+Tests: 63 checks in the new gated `test_replay_subnames.py`, and 11 new pytest
+cases. Gate: 13 freecadcmd suites, 1240 checks, 0 failures; 554 pytest.
 
 ---
 
@@ -2604,3 +2707,53 @@ on `UseEndPoint`, unmeasured for the same reason.
     #    -> the ClearanceHeight assertion fires on both copies, exit 1
     # C: START_POINT_IS_COPIED_VERBATIM = True in the harness
     #    -> asserts the pre-fix behaviour instead, exit 0
+
+---
+
+## NEST-029 — the committed nested fixture predates NEST-007, so the gate cannot see that fix
+
+`status: open` · `severity: medium (unmeasured)` · `area: test fixture`
+
+Found while measuring [NEST-027](#nest-027)'s prerequisite, and filed separately
+on purpose: rebuilding the fixture shifts numbers in four gated suites, and doing
+that inside the same change as the NEST-027 check would make the two impossible
+to review apart.
+
+`replay-fixture-CAM-Nested.FCStd` is a committed `.FCStd`, so its nested parts
+were built **once, by whatever code existed then**, and every replay suite reads
+them rather than re-nesting. Measured: all **48** of its `part_*` objects are
+`BSplineSurface`, while the source job's `Model-*` entries are still
+`Cylinder`/`Plane`.
+
+| | source | nested part |
+|---|---|---|
+| faces, edge and vertex counts | — | **identical** |
+| max \|Δface area\| | — | **6.1054e-01** (BottomStrap), **3.8615e-01** (TopStrap), **3.1082e+01** (SimpleSpacer) mm² |
+| max relative \|Δedge length\| | — | 2.1e-14, 2.4e-14, **3.2e-13** |
+| surface type mismatches | — | **every face** |
+| curve type mismatches | — | **every edge** |
+
+So **NEST-007's fix is invisible to the gate.** The 0.2684% face-area error that
+commit `43003e1` removed is still sitting in the fixture, and a regression of that
+fix would leave all four replay suites green. Two of them compare nested geometry
+against a source and would have caught it; neither does.
+
+**This is not cosmetic, and it is the reason the NEST-027 tolerances are not the
+same for area and length.** A face check with a tolerance loose enough to accept
+this fixture would have to allow ~5e-3 relative -- which is far looser than the
+0.77 relative difference it exists to catch, so it would be useless. Edge length
+was measured to be insensitive to the same re-fitting, which is why its
+tolerance can be loose. NEST-027 therefore **does not** accommodate the stale
+fixture, and nothing trips over that today only because the fixture selects no
+face names.
+
+**Fix direction, not yet a plan.** Re-nest `replay-fixture.FCStd` with current
+code and commit the result, then re-measure whatever the four replay suites
+report -- `test_replay_order.py` asserts operation counts and 15 hole-nestings,
+and those are the numbers that would move. The tempting cheaper move, a check
+that fails when a nested part has non-analytic surfaces, does not avoid this: it
+fails against the fixture as committed, so the fixture still has to be rebuilt.
+
+**Also unmeasured:** whether a stale fixture is a general hazard here. It was
+committed once and read by four suites; nothing checks that a fixture's geometry
+matches what current code produces.

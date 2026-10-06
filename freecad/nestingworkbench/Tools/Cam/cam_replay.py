@@ -929,6 +929,13 @@ class OperationRecipe:
         base_entries: the operation's `Base` as (object, subs) pairs. These are
             what make the replay possible at all, since a nested copy keeps
             identical topology and therefore identical sub-element numbering.
+            That "therefore" is an assumption about geometry, not a fact about
+            names, and it used to be relied on unchecked: `getElement` raises
+            only when a name does not exist, so a copy with fewer faces than the
+            source still answers `Face3` -- with somebody else's face.
+            `check_subnames_against_clones` compares each name's geometry on the
+            source against the same name on every copy and refuses the ones that
+            mean something else; see NEST-027.
         outermost: the object the Operations list should carry for this step --
             the top of the dressup stack, or the operation itself if bare. This
             is what goes in the new job's Operations list; see the write half.
@@ -1627,23 +1634,173 @@ def resolve_subnames(subs, shape):
     return resolved
 
 
-def check_subnames_against_clones(subs, clones):
-    """Return `(clones_missing, detail)` for sub-names that fail on any clone.
+#: Relative tolerances for the sub-element geometry comparison below. Set from
+#: measurement, independently, because the two quantities are not equally
+#: sensitive to the one thing that could make a legitimate copy look different.
+#:
+#: **Area**, on geometry from current code: across all three part types of the
+#: committed fixture, every face, at four different nest angles, the nested
+#: copy's face areas match the source's to a worst case of **4.263e-14** mm2 --
+#: **4.3e-05 of this tolerance**, so about 23000x of headroom. That is the
+#: figure to quote rather than a round number, because it is the one that says
+#: how much room the check has left.
+#:
+#: It is deliberately not set to accommodate B-spline re-fitting, and would
+#: reject a fixture nested by the old nester (measured drift up to 31 mm2,
+#: relative 5e-3) -- correctly, since such a copy is genuinely a different solid
+#: and is NEST-0xx's stale-fixture problem rather than something to accommodate
+#: here.
+SUBNAME_AREA_TOLERANCE = 1e-9
+#:
+#: **Length**, looser than area because edge length was measured to be far less
+#: sensitive to that re-fitting: **0.000e+00** on current code, and a relative
+#: 3.2e-13 on the pre-NEST-007 nested fixture whose face areas had drifted by
+#: 31 mm2 on the very same edges. 1e-6 is six orders below the smallest real
+#: difference it has to catch -- a wrong edge on this corpus differs by a factor
+#: of ~1.4, not 1e-6.
+SUBNAME_LENGTH_TOLERANCE = 1e-6
 
-    `clones_missing` is the set of names that resolved nowhere. `detail` is a
-    per-name account of what resolved where, for the report.
+
+def subelement_signature(shape, name):
+    """Return placement-independent metrics for sub-element `name`, or None.
+
+    "Placement-independent" is the whole requirement, and it rules out anything
+    positional: the copy is the same solid somewhere else on the sheet, rotated
+    by whatever the nest chose. A centre of mass, a vertex position or a face
+    normal are all measured from a frame that differs between the two, so none
+    can be compared directly.
+
+    **No surface or curve TYPE name either.** Tempting, since `Cylinder` versus
+    `Plane` is the most direct evidence there is -- and it was measured, on the
+    three part types of the committed fixture: it reports 0 mismatches on
+    geometry from current code, and on the fixture nested by the pre-NEST-007
+    nester it reports **every** face and **every** edge different, because they
+    are all `BSplineSurface` and `BSplineCurve`. That is a true statement about
+    those copies and a useless one to act on, so the type name is left out and
+    the numeric measures below are compared instead. Which leaves area and
+    length, measured to be exact and near-exact respectively.
+
+    Compared face-by-face, these separate the case this exists for from the
+    case that must not be refused. NEST-014's mismatch, `Face3` on a holed plate
+    against `Face3` on a holeless box: area **886.9027 against 200.0000**, wires
+    **2 against 1**, edges **5 against 4**. A 4.4x area difference that no
+    legitimate variation comes close to.
+
+    Shape types are returned as-is and compared for equality, because a name that
+    resolves to a face on one shape and an edge on another is a mismatch in the
+    plainest sense.
+
+    `None` means the name does not resolve, which is a different failure and is
+    counted by the caller.
+    """
+    try:
+        sub = shape.getElement(name)
+    except Exception:
+        return None
+    kind = sub.ShapeType
+    if kind == "Face":
+        return (kind, float(sub.Area), len(sub.Wires), len(sub.Edges))
+    if kind in ("Edge", "Wire"):
+        return (kind, float(sub.Length), bool(sub.Closed))
+    # A Vertex has one coordinate and nothing to compare it against; a Shell or
+    # Compound is a container whose contents the named children already cover.
+    return (kind,)
+
+
+def _signature_agrees(want, got):
+    """True if two `subelement_signature` results describe the same feature.
+
+    Counts and shape types are exact. The one measure each kind carries is
+    compared relatively, so the test does not depend on the part's size: a
+    1e-9 relative area tolerance is the same tolerance whether the face is
+    886 mm2 or 8 mm2.
+    """
+    if want is None or got is None:
+        return False
+    if want[0] != got[0]:
+        return False
+    if len(want) != len(got):
+        return False
+    for a, b in zip(want[1:], got[1:]):
+        if isinstance(a, bool) or isinstance(b, bool):
+            if a != b:
+                return False
+        else:
+            scale = max(abs(a), abs(b))
+            if abs(a - b) > SUBNAME_AREA_TOLERANCE * scale:
+                return False
+    return True
+
+
+def display_label_of(model_entry):
+    """Return the label a user would recognise for a job's Model entry.
+
+    The replay's own geometry is named `CAMPart_57`, `CAMPart_58` and so on --
+    an internal sequence number that means nothing to somebody looking at a
+    failure message saying a Profile was not replayed on it. The part they
+    named is reachable from the Model entry:
+
+        CAMPart_57  ->  SourceObject  ->  part_Bracket_2
+
+    so that is preferred, then `nested_label_of` for the container, and only
+    then the Model entry's own label -- which is all that is left when the
+    entry has no `SourceObject` link, and still better than reporting nothing.
+    """
+    source = getattr(model_entry, "SourceObject", None)
+    label = getattr(source, "Label", "") if source is not None else ""
+    if label:
+        return label
+    nested = nested_label_of(model_entry)
+    if nested:
+        return nested
+    return getattr(model_entry, "Label", "?")
+
+
+def check_subnames_against_clones(subs, clones, source_geometry=None):
+    """Return `(missing, mismatched, detail)` for sub-names that fail on a clone.
+
+    `missing` is the set of names that resolved nowhere. `mismatched` is the set
+    of `(name, clone label)` pairs where the name resolved on the clone but
+    addresses a *different* feature there than it does on the source.
+    `detail` is a per-name account of what resolved where, for the report.
 
     A name resolving on some clones and not others is the alarming case: the
     operation would cut a different feature on different parts of the same
     nest. It is reported separately from a name that resolves on none.
+
+    **`mismatched` is the case `detail` alone could not see, and it is the
+    dangerous one.** `getElement` raises only on a name that does not exist, so
+    a name that *does* exist reports "ok" whether or not it means what the source
+    meant by it. A nested part with fewer faces than the source still has a
+    `Face3`; it is simply somebody else's. NEST-027 measured that on a holed
+    plate against a holeless box: `Face3` on the source is the 886.9 mm2 top,
+    two wires; `Face3` on the copy is a 200.0 mm2 side, one wire. The sub-element
+    check said `ok`, the replay profiled the side face as though it were the
+    outline, and the only symptom anywhere was a coverage warning about a path
+    that collapsed to a line.
+
+    `source_geometry` is what makes that visible -- the thing the name was
+    originally resolved against. Without it the comparison cannot be made and
+    only existence is checked, which is the behaviour that let the case through.
+    It is optional so that callers holding no source geometry keep working, and
+    the tests that only care about existence say so.
     """
     missing = set()
+    mismatched = set()
     detail = {}
+    source_shape = None
+    if source_geometry is not None:
+        source_shape = getattr(source_geometry, "Shape", None)
+        if source_shape is not None and source_shape.isNull():
+            source_shape = None
     for name in subs:
         if not name:
             detail[name] = "whole object"
             continue
+        want = subelement_signature(source_shape, name) if source_shape is not None \
+            else None
         hits = 0
+        agreed = 0
         for clone in clones:
             shape = getattr(clone, "Shape", None)
             if shape is None:
@@ -1653,14 +1810,32 @@ def check_subnames_against_clones(subs, clones):
             except Exception:
                 continue
             hits += 1
+            # Only compare when both sides are known. `want is None` is not a
+            # mismatch: it means the caller gave us no source to compare against,
+            # and refusing every name on that basis would be wrong.
+            if want is not None:
+                if _signature_agrees(want, subelement_signature(shape, name)):
+                    agreed += 1
+                else:
+                    # The label a user would recognise, not the replay's own
+                    # `CAMPart_57`: this string goes in a failure message.
+                    mismatched.add((name, display_label_of(clone)))
+        wrong = sum(1 for n, _label in mismatched if n == name)
         if hits == 0:
             missing.add(name)
             detail[name] = "resolved on 0 of %d" % len(clones)
+        elif wrong:
+            # Resolves everywhere and means the same thing everywhere except on
+            # the named clones -- so say exactly that, with both counts, rather
+            # than the "ok" this used to report.
+            detail[name] = ("addresses a different feature on %d of %d, the "
+                            "same feature on %d"
+                            % (wrong, len(clones), agreed))
         elif hits < len(clones):
             detail[name] = "resolved on %d of %d" % (hits, len(clones))
         else:
             detail[name] = "ok"
-    return missing, detail
+    return missing, mismatched, detail
 
 
 def clones_for_source(clones, source_geometry):
@@ -2958,7 +3133,8 @@ def replay_recipe(recipe, job, clones, tool_cache=None,
             if not subs or "" in subs:
                 base_value.extend((clone, [""], geometry) for clone in targets)
                 continue
-            missing, detail = check_subnames_against_clones(subs, targets)
+            missing, mismatched, detail = check_subnames_against_clones(
+                subs, targets, geometry)
             for name, note in detail.items():
                 if name:
                     result.subname_detail[name] = note
@@ -2972,6 +3148,30 @@ def replay_recipe(recipe, job, clones, tool_cache=None,
                        "resolves on only some of the nested parts")
                 )
                 continue
+            if mismatched:
+                # The name exists on the copy but means something else there, so
+                # this copy is left out and the rest keep the operation. Reported
+                # per copy rather than abandoning the step: one bad part in a
+                # 23-part nest should not cost the other 22 their recipe, and
+                # refusing is what makes the cut wrong-ness visible at all
+                # (NEST-027).
+                # Compared by the same display label the message used, or the
+                # copy would not be dropped -- the whole point of the block.
+                dropped = set(display_label_of(c) for c in targets) & \
+                    set(label for _n, label in mismatched)
+                for name in sorted(set(n for n, _l in mismatched)):
+                    labels = sorted(l for n, l in mismatched if n == name)
+                    result.failures.append(
+                        "Operation '%s' selects %s, which addresses a different "
+                        "feature on %s than it does on the source. Not replayed "
+                        "there, because it would cut a different feature than "
+                        "intended."
+                        % (item.label, name, ", ".join(labels))
+                    )
+                targets = [c for c in targets
+                           if display_label_of(c) not in dropped]
+                if not targets:
+                    continue
             base_value.extend((clone, subs, geometry) for clone in targets)
 
         # What to build. Each unit is `(label_for, base_entries_to_assign,

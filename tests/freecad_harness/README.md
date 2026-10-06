@@ -471,6 +471,56 @@ Both traps bit `test_replay_boundary.py` on its first run, and both failed the w
 a vacuous check fails: as "no Dogbone chain in the list" and "no BarePlate
 operation", against documents that contained eight of each.
 
+## Comparing a sub-element across two shapes, and why a face normal is not one
+
+`test_replay_subnames.py` (gated, `freecadcmd`) checks that a sub-element name
+means the same *feature* on a nested copy as on the CAM source, not merely that
+it resolves. `getElement` raises only when a name is absent, so existence alone
+reports "ok" for a `Face3` that has landed on somebody else's face — NEST-027.
+
+**The trap: a face normal looks placement-independent and is not.** Comparing
+`Face.normalAt(*Surface.parameter(CentreOfMass))` between a source and its nested
+copy gives **90° and 180° disagreements** between faces that are provably the
+same face — areas equal to 1.4e-14, every wire/edge count equal, and every
+`Placement` rotation identity, so the relative rotation is provably zero and a
+rigid translation cannot change a normal.
+
+The cause is that the surface's **parameterisation origin is rotated**. On
+`BottomStrap` Face11 the u at centre-of-mass is 0.000 in the source and
+**4.712 rad** in the copy; on `TopStrap` Face11 it is π apart. Both were built by
+different code paths, so each cylinder's u=0 sits elsewhere on the circle.
+`normalAt(u, v)` answers wherever the parameter lands, which is arbitrary.
+
+Note that **both** directions of the obvious frame —
+`clone.Rotation * source.Rotation⁻¹` and its reverse — give the same wrong answer
+here, because the rotations are identity and the frame is not the problem. Fixing
+the frame does not fix the normal.
+
+What is compared instead, all placement-independent: face **area**, wire and edge
+counts; edge **length** and closedness. Type *names* are deliberately excluded —
+they report 0 mismatches on current code, which is what makes them tempting, and
+"every face differs" on the pre-NEST-007 fixture of issues.md NEST-029, which is
+a true statement about that fixture and a useless one to act on.
+
+Two vacuity traps this file hit, both found by trying to break it:
+
+- **The obvious mismatch case does not test the area.** A holed plate against a
+  holeless box differs in wire count as well, so zeroing the area in
+  `subelement_signature` left the file green. `Face2` is the case where area is
+  the *only* discriminator — 200.0 against 125.0 with the same one wire and four
+  edges — and it is the one that matters, being a side face profiled as though it
+  were the outline.
+- **Do not pick the test case through the function under test.** Choosing the
+  length-only edge by asking `subelement_signature` which edges differ means that
+  zeroing the length empties the candidate list, and the failure reads "no edge
+  differs in length": true, and silent about the defect injected. Pick it from the
+  geometry.
+
+Both `test_replay_subnames.py` and `test_shape_preparer_rigid.py` report each
+measured difference as a **fraction of its tolerance** rather than as a raw
+number, because a check sitting at 0.1% of its budget and one at 99% are not the
+same check and the reader should be able to see which this is.
+
 ## Layout persistence, and the two vacuity traps behind it
 
 `test_layout_persistence.py` (gated, `freecadcmd`) covers the *write* half of what a

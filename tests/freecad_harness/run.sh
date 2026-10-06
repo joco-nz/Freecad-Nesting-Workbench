@@ -39,11 +39,12 @@ ORDER_STATUS="$HARNESS_DIR/.last_status_order"
 STARTPOINT_STATUS="$HARNESS_DIR/.last_status_startpoint"
 BOUNDARY_STATUS="$HARNESS_DIR/.last_status_boundary"
 RIGID_STATUS="$HARNESS_DIR/.last_status_rigid"
+SUBNAME_STATUS="$HARNESS_DIR/.last_status_subnames"
 PERSIST_STATUS="$HARNESS_DIR/.last_status_persist"
 rm -f "$BENCH_STATUS" "$TEST_STATUS" "$GA_STATUS" "$PANEL_STATUS" \
       "$UNITS_STATUS" "$PYTEST_STATUS" "$REPLAY_STATUS" "$DRESSUP_STATUS" \
       "$ORDER_STATUS" "$STARTPOINT_STATUS" "$BOUNDARY_STATUS" \
-      "$RIGID_STATUS" "$PERSIST_STATUS"
+      "$RIGID_STATUS" "$SUBNAME_STATUS" "$PERSIST_STATUS"
 
 cd "$REPO_ROOT"
 "$FREECADCMD" "$HARNESS_DIR/nest_benchmark.py" || true
@@ -79,6 +80,11 @@ cd "$REPO_ROOT"
 # The nester centres a part with a rigid transform, and must not re-fit the
 # geometry doing it: transformShape, not transformGeometry. NEST-007.
 "$FREECADCMD" "$HARNESS_DIR/test_shape_preparer_rigid.py" || true
+# A sub-element name that resolves is not the same as a name that means the same
+# thing: getElement raises only when a name is absent, so `Face3` on a copy with
+# fewer faces than the source answered fine and profiled the wrong feature.
+# Compared against the source geometry; NEST-027.
+"$FREECADCMD" "$HARNESS_DIR/test_replay_subnames.py" || true
 # The write half of layout persistence: a layout records the algorithm that ran,
 # the direction that algorithm's dial held, whether that direction was used, and
 # each part's raw rotation override. The reload half needs a panel and lives in
@@ -88,7 +94,7 @@ cd "$REPO_ROOT"
 for f in "$BENCH_STATUS" "$TEST_STATUS" "$GA_STATUS" "$PANEL_STATUS" \
          "$UNITS_STATUS" "$REPLAY_STATUS" "$DRESSUP_STATUS" "$ORDER_STATUS" \
          "$STARTPOINT_STATUS" "$BOUNDARY_STATUS" "$RIGID_STATUS" \
-         "$PERSIST_STATUS"; do
+         "$SUBNAME_STATUS" "$PERSIST_STATUS"; do
     if [ ! -f "$f" ]; then
         echo "harness did not write $f -- it probably did not run" >&2
         exit 3
@@ -184,6 +190,12 @@ fi
 RIGID=$(cat "$RIGID_STATUS")
 if [ "$RIGID" -ne 0 ]; then
     echo "shape-preparer-rigidity regression test FAILED (status $RIGID)" >&2
+    [ "$STATUS" -eq 0 ] && STATUS=1
+fi
+
+SUBNAME=$(cat "$SUBNAME_STATUS")
+if [ "$SUBNAME" -ne 0 ]; then
+    echo "replay-subname-agreement regression test FAILED (status $SUBNAME)" >&2
     [ "$STATUS" -eq 0 ] && STATUS=1
 fi
 
