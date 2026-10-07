@@ -480,6 +480,25 @@ class PlacementOptimizer:
         else:
             angles = [i * (360.0 / part_rotation_steps) for i in range(part_rotation_steps)]
         
+        # One rng per rotation, minted here on this thread in `angles` order.
+        #
+        # `score_gravity` breaks a metric tie with `rng.randrange`
+        # (minkowski_engine.py:617), and every rotation's evaluation ran that
+        # against the *shared* `self.rng`. Under the pool that draw happens
+        # concurrently from several worker threads, so which tie-index each
+        # rotation received depended on thread interleaving: measured 29
+        # distinct drawing threads for one seeded pooled run, against 1 with
+        # `NESTING_ROTATION_WORKERS=0`. A seeded run was therefore not
+        # reproducible no matter what the fold order did.
+        #
+        # Minting children up front keeps the random tie-break -- which is worth
+        # keeping, since always taking `tied[0]` biases placement toward
+        # whichever candidate happens to be first -- while making each rotation's
+        # draw depend only on its own index. Cost is one `getrandbits` per
+        # rotation per part placed.
+        rotation_rngs = [random.Random(self.rng.getrandbits(64))
+                         for _ in angles]
+
         # Rotations are evaluated either serially or through a pool. Candidate
         # point-in-polygon rejection runs on the CPU via shapely, which releases
         # the GIL around the GEOS call but not around the surrounding Python.
@@ -514,8 +533,9 @@ class PlacementOptimizer:
                         placed_parts_grouped,
                         sheet,
                         direction,
-                    ): angle
-                    for angle in angles
+                        rotation_rngs[index],
+                    ): index
+                    for index, angle in enumerate(angles)
                 }
 
                 for future in as_completed(futures):
@@ -537,10 +557,11 @@ class PlacementOptimizer:
             #     best with a strict `<` means a metric tie is won by whichever
             #     rotation finishes first, which under a pool is a scheduling
             #     detail. Serial evaluation is order-stable by construction.
-            for angle in angles:
+            for index, angle in enumerate(angles):
                 try:
                     res = self._evaluate_rotation_tracked(
-                        angle, part, placed_parts_grouped, sheet, direction)
+                        angle, part, placed_parts_grouped, sheet, direction,
+                        rotation_rngs[index])
                 except Exception as e:
                     self.log(f"Error in rotation evaluation: {e}")
                     continue
@@ -677,9 +698,15 @@ class PlacementOptimizer:
         return best_result
 
     def _evaluate_rotation_tracked(
-        self, angle, part, placed_parts_grouped, sheet, direction
+        self, angle, part, placed_parts_grouped, sheet, direction, rng=None
     ):
-        """Track rotation-worker occupancy without changing evaluation behavior."""
+        """Track rotation-worker occupancy without changing evaluation behavior.
+
+        `rng` is this rotation's own tie-break generator, minted by the caller.
+        It is a parameter rather than `self.rng` because the shared instance is
+        drawn from concurrently once the pool is on: measured 29 distinct drawing
+        threads for one seeded pooled run, against 1 serial.
+        """
         if self.performance_logging:
             with self._perf_lock:
                 self._active_workers += 1
@@ -689,7 +716,7 @@ class PlacementOptimizer:
                 )
         try:
             return self._evaluate_rotation(
-                angle, part, placed_parts_grouped, sheet, direction
+                angle, part, placed_parts_grouped, sheet, direction, rng
             )
         finally:
             if self.performance_logging:
@@ -735,7 +762,8 @@ class PlacementOptimizer:
             self._perf_stats['candidate_geometry_unique'] += unique_count
             self._perf_stats['candidate_geometry_repeats'] += repeat_count
 
-    def _evaluate_rotation(self, angle, part, placed_parts_grouped, sheet, direction):
+    def _evaluate_rotation(self, angle, part, placed_parts_grouped, sheet, direction,
+                          rng=None):
         """
         Evaluates placing the part at a given rotation angle on the sheet.
         
@@ -802,7 +830,8 @@ class PlacementOptimizer:
                 performance_logging=self.performance_logging,
             )
             t_validity = _time.perf_counter()
-            best_idx, metric = MinkowskiEngine.score_gravity(pts_arr, valid_mask, direction, rng=self.rng)
+            best_idx, metric = MinkowskiEngine.score_gravity(
+                pts_arr, valid_mask, direction, rng=rng)
             if best_idx is not None:
                 best = {'x': float(pts_arr[best_idx, 0]), 'y': float(pts_arr[best_idx, 1]),
                         'angle': angle, 'metric': metric}

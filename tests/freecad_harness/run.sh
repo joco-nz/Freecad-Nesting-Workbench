@@ -55,12 +55,14 @@ SUBNAME_STATUS="$HARNESS_DIR/.last_status_subnames"
 CLEARANCE_STATUS="$HARNESS_DIR/.last_status_clearance"
 TOOLTIP_STATUS="$HARNESS_DIR/.last_status_tooltip"
 PANELBUILD_STATUS="$HARNESS_DIR/.last_status_panelbuild"
+ROTATIONDET_STATUS="$HARNESS_DIR/.last_status_rotationdet"
 PERSIST_STATUS="$HARNESS_DIR/.last_status_persist"
 rm -f "$BENCH_STATUS" "$TEST_STATUS" "$GA_STATUS" "$PANEL_STATUS" \
       "$UNITS_STATUS" "$PYTEST_STATUS" "$REPLAY_STATUS" "$DRESSUP_STATUS" \
       "$ORDER_STATUS" "$STARTPOINT_STATUS" "$BOUNDARY_STATUS" \
       "$RIGID_STATUS" "$SUBNAME_STATUS" "$CLEARANCE_STATUS" \
-      "$TOOLTIP_STATUS" "$PANELBUILD_STATUS" "$PERSIST_STATUS"
+      "$TOOLTIP_STATUS" "$PANELBUILD_STATUS" "$PERSIST_STATUS" \
+      "$ROTATIONDET_STATUS"
 
 cd "$REPO_ROOT"
 "$FREECADCMD" "$HARNESS_DIR/nest_benchmark.py" || true
@@ -119,12 +121,16 @@ cd "$REPO_ROOT"
 # each part's raw rotation override. The reload half needs a panel and lives in
 # `probe_layout_restore.py`, run by hand on the `freecad` binary.
 "$FREECADCMD" "$HARNESS_DIR/test_layout_persistence.py" || true
+# A seeded nest must not depend on the rotation pool width. Four widths, plus a
+# seed that must change the result -- so neither "the pool does not matter" nor
+# "the rng is dead" can pass. NEST-032.
+"$FREECADCMD" "$HARNESS_DIR/test_rotation_determinism.py" || true
 
 for f in "$BENCH_STATUS" "$TEST_STATUS" "$GA_STATUS" "$PANEL_STATUS" \
          "$UNITS_STATUS" "$REPLAY_STATUS" "$DRESSUP_STATUS" "$ORDER_STATUS" \
          "$STARTPOINT_STATUS" "$BOUNDARY_STATUS" "$RIGID_STATUS" \
          "$SUBNAME_STATUS" "$CLEARANCE_STATUS" "$TOOLTIP_STATUS" \
-         "$PANELBUILD_STATUS" "$PERSIST_STATUS"; do
+         "$PANELBUILD_STATUS" "$PERSIST_STATUS" "$ROTATIONDET_STATUS"; do
     if [ ! -f "$f" ]; then
         echo "harness: DID NOT RUN -- did not write $f" >&2
         exit 3
@@ -244,6 +250,12 @@ fi
 PANELBUILD=$(cat "$PANELBUILD_STATUS")
 if [ "$PANELBUILD" -ne 0 ]; then
     echo "panel-construction regression test FAILED (status $PANELBUILD)" >&2
+    [ "$STATUS" -eq 0 ] && STATUS=1
+fi
+
+ROTATIONDET=$(cat "$ROTATIONDET_STATUS")
+if [ "$ROTATIONDET" -ne 0 ]; then
+    echo "rotation-determinism regression test FAILED (status $ROTATIONDET)" >&2
     [ "$STATUS" -eq 0 ] && STATUS=1
 fi
 

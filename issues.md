@@ -3081,11 +3081,51 @@ checks are the new gated `test_tool_clearance.py`, plus 16 new pytest cases.
 
 ## NEST-031 — `random_seed` is plumbed and printed, but three drawing sites never receive it
 
-`status: open` · `severity: medium (unmeasured)` · `area: nesting / GA`
+`status: open` · `severity: medium (measured)` · `area: nesting / GA`
 
 Found while scoping [NEST-029](#nest-029): rebuilding the committed fixture needs to
-know whether a nest can be reproduced at all, and the answer is **no, not
-reliably**, so the two are related even though the fixes are separate.
+know whether a nest can be reproduced at all.
+
+**Measured, and the first analysis of this was wrong in two places.** Both are
+corrected below rather than quietly replaced -- the errors are the useful part.
+
+| condition (job identical, seed 777, all 48 placements fingerprinted) | result |
+|---|---|
+| Minkowski, seeded, **serial** (`NESTING_ROTATION_WORKERS=0`) | **REPRODUCIBLE** -- `7fc5dac5` three times, three separate processes |
+| Minkowski, seeded, 4-worker pool (the default) | NOT reproducible -- `775b7e36` / `0c47947e` / `cecad2ac` |
+| Minkowski, seeded, serial, seed **778** | different fingerprint `a5900f95`, so the seed does drive the outcome |
+| Physics, seeded | NOT reproducible -- `08c956cb` / `5f156dad` |
+
+Global `random.*` calls during a **seeded** run, measured by wrapping the
+module-level functions:
+
+| algorithm | calls |
+|---|---|
+| Minkowski | **none** |
+| Physics | `uniform` **1682**, `randrange` **464**, `choice` **57** |
+
+### Correction 1: Minkowski's seed works, and `rng or random` is not a defect
+
+An earlier version of this entry listed `nesting_strategy.py:338`
+(`self.rng = rng or random`) as "silently discarding the seed". **It does not.**
+The fallback only fires when `rng` is `None`, and `ga_coordinator.py:1191` always
+sets `current_kwargs['rng'] = self.rng`. The measurement agrees: a seeded Minkowski
+run makes **zero** global `random.*` calls, and is bit-identical across three
+processes with the pool off. The comment on that line is accurate as written.
+
+### Correction 2: "serial" was never tested, because `rotation_workers=0` is not serial
+
+`_rotation_worker_limit({'rotation_workers': 0})` returns **4**, measured. Line 108
+requires `int(explicit) > 0`, so `0` is not "explicitly serial", it is "unset" and
+falls through to the core count. Only the environment variable
+`NESTING_ROTATION_WORKERS=0` resolves to 0 -- and its own docstring says so ("0 is
+meaningful and explicit: no pool at all").
+
+So every earlier reading of "still diverges with the pool off" was the **pool**, not
+the rng. The two conditions have to be set independently:
+
+    NESTING_ROTATION_WORKERS=0   -> serial, and with a seed, reproducible
+    (unset, 4 workers)           -> not reproducible even with a perfect seed
 
 ### What the seed does reach
 
@@ -3124,6 +3164,24 @@ ui_params.get('random_seed')`, and **there is no `random_seed` anywhere in
 `ga_coordinator.py:537` draws the seed itself from the unseeded global module. The
 seed is a random draw from an unseeded source.
 
+### The Minkowski non-determinism is thread order, not the rng -- filed as NEST-032
+
+With a working seed and the pool off, Minkowski is reproducible. With the pool on
+it is not, and the rng cannot fix it. `nesting_strategy.py:521` folds results in
+`as_completed` order, and `_absorb_rotation_result` picks the winner with a strict
+`<` against the incumbent. When two rotations score **identically**, which one wins
+is decided by which thread finishes first.
+
+Tie-broken `score_gravity` calls measured over one seeded serial run: **30** in run
+1 and **29** in run 2 -- same seed, same inputs (input-parts fingerprint identical),
+different number of ties reached, because earlier placements had already diverged.
+The seeded tie-break in `minkowski_engine.py:616` (`tied[rng.randrange(len(tied))]`)
+is correct and reproducible; it is being fed a different candidate set each time.
+
+So the two defects are independent: **NEST-031 is Physics's unseeded draws, NEST-032
+is the rotation pool's completion order.** Fixing either alone leaves runs
+irreproducible.
+
 ### Consequence, stated no more strongly than measured
 
 A user who reads `GA random seed: 3812746` off the console, notes it, and re-runs the
@@ -3149,3 +3207,113 @@ Kept separate from NEST-029 because this is a product change with its own
 measurements, and because it bears on **what NEST-029 can honestly pin** -- a
 fixture regenerated from a seed the code does not honour is a different artefact
 than one regenerated deterministically.
+
+---
+
+## NEST-032 — a seeded nest depended on the rotation pool width
+
+`status: resolved` · `severity: medium (measured)` · `area: nesting / Minkowski`
+
+Split out of [NEST-031](#nest-031) during its measurement, because it is a
+different mechanism and fixing one does not fix the other. **Independent**: with a
+seed set and the pool off, Minkowski is bit-identical across three processes
+(`7fc5dac5`); with the pool on and the same seed, three processes give
+`775b7e36`, `0c47947e`, `cecad2ac`.
+
+### The mechanism
+
+`score_gravity` breaks a metric tie by drawing from an rng
+(`minkowski_engine.py:615-617`):
+
+    tied = np.flatnonzero(scores == metric)
+    if rng is not None and len(tied) > 1:
+        best_idx = int(tied[rng.randrange(len(tied))])
+
+Every rotation's evaluation was handed the **same** `random.Random` instance, and
+under the pool those draws happen **concurrently from several worker threads**.
+Which tie-index a given rotation received therefore depended on thread
+interleaving. Measured with a shim recording the thread of each draw: **29
+distinct drawing threads** for one seeded pooled run, against **1** with
+`NESTING_ROTATION_WORKERS=0`.
+
+### Correction: the fold order was blamed first, and it was not the cause
+
+This entry originally named `as_completed` fold order (`nesting_strategy.py:521`)
+as the mechanism -- results folded in completion order, with `_absorb_rotation_result`
+picking the winner by a strict `<`, so an exactly-tied metric went to whichever
+rotation finished first.
+
+That is a real dependency, and **fixing it did not work**: three processes gave
+`3955f9f7` / `51fcb53b` / `fc13a933` *after* the fold order was changed to
+submission order. Reverting that change and minting a per-rotation rng instead
+gives width independence on its own.
+
+So the fold-order fix was **dropped rather than committed**. Reintroducing it into
+the committed code changes nothing measurable -- `ee223895` at both widths -- and
+that null result is recorded in the gated suite's docstring as the measurement
+that removed it. A plausible-sounding mechanism that survived no test is worth
+naming precisely because it was wrong.
+
+### Measured
+
+* Tie-broken `score_gravity` calls in one seeded **serial** run: **30** in run 1,
+  **29** in run 2. Same seed, and the input-parts fingerprint was identical
+  (`d4d18a0ba89294c6` both runs), so the divergence is not in the inputs.
+* First divergence in a same-seed serial pair: row **15 of 48** --
+  `BottomStrap_23` at angle 90.0, y identical at 69.0073, x **132.7101** vs
+  **112.6643**. Same angle, same row, different column: a tie resolved differently.
+* `rotation_workers=0` passed as a kwarg does **not** select serial. Measured
+  `_rotation_worker_limit({'rotation_workers': 0})` -> **4**, because line 108
+  requires `int(explicit) > 0`. Only `NESTING_ROTATION_WORKERS=0` reaches 0. The
+  docstring at :91 already says "0 is meaningful and explicit: no pool at all",
+  which makes the kwarg path the surprising one.
+* Default width is `os.cpu_count()`, 4 here, so **this box runs pooled by default**
+  and the serial path is reachable only through the environment variable.
+
+### Fixed
+
+One rng per rotation, minted on the calling thread in `angles` order, and threaded
+through `_evaluate_rotation_tracked` -> `_evaluate_rotation` -> `score_gravity` as
+a parameter:
+
+    rotation_rngs = [random.Random(self.rng.getrandbits(64)) for _ in angles]
+
+The random tie-break is **kept deliberately** -- always taking `tied[0]` would bias
+placement toward whichever candidate happens to be first -- while each rotation's
+draw now depends only on its own index. Cost is one `getrandbits` per rotation per
+part placed.
+
+Measured after the fix, seed 777, 48 parts placed each time:
+
+| pool width | fingerprint |
+|---|---|
+| 0 (serial) | `973d67bc5f1d6b44b0f5d0bb` |
+| 4 (this box's default) | `973d67bc5f1d6b44b0f5d0bb` |
+| 8 | `973d67bc5f1d6b44b0f5d0bb` |
+| 16 | `973d67bc5f1d6b44b0f5d0bb` |
+
+Three processes at width 4 agree with each other. Seeds 778 and 779 give
+`d88ae03e...` and `a869beb7...`, so the seed still drives the outcome.
+
+**Packing quality is unchanged**, which was worth checking rather than assuming:
+48 placed either way, efficiency **40.9427%** both, delta **+0.000000 pp**, and 48
+of 48 placements identical. So this is a reproducibility fix, not a quality one.
+
+### Injection-verified
+
+`test_rotation_determinism.py`, gated, 12 checks: four widths must agree, two seeds
+must differ, and 48 parts must be placed (so the fingerprint is of a real layout).
+
+| injection | caught |
+|---|---|
+| one shared rng across all rotations | **yes** -- `da8e2bdf` vs `8df33f69` |
+| every rotation sharing `rotation_rngs[0]` | **yes** -- `ee223895` vs `d6e64a8f` |
+| frozen seed replacing `self.rng.getrandbits(64)` | **yes** -- caught by the seed check, since 777 and 778 then agree |
+| reintroducing the arrival-order fold the fix omits | **no effect** -- `ee223895` at both widths, which is why it was dropped |
+
+Gate exit verified too: reverting the fix gives `harness: GATE FAILED` and exit 1;
+restored gives exit 0.
+
+**Still true, and now the only reproducibility caveat left:** `rotation_workers=0`
+passed as a *kwarg* resolves to `os.cpu_count()`, measured. Only the environment
+variable reaches 0. That is a separate trap, asserted by the suite.

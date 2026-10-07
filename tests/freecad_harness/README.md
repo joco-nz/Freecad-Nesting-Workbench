@@ -268,6 +268,37 @@ The split is forced: `freecadcmd` has no `FreeCADGui.UiLoader`, so
 (`AttributeError: module 'FreeCADGui' has no attribute 'UiLoader'`). No Xvfb
 needed — see above.
 
+### Width independence of a seeded nest
+
+`test_rotation_determinism.py` asserts that a seeded nest does not depend on the
+rotation pool width -- widths 0, 4, 8 and 16 all produce the same 48-placement
+fingerprint, and two different seeds produce different ones.
+
+It exists because the pool **did** change the result, and the cause was not the
+obvious one. `score_gravity` breaks a metric tie with `rng.randrange`
+(`minkowski_engine.py:617`), and every rotation's evaluation shared one
+`random.Random`, so under the pool those draws raced across worker threads.
+Measured with a shim recording each draw's thread: **29 distinct drawing threads**
+for one seeded pooled run, against **1** serial.
+
+The first fix attempted was to fold results in `angles` order rather than
+`as_completed` order, on the reasonable reading that a strict `<` winner decided
+by thread completion is a scheduling dependency. **That was not the cause.** It
+changed nothing -- reintroducing it into the committed code leaves the fingerprints
+identical -- so it was dropped rather than committed. The null result is recorded
+in the suite's docstring, because "I fixed the plausible mechanism and the test
+still failed" is the useful part.
+
+**Two environment facts this suite depends on**, both measured rather than assumed:
+
+* `rotation_workers=0` passed as a **kwarg** resolves to `os.cpu_count()`, because
+  `_rotation_worker_limit` requires `int(explicit) > 0` (`nesting_strategy.py:108`).
+  Measured: `{'rotation_workers': 0}` -> `4`. Only `NESTING_ROTATION_WORKERS=0`
+  reaches 0. The suite asserts this trap rather than working around it silently.
+* Nesting without zeroing the sources' placements produces **2031 mm³ of genuinely
+  shared solid**, because `BottomStrap` arrives at `base=(-42, 0, 0)`. See the
+  fixture section below.
+
 ### Rebuilding the nested fixture
 
 `replay-fixture-CAM-Nested.FCStd` is the only fixture in
