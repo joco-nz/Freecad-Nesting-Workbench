@@ -299,6 +299,33 @@ still failed" is the useful part.
   shared solid**, because `BottomStrap` arrives at `base=(-42, 0, 0)`. See the
   fixture section below.
 
+### Pinning a seed: `NESTING_RANDOM_SEED`
+
+A run's seed is resolved in `GACoordinator._resolve_seed`, in this order:
+
+1. `algo_kwargs['random_seed']`
+2. `NESTING_RANDOM_SEED` (environment)
+3. a fresh `random.randrange(2**32)`
+
+The env var exists because **the panel cannot supply one**.
+`nesting_controller.py:1323` reads `ui_params.get('random_seed')`, and
+`random_seed` appears nowhere in `ui_nesting.py` — 0 occurrences — so from the GUI
+the value is always `None`. The harnesses already pass the kwarg
+(`bench_ga.py:243` and others) and still win step 1, so they are unaffected.
+
+An unparseable value **warns and falls through**, unlike the other env overrides
+which are silent. Here the whole point of setting it is reproducibility, and a
+silent fresh draw would leave someone believing the run was pinned.
+
+The console names the source, so a report can say whether a number was chosen:
+
+    GA random seed: 4242 (from NESTING_RANDOM_SEED)
+    GA random seed: 99935349 (random (not pinned))
+
+**No `NESTING_ROTATION_WORKERS=0` is needed.** That was true while the fold order
+decided the winner; NEST-032 made pool width a pure speed knob. Measured at seed
+777: widths 0, 4 and 8 all give `973d67bc5f1d6b44b0f5d0bb`.
+
 ### Seeded nests, both algorithms
 
 `test_rotation_determinism.py` (24 checks) asserts that a seeded nest is
@@ -330,6 +357,11 @@ Both were gaps in the test, not the fix. Sections 4b and 4c exist because of the
 (`nesting_strategy.py:108` requires `int(explicit) > 0`); only
 `NESTING_ROTATION_WORKERS=0` reaches 0. The suite asserts this rather than working
 around it silently.
+
+**Importing `GACoordinator` needs a document already open**, and
+`FreeCAD.newDocument` is *not* enough — measured: a bare interpreter segfaults 3/3
+with no output, `newDocument` segfaults too, and only `openDocument` of a real file
+works (2/2). The suite's own docstrings say so at the point of use.
 
 ### Rebuilding the nested fixture
 

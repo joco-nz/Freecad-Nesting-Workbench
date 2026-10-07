@@ -3243,27 +3243,55 @@ rng is threaded through. Neither is established, so the size of the divergence
 between two same-seed runs is not known. A claim like "two runs differ by 3 parts"
 would be invented; what is measured is only that three sites cannot see the seed.
 
-### Follow-ups, not part of this fix
+### `NESTING_RANDOM_SEED` -- the channel the panel cannot provide
 
-**The seed is still unreachable from the panel.** `nesting_controller.py:1323` reads
-`algo_kwargs['random_seed'] = ui_params.get('random_seed')`, and no `random_seed`
-field exists in `ui_nesting.py`, so it is always `None` and `:537` draws the seed
-from the module. Every current consumer of a seed is a harness:
-`bench_ga.py:243`, `probe_target_sheets.py:224`, `probe_gui_session.py:214`.
+**The defect this closes:** `nesting_controller.py:1323` reads
+`algo_kwargs['random_seed'] = ui_params.get('random_seed')`, and `random_seed`
+appears **nowhere** in `ui_nesting.py` -- measured, 0 occurrences. So from the GUI
+that value is always `None`, the seed was always drawn from the unseeded global
+module, and the console printed it as though it were something the user could note
+and reuse. **It was not.** Every existing consumer of a seed is a harness passing
+the kwarg directly: `bench_ga.py:243`, `probe_target_sheets.py:224`,
+`probe_gui_session.py:214`.
 
-The agreed direction is an **environment variable**, not a panel control: the
-workbench already has `NESTING_ROTATION_WORKERS`, `NESTING_STEP_SIZE` and
-`NESTING_FILL_DEAD_HOLES` for exactly this purpose, and the harnesses already lean
-on them. Deliberately *not* persisted on the layout, because a layout recording
-seed 777 but nested on a different core count is not reproducible, and recording it
-would promise what the code cannot deliver.
+An **environment variable**, not a panel control, matching the three that already
+exist for this purpose (`NESTING_ROTATION_WORKERS`, `NESTING_STEP_SIZE`,
+`NESTING_FILL_DEAD_HOLES`). Precedence in `GACoordinator._resolve_seed`:
+`algo_kwargs['random_seed']` -> `NESTING_RANDOM_SEED` -> `random.randrange(2**32)`.
+The kwarg still wins, so **the harnesses are unaffected**.
 
-**A caveat that survives both fixes.** With NEST-032 and this entry applied,
-`NESTING_RANDOM_SEED=777` plus `NESTING_ROTATION_WORKERS=0` gives identical nests
-**on one machine**. `os.cpu_count()` still chooses the default width, so a 4-core
-box and an 8-core box nest identically now that the pool is order-independent, but
-that is because the fold no longer decides the winner -- the width is now a pure
-speed knob, which is the correct property.
+An unparseable value **warns and falls through**. The other env overrides are
+silent on a bad value, but here the entire point of setting it is reproducibility:
+a user who exports `NESTING_RANDOM_SEED` with a typo and gets a silent fresh draw
+would believe the run was pinned. Measured -- the warning reads:
+
+    NESTING_RANDOM_SEED is not an integer ('banana'); ignoring it and drawing a
+    fresh seed. A run started with a typo here is NOT reproducible.
+
+The console line now names its source, so a report can say whether a number was
+chosen or drawn -- the same idea `bench_ga.py` already applies to worker width:
+
+    GA random seed: 4242 (from NESTING_RANDOM_SEED)
+    GA random seed: 99935349 (random (not pinned))
+
+Measured end to end, `NESTING_RANDOM_SEED=4242`, **no `random_seed` kwarg
+anywhere** -- which is the situation the GUI is in:
+
+| run | fingerprint |
+|---|---|
+| 3 separate processes | `5f8f5e616a0dc58e` three times, 48 containers |
+| `NESTING_RANDOM_SEED=4243` | `6cb089c11308db76`, different |
+| no env var, 2 processes | `bfeffad3...` / `60a5d978...`, and seeds `99935349` / `3854624357` |
+
+**Deliberately not persisted on the layout.** A layout recording seed 777 but
+nested elsewhere is not a promise the code can keep, and recording it would be
+worse than not offering it.
+
+**And the `NESTING_ROTATION_WORKERS=0` caveat is gone.** An earlier draft of this
+entry said a pinned seed also needed the pool pinned. That was true while the fold
+order decided the winner; NEST-032 removed it. Measured now: widths 0, 4 and 8
+all give `973d67bc5f1d6b44b0f5d0bb` at seed 777, so the width is a pure speed
+knob and the env var is sufficient on its own.
 
 ---
 

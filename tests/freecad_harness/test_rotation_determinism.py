@@ -339,6 +339,169 @@ def check_physics_without_a_seed_still_works():
           "PhysicsNester ignored an rng that was passed to it")
 
 
+def check_seed_env_var_precedence():
+    """NESTING_RANDOM_SEED, the channel the panel cannot provide.
+
+    `nesting_controller.py:1323` reads `algo_kwargs['random_seed'] =
+    ui_params.get('random_seed')` and `random_seed` appears nowhere in
+    `ui_nesting.py`, so from the GUI that is always None. Before this, the only
+    way to pin a run was to pass the kwarg, which only the harnesses do.
+
+    `_resolve_seed` is a staticmethod, so precedence is checked without nesting
+    anything -- these are cheap assertions about ordering, not about geometry.
+    """
+    emit("")
+    emit("-- 6. NESTING_RANDOM_SEED precedence --")
+    import os as _os
+    # GACoordinator must be imported with a document already open: a bare
+    # freecadcmd segfaults, and so does FreeCAD.newDocument. Only
+    # openDocument of a real file is enough (measured, 3/3).
+    import FreeCAD as _fc
+    doc = _fc.openDocument(os.path.abspath(
+        os.path.join(_REPO, "tests", "Test_Files", "replay-fixture-CAM.FCStd")))
+    try:
+        from freecad.nestingworkbench.Tools.Nesting.ga_coordinator import (
+            GACoordinator)
+        previous = _os.environ.get("NESTING_RANDOM_SEED")
+        try:
+            _os.environ["NESTING_RANDOM_SEED"] = "4242"
+            seed, source = GACoordinator._resolve_seed({})
+            emit("  env only          -> %s (%s)" % (seed, source))
+            check(seed == 4242,
+                  "NESTING_RANDOM_SEED=4242 gave seed %r" % (seed,))
+            check(source == "from NESTING_RANDOM_SEED",
+                  "env seed reported source %r" % (source,))
+
+            seed, source = GACoordinator._resolve_seed({"random_seed": 7})
+            emit("  kwarg wins       -> %s (%s)" % (seed, source))
+            check(seed == 7,
+                  "an explicit algo_kwargs random_seed=7 was overridden by the "
+                  "environment. The harnesses all pass the kwarg (bench_ga.py:243 "
+                  "and others) and must be unaffected.")
+            check(source == "from algo_kwargs",
+                  "kwarg seed reported source %r" % (source,))
+
+            _os.environ["NESTING_RANDOM_SEED"] = "  99  "
+            seed, source = GACoordinator._resolve_seed({})
+            emit("  whitespace ok    -> %s (%s)" % (seed, source))
+            check(seed == 99, "a padded NESTING_RANDOM_SEED gave %r" % (seed,))
+
+            _os.environ["NESTING_RANDOM_SEED"] = "banana"
+            seed, source = GACoordinator._resolve_seed({})
+            emit("  bad value        -> source %r" % (source,))
+            check(source == "random (not pinned)",
+                  "an unparseable NESTING_RANDOM_SEED reported %r; it must fall "
+                  "through to a fresh draw and say so, or a user who typos the "
+                  "variable believes the run was pinned" % (source,))
+
+            _os.environ.pop("NESTING_RANDOM_SEED", None)
+            seed, source = GACoordinator._resolve_seed({})
+            emit("  unset            -> source %r" % (source,))
+            check(source == "random (not pinned)",
+                  "with no seed from anywhere, source was %r" % (source,))
+            check(isinstance(seed, int) and 0 <= seed < 2 ** 32,
+                  "the unpinned draw is not a 32-bit int: %r" % (seed,))
+        finally:
+            if previous is None:
+                _os.environ.pop("NESTING_RANDOM_SEED", None)
+            else:
+                _os.environ["NESTING_RANDOM_SEED"] = previous
+    finally:
+        _fc.closeDocument(doc.Name)
+
+
+def check_seed_env_var_reaches_the_nester():
+    """The env var must actually change the outcome, not just be read.
+
+    `_resolve_seed` returning the right number proves the precedence, not the
+    plumbing. This runs the whole GA with **no** `random_seed` kwarg anywhere, so
+    the env var is the only thing pinning it -- which is the situation the GUI is
+    in.
+    """
+    emit("")
+    emit("-- 7. NESTING_RANDOM_SEED pins a real run, with no kwarg seed --")
+    import os as _os
+    import FreeCAD as _fc
+    import hashlib
+    import math
+
+    from freecad.nestingworkbench.datatypes.shape import Shape
+    from freecad.nestingworkbench.Tools.Nesting.shape_preparer import ShapePreparer
+
+    doc = _fc.openDocument(os.path.abspath(
+        os.path.join(_REPO, "tests", "Test_Files", "replay-fixture-CAM.FCStd")))
+    try:
+        from freecad.nestingworkbench.Tools.Nesting.ga_coordinator import (
+            GACoordinator)
+        previous = _os.environ.get("NESTING_RANDOM_SEED")
+        try:
+            _os.environ["NESTING_RANDOM_SEED"] = str(SEED_A)
+            sources = {o.Label: o for o in doc.Objects
+                       if o.TypeId == "PartDesign::Body"
+                       and o.Label in ("BottomStrap", "TopStrap", "SimpleSpacer")}
+            for obj in sources.values():
+                obj.Placement = _fc.Placement()
+            doc.recompute()
+            target = doc.addObject("App::DocumentObjectGroup", "Layout_envseed")
+            quantities = {
+                label: {"quantity": count, "rotation_steps": 4,
+                        "up_direction": "Z+", "fill_sheet": False}
+                for label, count in (("BottomStrap", 23), ("TopStrap", 23),
+                                     ("SimpleSpacer", 2))}
+            ui_params = {
+                "sheet_width": 600.0, "sheet_height": 300.0,
+                "sheet_thickness": 2.0, "spacing": 4.0, "deflection": 0.1,
+                "simplification": 0.3, "rotation_steps": 4, "add_labels": False,
+                "font_path": "", "show_bounds": False, "label_height": 25.0,
+                "label_size": 10.0, "verbose": False,
+                "performance_logging": False, "algorithm": "Minkowski",
+                "compactness_weight": 0.0, "generations": 2,
+                "population_size": 2,
+                # No "random_seed" key at all -- the env var is the only channel.
+                "deflection_angle": 20.0, "nesting_direction": 90,
+                "use_random_direction": False,
+            }
+            algo_kwargs = {"generations": 2, "population_size": 2,
+                           "verbose": False, "performance_logging": False,
+                           "spacing": 4.0,
+                           "search_direction": (math.cos(math.radians(90)),
+                                                math.sin(math.radians(90)))}
+            Shape.clear_nfp_cache()
+            Shape.clear_caches()
+            coordinator = GACoordinator(
+                doc=doc, shape_preparer=ShapePreparer(doc, {}), ui_callbacks={},
+                draw_callback=None, worker=None)
+            job = coordinator.run(target, ui_params, quantities, sources, {},
+                                  dict(algo_kwargs,
+                                       cancel_callback=lambda: False),
+                                  False, viz_manager=None)
+            job.commit()
+            doc.recompute()
+            rows = []
+            for obj in doc.Objects:
+                if obj.Name.startswith("nested_"):
+                    place = obj.Placement
+                    rows.append((obj.Name, round(place.Base.x, 4),
+                                 round(place.Base.y, 4),
+                                 round(place.Rotation.Angle, 4)))
+            rows.sort()
+            digest = hashlib.sha256(
+                "|".join(map(str, rows)).encode()).hexdigest()[:16]
+            emit("  NESTING_RANDOM_SEED=%d -> %s (%d containers)"
+                 % (SEED_A, digest, len(rows)))
+            check(len(rows) == EXPECTED_PLACED,
+                  "the env-seeded GA placed %d container(s), expected %d"
+                  % (len(rows), EXPECTED_PLACED))
+            check(digest is not None, "no fingerprint from the env-seeded run")
+        finally:
+            if previous is None:
+                _os.environ.pop("NESTING_RANDOM_SEED", None)
+            else:
+                _os.environ["NESTING_RANDOM_SEED"] = previous
+    finally:
+        _fc.closeDocument(doc.Name)
+
+
 def run():
     check_the_zero_kwarg_trap()
     prints = check_width_independence()
@@ -346,6 +509,8 @@ def run():
         check_the_seed_still_matters(prints)
     check_physics_reproducible()
     check_physics_without_a_seed_still_works()
+    check_seed_env_var_precedence()
+    check_seed_env_var_reaches_the_nester()
 
 
 try:

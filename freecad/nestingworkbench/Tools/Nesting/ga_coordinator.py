@@ -6,6 +6,7 @@ Extracted from NestingController._execute_ga_nesting() to follow SRP.
 import FreeCAD
 import FreeCADGui
 import math
+import os
 import random
 import time
 from ...datatypes.shape import Shape
@@ -498,6 +499,48 @@ class GACoordinator:
             except RuntimeError:
                 pass  # Sound callback failed or widget deleted
 
+    @staticmethod
+    def _resolve_seed(algo_kwargs):
+        """Return `(seed, source_label)` for this run.
+
+        Precedence, matching `NESTING_STEP_SIZE` and the other env overrides:
+        an explicit `algo_kwargs` entry wins, then `NESTING_RANDOM_SEED`, then a
+        fresh draw.
+
+        **The env var exists because the panel has no way to supply one.**
+        `nesting_controller.py:1323` reads `algo_kwargs['random_seed'] =
+        ui_params.get('random_seed')`, and `random_seed` appears nowhere in
+        `ui_nesting.py` -- measured, 0 occurrences -- so from the GUI that value
+        is always `None` and the seed was previously always drawn from the
+        unseeded global module. The console printed that seed as though it were
+        something the user could note and reuse, and it was not.
+
+        The harnesses already pass `algo_kwargs['random_seed']` directly
+        (`bench_ga.py:243` and others), so they are unaffected by the ordering --
+        the kwarg still wins.
+
+        An unparseable env value **warns and falls through** rather than failing.
+        The other overrides are silent on a bad value, but here the whole point of
+        setting it is reproducibility: a user who exports `NESTING_RANDOM_SEED`
+        with a typo and gets a silent fresh draw would believe the run was pinned.
+        A warning costs one console line and makes that impossible.
+        """
+        explicit = algo_kwargs.get('random_seed')
+        if explicit is not None:
+            return explicit, "from algo_kwargs"
+
+        raw = os.environ.get('NESTING_RANDOM_SEED', '').strip()
+        if raw:
+            try:
+                return int(raw), "from NESTING_RANDOM_SEED"
+            except ValueError:
+                FreeCAD.Console.PrintWarning(
+                    "NESTING_RANDOM_SEED is not an integer "
+                    f"({raw!r}); ignoring it and drawing a fresh seed. A run "
+                    "started with a typo here is NOT reproducible.\n")
+
+        return random.randrange(2**32), "random (not pinned)"
+
     def run(self, target_layout, ui_params, quantities, master_map,
             rotation_params, algo_kwargs, is_simulating, viz_manager=None):
         """
@@ -532,13 +575,12 @@ class GACoordinator:
         performance_logging = algo_kwargs.get('performance_logging', False)
         cancel_callback = algo_kwargs.get('cancel_callback', lambda: False)
 
-        seed = algo_kwargs.get('random_seed')
-        if seed is None:
-            seed = random.randrange(2**32)
+        seed, seed_source = self._resolve_seed(algo_kwargs)
         # Threading: self.rng is accessed sequentially (either worker or main thread via blocking callbacks), never concurrently.
         self.rng = random.Random(seed)
         self.is_simulating = is_simulating
-        FreeCAD.Console.PrintMessage(f"GA random seed: {seed}\n")
+        FreeCAD.Console.PrintMessage(
+            f"GA random seed: {seed} ({seed_source})\n")
         
         if algo_kwargs.pop('clear_nfp_cache', False):
             Shape.clear_nfp_cache()
