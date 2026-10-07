@@ -2886,6 +2886,40 @@ Seed 1234 gives **the same check counts as the fixture it replaces** -- 431 / 18
 `test_replay_startpoint` and `test_tool_clearance`, all 0 failures -- so nothing was
 re-baselined.
 
+### The generator's parameters are validated, not assumed
+
+Every property the layout records reads **identically** on the original fixture and
+on the regenerated one:
+
+| property | original | regenerated |
+|---|---|---|
+| `Algorithm` | `'Minkowski'` | `'Minkowski'` |
+| `RandomDirection` | `False` | `False` |
+| `Generations` | `4` | `4` |
+| `PopulationSize` | `10` | `10` |
+| `GlobalRotationSteps` | `4` | `4` |
+| `Simplification` | `0.3` | `0.3` |
+| `DeflectionAngle` | `20.0` | `20.0` |
+| `NestingDirection` | `90` | `90` |
+| `AddLabels` / `ShowBounds` / `LabelSize` | `False` / `True` / `10.0` | same |
+| sheet + `PartSpacing` | 600 x 300 x 2 mm, 4 mm | same |
+
+So the generator reads real values off the original rather than guessing them. The
+user independently confirmed Minkowski, which is what the file says.
+
+**Correction to commit `e3378a7`.** That message claimed this fixture predates
+NEST-001 and therefore records no `Algorithm` property, and that whether the
+original ran Minkowski or Physics "cannot be read from the file". **It does record
+it, and it reads `'Minkowski'`.** The claim came from an earlier property dump,
+read before this one, and it was wrong in both halves -- the property exists, and it
+was readable.
+
+One generator setting remains unverified, and it is the only one not on the layout:
+`compactness_weight = 0.0`. That is the panel's own default
+(`ui_nesting.py:1337`, `prefs.GetFloat("GACompactnessWeight", 0.0)`), so a run that
+never touched that dial produces exactly this value -- but nothing records it, so
+this rests on the default rather than on evidence from the file.
+
 ### A measurement error worth recording
 
 The seed sweep first reported that **no** seed gave a one-sheet pack, and would
