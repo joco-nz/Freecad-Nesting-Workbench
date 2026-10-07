@@ -299,6 +299,38 @@ still failed" is the useful part.
   shared solid**, because `BottomStrap` arrives at `base=(-42, 0, 0)`. See the
   fixture section below.
 
+### Seeded nests, both algorithms
+
+`test_rotation_determinism.py` (24 checks) asserts that a seeded nest is
+reproducible, on **both** algorithms, and that Minkowski's result does not depend
+on the rotation pool width.
+
+Neither algorithm had a gated check before, so nothing would have noticed either
+regression. Two independent causes, both needed fixing before the property held:
+
+* **Minkowski** — `score_gravity` breaks a metric tie with `rng.randrange`, and
+  every rotation's evaluation shared one `random.Random`, so under the pool those
+  draws raced across worker threads (NEST-032).
+* **Physics** — seven sites drew from the bare `random` module, which nothing in
+  the repo seeds. Measured 1682 `uniform` + 464 `randrange` + 57 `choice` calls
+  from the global module during a run that had been given a seed (NEST-031).
+
+**The suite runs three Physics configurations, not one**, and that is not
+excess. The seven draw sites are not all on one path, and injecting each of them
+individually found **two that a single configuration cannot see**:
+
+| injected site | single-config result |
+|---|---|
+| `initial_side` (`base_nester.py:128`) | **passed** — computed always, consumed only when `anneal_random_shake_direction` is false |
+| `physics_direction=None` (`physics_nester.py:45`) | **passed** — the suite set a fixed direction, so the branch never ran |
+
+Both were gaps in the test, not the fix. Sections 4b and 4c exist because of them.
+
+`rotation_workers=0` passed as a **kwarg** resolves to `os.cpu_count()`
+(`nesting_strategy.py:108` requires `int(explicit) > 0`); only
+`NESTING_ROTATION_WORKERS=0` reaches 0. The suite asserts this rather than working
+around it silently.
+
 ### Rebuilding the nested fixture
 
 `replay-fixture-CAM-Nested.FCStd` is the only fixture in

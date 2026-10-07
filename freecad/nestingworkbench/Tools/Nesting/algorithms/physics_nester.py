@@ -21,15 +21,18 @@ class PhysicsNester(BaseNester):
         """Tries to place a shape at a random location without initial collision."""
         for _ in range(self.max_spawn_count):
             if shape.rotation_steps > 1:
-                angle = random.randrange(shape.rotation_steps) * (360 / shape.rotation_steps)
+                angle = self.rng.randrange(
+                    shape.rotation_steps) * (360 / shape.rotation_steps)
                 shape.set_rotation(angle)
 
             _, _, w, h = shape.bounding_box()
             
             max_target_x = self._bin_width - w
             max_target_y = self._bin_height - h
-            target_x = random.uniform(0, max_target_x) if max_target_x > 0 else 0
-            target_y = random.uniform(0, max_target_y) if max_target_y > 0 else 0
+            target_x = (self.rng.uniform(0, max_target_x)
+                        if max_target_x > 0 else 0)
+            target_y = (self.rng.uniform(0, max_target_y)
+                        if max_target_y > 0 else 0)
             shape.move_to(target_x, target_y)
 
             if sheet.is_placement_valid(shape):
@@ -42,7 +45,7 @@ class PhysicsNester(BaseNester):
         
         if spawned_part:
             if self.physics_direction is None:
-                angle_rad = random.uniform(0, 2 * math.pi)
+                angle_rad = self.rng.uniform(0, 2 * math.pi)
                 part_direction = (math.cos(angle_rad), math.sin(angle_rad))
             else:
                 part_direction = self.physics_direction

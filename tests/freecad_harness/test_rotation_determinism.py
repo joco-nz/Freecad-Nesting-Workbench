@@ -1,6 +1,7 @@
-"""Does a seeded nest depend on the rotation pool width?
+"""Is a seeded nest reproducible, on either algorithm?
 
-Written for [NEST-032], where a seeded nest depended on the rotation pool width.
+Written for [NEST-032] (Minkowski) and [NEST-031] (Physics), which had two
+independent causes and needed both fixed before this property held at all.
 
 **One cause, not two.** The first analysis blamed `as_completed` fold order --
 `find_best_placement` folded in completion order and `_absorb_rotation_result`
@@ -46,6 +47,9 @@ meaningful.
 Reads the placement arrays `nest()` returns, so nothing is measured off a saved
 document.
 
+Neither algorithm had a gated check before, so nothing would have noticed either
+regression.
+
 Gated via `run.sh`. Writes `.last_status_rotationdet`; 0 pass, 1 fail.
 """
 import os
@@ -88,8 +92,12 @@ def check(condition, detail):
     return bool(condition)
 
 
-def fingerprint(seed, workers):
+def fingerprint(seed, workers, algo="Minkowski", physics_shake=True,
+               physics_direction=(0.0, 1.0)):
     """Nest once and return a digest of every placed part's (id, angle, x, y).
+
+    `algo="Physics"` takes no pool: the physics path is single-threaded, so the
+    width is meaningless there and is not varied.
 
     `NESTING_ROTATION_WORKERS` rather than the `rotation_workers` kwarg, because
     `_rotation_worker_limit` treats an explicit 0 as *unset* and falls back to
@@ -159,9 +167,18 @@ def fingerprint(seed, workers):
             Shape.clear_caches()
             parts = preparer.prepare_parts(ui_params, quantities, sources,
                                            target, None)
-            sheets = nesting_logic.nest(parts, 600.0, 300.0, 4, False,
-                                       "Minkowski", None,
-                                       rng=random.Random(seed),
+            if algo == "Physics":
+                # Reduced anneal settings purely for runtime; the draw sites
+                # under test are the spawn and anneal draws, and both are
+                # exercised at these values. The panel's defaults are 25/10.
+                algo_kwargs.update({"anneal_steps": 5, "anneal_rot_steps": 2,
+                                    "physics_direction": physics_direction,
+                                    "step_size": 5.0, "max_spawn_count": 20,
+                                    "max_nesting_steps": 100,
+                                    "anneal_random_shake_direction":
+                                        physics_shake})
+            sheets = nesting_logic.nest(parts, 600.0, 300.0, 4, False, algo,
+                                       None, rng=random.Random(seed),
                                        **algo_kwargs)[0]
             rows = sorted(
                 (str(getattr(p.shape, "id", "?")), round(p.angle, 4),
@@ -236,22 +253,110 @@ def check_the_seed_still_matters(prints):
                                  prints.get(WIDTHS[0])))
 
 
+def check_physics_reproducible():
+    """NEST-031. Physics drew from the unseeded global module at seven sites."""
+    emit("")
+    emit("-- 4. Physics: the same seed gives the same nest --")
+    digests = []
+    for attempt in range(3):
+        digest, placed = fingerprint(SEED_A, 4, algo="Physics")
+        digests.append(digest)
+        emit("  attempt %d -> %s (%d placed)" % (attempt + 1, digest, placed))
+        if not check(digest is not None,
+                     "the Physics nest produced no fingerprint"):
+            return
+        check(placed == EXPECTED_PLACED,
+              "Physics attempt %d placed %d part(s), expected %d"
+              % (attempt + 1, placed, EXPECTED_PLACED))
+    check(len(set(digests)) == 1,
+          "three seeded Physics runs gave %d different layouts: %s. "
+          "physics_nester and base_nester must draw from the seeded rng."
+          % (len(set(digests)), digests))
+
+    other, _ = fingerprint(SEED_B, 4, algo="Physics")
+    emit("  seed %d -> %s" % (SEED_B, other))
+    check(other != digests[0],
+          "Physics seeds %d and %d produced the same layout (%s)"
+          % (SEED_A, SEED_B, digests[0]))
+
+    # The deterministic-shake branch, which is a *different* draw site.
+    # `initial_side = self.rng.choice([1, -1])` is computed unconditionally but
+    # only consumed when `anneal_random_shake_direction` is false; with it on,
+    # `rand_angle` replaces it (base_nester.py:158-160). Injecting a global draw
+    # at `initial_side` while shake is on is therefore NOT caught -- measured,
+    # status 0 -- so this second configuration is what covers that site. Without
+    # it the suite would pass with one of the seven draws still unseeded.
+    emit("")
+    emit("-- 4b. Physics with the deterministic shake branch --")
+    fixed_shake = []
+    for attempt in range(2):
+        digest, placed = fingerprint(SEED_A, 4, algo="Physics",
+                                     physics_shake=False)
+        fixed_shake.append(digest)
+        emit("  attempt %d (shake off) -> %s (%d placed)"
+             % (attempt + 1, digest, placed))
+    check(len(set(fixed_shake)) == 1,
+          "seeded Physics with anneal_random_shake_direction=False gave %d "
+          "different layouts: %s" % (len(set(fixed_shake)), fixed_shake))
+
+    # The third Physics branch: `physics_direction=None`, which draws its own
+    # angle per part. Uncovered by the two above, and an injection at that site
+    # passed the suite (measured, status 0) until this was added. Three
+    # configurations, because the seven draw sites are not all on one path.
+    emit("")
+    emit("-- 4c. Physics with a randomised physics direction --")
+    randomised = []
+    for attempt in range(2):
+        digest, placed = fingerprint(SEED_A, 4, algo="Physics",
+                                     physics_direction=None)
+        randomised.append(digest)
+        emit("  attempt %d (direction None) -> %s (%d placed)"
+             % (attempt + 1, digest, placed))
+    check(len(set(randomised)) == 1,
+          "seeded Physics with physics_direction=None gave %d different "
+          "layouts: %s" % (len(set(randomised)), randomised))
+
+
+def check_physics_without_a_seed_still_works():
+    """The `kwargs.get("rng") or random` fallback must not turn into a crash.
+
+    A direct `nest()` caller with no rng gets the global module, as before. Making
+    the seeded path mandatory would break every caller outside `GACoordinator`,
+    which is not a change this fix is entitled to make.
+    """
+    emit("")
+    emit("-- 5. Physics with no rng at all still nests --")
+    from freecad.nestingworkbench.Tools.Nesting.algorithms import physics_nester
+    nester = physics_nester.PhysicsNester(600.0, 300.0, 4)
+    emit("  PhysicsNester(...).rng is the global module: %s"
+         % (nester.rng is __import__("random")))
+    check(nester.rng is not None,
+          "PhysicsNester with no rng has rng=None, so the first draw would "
+          "raise AttributeError")
+
+    seeded = physics_nester.PhysicsNester(600.0, 300.0, 4, rng=__import__("random").Random(5))
+    check(seeded.rng is not None and seeded.rng is not nester.rng,
+          "PhysicsNester ignored an rng that was passed to it")
+
+
 def run():
     check_the_zero_kwarg_trap()
     prints = check_width_independence()
     if prints:
         check_the_seed_still_matters(prints)
+    check_physics_reproducible()
+    check_physics_without_a_seed_still_works()
 
 
 try:
     run()
     emit("")
-    emit("rotation determinism: %d checks, %d failure(s)"
+    emit("seeded-nest determinism: %d checks, %d failure(s)"
          % (_checks[0], len(_failures)))
     status = 1 if _failures else 0
 except Exception:
     traceback.print_exc()
-    emit("rotation determinism: CRASHED")
+    emit("seeded-nest determinism: CRASHED")
     status = 1
 
 with open(_STATUS_FILE, "w") as fh:

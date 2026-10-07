@@ -36,6 +36,23 @@ class BaseNester(object):
         self.anneal_rot_max = kwargs.get("anneal_rot_max", 90.0)
         self.verbose = kwargs.get("verbose", False)
 
+        # The seeded generator for every random draw in the physics path --
+        # spawn position, spawn angle, and the annealer's side choice, shake
+        # direction and rotation jitter.
+        #
+        # This used to be the bare `random` module at each of those sites, and
+        # `random.seed(` appears nowhere in the repository, so a Physics run drew
+        # from OS entropy on every process: measured 1682 `uniform`, 464
+        # `randrange` and 57 `choice` calls from the global module during a run
+        # that had been given a seed. Two runs at the same seed gave
+        # 08c956cb / 5f156dad.
+        #
+        # `kwargs.get("rng") or random` matches `nesting_strategy.Nester`, so a
+        # direct `nest()` caller with no rng keeps the old behaviour rather than
+        # raising -- `GACoordinator` always supplies one
+        # (`ga_coordinator.py:1191`), and this fallback is for everyone else.
+        self.rng = kwargs.get("rng") or random
+
         self.parts_to_place = []
         self.sheets = []
         self.update_callback = None
@@ -125,7 +142,7 @@ class BaseNester(object):
         initial_angle = part.angle
         
         base_perp_dir = (-direction[1], direction[0])
-        initial_side = random.choice([1, -1])
+        initial_side = self.rng.choice([1, -1])
 
         starting_score = self._evaluate_placement(part, direction)
         best_score = starting_score
@@ -153,7 +170,7 @@ class BaseNester(object):
 
             if translate_enabled:
                 if self.anneal_random_shake_direction:
-                    rand_angle = random.uniform(0, 2 * math.pi)
+                    rand_angle = self.rng.uniform(0, 2 * math.pi)
                     move_dir = (math.cos(rand_angle), math.sin(rand_angle))
                 else:
                     side = initial_side if i % 2 == 0 else -initial_side
@@ -173,7 +190,7 @@ class BaseNester(object):
 
             for r in range(rot_loops):
                 if rotate_enabled and self.anneal_rot_steps > 0:
-                    jitter = random.uniform(-rot_amp, rot_amp)
+                    jitter = self.rng.uniform(-rot_amp, rot_amp)
                     target_angle = current_state[2] + jitter
                 else:
                     target_angle = current_state[2]

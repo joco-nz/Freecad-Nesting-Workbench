@@ -3081,7 +3081,7 @@ checks are the new gated `test_tool_clearance.py`, plus 16 new pytest cases.
 
 ## NEST-031 — `random_seed` is plumbed and printed, but three drawing sites never receive it
 
-`status: open` · `severity: medium (measured)` · `area: nesting / GA`
+`status: resolved` · `severity: medium (measured)` · `area: nesting / GA`
 
 Found while scoping [NEST-029](#nest-029): rebuilding the committed fixture needs to
 know whether a nest can be reproduced at all.
@@ -3126,6 +3126,55 @@ the rng. The two conditions have to be set independently:
 
     NESTING_ROTATION_WORKERS=0   -> serial, and with a seed, reproducible
     (unset, 4 workers)           -> not reproducible even with a perfect seed
+
+### Resolved: Physics now draws from the seeded rng
+
+Seven sites drew from the global module. All now draw from `self.rng`, set once in
+`BaseNester.__init__` as `kwargs.get("rng") or random` -- the same expression
+`nesting_strategy.Nester` uses, so a direct `nest()` caller with no rng keeps the
+old behaviour instead of raising.
+
+| site | draw |
+|---|---|
+| `physics_nester.py:24` | spawn angle |
+| `physics_nester.py:31,32` | spawn target x, y |
+| `physics_nester.py:45` | randomised physics direction, when the box is ticked |
+| `base_nester.py:128` | anneal `initial_side` |
+| `base_nester.py:156` | anneal shake angle |
+| `base_nester.py:176` | anneal rotation jitter |
+
+`PhysicsNester.__init__` needed no change: it forwards `**kwargs` to
+`super().__init__`, so the rng arrives with everything else.
+
+Measured after, seed 777, three separate processes: **`e1a16cea750773eefc3feefb`
+three times**, 48 placed each. Seeds 778 and 779 give `2058823360e93d4692105557`
+and `f6717fa51edf776d4a0f5e3d`. Global `random.*` calls during a seeded Physics
+run: **none**, against 1682 + 464 + 57 before.
+
+The `rng=None` fallback still works: a `nest()` call with no rng places 48 parts
+and does not raise.
+
+### Injection-verified, and two injections that escaped
+
+`test_rotation_determinism.py` grew Physics sections, 24 checks. All seven sites
+were individually injected back to the global module, and **the first pass found
+two sites the suite could not see**:
+
+* **`initial_side` (`base_nester.py:128`) passed with status 0.** It is computed
+  unconditionally but only *consumed* when `anneal_random_shake_direction` is
+  false; with it on, `rand_angle` replaces it (`:158-160`). The suite had only the
+  random-shake configuration. Added section 4b, and the injection is caught.
+* **`physics_direction=None` (`physics_nester.py:45`) passed with status 0.** The
+  suite set a fixed direction, so that branch never ran. Added section 4c, and the
+  injection is caught.
+
+Both were real gaps in the test rather than in the fix, and both are the reason the
+suite now runs **three** Physics configurations rather than one: the seven draw
+sites are not all on one code path. An injection matrix that only tests the
+configuration that happens to be convenient proves much less than it looks like.
+
+Full gate verified too: reverting `BaseNester` to ignore the rng gives exit 1 and
+4 failures in the suite; restored gives exit 0.
 
 ### What the seed does reach
 
@@ -3194,19 +3243,27 @@ rng is threaded through. Neither is established, so the size of the divergence
 between two same-seed runs is not known. A claim like "two runs differ by 3 parts"
 would be invented; what is measured is only that three sites cannot see the seed.
 
-### Fix direction, not yet a plan
+### Follow-ups, not part of this fix
 
-Thread the coordinator's `random.Random` through `physics_nester` and `base_nester`,
-close the `rng or random` fallback so a seeded run cannot silently degrade, expose
-the seed in the UI (or state plainly that runs are not reproducible), then measure
-whether two same-seed runs are identical before and after. The fallback at
-`nesting_strategy.py:338` is the sharpest single point: it is a one-line change that
-converts a silent loss of reproducibility into a loud one.
+**The seed is still unreachable from the panel.** `nesting_controller.py:1323` reads
+`algo_kwargs['random_seed'] = ui_params.get('random_seed')`, and no `random_seed`
+field exists in `ui_nesting.py`, so it is always `None` and `:537` draws the seed
+from the module. Every current consumer of a seed is a harness:
+`bench_ga.py:243`, `probe_target_sheets.py:224`, `probe_gui_session.py:214`.
 
-Kept separate from NEST-029 because this is a product change with its own
-measurements, and because it bears on **what NEST-029 can honestly pin** -- a
-fixture regenerated from a seed the code does not honour is a different artefact
-than one regenerated deterministically.
+The agreed direction is an **environment variable**, not a panel control: the
+workbench already has `NESTING_ROTATION_WORKERS`, `NESTING_STEP_SIZE` and
+`NESTING_FILL_DEAD_HOLES` for exactly this purpose, and the harnesses already lean
+on them. Deliberately *not* persisted on the layout, because a layout recording
+seed 777 but nested on a different core count is not reproducible, and recording it
+would promise what the code cannot deliver.
+
+**A caveat that survives both fixes.** With NEST-032 and this entry applied,
+`NESTING_RANDOM_SEED=777` plus `NESTING_ROTATION_WORKERS=0` gives identical nests
+**on one machine**. `os.cpu_count()` still chooses the default width, so a 4-core
+box and an 8-core box nest identically now that the pool is order-independent, but
+that is because the fold no longer decides the winner -- the width is now a pure
+speed knob, which is the correct property.
 
 ---
 
