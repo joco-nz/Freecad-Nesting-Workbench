@@ -2849,6 +2849,53 @@ without a measured gain, and the evidence says little would be lost.
 For contrast, a re-nest with the wrong `search_direction` produced **2 failures in
 `test_replay_order` and 3 in `test_tool_clearance`**. The suites do catch a bad nest.
 
+### The fixture now has a generator (Block 4)
+
+`tests/Test_Files/replay-fixture-CAM-Nested.FCStd` arrived in one commit with
+nothing producing it, so every change to it since has been manual and this entry
+had to describe a rebuild in prose. `tests/freecad_harness/make_nested_fixture.py`
+is that missing generator, pinned to a seed:
+
+    freecadcmd tests/freecad_harness/make_nested_fixture.py            # verify
+    NESTING_WRITE_FIXTURE=1 freecadcmd tests/freecad_harness/make_nested_fixture.py
+
+**Verification is the default and writes nothing.** The output is a committed
+binary four gated suites depend on, so writing it takes an explicit variable.
+
+**The script verifies its own seed rather than asserting it**: it nests twice and
+compares placement digests, and reports `NOT REPRODUCIBLE` if they disagree. At
+seed 1234 both runs give `66b1eefbec50651e`, 48 parts.
+
+**The seed is not arbitrary, and the first choice was wrong.** Seed 20251007 nests
+reproducibly but spreads the 48 parts over **2 sheets**, and
+`test_replay_order.py` asserts one sheet -- 2 failures there, plus 1 in
+`test_replay_startpoint.py` in consequence. Measured at the recorded settings:
+
+| seed | sheets | hole nestings |
+|---|---|---|
+| 1 | **1** | 14 |
+| **1234** | **1** | 14 |
+| 20251007 | 2 | 14 |
+| 7, 42, 99999 | 2 | 14 |
+
+A one-sheet pack is reachable at the settings the layout records; 20251007 was
+simply not it. The reason is recorded at the `SEED` constant.
+
+Seed 1234 gives **the same check counts as the fixture it replaces** -- 431 / 181 /
+59 / 25 across `test_replay_order`, `test_replay_dressups`,
+`test_replay_startpoint` and `test_tool_clearance`, all 0 failures -- so nothing was
+re-baselined.
+
+### A measurement error worth recording
+
+The seed sweep first reported that **no** seed gave a one-sheet pack, and would
+have had that written up as a finding about the nester. It was my own bug: the
+count used `Name.startswith("Sheet_")`, which matches `Sheet_Boundary_1` as well
+as `Sheet_1`, so every sheet count was doubled. Re-measured with
+`get_sheet_groups`, seeds 1 and 1234 both give one sheet. The doubled count also
+made three different generation settings look like they had produced different
+fingerprints when they had produced identical ones.
+
 ### How the fixture was rebuilt, so the next person does not have to rediscover it
 
 Headless, through `GACoordinator` directly (the route `test_ga_loop.py` uses), not
