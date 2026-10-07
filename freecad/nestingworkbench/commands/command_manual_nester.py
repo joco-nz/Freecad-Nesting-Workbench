@@ -5,6 +5,8 @@ from freecad.nestingworkbench.Tools.ManualNester import manual_nester_panel_mana
 from freecad.nestingworkbench.ui_helpers import QT_TRANSLATE_NOOP
 from freecad.nestingworkbench.freecad_helpers import is_layout_group
 
+MANUAL_NESTER_DISABLED = True
+
 class ManualNesterCommand:
     """The command to manually nest parts in a layout."""
     _task_panel = None
@@ -24,6 +26,9 @@ class ManualNesterCommand:
 
     def IsActive(self):
         """Active only if a document is open and a layout group is selected."""
+        # Greyed out in the toolbar and menu until the manual nester is fixed.
+        if MANUAL_NESTER_DISABLED:
+            return False
         if not FreeCAD.ActiveDocument:
             return False
         selection = FreeCADGui.Selection.getSelection()

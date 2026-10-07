@@ -30,7 +30,8 @@ To re-nest an existing layout, select its `Layout_*` group before you open the p
 **Nesting Algorithm:** **Minkowski** (the default) places parts using No-Fit Polygons. **Physics** drops parts in and shakes them together with a physics simulation.
 
 #### Sheet Setup
-*   **Sheet Width / Height:** Size of the material sheet.
+*   **Sheet list:** An ordered list of sheets to cut from. Each row is a Library sheet or a **Custom** size. Sheet 1 of the layout uses row 1, sheet 2 uses row 2, and the last row repeats. A part too big for an earlier row waits for later rows; one that fits no row stops the run. All rows must share a thickness.
+*   **Sheet Width / Height:** Size of the selected row when it is Custom.
 *   **Sheet Thickness:** Thickness of the material, used for the 3D view and CAM.
 *   **Part Spacing:** Minimum gap between nested parts.
 *   **Bounds Resolution:**
@@ -75,8 +76,9 @@ Click **Run Nesting**. You can stop a run at any time with **Cancel Nesting**.
 
 *   **Stack/Unstack Sheets:** Toggles the selected layout's sheets between stacked at the origin and laid out side by side.
 *   **Export Sheets as DXF:** Exports each sheet of the selected layout to its own DXF file, in a folder you choose.
-*   **Create CAM Job:** Builds a CAM job from the selected layout, with parts, labels and sheet outlines organised for machining.
+*   **Create CAM Job:** Builds a CAM job from the selected layout, with parts, labels and sheet outlines organised for machining. A sheet set to flip also gets a second job for its back side.
 *   **Create Silhouette:** Creates a 2D outline of a 3D part, for use in a CAM job.
+*   **Library:** Opens the Library window. The **Sheets** tab holds your saved sheets. Each one has a name, a material, a size, a thickness, a price and an optional grain direction. The **Materials** tab holds the list a sheet's material is picked from. It starts with a few common materials, and you can add, rename or delete them. Renaming a material changes every sheet that uses it. Deleting one leaves those sheets with no material and keeps everything else. **Duplicate** makes a copy; a copy of a variant is a variant of the same sheet, with the same overrides. **New Variant** makes a sheet that follows another sheet's values until you tick **Override** on a field, so editing the parent's size changes every variant that hasn't overridden it. Deleting a sheet that has variants turns them into independent sheets that keep their current values. The **Flip** property marks a sheet that is turned over after the first side is cut: the finished layout shows its back side above it, rotated 180° about the chosen axis, and the Sheet list shows `+ back` on that row. Sheets are stored per user in the FreeCAD user data folder under `NestingWorkbench/SheetLibrary/` and the materials list in `NestingWorkbench/materials.json`. A nested layout keeps the sheet size it was nested on, even if you edit the library later; reopening it shows what changed, and re-nesting applies it.
 *   **Manual Nester:** (Experimental) Move and rotate parts in a nested layout by hand. Drag a part to move it; hold **Shift** to rotate it instead. **X** / **Y** lock the movement to one axis. **Esc** or a right-click cancels the current drag, and **Enter** confirms it. Three modes are available: push nearby parts out of the way, allow valid (non-overlapping) positions only, or auto-rotate to fit. **NOTE: This tool is still under construction. It may not work correctly, and future versions may change its behaviour or break layouts saved with it.**
 *   **Nesting Settings:** (Nesting menu) Configures crash logging (`Nesting.log`) and debug logging to the Report view.
 *   **About Nesting Workbench** (Nesting menu): Shows the installed version.

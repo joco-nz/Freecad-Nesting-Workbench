@@ -16,18 +16,19 @@ from .layout_manager import LayoutManager, Layout
 from .ga_coordinator import GACoordinator
 from .worker_sizing import set_worker_override
 from ...freecad_helpers import (recursive_delete, set_master_shapes_visible,
-                               hide_all_master_shapes)
+                               hide_all_master_shapes, get_sheet_groups, read_sheet_instance)
 from ...constants import (
-    PHYSICS_ROTATION_PRESETS, PREFS_PATH, PROP_ADD_LABELS, PROP_ALGORITHM, PROP_CANDIDATE_SPACING, PROP_DEFLECTION_ANGLE,
+    FLIPPED_PREFIX, PHYSICS_ROTATION_PRESETS, PREFS_PATH, PREF_SHEET_SEQUENCE, PROP_ADD_LABELS, PROP_ALGORITHM, PROP_CANDIDATE_SPACING, PROP_DEFLECTION_ANGLE,
     PROP_FILL_SHEET, PROP_FONT_FILE, PROP_GENERATIONS, PROP_GLOBAL_ROTATION_STEPS, PROP_LABEL_HEIGHT, PROP_LABEL_SIZE,
     PROP_NESTING_DIRECTION, PROP_PART_ROTATION_OVERRIDE, PROP_PART_ROTATION_STEPS, PROP_PART_SPACING,
-    PROP_POPULATION_SIZE, PROP_QUANTITY, PROP_SHEET_HEIGHT, PROP_SHEET_THICKNESS, PROP_SHEET_WIDTH,
-    PROP_SHOW_BOUNDS, PROP_SIMPLIFICATION, PROP_UP_DIRECTION,
-    SIM_ALL, SIM_OFF,
+    PROP_POPULATION_SIZE, PROP_QUANTITY, PROP_SHEET_SEQUENCE,
+    PROP_SHOW_BOUNDS, PROP_SIMPLIFICATION, PROP_UP_VECTOR,
+    SIM_ALL, SIM_OFF, THICKNESS_MATCH_TOL_MM,
 )
 from ...ui_helpers import closest_angle_index
 from .nesting_job import NestingJob
 from ... import DEFAULT_FONT
+from .algorithms import sheet_sequence
 
 DEFLECTION_ANGLE_PER_MM = 200.0  # legacy UI scale: deflection_angle = deflection_mm * 200
 
@@ -125,10 +126,7 @@ def _as_int(value, default=0):
 # restore. The warning built from these is read by users, not developers, so it
 # must not print raw FreeCAD property names.
 _LAYOUT_SETTING_LABELS = {
-    PROP_SHEET_WIDTH: "sheet width",
-    PROP_SHEET_HEIGHT: "sheet height",
     PROP_PART_SPACING: "part spacing",
-    PROP_SHEET_THICKNESS: "sheet thickness",
     PROP_SIMPLIFICATION: "simplification",
     PROP_LABEL_SIZE: "label size",
     PROP_GENERATIONS: "generations",
@@ -150,6 +148,7 @@ class NestingController:
         self.shape_preparer = ShapePreparer(self.doc, {})
         self.is_running = False
         self.cancel_requested = False
+        self._run_rows = None
         
         self.viz_manager = VisualizationManager()
         
@@ -161,6 +160,10 @@ class NestingController:
 
     def execute_nesting(self):
         nw_logger.info("\n--- NESTING START ---")
+
+        ok, self._run_rows = self._resolve_sheet_sequence()
+        if not ok:
+            return
         
         if self.current_job:
             self.current_job.cleanup()
@@ -243,6 +246,7 @@ class NestingController:
         self.ui.hidden_originals = []
 
         params_missing = self._load_params_from_layout(layout_group) or []
+        library_sentence = self._restore_sheet_sequence(layout_group)
         shapes_missing, dropped_masters = self._load_shapes_from_layout(layout_group)
 
         # The panel owns master visibility while it is open: this layout's row is
@@ -263,6 +267,8 @@ class NestingController:
             sentences.append(
                 f"{len(dropped_masters)} part(s) could not be loaded: "
                 f"{', '.join(dropped_masters)}.")
+        if library_sentence:
+            sentences.append(library_sentence)
         if sentences:
             self.ui.log_message(" ".join(sentences), level="warning")
 
@@ -280,15 +286,11 @@ class NestingController:
         """Extracts algorithm parameters from layout properties."""
         missing = []
         props_map = {
-            PROP_SHEET_WIDTH: self.ui.sheet_width_input,
-            PROP_SHEET_HEIGHT: self.ui.sheet_height_input,
             PROP_PART_SPACING: self.ui.part_spacing_input,
-            PROP_SHEET_THICKNESS: self.ui.sheet_thickness_input,
             PROP_SIMPLIFICATION: self.ui.simplification_input,
             PROP_LABEL_SIZE: self.ui.label_size_input,
             PROP_GENERATIONS: self.ui.minkowski_generations_input,
             PROP_POPULATION_SIZE: self.ui.minkowski_population_size_input,
-            PROP_NESTING_DIRECTION: self.ui.minkowski_direction_dial,
             PROP_CANDIDATE_SPACING: self.ui.minkowski_candidate_spacing_input,
         }
         
@@ -300,6 +302,13 @@ class NestingController:
                 widget.setValue(val)
             else:
                 missing.append(f"{_LAYOUT_SETTING_LABELS.get(prop, prop)} (defaulted)")
+
+
+        nesting_direction = getattr(layout_group, PROP_NESTING_DIRECTION, None)
+        if nesting_direction is not None:
+            self.ui.minkowski_direction_dial.setDegrees(nesting_direction)
+        else:
+            missing.append(f"{_LAYOUT_SETTING_LABELS[PROP_NESTING_DIRECTION]} (defaulted)")
 
         # Deflection has three outcomes and only one of them is a real default.
         deflection_angle = getattr(layout_group, PROP_DEFLECTION_ANGLE, None)
@@ -358,6 +367,76 @@ class NestingController:
 
         return missing
 
+
+    def _restore_sheet_sequence(self, layout_group):
+        """Restore the sheet sequence from layout properties or sheet groups.
+
+        Returns a warning sentence or None.
+        """
+        from ...sheet_library import model, store
+        label = getattr(layout_group, "Label", "")
+        rebuilt = False
+        raw_seq = getattr(layout_group, PROP_SHEET_SEQUENCE, None)
+        if raw_seq is not None:
+            try:
+                rows = sheet_sequence.from_json(raw_seq)
+            except ValueError:
+                return f"Layout '{label}' has an unreadable sheet list; kept the panel's current sheets."
+        else:
+            sheets = get_sheet_groups(layout_group)
+            if not sheets:
+                return f"Layout '{label}' was saved without a sheet list; kept the panel's current sheets."
+            rows = []
+            for g in sheets:
+                snap = read_sheet_instance(g)
+                if snap is None:
+                    return f"Layout '{label}' was saved without a sheet list; kept the panel's current sheets."
+                rows.append(snap)
+            while len(rows) > 1 and rows[-1] == rows[-2]:
+                rows.pop()
+            rebuilt = True
+
+        self.ui.set_sheet_sequence(rows)
+
+        # Compare each library row with the disk library before populate_library_sheets reconciles it.
+        lib = store.load_library()
+        missing_rows = []
+        changed_messages = []
+        for i, row in enumerate(rows, start=1):
+            sheet_id = row.get("sheet_id")
+            if not sheet_id:
+                continue
+            record = lib.sheets.get(sheet_id)
+            if record is None or model.validate_sheet(record, lib):
+                missing_rows.append(str(i))
+            else:
+                effective = model.resolve_sheet(record, lib)[0]
+                changed = [key for key in ("width", "height", "thickness", "cost")
+                           if abs(float(effective[key]) - float(row[key])) > 1e-6]
+                if effective["material"] != row["material"]:
+                    changed.append("material")
+                if effective["flip"] != row["flip"]:
+                    changed.append("flip")
+                if changed:
+                    changed_messages.append(
+                        f"Sheet row {i} ('{row['sheet_name']}') has changed in the library since this layout was nested ({', '.join(changed)}). Re-nest to apply it."
+                    )
+
+        sentences = []
+        if missing_rows:
+            rows_str = ", ".join(missing_rows)
+            sentences.append(
+                f"Sheet row(s) {rows_str} are not in this machine's sheet library or are not valid; using the layout's saved size as Custom."
+            )
+        sentences.extend(changed_messages)
+
+        self.ui.populate_library_sheets()
+
+        if rebuilt:
+            sentences.append("sheet list rebuilt from the layout's sheets")
+
+        return " ".join(sentences) if sentences else None
+
     def _load_shapes_from_layout(self, layout_group):
         """Identifies master shapes and their quantities/overrides."""
         master_shapes_group = next((c for c in layout_group.Group if c.Label.startswith("MasterShapes")), None)
@@ -368,13 +447,13 @@ class NestingController:
             return [], []
 
         shapes_to_load = []
-        quantities, overrides, steps_map, up_dirs, fill_map = {}, {}, {}, {}, {}
+        quantities, overrides, steps_map, up_vectors, fill_map = {}, {}, {}, {}, {}
         dropped_masters = []
         
         missing_counts = {
             PROP_PART_ROTATION_OVERRIDE: 0,
             PROP_PART_ROTATION_STEPS: 0,
-            PROP_UP_DIRECTION: 0,
+            PROP_UP_VECTOR: 0,
             PROP_FILL_SHEET: 0,
             PROP_QUANTITY: 0,
         }
@@ -406,10 +485,10 @@ class NestingController:
                     if verbose:
                         nw_logger.info(f"[NestingController] Part '{label}': missing {PROP_PART_ROTATION_STEPS}, defaulted to global")
 
-                if not hasattr(master, PROP_UP_DIRECTION):
-                    missing_counts[PROP_UP_DIRECTION] += 1
+                if not hasattr(master, PROP_UP_VECTOR):
+                    missing_counts[PROP_UP_VECTOR] += 1
                     if verbose:
-                        nw_logger.info(f"[NestingController] Part '{label}': missing {PROP_UP_DIRECTION}, defaulted to Z+")
+                        nw_logger.info(f"[NestingController] Part '{label}': missing {PROP_UP_VECTOR}, defaulted to (0, 0, 1)")
 
                 if not hasattr(master, PROP_FILL_SHEET):
                     missing_counts[PROP_FILL_SHEET] += 1
@@ -429,7 +508,7 @@ class NestingController:
                 if raw_steps > 0:
                     steps_map[label] = raw_steps
 
-                up_dirs[label] = str(getattr(master, PROP_UP_DIRECTION, "Z+"))
+                up_vectors[label] = getattr(master, PROP_UP_VECTOR, FreeCAD.Vector(0, 0, 1))
                 fill_map[label] = _as_bool(getattr(master, PROP_FILL_SHEET, False))
             else:
                 dropped_masters.append(master.Label)
@@ -437,7 +516,7 @@ class NestingController:
         self.load_shapes(
             shapes_to_load, is_reloading_layout=True, initial_quantities=quantities,
             initial_overrides=overrides, initial_rotation_steps=steps_map,
-            initial_up_directions=up_dirs, initial_fill_sheet=fill_map
+            initial_up_vectors=up_vectors, initial_fill_sheet=fill_map
         )
 
         missing_descriptions = []
@@ -447,9 +526,9 @@ class NestingController:
         if missing_counts[PROP_PART_ROTATION_STEPS] > 0:
             c = missing_counts[PROP_PART_ROTATION_STEPS]
             missing_descriptions.append(f"per-part rotation steps ({c} {'part' if c == 1 else 'parts'}, defaulted to global)")
-        if missing_counts[PROP_UP_DIRECTION] > 0:
-            c = missing_counts[PROP_UP_DIRECTION]
-            missing_descriptions.append(f"up direction ({c} {'part' if c == 1 else 'parts'}, defaulted to Z+)")
+        if missing_counts[PROP_UP_VECTOR] > 0:
+            c = missing_counts[PROP_UP_VECTOR]
+            missing_descriptions.append(f"up vector ({c} {'part' if c == 1 else 'parts'}, defaulted to (0, 0, 1))")
         if missing_counts[PROP_FILL_SHEET] > 0:
             c = missing_counts[PROP_FILL_SHEET]
             missing_descriptions.append(f"fill sheet ({c} {'part' if c == 1 else 'parts'}, defaulted to off)")
@@ -505,7 +584,7 @@ class NestingController:
 
     def load_shapes(self, selection, is_reloading_layout=False, initial_quantities=None, 
                      initial_overrides=None, initial_rotation_steps=None,
-                     initial_up_directions=None, initial_fill_sheet=None):
+                     initial_up_vectors=None, initial_fill_sheet=None):
         """Loads a selection of shapes into the UI."""
         self.ui.nest_button.setEnabled(True)
         
@@ -555,9 +634,9 @@ class NestingController:
             if initial_overrides and obj.Label in initial_overrides:
                 override = initial_overrides[obj.Label]
             
-            up_dir = "Z+"
-            if initial_up_directions and obj.Label in initial_up_directions:
-                up_dir = initial_up_directions[obj.Label]
+            up_vec = FreeCAD.Vector(0, 0, 1)
+            if initial_up_vectors and obj.Label in initial_up_vectors:
+                up_vec = initial_up_vectors[obj.Label]
                 
             fill = False
             if initial_fill_sheet and obj.Label in initial_fill_sheet:
@@ -566,7 +645,7 @@ class NestingController:
             add_row_fn = getattr(self.ui, 'add_part_row', getattr(self.ui, '_add_part_row', None))
             if add_row_fn:
                  add_row_fn(i, display_label, quantity=qty, rotation_steps=steps, 
-                            override_rotation=override, up_direction=up_dir, fill_sheet=fill)
+                            override_rotation=override, up_vector=up_vec, fill_sheet=fill)
             
             item = self.ui.shape_table.item(i, 0)
             if item:
@@ -937,7 +1016,7 @@ class NestingController:
             nonlocal found_count
             indent = "  " * depth
             
-            if obj.Label.startswith("boundary_"):
+            if obj.Label.startswith(("boundary_", f"{FLIPPED_PREFIX}boundary_")):
                 found_count += 1
                 if hasattr(obj, "ViewObject"):
                     obj.ViewObject.Visibility = is_visible
@@ -953,6 +1032,54 @@ class NestingController:
                     
         set_show_bounds(target_layout)
         self.doc.recompute()
+
+    def _resolve_sheet_sequence(self):
+        """Re-read the library for every row in the sequence just before a run.
+
+        Returns (ok, rows). Refuses the run on a missing or invalid library sheet
+        or a thickness mismatch. On success, updates the panel sequence to refreshed
+        disk values and returns (True, rows).
+        """
+        from ...sheet_library import model, store
+        library = store.load_library()
+        rows = self.ui.sheet_sequence()
+        reasons = []
+        resolved_rows = []
+
+        for n, row in enumerate(rows, start=1):
+            sheet_id = row.get("sheet_id", "")
+            if not sheet_id:
+                resolved_rows.append(dict(row))
+                continue
+            record = library.sheets.get(sheet_id) if library else None
+            if record is None:
+                reasons.append(f"row {n}: sheet '{row.get('sheet_name', '')}' is no longer in the sheet library")
+            else:
+                errors = model.validate_sheet(record, library)
+                if errors:
+                    name = record.get("name", row.get("sheet_name", ""))
+                    reasons.append(f"row {n}: sheet '{name}' is not valid ({'; '.join(errors)})")
+                else:
+                    effective, _err = model.resolve_sheet(record, library)
+                    resolved_rows.append(sheet_sequence.library_row(effective))
+
+        if reasons:
+            self.ui.log_message("Cannot nest: " + "; ".join(reasons) + ". Fix the row or pick another sheet.", level="warning")
+            return False, None
+
+        mismatch = sheet_sequence.thickness_mismatch(resolved_rows, THICKNESS_MATCH_TOL_MM)
+        if mismatch:
+            t1 = resolved_rows[0]["thickness"]
+            mismatch_details = ", ".join(f"row {n} is {t:g} mm" for n, t in mismatch)
+            self.ui.log_message(
+                f"Cannot nest: every sheet in the list must be the same thickness (row 1 is {t1:g} mm; {mismatch_details}).",
+                level="warning",
+            )
+            return False, None
+
+        cur_sel = self.ui.selected_sheet_row()
+        self.ui.set_sheet_sequence(resolved_rows, selected=cur_sel)
+        return True, resolved_rows
 
     def _ensure_target_layout(self):
         """Determines the target layout, creating a default one if none exists."""
@@ -986,10 +1113,7 @@ class NestingController:
         deflection_mm = deflection_angle / DEFLECTION_ANGLE_PER_MM
         
         settings_dict = {
-            'sheet_width': self.ui.sheet_width_input.value(),
-            'sheet_height': self.ui.sheet_height_input.value(),
             'spacing': self.ui.part_spacing_input.value(),
-            'sheet_thickness': self.ui.sheet_thickness_input.value(),
             'deflection': deflection_mm,
             'deflection_angle': deflection_angle,
             'simplification': self.ui.simplification_input.value(),
@@ -1004,7 +1128,7 @@ class NestingController:
             'candidate_spacing': self.ui.minkowski_candidate_spacing_input.value(),
             'compactness_weight': self.ui.minkowski_compactness_input.value(),
             'verbose': self.ui.verbose_logging_checkbox.isChecked(),
-            'nesting_direction': self.ui.minkowski_direction_dial.value(),
+            'nesting_direction': self.ui.minkowski_direction_dial.degrees(),
             'algorithm': self.ui.algorithm_dropdown.currentText(),
             'use_random_direction': (self.ui.physics_random_checkbox.isChecked() if self.ui.algorithm_dropdown.currentText() == 'Physics' else self.ui.minkowski_random_checkbox.isChecked()),
             'stability_tolerance': self.ui.physics_improvement_threshold_input.value(),
@@ -1016,6 +1140,8 @@ class NestingController:
             'anneal_rot_min': self.ui.physics_anneal_rot_min.value(),
             'anneal_rot_max': self.ui.physics_anneal_rot_max.value(),
             'worker_processes': self.ui.worker_processes_input.value(),
+            'sheet_sequence': [dict(r) for r in self._run_rows] if self._run_rows else [],
+            'sheet_thickness': self._run_rows[0]['thickness'] if self._run_rows else self.ui.sheet_thickness_input.value(),
         }
         
         self.save_settings(settings_dict)
@@ -1025,13 +1151,12 @@ class NestingController:
     def save_settings(self, settings):
         """Saves current UI settings to FreeCAD preferences."""
         prefs = FreeCAD.ParamGet(PREFS_PATH)
-        prefs.SetFloat(PROP_SHEET_WIDTH, float(settings['sheet_width']))
-        prefs.SetFloat(PROP_SHEET_HEIGHT, float(settings['sheet_height']))
+        prefs.SetString(PREF_SHEET_SEQUENCE, sheet_sequence.to_json(settings['sheet_sequence']))
         prefs.SetFloat(PROP_PART_SPACING, float(settings['spacing']))
-        prefs.SetFloat(PROP_SHEET_THICKNESS, float(settings['sheet_thickness']))
         prefs.SetFloat(PROP_DEFLECTION_ANGLE, float(settings.get('deflection_angle', 10)))  # Save angle, not mm
         prefs.SetFloat(PROP_SIMPLIFICATION, float(settings['simplification']))
         prefs.SetFloat("GACompactnessWeight", float(settings['compactness_weight']))
+        prefs.SetFloat("DirectionDetentStep", self.ui.minkowski_direction_dial.detentStep())
         
         mink_steps = int(360 / self.ui.rotation_angles[self.ui.minkowski_rotation_steps_slider.value()])
         prefs.SetInt("MinkowskiRotationSteps", mink_steps)
@@ -1074,8 +1199,12 @@ class NestingController:
                 override_box = rot_widget.findChild(QtWidgets.QCheckBox)
                 override = override_box.isChecked() if override_box else False
                 
-                up_dir_combo = self.ui.shape_table.cellWidget(row, 3)
-                up_direction = up_dir_combo.currentText() if up_dir_combo else "Z+"
+                up_vector_widget = self.ui.shape_table.cellWidget(row, 3)
+                if up_vector_widget:
+                    spinboxes = up_vector_widget.findChildren(QtWidgets.QDoubleSpinBox)
+                    up_vector = FreeCAD.Vector(spinboxes[0].value(), spinboxes[1].value(), spinboxes[2].value())
+                else:
+                    up_vector = FreeCAD.Vector(0, 0, 1)
                 
                 fill_checkbox = self.ui.shape_table.cellWidget(row, 4)
                 fill_sheet = fill_checkbox.isChecked() if fill_checkbox else False
@@ -1089,7 +1218,7 @@ class NestingController:
                     # reopening the layout can restore the row.
                     'override_rotation': override,
                     'part_rotation_steps': rot_val,
-                    'up_direction': up_direction,
+                    'up_vector': up_vector,
                     'fill_sheet': fill_sheet
                 }
                 
@@ -1116,10 +1245,8 @@ class NestingController:
             if self.ui.physics_random_checkbox.isChecked():
                 algo_kwargs['physics_direction'] = None 
             else:
-                # Dial value is CCW from 6 o'clock. 
-                # 0=Down(0,-1), 90=Left(-1,0), 180=Up(0,1), 270=Right(1,0)
-                angle_deg = (270 - self.ui.physics_direction_dial.value()) % 360
-                angle_rad = math.radians(angle_deg)
+                # degrees() is a maths angle: 0 = Right (1,0), 90 = Up (0,1), 180 = Left, 270 = Down (0,-1)
+                angle_rad = math.radians(self.ui.physics_direction_dial.degrees())
                 algo_kwargs['physics_direction'] = (math.cos(angle_rad), math.sin(angle_rad))
             
             algo_kwargs['step_size'] = self.ui.physics_step_size_input.value()
@@ -1141,8 +1268,8 @@ class NestingController:
             if self.ui.minkowski_random_checkbox.isChecked():
                 algo_kwargs['search_direction'] = None
             else:
-                angle_deg = (270 - self.ui.minkowski_direction_dial.value()) % 360
-                angle_rad = math.radians(angle_deg)
+                # degrees() is a maths angle: 0 = Right (1,0), 90 = Up (0,1), 180 = Left, 270 = Down (0,-1)
+                angle_rad = math.radians(self.ui.minkowski_direction_dial.degrees())
                 algo_kwargs['search_direction'] = (math.cos(angle_rad), math.sin(angle_rad))
             
             algo_kwargs['population_size'] = self.ui.minkowski_population_size_input.value()

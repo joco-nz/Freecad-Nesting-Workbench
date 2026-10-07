@@ -5,8 +5,10 @@ from ...constants import (
     PROP_ADD_LABELS, PROP_ALGORITHM, PROP_BOOL, PROP_CANDIDATE_SPACING, PROP_DEFLECTION_ANGLE, PROP_FILE, PROP_FLOAT,
     PROP_FONT_FILE, PROP_GENERATIONS, PROP_GLOBAL_ROTATION_STEPS, PROP_INTEGER, PROP_LABEL_HEIGHT, PROP_LABEL_SIZE,
     PROP_LENGTH, PROP_NESTING_DIRECTION, PROP_PART_SPACING, PROP_POPULATION_SIZE, PROP_SHEET_HEIGHT,
-    PROP_SHEET_THICKNESS, PROP_SHEET_WIDTH, PROP_SHOW_BOUNDS, PROP_SIMPLIFICATION, PROP_STRING,
+    PROP_SHEET_SEQUENCE, PROP_SHEET_THICKNESS, PROP_SHEET_WIDTH, PROP_SHOW_BOUNDS, PROP_SIMPLIFICATION, PROP_STRING,
 )
+from freecad.nestingworkbench import nw_logger
+from .algorithms import sheet_sequence
 from .algorithms.minkowski_engine import DEFAULT_CANDIDATE_SPACING
 
 class NestingJob:
@@ -98,8 +100,11 @@ class NestingJob:
 
     def _apply_properties(self, target_layout):
         p = self.params
-        self._set_prop(target_layout, PROP_LENGTH, PROP_SHEET_WIDTH, p['sheet_width'])
-        self._set_prop(target_layout, PROP_LENGTH, PROP_SHEET_HEIGHT, p['sheet_height'])
+        self._set_prop(target_layout, PROP_STRING, PROP_SHEET_SEQUENCE,
+                       sheet_sequence.to_json(p['sheet_sequence']))
+        for stale in (PROP_SHEET_WIDTH, PROP_SHEET_HEIGHT):
+            if hasattr(target_layout, stale):
+                target_layout.removeProperty(stale)
         self._set_prop(target_layout, PROP_LENGTH, PROP_PART_SPACING, p['spacing'])
         self._set_prop(target_layout, PROP_LENGTH, PROP_SHEET_THICKNESS, p['sheet_thickness'])
         self._set_prop(target_layout, PROP_FLOAT, PROP_DEFLECTION_ANGLE, p.get('deflection_angle', 30))
@@ -116,11 +121,7 @@ class NestingJob:
                        p.get('candidate_spacing', DEFAULT_CANDIDATE_SPACING))
         self._set_prop(target_layout, PROP_STRING, PROP_ALGORITHM,
                        str(p.get('algorithm', 'Minkowski')))
-
-        # Save Nesting Direction as a vector/tuple if possible, or just the dial value
-        # For simplicity and transparency in the UI, we'll save the dial value (degrees)
-        dial_val = p.get('nesting_direction', 0)
-        self._set_prop(target_layout, PROP_INTEGER, PROP_NESTING_DIRECTION, dial_val)
+        self._set_prop(target_layout, PROP_FLOAT, PROP_NESTING_DIRECTION, float(p.get('nesting_direction', 270.0)))
 
     def _set_prop(self, obj, type_str, name, val):
         if not hasattr(obj, name):

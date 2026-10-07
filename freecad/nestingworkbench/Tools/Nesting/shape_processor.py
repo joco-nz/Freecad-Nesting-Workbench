@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: LGPL-2.1-or-later
-# freecad/nestingworkbench/Tools/Nesting/algorithms/shape_processor.py
+# freecad/nestingworkbench/Tools/Nesting/shape_processor.py
 
 """
 This module contains functions for processing FreeCAD shapes to prepare them
@@ -9,42 +9,40 @@ buffered boundaries.
 
 import FreeCAD
 import Part
-from ....freecad_helpers import get_up_direction_rotation
-from .... import nw_logger
+from ...freecad_helpers import get_up_vector_rotation, world_shape
+from ... import nw_logger
 
 
 class EdgeOnProfileError(ValueError):
     """A flat object seen edge-on from the chosen up direction has no 2D area."""
 
 
-def _require_area(poly, obj, up_direction):
+def _require_area(poly, obj, up_vector):
     if poly.is_empty or poly.area < 1e-6:
         raise EdgeOnProfileError(
-            f"'{obj.Label}' has no area seen from up direction {up_direction}: "
+            f"'{obj.Label}' has no area seen from up vector {up_vector}: "
             f"it is flat and viewed edge-on. Choose the up direction along its normal."
         )
 
 
-def get_2d_profile_from_obj(obj, up_direction="Z+", tessellation_quality=0.1, simplification=1.0, verbose=False):
+def get_2d_profile_from_obj(obj, up_vector=None, tessellation_quality=0.1, simplification=1.0, verbose=False):
     """
     Extracts a usable 2D profile from a FreeCAD object by projecting it onto the XY plane.
     This captures the full silhouette of the shape from the specified viewing direction.
     
     Args:
         obj: FreeCAD object to extract profile from
-        up_direction: Which direction should be treated as "up" when projecting to 2D.
-                      One of "Z+", "Z-", "Y+", "Y-", "X+", "X-" (default: "Z+")
+        up_vector: A FreeCAD.Vector giving the part's local "up" direction, or None.
         tessellation_quality: Max deviation for meshing (mm).
         simplification: Tolerance for simplifying the polygon (mm). Applied early to reduce point count.
     """
-    # Get shape in world coordinates (apply source object's placement)
-    shape = obj.Shape.copy()
-    if obj.Placement and not obj.Placement.isIdentity():
-        shape.transformShape(obj.Placement.Matrix)
+    # World shape includes the object's own Placement and any parents'
+    # placement (PartDesign Body, App::Part; GLB-001).
+    shape = world_shape(obj)
     
     # If we need to rotate the shape to align the up direction with Z+
-    rotation = get_up_direction_rotation(up_direction)
-    needs_rotation = up_direction != "Z+" and up_direction is not None
+    rotation = get_up_vector_rotation(up_vector)
+    needs_rotation = not rotation.isIdentity()
     
     if needs_rotation:
         # Rotate the shape around its center
@@ -58,7 +56,7 @@ def get_2d_profile_from_obj(obj, up_direction="Z+", tessellation_quality=0.1, si
         placement = FreeCAD.Placement(FreeCAD.Vector(0, 0, 0), rotation, center)
         shape.transformShape(placement.Matrix)
         if verbose:
-            nw_logger.info(f"  -> Rotated shape for up_direction={up_direction}")
+            nw_logger.info(f"  -> Rotated shape for up_vector={up_vector}")
     
     # Always center the shape using bounding box center (for both rotated and non-rotated)
     bb = shape.BoundBox
@@ -81,7 +79,7 @@ def get_2d_profile_from_obj(obj, up_direction="Z+", tessellation_quality=0.1, si
                      from shapely.geometry import Polygon as ShapelyPolygon
                      if pts[0] != pts[-1]: pts.append(pts[0])
                      poly = ShapelyPolygon(pts)
-                     _require_area(poly, obj, up_direction)
+                     _require_area(poly, obj, up_vector)
                      return poly
             except EdgeOnProfileError:
                 raise
@@ -115,7 +113,7 @@ def get_2d_profile_from_obj(obj, up_direction="Z+", tessellation_quality=0.1, si
                                 h_pts.append(h_pts[0])
                             holes.append(h_pts)
                     poly = ShapelyPolygon(outer_pts, holes)
-                    _require_area(poly, obj, up_direction)
+                    _require_area(poly, obj, up_vector)
                     if simplification > 0:
                         poly = poly.simplify(simplification, preserve_topology=True)
                     if verbose:
@@ -253,7 +251,7 @@ def get_2d_profile_from_obj(obj, up_direction="Z+", tessellation_quality=0.1, si
     # If nothing worked
     raise ValueError(f"Unsupported object '{obj.Label}' or no valid 2D geometry found.")
 
-def create_single_nesting_part(shape_to_populate, shape_obj, spacing, deflection=0.05, simplification=1.0, up_direction="Z+", verbose=False):
+def create_single_nesting_part(shape_to_populate, shape_obj, spacing, deflection=0.05, simplification=1.0, up_vector=None, verbose=False):
     """
     Processes a FreeCAD object to generate a shapely-based boundary and populates
     the geometric properties of the provided Shape object. The created boundary is
@@ -265,9 +263,9 @@ def create_single_nesting_part(shape_to_populate, shape_obj, spacing, deflection
     :param spacing: The spacing/buffer to add around the shape.
     :param deflection: Max deviation for curve creation (mm).
     :param simplification: Tolerance for smoothing (mm).
-    :param up_direction: Which direction is "up" for 2D projection ("Z+", "Z-", "Y+", "Y-", "X+", "X-").
+    :param up_vector: A FreeCAD.Vector giving the part's local "up" direction, or None.
     """
-    from ..nesting_logic import SHAPELY_AVAILABLE
+    from .nesting_logic import SHAPELY_AVAILABLE
     if not SHAPELY_AVAILABLE:
         raise ImportError("The shapely library is required for boundary creation but is not installed.")
     
@@ -278,13 +276,12 @@ def create_single_nesting_part(shape_to_populate, shape_obj, spacing, deflection
     from shapely.affinity import translate
     from shapely.validation import make_valid
 
-    profile_2d = get_2d_profile_from_obj(shape_obj, up_direction, deflection, simplification, verbose=verbose)
+    profile_2d = get_2d_profile_from_obj(shape_obj, up_vector, deflection, simplification, verbose=verbose)
     
-    # Compute the world-space BB center from the NON-ROTATED shape
-    # The rotation is handled by the placement in shape_preparer
-    temp_shape = shape_obj.Shape.copy()
-    if shape_obj.Placement and not shape_obj.Placement.isIdentity():
-        temp_shape.transformShape(shape_obj.Placement.Matrix)
+    # World-space BB centre of the NON-ROTATED shape (including parents'
+    # placement; GLB-001). The up-vector rotation is handled by the
+    # placement in shape_preparer.
+    temp_shape = world_shape(shape_obj)
     
     # Get BB center BEFORE rotation - this is the offset for centering
     bb = temp_shape.BoundBox
@@ -343,7 +340,7 @@ def create_single_nesting_part(shape_to_populate, shape_obj, spacing, deflection
     
     # offset_from_origin is the vector in the 2D PROFILE PLANE.
     # It needs to be rotated back to world space.
-    rotation = get_up_direction_rotation(up_direction)
+    rotation = get_up_vector_rotation(up_vector)
     inv_rotation = rotation.inverted()
 
     offset_3d = FreeCAD.Vector(offset_from_origin.x, offset_from_origin.y, 0)

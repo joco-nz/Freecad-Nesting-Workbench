@@ -109,9 +109,7 @@ class MinkowskiEngine:
     Handles geometric operations for Minkowski nesting, such as NFP generation,
     candidate point finding, and placement validation.
     """
-    def __init__(self, bin_width, bin_height, candidate_spacing, discretize_edges=True, log_callback=None, verbose=False, search_direction=(0, -1), rng=None):
-        self.bin_width = bin_width
-        self.bin_height = bin_height
+    def __init__(self, candidate_spacing, discretize_edges=True, log_callback=None, verbose=False, search_direction=(0, -1), rng=None):
         self.candidate_spacing = candidate_spacing
         self.discretize_edges = discretize_edges
         self.log_callback = log_callback
@@ -121,7 +119,6 @@ class MinkowskiEngine:
         self.rng = rng
         self._log_lock = Lock()
 
-        self.bin_polygon = Polygon([(0, 0), (self.bin_width, 0), (self.bin_width, self.bin_height), (0, self.bin_height)])
         self._perf_stats = {'cache_hits': 0, 'cache_misses': 0, 'nfp_compute_ms': 0.0, 'rotations_skipped': 0}
         self._perf_lock = Lock()
         self._cand_cache_lock = Lock()
@@ -224,8 +221,8 @@ class MinkowskiEngine:
         rminx, rminy, rmaxx, rmaxy = part_extents
 
         def _bounds_ok(pts):
-            return ((pts[:, 0] + rminx >= -tol) & (pts[:, 0] + rmaxx <= self.bin_width + tol) &
-                    (pts[:, 1] + rminy >= -tol) & (pts[:, 1] + rmaxy <= self.bin_height + tol))
+            return ((pts[:, 0] + rminx >= -tol) & (pts[:, 0] + rmaxx <= sheet.width + tol) &
+                    (pts[:, 1] + rminy >= -tol) & (pts[:, 1] + rmaxy <= sheet.height + tol))
 
         def _drop_inside(polys, pts, keep):
             """Clear keep-mask bits for points strictly inside any poly."""

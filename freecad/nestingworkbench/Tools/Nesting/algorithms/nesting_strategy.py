@@ -7,14 +7,11 @@ from datetime import datetime
 import numpy as np
 from shapely.affinity import rotate
 
-try:
-    import FreeCAD
-except ImportError:
-    FreeCAD = None
 from ....datatypes.sheet import Sheet
 from ....datatypes.placed_part import PlacedPart
 from .... import nw_logger
 from . import genetic_utils
+from . import sheet_sequence
 from .minkowski_engine import MinkowskiEngine, DEFAULT_CANDIDATE_SPACING
 
 class PlacementOptimizer:
@@ -134,7 +131,7 @@ class PlacementOptimizer:
         min_x, min_y, max_x, max_y = rotated_poly.bounds
         extents = (min_x - centroid.x, min_y - centroid.y,
                    max_x - centroid.x, max_y - centroid.y)
-        w_bin, h_bin = self.engine.bin_width, self.engine.bin_height
+        w_bin, h_bin = sheet.width, sheet.height
         corners = np.array([
             [-extents[0],         -extents[1]        ],
             [w_bin - extents[2],  -extents[1]        ],
@@ -171,9 +168,10 @@ class Nester:
     The main nesting algorithm class. 
     It orchestrates the nesting process using PlacementOptimizer and MinkowskiEngine.
     """
-    def __init__(self, width, height, rotation_steps=1, **kwargs):
-        self.bin_width = width
-        self.bin_height = height
+    def __init__(self, sheet_sizes, rotation_steps=1, **kwargs):
+        if not sheet_sizes:
+            raise ValueError("sheet_sizes must be a non-empty list of (width, height) tuples")
+        self.sheet_sizes = [(float(w), float(h)) for w, h in sheet_sizes]
         self.spacing = kwargs.get("spacing", 0)
         self.search_direction = kwargs.get("search_direction", (0, -1)) # Default Down
         
@@ -189,7 +187,7 @@ class Nester:
         self.spawn_more_callback = kwargs.get("spawn_more_callback")  # Mints fill-part instances on the main thread
         
         candidate_spacing = kwargs.get("candidate_spacing", DEFAULT_CANDIDATE_SPACING)
-        self.engine = MinkowskiEngine(width, height, candidate_spacing, log_callback=self.log_callback, verbose=self.verbose, search_direction=self.search_direction, rng=kwargs.get("rng"))
+        self.engine = MinkowskiEngine(candidate_spacing, log_callback=self.log_callback, verbose=self.verbose, search_direction=self.search_direction, rng=kwargs.get("rng"))
         # quiet (multi-layout GA) silences the optimizer's per-placement [TIMING] lines
         self.optimizer = PlacementOptimizer(self.engine, rotation_steps, self.search_direction,
                                             None if self.quiet else self.log_callback,
@@ -216,18 +214,6 @@ class Nester:
         NOTE: GA optimization is now handled at the controller level using LayoutManager.
         This method just runs standard greedy nesting.
         """
-        # Cleanup debug objects — only safe from the main thread
-        try:
-            from PySide.QtCore import QThread, QCoreApplication
-            app = QCoreApplication.instance()
-            if app and QThread.currentThread() == app.thread():
-                doc = FreeCAD.ActiveDocument if FreeCAD else None
-                if doc and doc.getObject("MinkowskiDebug"):
-                    doc.removeObject("MinkowskiDebug")
-                    doc.recompute()
-        except Exception as e:
-            nw_logger.debug(f"[Nester] cleanup of debug objects skipped: {e}")
-
         return self._nest_standard(parts, sort=sort)
 
     def _nest_standard(self, parts, sort=True, quiet=None):
@@ -297,20 +283,26 @@ class Nester:
                     break
 
             if not placed:
-                new_sheet = Sheet(len(sheets), self.bin_width, self.bin_height, spacing=self.spacing)
-                if self._attempt_placement_on_sheet(part, new_sheet):
+                while True:
+                    new_sheet = sheet_sequence.open_sheet(sheets, self.sheet_sizes, self.spacing)
+                    if self._attempt_placement_on_sheet(part, new_sheet):
+                        sheets.append(new_sheet)
+                        placed = True
+                        if self.verbose and not quiet:
+                            elapsed = (datetime.now() - start_part_time).total_seconds()
+                            self.log(f"  -> Placed on New Sheet {len(sheets)} ({elapsed:.4f}s)")
+                        if self.update_callback:
+                            self.update_callback(part, new_sheet)
+                        break
+                    if sheet_sequence.is_repeat_index(self.sheet_sizes, new_sheet.id):
+                        unplaced_parts.append(part)
+                        if not quiet:
+                            self.log(f"  -> FAILED to place in {(datetime.now() - start_part_time).total_seconds():.4f}s")
+                        break
+                    # A listed sheet this part does not fit stays open: later,
+                    # smaller parts may still fill it. compact_sheets drops it
+                    # at the end if nothing ever does.
                     sheets.append(new_sheet)
-                    placed = True
-                    if self.verbose and not quiet:
-                        elapsed = (datetime.now() - start_part_time).total_seconds()
-                        self.log(f"  -> Placed on New Sheet {len(sheets)} ({elapsed:.4f}s)")
-
-                    if self.update_callback:
-                        self.update_callback(part, new_sheet)
-                else:
-                    unplaced_parts.append(part)
-                    if not quiet:
-                        self.log(f"  -> FAILED to place in {(datetime.now() - start_part_time).total_seconds():.4f}s")
 
             _part_timings.append((part.id, _time.perf_counter() - _t0_part, placed))
 
@@ -323,6 +315,10 @@ class Nester:
         if fill_parts and not was_cancelled:
             self._nest_fill_parts(sheets, fill_parts, unplaced_parts, quiet, _part_timings)
 
+        sheets = sheet_sequence.compact_sheets(sheets)
+        for sheet in sheets:
+            for placed_part in sheet.parts:
+                placed_part.shape.placement = placed_part.shape.get_final_placement(sheet.get_origin())
 
         if not quiet and _part_timings:
             self._log_timing_summary(_part_timings)
@@ -343,7 +339,7 @@ class Nester:
         from collections import deque
 
         if not sheets:
-            sheets.append(Sheet(0, self.bin_width, self.bin_height, spacing=self.spacing))
+            sheets.append(sheet_sequence.open_sheet(sheets, self.sheet_sizes, self.spacing))
 
         # Group by explicit master_label — NEVER parse part.id (display string,
         # no format guarantee; parsing it once caused exponential spawn growth).

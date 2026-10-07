@@ -69,14 +69,26 @@ def largest_open_area(parts, sheet_width, sheet_height):
     return max(region.area for region in regions)
 
 
-def compute_layout_fitness(sheets, sheet_width, sheet_height, compactness_weight=0.0) -> tuple:
+UNPLACED_PENALTY_FACTOR = 10.0  # each unplaced part costs 10 sheet-areas of fitness
+
+
+def unplaced_penalty(count, sheet_sizes):
+    """Fitness cost of *count* unplaced regular parts: each costs
+    UNPLACED_PENALTY_FACTOR of the LARGEST listed sheet's area, so leaving a
+    part out never beats opening any sheet for it."""
+    if count <= 0:
+        return 0.0
+    return count * max(w * h for w, h in sheet_sizes) * UNPLACED_PENALTY_FACTOR
+
+
+def compute_layout_fitness(sheets, compactness_weight=0.0) -> tuple:
     """
     Calculates (fitness, efficiency_percent) for a placed layout's sheets.
     """
     if not sheets:
         return float('inf'), 0.0
 
-    total_sheet_area = len(sheets) * sheet_width * sheet_height
+    total_sheet_area = sum(s.width * s.height for s in sheets)
     total_parts_area = 0.0
     for sheet in sheets:
         for part in sheet.parts:
@@ -85,7 +97,7 @@ def compute_layout_fitness(sheets, sheet_width, sheet_height, compactness_weight
 
     efficiency = (total_parts_area / total_sheet_area * 100.0) if total_sheet_area > 0 else 0.0
 
-    fitness = len(sheets) * sheet_width * sheet_height
+    fitness = float(total_sheet_area)
     last_sheet = sheets[-1]
     if last_sheet.parts:
         min_x, min_y = float('inf'), float('inf')
@@ -109,9 +121,10 @@ def compute_layout_fitness(sheets, sheet_width, sheet_height, compactness_weight
             bbox_area = (max_x - min_x) * (max_y - min_y)
             tie_break = bbox_area
             if compactness_weight > 0:
-                open_deficit = (sheet_width * sheet_height
+                last_sheet_area = last_sheet.width * last_sheet.height
+                open_deficit = (last_sheet_area
                                 - largest_open_area(last_sheet.parts,
-                                                    sheet_width, sheet_height))
+                                                    last_sheet.width, last_sheet.height))
                 tie_break = ((bbox_area + compactness_weight * open_deficit)
                              / (1.0 + compactness_weight))
             fitness += tie_break

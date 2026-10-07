@@ -43,6 +43,7 @@ class Layout:
         self.parts = parts                # List of Shape objects for nesting
         self.master_shapes_group = master_shapes_group
         self.sheets = []                  # Filled after nesting
+        self.unplaced = []                # Parts nesting could not place
         self.fitness = float('inf')
         self.efficiency = 0.0
         self.genes = []                   # (part_id, angle) tuples - the "DNA" of this layout
@@ -239,15 +240,12 @@ class LayoutManager:
         if template is not None and template.layout_group is not None:
             recursive_delete(self.doc, template.layout_group)
 
-    def calculate_efficiency(self, layout, sheet_width, sheet_height,
-                             compactness_weight=0.0) -> tuple:
+    def calculate_efficiency(self, layout, compactness_weight=0.0) -> tuple:
         """
         Calculates the packing efficiency of a layout.
         
         Args:
             layout: Layout object with sheets populated
-            sheet_width: Width of each sheet
-            sheet_height: Height of each sheet
             compactness_weight: 0 disables the open-area term (default); higher
                                 values weight the largest-open-area deficit into the last-sheet
                                 tie-break as a blend that never exceeds one sheet's area
@@ -256,7 +254,7 @@ class LayoutManager:
             (fitness, efficiency_percent) tuple
         """
         fitness, efficiency = compute_layout_fitness(
-            layout.sheets, sheet_width, sheet_height, compactness_weight=compactness_weight
+            layout.sheets, compactness_weight=compactness_weight
         )
         layout.fitness = fitness
         layout.efficiency = efficiency

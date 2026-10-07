@@ -8,13 +8,12 @@ and managing CAM jobs from the nested layouts.
 
 import FreeCAD
 from freecad.nestingworkbench import nw_logger
-from ...constants import PROP_SHEET_HEIGHT, PROP_SHEET_THICKNESS, PROP_SHEET_WIDTH
-from ...freecad_helpers import get_nested_containers
+from ...constants import FLIPPED_PREFIX, PROP_SHEET_THICKNESS, THICKNESS_MATCH_TOL_MM
+from ...freecad_helpers import (
+    find_back_boundary, find_back_group, find_sheet_boundary, get_nested_containers,
+)
 
-FALLBACK_SHEET_WIDTH_MM = 600.0   # used only when the layout group has no SheetWidth property
-FALLBACK_SHEET_HEIGHT_MM = 600.0
 FALLBACK_SHEET_THICKNESS_MM = 3.0
-THICKNESS_MATCH_TOL_MM = 0.01
 
 class CAMManager:
     """Manages the creation of FreeCAD CAM jobs from nested layouts."""
@@ -41,6 +40,7 @@ class CAMManager:
             # We assume groups starting with "Sheet_" are the sheet containers
             if obj.isDerivedFrom("App::DocumentObjectGroup") and obj.Label.startswith("Sheet_"):
                 self._create_job_for_sheet(obj, include_parts, include_labels, include_outlines, template_path, post_processor)
+                self._create_back_job(obj, include_parts, include_labels, include_outlines, template_path, post_processor)
 
     def _create_job_for_sheet(self, sheet_group, include_parts=True, include_labels=True, include_outlines=False, template_path=None, post_processor="grbl"):
         """Creates a CAM job for a sheet with proper stock dimensions.
@@ -53,35 +53,18 @@ class CAMManager:
             template_path: Optional path to a CAM template JSON file
             post_processor: Optional post processor to use (default: "grbl")
         """
-        # Import CAM modules (FreeCAD 1.1+)
-        try:
-            from Path.Main import Stock as PathStock
-        except ImportError as e:
-            nw_logger.error(f"Failed to import CAM modules. Error: {e}")
-            nw_logger.error("Please ensure the CAM workbench is installed and enabled in FreeCAD 1.1+.")
+        boundary = find_sheet_boundary(sheet_group)
+        if not boundary:
+            nw_logger.error(f"Cannot create CAM job for '{sheet_group.Label}': no sheet boundary found.")
             return
-        
-        # Layout dimensions live on the layout group's properties.
-        sheet_width = FALLBACK_SHEET_WIDTH_MM
-        sheet_height = FALLBACK_SHEET_HEIGHT_MM
+
+        sheet_width = boundary.Shape.BoundBox.XLength
+        sheet_height = boundary.Shape.BoundBox.YLength
+        sheet_origin = boundary.Placement.Base
+
         sheet_thickness = FALLBACK_SHEET_THICKNESS_MM
-
-        if self.layout_group:
-            if hasattr(self.layout_group, PROP_SHEET_WIDTH):
-                sheet_width = float(self.layout_group.SheetWidth)
-            if hasattr(self.layout_group, PROP_SHEET_HEIGHT):
-                sheet_height = float(self.layout_group.SheetHeight)
-            if hasattr(self.layout_group, PROP_SHEET_THICKNESS):
-                sheet_thickness = float(self.layout_group.SheetThickness)
-
-        # Sheets are drawn side by side at a global X offset. Bake geometry
-        # back to sheet-local coordinates so each sheet's G-code starts at
-        # X0 Y0 and lines up with the stock placed at the origin.
-        sheet_origin = FreeCAD.Vector(0, 0, 0)
-        boundary = next((c for c in sheet_group.Group
-                         if c.Label.startswith("Sheet_Boundary_")), None)
-        if boundary:
-            sheet_origin = boundary.Placement.Base
+        if self.layout_group and hasattr(self.layout_group, PROP_SHEET_THICKNESS):
+            sheet_thickness = float(self.layout_group.SheetThickness)
 
         thickness_mismatches = []
         
@@ -94,39 +77,24 @@ class CAMManager:
         
         for nested_part in get_nested_containers(sheet_group):
             container_placement = nested_part.Placement
-            
+
             # Find the part_*, label_*, and outline_* shapes inside the container
             for child in nested_part.Group:
                 if hasattr(child, 'Shape') and child.Shape and not child.Shape.isNull():
-                    # Transform shape to global coordinates
                     combined_placement = container_placement.multiply(child.Placement)
-                    transformed_shape = child.Shape.copy()
-                    transformed_shape.Placement = FreeCAD.Placement()
-                    transformed_shape = transformed_shape.transformGeometry(combined_placement.toMatrix())
-                    
+
                     if include_parts and child.Label.startswith("part_"):
-                        # Adjust Z so bottom is at Z = -sheet_thickness
-                        z_min = transformed_shape.BoundBox.ZMin
-                        z_offset = -sheet_thickness - z_min
-                        z_placement = FreeCAD.Placement(FreeCAD.Vector(-sheet_origin.x, -sheet_origin.y, z_offset), FreeCAD.Rotation())
-                        transformed_shape = transformed_shape.transformGeometry(z_placement.toMatrix())
-                        if abs(transformed_shape.BoundBox.ZLength - sheet_thickness) > THICKNESS_MATCH_TOL_MM:
+                        baked = self._bake_part(child.Shape, combined_placement, sheet_origin, sheet_thickness)
+                        if abs(baked.BoundBox.ZLength - sheet_thickness) > THICKNESS_MATCH_TOL_MM:
                             thickness_mismatches.append(child.Label)
-                        parts_shapes.append(transformed_shape)
-                    
+                        parts_shapes.append(baked)
+
                     elif include_labels and child.Label.startswith("label_"):
-                        # Labels at Z = 0
-                        z_min = transformed_shape.BoundBox.ZMin
-                        z_offset = -z_min
-                        z_placement = FreeCAD.Placement(FreeCAD.Vector(-sheet_origin.x, -sheet_origin.y, z_offset), FreeCAD.Rotation())
-                        transformed_shape = transformed_shape.transformGeometry(z_placement.toMatrix())
-                        labels_shapes.append(transformed_shape)
-                    
+                        labels_shapes.append(self._bake_label(child.Shape, combined_placement, sheet_origin))
+
                     elif include_outlines and child.Label.startswith("outline_"):
-                        shift = FreeCAD.Placement(FreeCAD.Vector(-sheet_origin.x, -sheet_origin.y, 0), FreeCAD.Rotation())
-                        transformed_shape = transformed_shape.transformGeometry(shift.toMatrix())
-                        outlines_shapes.append(transformed_shape)
-        
+                        outlines_shapes.append(self._bake_outline(child.Shape, combined_placement, sheet_origin))
+
         if thickness_mismatches:
             nw_logger.warn(
                 f"{sheet_group.Label}: {len(thickness_mismatches)} part(s) do not match the "
@@ -134,8 +102,88 @@ class CAMManager:
                 f"the CAM model will not line up with the stock height."
             )
 
+        self._create_job(sheet_group.Label, sheet_group.Label, parts_shapes, labels_shapes, outlines_shapes,
+                         sheet_width, sheet_height, sheet_thickness, template_path, post_processor)
+
+    @staticmethod
+    def _to_world(shape, world_placement):
+        """A copy of *shape* with *world_placement* baked into its geometry."""
+        transformed = shape.copy()
+        transformed.Placement = FreeCAD.Placement()
+        return transformed.transformGeometry(world_placement.toMatrix())
+
+    def _bake_part(self, shape, world_placement, sheet_origin, sheet_thickness):
+        """World shape shifted by -sheet_origin in XY, with its bottom at Z = -sheet_thickness."""
+        transformed = self._to_world(shape, world_placement)
+        z_offset = -sheet_thickness - transformed.BoundBox.ZMin
+        z_placement = FreeCAD.Placement(FreeCAD.Vector(-sheet_origin.x, -sheet_origin.y, z_offset), FreeCAD.Rotation())
+        return transformed.transformGeometry(z_placement.toMatrix())
+
+    def _bake_label(self, shape, world_placement, sheet_origin):
+        """World shape shifted by -sheet_origin in XY, with its bottom at Z = 0."""
+        transformed = self._to_world(shape, world_placement)
+        z_placement = FreeCAD.Placement(FreeCAD.Vector(-sheet_origin.x, -sheet_origin.y, -transformed.BoundBox.ZMin), FreeCAD.Rotation())
+        return transformed.transformGeometry(z_placement.toMatrix())
+
+    def _bake_outline(self, shape, world_placement, sheet_origin):
+        """World shape shifted by -sheet_origin in XY only."""
+        transformed = self._to_world(shape, world_placement)
+        shift = FreeCAD.Placement(FreeCAD.Vector(-sheet_origin.x, -sheet_origin.y, 0), FreeCAD.Rotation())
+        return transformed.transformGeometry(shift.toMatrix())
+
+    def _create_back_job(self, sheet_group, include_parts=True, include_labels=True,
+                         include_outlines=False, template_path=None, post_processor="grbl"):
+        """The CAM job for a flipped sheet's back side (Back_<n> inside *sheet_group*).
+
+        Parts, labels and outlines, each gated by the same option as the front job
+        (SVF decision 11). Built from the drawn flip_part_/flip_label_/flip_outline_
+        objects, in the back boundary's frame, so it follows stacking. Does nothing
+        when the sheet has no back side.
+        """
+        back_group = find_back_group(sheet_group)
+        if back_group is None:
+            return
+        boundary = find_back_boundary(back_group)
+        if not boundary:
+            nw_logger.error(f"Cannot create the back-side CAM job for '{sheet_group.Label}': no back boundary found.")
+            return
+        origin = boundary.Placement.Base
+        sheet_thickness = FALLBACK_SHEET_THICKNESS_MM
+        if self.layout_group and hasattr(self.layout_group, PROP_SHEET_THICKNESS):
+            sheet_thickness = float(self.layout_group.SheetThickness)
+        parts_shapes, labels_shapes, outlines_shapes = [], [], []
+        for obj in back_group.Group:
+            if not (hasattr(obj, "Shape") and obj.Shape and not obj.Shape.isNull()):
+                continue
+            if include_parts and obj.Label.startswith(f"{FLIPPED_PREFIX}part_"):
+                parts_shapes.append(self._bake_part(obj.Shape, obj.Placement, origin, sheet_thickness))
+            elif include_labels and obj.Label.startswith(f"{FLIPPED_PREFIX}label_"):
+                labels_shapes.append(self._bake_label(obj.Shape, obj.Placement, origin))
+            elif include_outlines and obj.Label.startswith(f"{FLIPPED_PREFIX}outline_"):
+                outlines_shapes.append(self._bake_outline(obj.Shape, obj.Placement, origin))
+        self._create_job(f"{sheet_group.Label}_Back", sheet_group.Label,
+                         parts_shapes, labels_shapes, outlines_shapes,
+                         boundary.Shape.BoundBox.XLength, boundary.Shape.BoundBox.YLength,
+                         sheet_thickness, template_path, post_processor)
+
+    def _create_job(self, job_key, group_key, parts_shapes, labels_shapes, outlines_shapes,
+                    sheet_width, sheet_height, sheet_thickness, template_path, post_processor):
+        """Builds the CAM models, the Job, its box stock and its groups from baked shapes.
+
+        *job_key* names the models and the job (CAM_Job_<job_key>); *group_key* names
+        the parent group (CAM_Sheet_<group_key>), so a sheet's back job sits beside
+        its front job.
+        """
+        # Import CAM modules (FreeCAD 1.1+)
+        try:
+            from Path.Main import Stock as PathStock
+        except ImportError as e:
+            nw_logger.error(f"Failed to import CAM modules. Error: {e}")
+            nw_logger.error("Please ensure the CAM workbench is installed and enabled in FreeCAD 1.1+.")
+            return
+
         if not (parts_shapes or labels_shapes or outlines_shapes):
-            nw_logger.warn(f"No objects selected for CAM in {sheet_group.Label}. Skipping.")
+            nw_logger.warn(f"No objects selected for CAM in {job_key}. Skipping.")
             return
         
         # Build status message
@@ -154,21 +202,21 @@ class CAMManager:
         all_models = []
         
         if parts_shapes:
-            parts_compound = self.doc.addObject("Part::Feature", f"CAM_Parts_{sheet_group.Label}")
+            parts_compound = self.doc.addObject("Part::Feature", f"CAM_Parts_{job_key}")
             parts_compound.Shape = Part.Compound(parts_shapes)
             if hasattr(parts_compound, 'ViewObject') and parts_compound.ViewObject:
                 parts_compound.ViewObject.Visibility = False
             all_models.append(parts_compound)
         
         if labels_shapes:
-            labels_compound = self.doc.addObject("Part::Feature", f"CAM_Labels_{sheet_group.Label}")
+            labels_compound = self.doc.addObject("Part::Feature", f"CAM_Labels_{job_key}")
             labels_compound.Shape = Part.Compound(labels_shapes)
             if hasattr(labels_compound, 'ViewObject') and labels_compound.ViewObject:
                 labels_compound.ViewObject.Visibility = False
             all_models.append(labels_compound)
         
         if outlines_shapes:
-            outlines_compound = self.doc.addObject("Part::Feature", f"CAM_Outlines_{sheet_group.Label}")
+            outlines_compound = self.doc.addObject("Part::Feature", f"CAM_Outlines_{job_key}")
             outlines_compound.Shape = Part.Compound(outlines_shapes)
             if hasattr(outlines_compound, 'ViewObject') and outlines_compound.ViewObject:
                 outlines_compound.ViewObject.Visibility = False
@@ -184,7 +232,7 @@ class CAMManager:
             
             if job:
                 # Rename the job to our desired name
-                job.Label = f"CAM_Job_{sheet_group.Label}"
+                job.Label = f"CAM_Job_{job_key}"
                 
                 # Note: CAM_Parts/Labels/Outlines compounds are hidden base objects
                 # that the CAM job references. They cannot be deleted.
@@ -219,12 +267,12 @@ class CAMManager:
                 
                 # Organize the base objects into a group to clean up the tree
                 try:
-                    group_name = f"CAM_Geometry_{sheet_group.Label}"
+                    group_name = f"CAM_Geometry_{job_key}"
                     # Check if group already exists (unlikely given new job each time, but good practice)
                     cam_group = self.doc.getObject(group_name)
                     if not cam_group:
                         cam_group = self.doc.addObject("App::DocumentObjectGroup", group_name)
-                        cam_group.Label = f"CAM Geometry ({sheet_group.Label})"
+                        cam_group.Label = f"CAM Geometry ({job_key})"
                     
                     for model in all_models:
                          cam_group.addObject(model)
@@ -233,11 +281,11 @@ class CAMManager:
                              model.ViewObject.Visibility = True
                     
                     # Create a parent group for the sheet's CAM artifacts
-                    parent_group_name = f"CAM_Sheet_{sheet_group.Label}"
+                    parent_group_name = f"CAM_Sheet_{group_key}"
                     parent_group = self.doc.getObject(parent_group_name)
                     if not parent_group:
                         parent_group = self.doc.addObject("App::DocumentObjectGroup", parent_group_name)
-                        parent_group.Label = f"CAM ({sheet_group.Label})"
+                        parent_group.Label = f"CAM ({group_key})"
                     
                     # Add job and geometry group to parent
                     parent_group.addObject(job)
@@ -253,7 +301,7 @@ class CAMManager:
                 # Recompute to finalize the job
                 self.doc.recompute()
                 
-                nw_logger.info(f"Created CAM job '{job.Label}' for {sheet_group.Label} (stock: {sheet_width}x{sheet_height}x{sheet_thickness}mm)")
+                nw_logger.info(f"Created CAM job '{job.Label}' for {job_key} (stock: {sheet_width}x{sheet_height}x{sheet_thickness}mm)")
             else:
                 nw_logger.error("Failed to create CAM job.")
                 

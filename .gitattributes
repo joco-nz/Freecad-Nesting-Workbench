@@ -9,6 +9,8 @@
 # Never normalize these.
 *.png binary
 *.jpg binary
+*.jpeg binary
+*.gif binary
 *.ttf binary
 *.otf binary
 *.npy binary

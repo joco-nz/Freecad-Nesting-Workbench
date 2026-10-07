@@ -9,8 +9,10 @@ finding, stacking, and unstacking the generated sheet layouts.
 import FreeCAD
 import ast
 from freecad.nestingworkbench import nw_logger
-from ...freecad_helpers import get_layout_group, get_sheet_groups, get_all_objects_recursive
-from ...constants import PROP_PART_SPACING, PROP_SHEET_WIDTH
+from ...freecad_helpers import (
+    find_back_boundary, find_back_group, find_sheet_boundary, get_layout_group,
+    get_sheet_groups, get_all_objects_recursive,
+)
 
 class SheetStacker:
     """Handles the logic for finding, stacking, and unstacking sheet layouts."""
@@ -20,22 +22,6 @@ class SheetStacker:
             self.layout_group = layout_group
         else:
             self.layout_group = get_layout_group(self.doc)
-
-    def _get_params_from_layout_group(self):
-        """Reads layout parameters from the properties of the layout group."""
-        if not self.layout_group:
-            return None
-
-        try:
-            # Check for properties directly on the group object
-            if hasattr(self.layout_group, PROP_SHEET_WIDTH) and hasattr(self.layout_group, PROP_PART_SPACING):
-                return {"width": self.layout_group.SheetWidth, "spacing": self.layout_group.PartSpacing}
-            else:
-                nw_logger.warn("Could not find parameter properties on the layout group. Stacking may be inaccurate.")
-                return None
-        except Exception as e:
-            nw_logger.error(f"Error reading from spreadsheet: {e}")
-            return None
 
     def toggle_stack(self):
         """Public method to stack or unstack the sheets."""
@@ -55,11 +41,28 @@ class SheetStacker:
         self.doc.recompute()
 
     def _stack(self):
-        """Moves all objects in sheets 2 and higher to overlay sheet 1."""
-        params = self._get_params_from_layout_group()
-        if not params:
-            nw_logger.error("Could not retrieve sheet parameters. Stacking aborted.")
+        """Moves all objects in sheets 2 and higher to overlay sheet 1, and every back side to the origin."""
+        sheet_groups = get_sheet_groups(self.layout_group)
+        back_groups = [find_back_group(sg) for sg in sheet_groups]
+        if len(sheet_groups) < 2 and not any(back_groups):
+            nw_logger.info("Stacking requires two or more sheets, or a sheet with a back side.")
             return
+
+        # Before moving anything, resolve every front and back boundary.
+        # When any is missing, log an error naming the sheet and abort before writing OriginalPlacements or moving any object.
+        boundaries = []
+        back_boundaries = []
+        for sg, back in zip(sheet_groups, back_groups):
+            b = find_sheet_boundary(sg)
+            if not b:
+                nw_logger.error(f"Cannot stack: sheet '{sg.Label}' has no boundary. Stacking aborted.")
+                return
+            boundaries.append(b)
+            back_boundary = find_back_boundary(back) if back else None
+            if back and not back_boundary:
+                nw_logger.error(f"Cannot stack: the back side of '{sg.Label}' has no boundary. Stacking aborted.")
+                return
+            back_boundaries.append(back_boundary)
 
         # Before any movement, store the current state of all objects in the layout.
         # This ensures that unstacking will always restore to the state right before stacking.
@@ -78,33 +81,28 @@ class SheetStacker:
             placements_dict[obj.Name] = placement_str
         self.layout_group.OriginalPlacements = placements_dict
 
-        total_sheet_width = params["width"] + params["spacing"]
-        sheet_groups = get_sheet_groups(self.layout_group)
-
-        if len(sheet_groups) < 2:
-            nw_logger.info("Stacking requires two or more sheets.")
-            return
-
-        # The target position is the origin (0,0,0)
-        target_pos = FreeCAD.Vector(0, 0, 0)
-        
-        # Iterate through all subsequent sheets and move them
-        for i in range(1, len(sheet_groups)):
-            sheet_group = sheet_groups[i]
-            
-            # The original position of this sheet determines how much it needs to move
-            original_pos = FreeCAD.Vector(i * total_sheet_width, 0, 0)
-            move_vec = target_pos - original_pos
-            
-            # Apply this transformation to all objects within this sheet's group
-            objects_to_move = get_all_objects_recursive(sheet_group)
-            for obj in objects_to_move:
-                new_placement = FreeCAD.Placement(move_vec, FreeCAD.Rotation()).multiply(obj.Placement)
-                obj.Placement = new_placement
+        # Front: for i >= 1, move_vec = -boundary.Placement.Base (with z = 0); sheet 1 stays.
+        # Back: every sheet's back side moves by -back_boundary.Placement.Base, sheet 1's included.
+        # A back object moves once, by the back offset only, never also by the front's.
+        for i, sheet_group in enumerate(sheet_groups):
+            back = back_groups[i]
+            back_names = {o.Name for o in get_all_objects_recursive(back)} if back else set()
+            if i >= 1:
+                base = boundaries[i].Placement.Base
+                self._shift([o for o in get_all_objects_recursive(sheet_group) if o.Name not in back_names],
+                            FreeCAD.Vector(-base.x, -base.y, 0.0))
+            if back:
+                base = back_boundaries[i].Placement.Base
+                self._shift(get_all_objects_recursive(back), FreeCAD.Vector(-base.x, -base.y, 0.0))
 
         self.layout_group.IsStacked = True
         nw_logger.info("Sheets are now stacked.")
         
+    @staticmethod
+    def _shift(objects, move_vec):
+        for obj in objects:
+            obj.Placement = FreeCAD.Placement(move_vec, FreeCAD.Rotation()).multiply(obj.Placement)
+
     def _unstack(self):
         """Restores all objects in the layout to their original positions."""
         if not hasattr(self.layout_group, "OriginalPlacements"):

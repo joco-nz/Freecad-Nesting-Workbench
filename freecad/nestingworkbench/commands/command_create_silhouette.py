@@ -12,7 +12,6 @@ Supports:
 
 import FreeCAD
 import FreeCADGui
-import os
 from freecad.nestingworkbench import nw_logger
 from freecad.nestingworkbench.ui_helpers import QT_TRANSLATE_NOOP
 

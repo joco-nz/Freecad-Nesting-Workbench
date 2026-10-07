@@ -13,9 +13,10 @@ from ...datatypes.shape import Shape
 from freecad.nestingworkbench import nw_logger
 from .layout_manager import LayoutManager
 from .algorithms import genetic_utils
+from .algorithms import sheet_sequence
 from .algorithms.minkowski_engine import DEFAULT_CANDIDATE_SPACING
-from .ga_snapshot import UNPLACED_PENALTY_FACTOR
 from .worker_sizing import ga_worker_count, SOURCE_LOGICAL_FALLBACK, SOURCE_SETTING
+from ...sheet_library import model as sheet_model, store as sheet_store
 
 ELITE_FRACTION_DIVISOR = 5      # top 1/5 of the population survives unchanged
 MIN_ELITE_COUNT = 2             # always keep a breeding pair
@@ -35,15 +36,15 @@ def enumerate_nfp_jobs(parts, candidate_spacing=DEFAULT_CANDIDATE_SPACING):
     """Enumerates every NFP cache key the placement loop can request for
     these parts, as {cache_key: (rep_A, rep_B, relative_angle)}.
 
-    Part type identity is source_freecad_object.Label — the same field the
-    cache key uses (never parse part.id). The placed part A is always keyed
+    Part type identity is Shape.type_label (the label plus an outline hash, set by
+    ShapePreparer) — the same field the cache key uses (never parse part.id). The placed part A is always keyed
     at angle 0 with the rotation folded into relative_angle, matching
     get_incremental_candidates / _calculate_and_cache_nfp:
     (placed_label, part_label, relative_angle, spacing, deflection, simplification, candidate_spacing).
     """
     reps = {}
     for p in parts:
-        reps.setdefault(p.source_freecad_object.Label, p)
+        reps.setdefault(p.type_label, p)
 
     def angle_grid(part):
         steps = max(1, getattr(part, 'rotation_steps', 1) or 1)
@@ -60,8 +61,8 @@ def enumerate_nfp_jobs(parts, candidate_spacing=DEFAULT_CANDIDATE_SPACING):
                         rel = 0.0
                     rel_angles.add(round(rel, 4))
             for rel in rel_angles:
-                key = (a.source_freecad_object.Label,
-                       b.source_freecad_object.Label,
+                key = (a.type_label,
+                       b.type_label,
                        rel, b.spacing, b.deflection, b.simplification,
                        float(candidate_spacing))
                 jobs.setdefault(key, (a, b, rel))
@@ -178,22 +179,31 @@ def wait_for_any(pending, cancel_callback, deadline=None, on_poll=None):
 SIM_ROW_GAP_FRACTION = 0.15  # gap between preview rows, as a fraction of sheet height
 
 
-def build_preview_row(placements, parts_by_id, row, sheet_w, sheet_h, spacing):
+def build_preview_row(placements, parts_by_id, row, sheet_sizes, spacing):
     """World-space outlines for one simulation preview row.
 
     placements: [(sheet_index, part_id, x, y, angle)] in placement order,
     sheet-local centroids as PlacedPart records them. Row 0 sits on the real
-    sheet row; row r is lifted by r * sheet_h * (1 + SIM_ROW_GAP_FRACTION).
+    sheet row; row r is lifted by r * max_h * (1 + SIM_ROW_GAP_FRACTION).
     Sheets in a row step along x exactly as Sheet.get_origin() does.
 
     Returns (sheet_rects, part_outlines): two lists of Shapely Polygons.
     """
     from shapely.geometry import box
     from shapely.affinity import rotate, translate
-    y0 = row * sheet_h * (1.0 + SIM_ROW_GAP_FRACTION)
+    max_h = max(h for _, h in sheet_sizes)
+    y0 = row * max_h * (1.0 + SIM_ROW_GAP_FRACTION)
     used = sorted({s for s, *_ in placements})
-    rects = [box(s * (sheet_w + spacing), y0, s * (sheet_w + spacing) + sheet_w, y0 + sheet_h)
-             for s in used]
+
+    def origin_x_for_sheet(s_idx):
+        return sum(sheet_sequence.row_for_index(sheet_sizes, j)[0] + spacing for j in range(s_idx))
+
+    rects = []
+    for s in used:
+        w_s, h_s = sheet_sequence.row_for_index(sheet_sizes, s)
+        ox = origin_x_for_sheet(s)
+        rects.append(box(ox, y0, ox + w_s, y0 + h_s))
+
     outlines = []
     for s, part_id, x, y, angle in placements:
         part = parts_by_id.get(part_id)
@@ -201,7 +211,8 @@ def build_preview_row(placements, parts_by_id, row, sheet_w, sheet_h, spacing):
             continue
         poly = rotate(part.original_polygon, angle, origin="centroid")
         c = poly.centroid
-        outlines.append(translate(poly, x - c.x + s * (sheet_w + spacing), y - c.y + y0))
+        ox = origin_x_for_sheet(s)
+        outlines.append(translate(poly, x - c.x + ox, y - c.y + y0))
     return rects, outlines
 
 
@@ -390,6 +401,21 @@ class GACoordinator:
             )
         
         if layouts and layouts[0].parts:
+            misfits = sheet_sequence.parts_that_fit_no_sheet(
+                layouts[0].parts, sheet_sequence.sizes(ui_params['sheet_sequence']),
+                default_rotation_steps=rotation_steps)
+            if misfits:
+                names = ", ".join(f"{label} ({w:.0f} × {h:.0f} mm)" for label, w, h in misfits)
+                msg = (f"Cannot nest: {len(misfits)} part(s) fit on no sheet in the list "
+                       f"at any allowed rotation: {names}.")
+                self._set_status(msg)
+                nw_logger.warn(msg)
+                for layout in layouts:
+                    self.layout_manager.delete_layout(layout)
+                self._dispatch_discard_template()
+                self._dispatch_recompute()
+                return None
+
             self._precompute_all_nfps(
                 layouts[0].parts, cancel_callback,
                 algo_kwargs.get('candidate_spacing', DEFAULT_CANDIDATE_SPACING))
@@ -567,7 +593,7 @@ class GACoordinator:
                     pre_counts = [len(s.parts) for s in best_layout.sheets]
                     _, fill_time = fill_existing_sheets(
                         best_layout.sheets, fill_parts,
-                        ui_params['sheet_width'], ui_params['sheet_height'],
+                        sheet_sequence.sizes(ui_params['sheet_sequence']),
                         rotation_steps, simulate=is_simulating,
                         viz_manager=viz_manager, **fill_kwargs)
                     total_nesting_time += fill_time
@@ -579,10 +605,30 @@ class GACoordinator:
                         for placed in sheet.parts:
                             placed.shape.placement = placed.shape.get_final_placement(sheet.get_origin())
                     self.layout_manager.calculate_efficiency(
-                        best_layout, ui_params['sheet_width'], ui_params['sheet_height'],
-                        ui_params.get('compactness_weight', 0.0))
+                        best_layout, ui_params.get('compactness_weight', 0.0))
                     best_efficiency = best_layout.efficiency
             
+            # An unplaced part is a failed run (owner decision): nothing is
+            # drawn or committed. Cancelled runs are left to the existing
+            # cancel handling: a cancelled nester stops consuming parts without
+            # listing them as unplaced, so this check would be meaningless there.
+            if best_layout is not None and not cancel_callback():
+                unplaced_regular, _ = self._split_fill_parts(best_layout.unplaced or [])
+                if unplaced_regular:
+                    names = ", ".join(sorted({getattr(p, 'master_label', None) or p.id
+                                              for p in unplaced_regular}))
+                    msg = (f"Nesting failed: {len(unplaced_regular)} part(s) could not be "
+                           f"placed ({names}). Add a sheet they fit on to the list, or "
+                           f"move a larger sheet to the end so it repeats.")
+                    self._set_status(msg)
+                    nw_logger.warn(msg)
+                    doomed = list({id(l): l for l in [*layouts, best_layout]}.values())
+                    for layout in doomed:
+                        self.layout_manager.delete_layout(layout)
+                    self._dispatch_discard_template()
+                    self._dispatch_recompute()
+                    return None
+
             # STEP 4: Finalize result — dispatch to main thread (ViewObject + recompute)
             job = self._dispatch_finalize(best_layout, best_efficiency, total_nesting_time, target_layout, ui_params)
             return job
@@ -751,8 +797,6 @@ class GACoordinator:
                     # Every member gets a row, including carried ones, so member i
                     # stays in row i from one generation to the next.
                     row_members = sorted(streamed + [m for m, _ in carried])
-                    sheet_w = float(ui_params.get('sheet_width', 300.0))
-                    sheet_h = float(ui_params.get('sheet_height', 300.0))
                     spacing = float(ui_params.get('spacing', 0.0))
                     layout_map = {m_idx: l for m_idx, l in pending_layouts}
                     parts_by_id_map = {m_idx: {p.id: p for p in l.parts} for m_idx, l in layout_map.items()}
@@ -784,7 +828,8 @@ class GACoordinator:
                                 row_idx = row_members.index(m) if show_all else 0
                                 parts_by_id = parts_by_id_map.get(m, {})
                                 rects, outlines = build_preview_row(
-                                    rows_acc[m], parts_by_id, row_idx, sheet_w, sheet_h, spacing
+                                    rows_acc[m], parts_by_id, row_idx,
+                                    sheet_sequence.sizes(ui_params['sheet_sequence']), spacing
                                 )
                                 rows[row_idx] = (rects, outlines)
                             self.draw_callback({'sim_member_rows': True, 'rows': rows})
@@ -805,7 +850,7 @@ class GACoordinator:
                                 row_idx = row_members.index(m_idx)
                                 start_rows[row_idx] = build_preview_row(
                                     placements, {p.id: p for p in layout.parts},
-                                    row_idx, sheet_w, sheet_h, spacing)
+                                    row_idx, [(s.width, s.height) for s in layout.sheets], spacing)
                         if start_rows:
                             self.draw_callback({'sim_member_rows': True, 'rows': start_rows})
                             self._sim_rows_shown.update(start_rows)
@@ -879,8 +924,10 @@ class GACoordinator:
             # measures the true free area.
             regular_parts, _ = self._split_fill_parts(layout.parts)
             consumption_order = []
+            sizes = sheet_sequence.sizes(ui_params['sheet_sequence'])
             sheets, unplaced, _, elapsed = nest(
-                regular_parts, ui_params['sheet_width'], ui_params['sheet_height'],
+                regular_parts,
+                sizes,
                 rotation_steps, is_simulating, algorithm=ui_params.get('algorithm', 'Minkowski'),
                 viz_manager=viz_manager, order_out=consumption_order, **current_kwargs
             )
@@ -923,11 +970,10 @@ class GACoordinator:
             
             # Efficiency/Fitness
             self.layout_manager.calculate_efficiency(
-                layout, ui_params['sheet_width'], ui_params['sheet_height'],
-                ui_params.get('compactness_weight', 0.0))
+                layout, ui_params.get('compactness_weight', 0.0))
             unplaced_regular, _ = self._split_fill_parts(unplaced)
             if unplaced_regular:
-                layout.fitness += len(unplaced_regular) * ui_params['sheet_width'] * ui_params['sheet_height'] * UNPLACED_PENALTY_FACTOR
+                layout.fitness += genetic_utils.unplaced_penalty(len(unplaced_regular), sizes)
             
         return total_time, False
 
@@ -1093,6 +1139,7 @@ class GACoordinator:
             best_layout.layout_group.ViewObject.Visibility = True
         
         for sheet in best_layout.sheets:
+            sheet.stock = dict(sheet_sequence.row_for_index(ui_params['sheet_sequence'], sheet.spec_index))
             sheet.draw(self.doc, ui_params, best_layout.layout_group,
                        parts_to_place_group=best_layout.parts_group)
 
@@ -1107,18 +1154,17 @@ class GACoordinator:
             layout_group=best_layout.layout_group, parts_group=best_layout.parts_group, sheets=best_layout.sheets
         )
         
-        unplaced_count = len(getattr(best_layout, 'unplaced', []) or [])
         placed_count = sum(len(s) for s in best_layout.sheets)
         msg = f"GA Complete: {best_efficiency:.1f}% efficiency, {len(best_layout.sheets)} sheets, {placed_count} placed"
-        if unplaced_count: msg += f", {unplaced_count} UNPLACED"
         msg += f", Time: {total_time:.2f}s"
+        total_cost = sum(s.stock['cost'] for s in best_layout.sheets)
+        if total_cost > 0:
+            msg += f", sheets {sheet_model.format_cost(total_cost, sheet_store.currency_symbol())}"
         if getattr(self, '_serial_fallback', False):
             msg += " (workers failed to start - ran serially)"
         
         self._set_status(msg)
         nw_logger.info(msg)
-        if unplaced_count:
-            nw_logger.warn(f"WARNING: {unplaced_count} part(s) could not be placed: {[p.id for p in best_layout.unplaced]}")
         nw_logger.info("--- NESTING DONE ---")
         self._play_sound()
         return job

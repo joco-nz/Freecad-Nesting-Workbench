@@ -3,16 +3,18 @@
 import FreeCAD
 import Part
 import copy
+import hashlib
 import Draft
+import shapely
 import traceback
 from freecad.nestingworkbench import nw_logger
-from .algorithms import shape_processor
+from . import shape_processor
 from ...datatypes.shape_object import create_shape_object
 from ...datatypes.shape import Shape
-from ...freecad_helpers import get_up_direction_rotation, create_part_feature
+from ...freecad_helpers import get_up_vector_rotation, create_part_feature, world_shape
 from ...constants import (
-    PROP_BOOL, PROP_INTEGER, PROP_STRING,
-    PROP_QUANTITY, PROP_UP_DIRECTION, PROP_FILL_SHEET,
+    PROP_BOOL, PROP_INTEGER, PROP_STRING, PROP_VECTOR,
+    PROP_QUANTITY, PROP_UP_VECTOR, PROP_FILL_SHEET,
     PROP_PART_ROTATION_OVERRIDE, PROP_PART_ROTATION_STEPS,
 )
 
@@ -38,8 +40,8 @@ def write_master_metadata(container, part_params):
     specs = (
         (PROP_INTEGER, PROP_QUANTITY, "Number of instances",
          int(part_params.get('quantity', 1))),
-        (PROP_STRING, PROP_UP_DIRECTION, "Up direction for 2D projection",
-         str(part_params.get('up_direction', 'Z+'))),
+        (PROP_VECTOR, PROP_UP_VECTOR, "Up vector for 2D projection",
+         FreeCAD.Vector(part_params.get('up_vector', FreeCAD.Vector(0, 0, 1)))),
         (PROP_BOOL, PROP_FILL_SHEET, "Use to fill remaining space",
          bool(part_params.get('fill_sheet', False))),
         (PROP_BOOL, PROP_PART_ROTATION_OVERRIDE,
@@ -72,7 +74,7 @@ class ShapePreparer:
         
         Args:
             ui_global_settings (dict): { 'spacing': float, 'deflection': float, 'simplification': float, 'rotation_steps': int, 'add_labels': bool, 'font_path': str, 'verbose': bool }
-            quantities (dict): { label: {'quantity': int, 'rotation_steps': int, 'up_direction': str, 'fill_sheet': bool} }
+            quantities (dict): { label: {'quantity': int, 'rotation_steps': int, 'up_vector': FreeCAD.Vector, 'fill_sheet': bool} }
             master_shapes_map (dict): { label: FreeCADObject }
             layout_obj (App::DocumentObjectGroup): The layout group.
             parts_group (App::DocumentObjectGroup): The PartsToPlace group to add temp instances to.
@@ -93,16 +95,8 @@ class ShapePreparer:
 
         for label, master_obj in master_shapes_map.items():
             try:
-                # Get up_direction for cache key
-                part_params = quantities.get(label, {'up_direction': 'Z+'})
-                if isinstance(part_params, tuple):
-                    up_direction = 'Z+'
-                else:
-                    up_direction = part_params.get('up_direction', 'Z+')
-                
-                # Cache Key: (Object Name, Spacing, Deflection, Simplification, UpDirection)
-                # Updated cache key to respect new parameters
-                cache_key = (master_obj.Name, spacing, deflection, simplification, up_direction)
+                cache_key = self._processed_cache_key(
+                    label, master_obj, quantities, spacing, deflection, simplification)
                 is_reloading = master_obj.Label.startswith("master_shape_")
                 
                 temp_shape_wrapper = None
@@ -145,6 +139,25 @@ class ShapePreparer:
         )
         
         return parts_to_nest
+
+    @staticmethod
+    def _processed_cache_key(label, master_obj, quantities, spacing, deflection, simplification):
+        """Key for processed_shape_cache: these settings produced this wrapper.
+
+        `label` is `master_shape_<name>` on the reload path, but `quantities`
+        is keyed by the table's display label `<name>`, so strip the prefix
+        before the lookup (as _create_temp_from_reloading and
+        _create_nesting_instances already do). Without it, every reloaded
+        part is keyed at the default up vector.
+        """
+        part_params = quantities.get(label.removeprefix("master_shape_"), {})
+        if isinstance(part_params, tuple):
+            up_vector = FreeCAD.Vector(0, 0, 1)
+        else:
+            up_vector = part_params.get('up_vector', FreeCAD.Vector(0, 0, 1))
+        # Vector isn't hashable; (x, y, z) is.
+        return (master_obj.Name, spacing, deflection, simplification,
+                (up_vector.x, up_vector.y, up_vector.z))
 
     def _get_or_create_master_group(self, layout_obj):
         master_shapes_group = None
@@ -260,36 +273,92 @@ class ShapePreparer:
                 temp_container.SourceCentroid = temp_shape_wrapper.source_centroid
             self.processed_shape_cache[cache_key] = copy.deepcopy(temp_shape_wrapper)
 
+        # The table's Up Dir wins over the one saved with the layout (RUP-001). The saved
+        # container is the one whose UpVector was stamped when the layout was committed;
+        # write_master_metadata has already overwritten temp_container with the new one.
+        new_up = (FreeCAD.Vector(0, 0, 1) if isinstance(part_params, tuple)
+                  else FreeCAD.Vector(part_params.get('up_vector', FreeCAD.Vector(0, 0, 1))))
+        saved_up = FreeCAD.Vector(getattr(original_container, "UpVector", FreeCAD.Vector(0, 0, 1)))
+        if (new_up - saved_up).Length > 1e-9:
+            temp_shape_wrapper = self._reproject_reloaded_master(
+                temp_master_obj, temp_container, new_up, spacing, deflection, simplification,
+                verbose=verbose)
+            self.processed_shape_cache[cache_key] = copy.deepcopy(temp_shape_wrapper)
+
         return temp_master_obj, temp_shape_wrapper
+
+    def _reproject_reloaded_master(self, temp_master_obj, temp_container, up_vector,
+                                   spacing, deflection, simplification, verbose=False):
+        """Re-projects a reloaded master for a changed up vector (RUP-001).
+
+        temp_master_obj is a copy of a saved master: the source geometry centred on its
+        old pivot, with the OLD up rotation held in its Placement. Clearing that
+        Placement recovers the unrotated geometry, so the new outline, pivot and
+        rotation are derived without the source object. The result matches a fresh
+        nest of the source at up_vector.
+
+        Returns the new Shape wrapper. temp_container.SourceCentroid is moved by the
+        same amount the geometry is re-centred by.
+        """
+        base = temp_master_obj.Shape.copy()
+        base.Placement = FreeCAD.Placement()
+        temp_master_obj.Placement = FreeCAD.Placement()
+        temp_master_obj.Shape = base
+
+        wrapper = Shape(temp_master_obj)
+        shape_processor.create_single_nesting_part(
+            wrapper, temp_master_obj, spacing, deflection, simplification, up_vector,
+            verbose=verbose)
+
+        # wrapper.source_centroid is the new pivot in the saved geometry's own frame.
+        delta = wrapper.source_centroid
+        temp_master_obj.Shape = self._center_3d_shape(temp_master_obj, base.copy(), delta)
+        temp_master_obj.Placement = FreeCAD.Placement(
+            FreeCAD.Vector(0, 0, 0), get_up_vector_rotation(up_vector))
+
+        temp_container.SourceCentroid = temp_container.SourceCentroid + delta
+        wrapper.source_centroid = temp_container.SourceCentroid
+
+        # The saved outline is for the old vector: replace it.
+        old_boundary = getattr(temp_master_obj, "BoundaryObject", None)
+        if old_boundary:
+            self.doc.removeObject(old_boundary.Name)
+        if not hasattr(temp_master_obj, "ShowBounds"):
+            temp_master_obj.addProperty("App::PropertyBool", "ShowBounds", "Display", "").ShowBounds = False
+        if not hasattr(temp_master_obj, "BoundaryObject"):
+            temp_master_obj.addProperty("App::PropertyLink", "BoundaryObject", "Nesting", "")
+        self._create_boundary_object(temp_container, temp_master_obj, wrapper, verbose)
+        return wrapper
 
     def _handle_new_master(self, master_obj, label, quantities, temp_shape_wrapper, spacing, deflection, simplification, cache_key, master_shapes_group, is_reloading, verbose=False):
         if not temp_shape_wrapper:
-            # Get up_direction for initial processing
-            part_params = quantities.get(label, {'up_direction': 'Z+'})
-            up_direction = 'Z+' if isinstance(part_params, tuple) else part_params.get('up_direction', 'Z+')
+            # Get up_vector for initial processing
+            part_params = quantities.get(label, {'up_vector': FreeCAD.Vector(0, 0, 1)})
+            up_vector = FreeCAD.Vector(0, 0, 1) if isinstance(part_params, tuple) else part_params.get('up_vector', FreeCAD.Vector(0, 0, 1))
             
             temp_shape_wrapper = Shape(master_obj)
-            shape_processor.create_single_nesting_part(temp_shape_wrapper, master_obj, spacing, deflection, simplification, up_direction, verbose=verbose)
+            shape_processor.create_single_nesting_part(temp_shape_wrapper, master_obj, spacing, deflection, simplification, up_vector, verbose=verbose)
             self.processed_shape_cache[cache_key] = copy.deepcopy(temp_shape_wrapper)
 
         if temp_shape_wrapper.source_centroid is not None:
             source_centroid = temp_shape_wrapper.source_centroid
         else:
-            # Fallback: calculate from shape bounding box
-            temp_shape = master_obj.Shape.copy()
-            if master_obj.Placement and not master_obj.Placement.isIdentity():
-                temp_shape.transformShape(master_obj.Placement.Matrix)
-            bb = temp_shape.BoundBox
+            # Fallback: calculate from shape bounding box of world shape
+            # (including parents' placement; GLB-001).
+            bb = world_shape(master_obj).BoundBox
             source_centroid = FreeCAD.Vector((bb.XMin + bb.XMax) / 2, (bb.YMin + bb.YMax) / 2, (bb.ZMin + bb.ZMax) / 2)
 
-        master_container, up_direction = self._create_master_container(label, quantities, source_centroid)
+        master_container, up_vector = self._create_master_container(label, quantities, source_centroid)
         
-        original_shape = master_obj.Shape.copy()
+        original_shape = world_shape(master_obj)
         if verbose:
-            nw_logger.info(f"  -> Creating master for '{label}' (type: {master_obj.TypeId}) with up_direction='{up_direction}'")
+            nw_logger.info(f"  -> Creating master for '{label}' (type: {master_obj.TypeId}) with up_vector='{up_vector}'")
         
         if master_obj.isDerivedFrom("Part::Part2DObject"):
-            plc = master_obj.Placement
+            # Edge points and curve centres of original_shape are already in world
+            # coordinates (including parents' placement; GLB-001), so the rebuild
+            # applies no further placement.
+            plc = FreeCAD.Placement()
             offset = FreeCAD.Vector(source_centroid.x, source_centroid.y, source_centroid.z)
             original_shape = self._rebuild_2d_shape(master_obj, original_shape, source_centroid, plc, offset, verbose, label)
         else:
@@ -303,7 +372,7 @@ class ShapePreparer:
         if not hasattr(master_shape_obj, "BoundaryObject"):
             master_shape_obj.addProperty("App::PropertyLink", "BoundaryObject", "Nesting", "")
         
-        master_shape_obj.Placement = FreeCAD.Placement(FreeCAD.Vector(0, 0, 0), get_up_direction_rotation(up_direction))
+        master_shape_obj.Placement = FreeCAD.Placement(FreeCAD.Vector(0, 0, 0), get_up_vector_rotation(up_vector))
 
         self._create_boundary_object(master_container, master_shape_obj, temp_shape_wrapper, verbose)
         master_shapes_group.addObject(master_container)
@@ -314,12 +383,12 @@ class ShapePreparer:
         """Creates the App::Part container and populates it with metadata properties."""
         master_container = self.doc.addObject("App::Part", f"master_{label}")
         
-        part_params = quantities.get(label, {'quantity': 1, 'up_direction': 'Z+', 'fill_sheet': False})
+        part_params = quantities.get(label, {'quantity': 1, 'up_vector': FreeCAD.Vector(0, 0, 1), 'fill_sheet': False})
         if isinstance(part_params, tuple):
-            quantity, up_direction, fill_sheet = part_params[0], 'Z+', False
+            quantity, up_vector, fill_sheet = part_params[0], FreeCAD.Vector(0, 0, 1), False
         else:
             quantity = part_params.get('quantity', 1)
-            up_direction = part_params.get('up_direction', 'Z+')
+            up_vector = part_params.get('up_vector', FreeCAD.Vector(0, 0, 1))
             fill_sheet = part_params.get('fill_sheet', False)
         
         write_master_metadata(master_container, part_params)
@@ -328,7 +397,7 @@ class ShapePreparer:
         if hasattr(master_container, "ViewObject"):
             master_container.ViewObject.Visibility = True
             
-        return master_container, up_direction
+        return master_container, up_vector
 
     def _rebuild_2d_shape(self, master_obj, original_shape, center_point, plc, offset, verbose, label):
         """Rebuilds 2D shape by transforming each edge's curve parameters to preserve smooth curves."""
@@ -372,7 +441,7 @@ class ShapePreparer:
             nw_logger.warn(f"     Curve preservation unsuccessful for '{label}': {e}. Using polygon approximation.")
             # Fallback: discretize to polygon
             new_wires = []
-            for wire in master_obj.Shape.Wires:
+            for wire in original_shape.Wires:
                 pts = wire.discretize(Number=72)
                 if len(pts) > 2:
                     transformed = [plc.multVec(p) - offset for p in pts]
@@ -388,11 +457,19 @@ class ShapePreparer:
         return original_shape
 
     def _center_3d_shape(self, master_obj, original_shape, center_point):
-        """Centers regular Part objects using combined transformGeometry (Placement + centering)."""
+        """Bakes the source's world placement and the centring into the geometry.
+
+        original_shape is master_obj.Shape.copy(), which already carries
+        master_obj.Placement as its own Placement. transformGeometry acts on the
+        geometry under that Placement and keeps it, and the caller then overwrites
+        the feature's Placement with the up-vector rotation, so the Placement is
+        moved into the matrix and cleared here (SRC-001).
+        """
+        world_plc = original_shape.Placement
+        original_shape.Placement = FreeCAD.Placement()
         combined_mat = FreeCAD.Matrix()
         combined_mat.move(center_point.negative())
-        if master_obj.Placement and not master_obj.Placement.isIdentity():
-            combined_mat = combined_mat.multiply(master_obj.Placement.Matrix)
+        combined_mat = combined_mat.multiply(world_plc.Matrix)
         return original_shape.transformGeometry(combined_mat)
 
     def _create_boundary_object(self, master_container, master_shape_obj, temp_shape_wrapper, verbose):
@@ -447,6 +524,21 @@ class ShapePreparer:
             # Move cursor past this shape
             cursor_x += width + spacing
 
+    @staticmethod
+    def _geometry_type_label(label, polygon):
+        """The part type's cache identity: its label plus a hash of its outline.
+
+        Shape.nfp_cache survives from one run to the next, and its key is built from
+        type_label. A label alone says nothing about the outline, so a changed Up Dir
+        (or an edited source) reused another outline's NFPs and stacked the parts
+        (NFC-001). The hash makes the key differ whenever the outline does, and stay the
+        same, so the cache stays warm, when it does not.
+        """
+        if polygon is None:
+            return label
+        digest = hashlib.sha1(shapely.to_wkb(polygon), usedforsecurity=False).hexdigest()[:10]
+        return f"{label}@{digest}"
+
     def _create_nesting_instances(self, master_shapes_map, quantities, master_shape_obj_map, master_geometry_cache, ui_settings, parts_group):
         parts_to_nest = []
         parts_to_place_group = parts_group
@@ -459,14 +551,16 @@ class ShapePreparer:
         verbose = ui_settings.get('verbose', False)
 
         def _spawn_factory(original_obj, master_wrapper, lookup_label,
-                           part_rotation_steps, fill_sheet, up_direction,
-                           master_shape_obj, master_container):
+                           part_rotation_steps, fill_sheet, up_vector,
+                           master_shape_obj, master_container, type_label):
             """Binds one part type's parameters into a dedicated closure scope.
 
             make_instance is handed out as spawn_next and called long after the
             master-shapes loop has moved on — defining it directly in the loop
             body would late-bind every spawner to the LAST type's variables.
-            Each factory call also gets its own instance counter.
+            Each factory call also gets its own instance counter. type_label is the
+            part type's cache identity (label plus outline hash), shared by every
+            instance of this master.
             """
             next_instance_num = [0]
 
@@ -483,12 +577,20 @@ class ShapePreparer:
                 shape_instance.source_centroid = master_wrapper.source_centroid
                 shape_instance.spacing = spacing
 
+                # Part of the NFP cache key (MinkowskiEngine._nfp_cache_key,
+                # enumerate_nfp_jobs). Left unset, every instance carries
+                # Shape.__init__'s 0.05 / 1.0 and the cache stops telling
+                # one Curve Angle or Simplification setting from another.
+                shape_instance.deflection = master_wrapper.deflection
+                shape_instance.simplification = master_wrapper.simplification
+
                 shape_instance.instance_num = i
                 shape_instance.id = f"{lookup_label}_{i}"
                 shape_instance.master_label = lookup_label  # type identity — never parse .id
+                shape_instance.type_label = type_label
                 shape_instance.rotation_steps = part_rotation_steps
                 shape_instance.fill_sheet = as_fill
-                shape_instance.up_direction = up_direction
+                shape_instance.up_vector = up_vector
                 # The simulation highlighter needs the row this instance came
                 # from; it must never go looking for it by label (see
                 # nesting_logic._find_master_container_for_part).
@@ -500,7 +602,7 @@ class ShapePreparer:
                 part_copy.Placement = master_shape_obj.Placement
 
                 # Debug: Check what geometry we're getting
-                if verbose and up_direction != "Z+" and up_direction is not None:
+                if verbose and up_vector is not None:
                     nw_logger.info(f"     Part copy {shape_instance.id}: BoundBox={part_copy.Shape.BoundBox}")
 
                 # Copy boundary if exists
@@ -536,7 +638,7 @@ class ShapePreparer:
             quantity = part_params.get('quantity', 0)
             part_rotation_steps = part_params.get('rotation_steps', global_rotation_steps)
             fill_sheet = part_params.get('fill_sheet', False)
-            up_direction = part_params.get('up_direction', 'Z+')
+            up_vector = part_params.get('up_vector', FreeCAD.Vector(0, 0, 1))
             
             master_shape_obj = master_shape_obj_map.get(id(original_obj))
             master_wrapper = master_geometry_cache.get(id(original_obj))
@@ -546,9 +648,14 @@ class ShapePreparer:
 
             master_container = master_shape_obj.InList[0] if master_shape_obj.InList else None
 
+            type_label = self._geometry_type_label(
+                lookup_label,
+                master_wrapper.original_polygon if master_wrapper.original_polygon is not None
+                else master_wrapper.polygon)
+
             make_instance = _spawn_factory(
                 original_obj, master_wrapper, lookup_label, part_rotation_steps,
-                fill_sheet, up_direction, master_shape_obj, master_container
+                fill_sheet, up_vector, master_shape_obj, master_container, type_label
             )
             # The quantity is a requirement even when Fill is on: those copies
             # are regular parts the GA arranges with everything else. Fill only

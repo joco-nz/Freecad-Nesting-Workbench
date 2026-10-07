@@ -11,7 +11,7 @@ import Part
 import os
 import importDXF
 from freecad.nestingworkbench import nw_logger
-from ...freecad_helpers import get_layout_group, get_sheet_groups, get_all_objects_recursive, recursive_delete
+from ...freecad_helpers import find_back_group, get_layout_group, get_sheet_groups, get_all_objects_recursive, recursive_delete
 
 class SheetExporter:
     """
@@ -47,7 +47,10 @@ class SheetExporter:
 
         # Process each sheet individually
         for sheet_group in sheet_groups:
-            objects_in_sheet = get_all_objects_recursive(sheet_group)
+            # A flipped sheet's back side is not exported (SVF decision 12).
+            back = find_back_group(sheet_group)
+            back_names = {o.Name for o in get_all_objects_recursive(back)} if back else set()
+            objects_in_sheet = [o for o in get_all_objects_recursive(sheet_group) if o.Name not in back_names]
             
             # Filter for only the objects we want to project, excluding offset bounds and annotations
             objects_to_project = [
