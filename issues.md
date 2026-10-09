@@ -3856,8 +3856,10 @@ method).
 
 ### Instrumented run — three layers, one verdict
 
-Probe `/tmp/opencode/step3a.py` (self-test: `step3a_selftest.py`, 27 checks),
-report `/tmp/opencode/step3a.txt`, status doc `collision-defect-status.md`.
+> **Reproduction note.** The probe, its reports and its self-test for these
+> runs were scratch files under `/tmp/opencode/` and are not preserved. The
+> measurements below stand as a record; re-deriving them needs the probe
+> rebuilt.
 Run 2, exit 0, 69.4 s: seed 1234 via `NESTING_RANDOM_SEED` only, spacing 3.0,
 direction 45, generations 4, population 10, rotation steps 4, deflection 20,
 simplification 0.3, sheet 600x300 x 2 -> **2 sheets, 54 parts**.
@@ -3983,7 +3985,8 @@ before buffering (`shape_processor.py:98/195`) *and* the buffered polygon
 is simplified again (`:294`). Each stage is 1-Lipschitz in Hausdorff, so a
 pair can deviate by up to **4 × tol = 1.2 mm**, not 0.6.
 
-`/tmp/opencode/step3b.py` (14/14 self-test) re-ran faithful A and split
+A rung-decomposition probe (scratch, not preserved; self-test 14/14 at the
+time) re-ran faithful A and split
 every violating pair's shortfall into telescoping rungs measured on that
 run's real artifacts — recomputed `get_2d_profile_from_obj` variants, the
 stored `unbuffered_polygon`/`original_polygon`/`polygon`, and the drawn
@@ -4034,9 +4037,6 @@ the panel default 1.0**, so only usable with simplification lowered in
 lockstep). Baseline: simplification off = exact but ~2.3× runtime and the
 1-sheet goal unreachable.
 
-Probe: `/tmp/opencode/step3b.py` + `step3b_selftest.py`; report
-`/tmp/opencode/step3b.txt`.
-
 ### Resolution: verify-on-accept implemented and measured (2026-10-08)
 
 Recommendation #3 option 1, ordered by the user ("implement #3 as
@@ -4050,8 +4050,10 @@ at both exits — same `area_tolerance`, same bounds window, candidate
 translated by the mask's own centroid delta, per-pair fallback to the
 mask polygon counted (`verify_fallback_pairs`), identity skipped.
 Gate: `NESTING_VERIFY_ON_ACCEPT` (default on; `=0` reproduces pre-fix
-bit-exactly). Unit smoke `/tmp/opencode/test_verify_stage.py` 17/17
-registration/semantics/counter checks.
+bit-exactly). Registration/semantics/counter checks are now committed as
+`tests/freecad_harness/test_verify_stage.py` (55 checks, wired into
+`run.sh`); at the time this entry was written they were a smoke script
+outside the repository, so the fix had no committed test.
 
 Measured (step3a, all exit 0, probe-to-probe):
 
@@ -4093,8 +4095,7 @@ Measured (step3a, all exit 0, probe-to-probe):
 
 `get_2d_profile_from_obj` (`shape_processor.py:14`) is asked for the same
 body at two `tessellation_quality` values and returns two polygons that
-cannot both be right. TopStrap, both calls with `simplification=0`
-(`/tmp/opencode/probe_bb.py`):
+cannot both be right. TopStrap, both calls with `simplification=0`:
 
 | deflection | vertices | area (mm²) | bounds |
 |---|---|---|---|
@@ -4128,8 +4129,10 @@ deflection. Suspected locus: the mesh silhouette tracing
 (`shape_processor.py:106`+) bridging or skipping narrow features as
 triangle density changes.
 
-Reproduce: `/tmp/opencode/probe_bb.py` (freecadcmd; report
-`/tmp/opencode/probe_bb.txt`).
+Reproduce by asking `get_2d_profile_from_obj` for one body at deflection 0.1
+and 0.01 with `simplification=0` and comparing the two polygons; ~10 lines
+under `freecadcmd`. (The probe that produced the table above was scratch and is
+not preserved.)
 
 ---
 
@@ -4218,6 +4221,17 @@ repair checks), pytest 647/647, `test_rotation_determinism` 34/34
 status 0 (widths 0/4/8/16 all 48/48 one digest; env-seeded GA 81.9 %,
 48/48 placed).
 
+That unit smoke was a script outside the repository and the measurement is
+therefore not reproducible from a checkout. It is now committed as
+`tests/freecad_harness/test_verify_stage.py` (55 checks, wired into
+`run.sh`). Mutation testing against `nesting_strategy.py` found two inherited
+checks that could not fail — the touching-pair case was pinned by the bbox
+screen rather than the area tolerance, and the registration case's fixture put
+the two candidate placements 1.5 mm apart, so both the correct and the
+de-registered translation rejected and the check could not distinguish them.
+Both were rewritten; see `tests/freecad_harness/README.md`. The figures above
+are unaffected — they are whole-nest measurements, not predicate checks.
+
 Alternate fix directions (not taken): #3 option 2 pairing (restore masks
 with `buffer(2 × tol + ε)` so generation is honest by construction) and
 option 3 (raw oversize) remain documented in
@@ -4228,9 +4242,7 @@ bit-exactly), `NESTING_VERIFY_REPAIR=0` (reject-only bit-exactly), or
 the user's clamped simplification 0.001.
 
 Evidence: `collision-defect-status.md` → "Repair-push implemented —
-NEST-036 fix"; probe reports `/tmp/opencode/step3a_fixA.txt` (G1),
-`step3a_fixA_off.txt` (G3), `step3a_fixF.txt` (G2),
-`step3a_fixR1b.txt` (repair faithful A), `step3a_fixR2b.txt` (repair run
-F), `step3a_fixR3off2.txt` (repair-off control ≡ G1),
-`probe_rotdet_after.txt` (empty-kills 0 diagnostic),
-`test_verify_stage.txt` (50/50 unit smoke).
+NEST-036 fix", for the per-run probe reports (G1, G3, G2, repair faithful A,
+repair run F, repair-off control, empty-kills diagnostic — all scratch, not
+preserved); and `tests/freecad_harness/test_verify_stage.py` (55/50 checks),
+which is committed and reruns in under a second.

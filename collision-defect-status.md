@@ -58,8 +58,15 @@ one of:
 
 ## Instrumentation design (locked — three layers)
 
-Probe file: `/tmp/opencode/step3a.py`, output `/tmp/opencode/step3a.txt`
-(contract: a final `DONE rc=N` line), console `/tmp/opencode/step3a.console`.
+> **Preservation note.** The three-layer probe, its output reports and its
+> console logs were scratch files under `/tmp/opencode/` and were **not
+> committed**. Every figure attributed to them below is a historical record and
+> cannot be re-derived from a checkout without rebuilding the probe. The probe's
+> own design is described here precisely enough to rebuild it — the wrapper
+> points below name the exact call sites.
+
+Probe and report files: `step3a.py` + `step3a.txt`, console `step3a.console`,
+`DONE rc=N` contract — all scratch and unpreserved.
 
 - **Layer 1 — mask-time fresh recheck.** Wrap `PlacementOptimizer._exact_candidate_mask`
   (staticmethod; install via `staticmethod(wrapper)`) after the original
@@ -111,8 +118,8 @@ gap < spacing → defect did not reproduce (see seed caveat below).
 
 ## Findings — instrumented run 1 (2026-10-08, exit 0, 72.4 s)
 
-Full report: `/tmp/opencode/step3a.txt` (superseded by run 2's file after the
-L3a fix below; console `/tmp/opencode/step3a.console`).
+Full report: the scratch `step3a.txt` (superseded by run 2's file after the
+L3a fix below; not preserved).
 
 - **Liveness healthy**: 2,162 mask calls, 1,998 commits (growth always +1),
   probe totals normal (132,240 candidates, 123,077 exact checks), 0 spy
@@ -143,7 +150,7 @@ allows.
 
 ## Findings — instrumented run 2 (2026-10-08, exit 0, 69.4 s, corrected L3a)
 
-Report: `/tmp/opencode/step3a.txt` (current), console `/tmp/opencode/step3a.console`.
+Report: the scratch `step3a.txt` (current; not preserved).
 
 **Prediction confirmed exactly:**
 
@@ -182,8 +189,8 @@ Report: `/tmp/opencode/step3a.txt` (current), console `/tmp/opencode/step3a.cons
 1. Phase 1 (detection), Phase 2 (lead-in fix), Phase 3 (progress/cancel) —
    complete and green.
 2. Defect proven genuine (measurements above); hypotheses a–d eliminated.
-3. Baseline `facdb4d` for `replay-fixture-CAM.FCStd`; pinned snapshot
-   `/tmp/opencode/snap.FCStd` (md5 `3c3786d4…`).
+3. Baseline `facdb4d` for `replay-fixture-CAM.FCStd`; a pinned snapshot copy
+   was taken for comparison (scratch, not preserved; md5 `3c3786d4…`).
 4. Fixture provenance: `make_nested_fixture.py` constants are **stale**
    (spacing 4.0 / direction 90 / 23-23-2 = 48 parts, seed 1234) vs adopted
    fixture (54 parts, spacing 3.0, direction 45, 26/26/2). Adopted-fixture seed
@@ -193,8 +200,9 @@ Report: `/tmp/opencode/step3a.txt` (current), console `/tmp/opencode/step3a.cons
 
 ## Next move
 
-1. ~~**Write `/tmp/opencode/step3a.py`** from scratch~~ **[DONE 2026-10-08]**
-   — rewritten from scratch; requirements below kept for the record:
+1. ~~**Write the three-layer probe** from scratch~~ **[DONE 2026-10-08]**
+   — written as a scratch script and **not committed**; requirements below are
+   kept for the record and are specific enough to rebuild it:
    - Harness pattern: module `_LOG` + lock-protected `e()`, top-level
      `try: rc = run() except: e(traceback.format_exc())` → `DONE rc=N` →
      `_LOG.close()` → `sys.exit(rc)`.
@@ -215,7 +223,7 @@ Report: `/tmp/opencode/step3a.txt` (current), console `/tmp/opencode/step3a.cons
 3. ~~Run~~ **[DONE 2026-10-08]** run 1 (exit 0, 72.4 s) exposed the L3a
    double-buffer probe bug (see Findings run 1); L3a fixed (polygons paired
    as-is) and self-test re-validated.
-4. ~~Read `/tmp/opencode/step3a.txt`, classify~~ **[DONE 2026-10-08]** run 2
+4. ~~Read the report, classify~~ **[DONE 2026-10-08]** run 2
    (exit 0, 69.4 s): **L1 = L2 = L3a = 0, L3b = 54 → hypothesis e
    (polygon-source divergence) confirmed**; see Findings run 2.
 5. ~~Report findings + assign NEST-034~~ **[DONE 2026-10-08]** — NEST-034
@@ -280,7 +288,7 @@ target 1 — run A @ sim 0.3 (`step3a_faithful.txt`), run B @ sim 0.0
 
 ### Findings — faithful run A (sim 0.3, seed 1892920427) [DONE]
 
-Report `/tmp/opencode/step3a_faithful.txt`, exit 0, 29.4 s:
+Report `step3a_faithful.txt` (scratch), exit 0, 29.4 s:
 
 - **1 sheet, 54 parts, target MET** — early stop fired after the first
   layout (54 commits, 214 mask calls vs 2,162 in the 4-gen runs).
@@ -312,7 +320,7 @@ shortfall for users on defaults.
 
 ### Findings — faithful run B (sim 0.0, same seed/params) [DONE]
 
-Report `/tmp/opencode/step3a_faithful_sim0.txt`, exit 0, 465.5 s:
+Report `step3a_faithful_sim0.txt` (scratch), exit 0, 465.5 s:
 
 - **L3b = 0, tightest 3.0000 mm** → defect eliminated on the faithful
   configuration too. Both A/B pairs (seed 1234 old params, seed 1892920427
@@ -361,7 +369,7 @@ workers 4):
 
 ### Findings — run C (user's exact revision: sim 0.0, step 0.1) + clamp hunt [DONE]
 
-Report `/tmp/opencode/step3a_c_fine_sim0.txt`, exit 0, 512.9 s:
+Report `step3a_c_fine_sim0.txt` (scratch), exit 0, 512.9 s:
 **2 sheets, target NOT reached** (ran all 4 gens, 2,054 commits),
 L1 = L2 = L3a = 0, **L3b = 0, tightest 3.0000** — exact geometry is clean,
 but the harness did **not** reproduce the user's 1-sheet/8.91 s result
@@ -390,7 +398,7 @@ Legs launched:
 
 ### Findings — run F (clamp value: sim 0.001, step 0.1) [DONE]
 
-Report `/tmp/opencode/step3a_f_sim001.txt`, exit 0, 140.2 s:
+Report `step3a_f_sim001.txt` (scratch), exit 0, 140.2 s:
 **1 sheet, target MET** (54 commits — first layout again) — reproduces the
 user's UI result on their field's *actual* canonical value. L1 = L2 = L3a = 0,
 **L3b = 1 pair, tightest 2.9998 mm** (shortfall 0.0002 = 0.2 µm — inside the
@@ -411,7 +419,7 @@ true 0.0 this seed deterministically fails to reach 1 sheet.
 
 ### Findings — run D (isolation twin: sim 0.3, step 0.1) [DONE]
 
-Report `/tmp/opencode/step3a_d_fine_sim03.txt`, exit 0, 29.3 s:
+Report `step3a_d_fine_sim03.txt` (scratch), exit 0, 29.3 s:
 **1 sheet, target MET, L1 = L2 = L3a = 0, L3b = 58, tightest 2.7160 mm**
 (shortfall 0.2840 — within the 0.6 DP bound this time). Fine step does not
 cure the defect: 58 violating pairs with simplification 0.3 regardless of
@@ -476,7 +484,8 @@ grid, and the 1-sheet result again arrives only via the lying mask.
 
 ### Recommendation #1 — stage-wise decomposition [DONE 2026-10-08]
 
-Instrument `/tmp/opencode/step3b.py` (+ `step3b_selftest.py`, 14/14 green).
+Instrumented with a rung-decomposition probe (scratch, `step3b.py`, plus a
+14/14 self-test; not preserved).
 Re-ran the faithful-A nest; decomposition of all **56 violating pairs**
 (total shortfall 6.0378 mm), telescope residual 9e-16, Kabsch 54/54 at
 2.3e-13, buffer recompute vs stored artifacts at 1.5e-14, mask↔foot match
@@ -567,8 +576,9 @@ Ordered by the user ("implement #3 as proposed"), option 1 landed:
   absorbed into `_perf_stats` with the `KeyError`-safe `.get` pattern
   (never inside a `quiet=True` `+=` on a possibly-missing key). step3a's
   `mask_wrapper` now forwards `**kwargs`.
-- **Unit smoke** `/tmp/opencode/test_verify_stage.py` **17/17 green**
-  under freecadcmd: both legs, touch-vs-overlap semantics (area 0
+- **Unit smoke** `tests/freecad_harness/test_verify_stage.py` (was a
+  scratch script at this point — **17/17 green** under freecadcmd): both legs,
+  touch-vs-overlap semantics (area 0
   accepted, 0.5 mm² rejected), bounds overhang, registration arithmetic
   (mask-centroid vs self-centroid placements proven to differ, manual
   rigid motion matches), probe counters.
@@ -702,7 +712,7 @@ that fails does the row reject, i.e. today's behaviour.
 
 - First cut (collision repairs only) took `test_rotation_determinism`
   from 6/48 to 44/48 but still failed. An instrumented replay of the
-  test's nest (`/tmp/opencode/probe_rotdet.py`) showed **28 EMPTY-SHEET
+  test's nest (a scratch rotation-determinism probe) showed **28 EMPTY-SHEET
   KILLS**, every one the same shape: 4 rows in, 4 rows rejected. On a
   fresh sheet the engine's only candidates are the 4 corner-flush
   positions — exact in MASK space; the unsimplified verify bbox
@@ -739,8 +749,9 @@ baseline (122.5 vs 129.0 s).
 
 **Validation (final code)**:
 
-- Unit smoke `/tmp/opencode/test_verify_stage.py`: **50/50** — the 17
-  NEST-034 checks pinned reject-only (`NESTING_VERIFY_REPAIR=0` before
+- Unit smoke, now committed as
+  `tests/freecad_harness/test_verify_stage.py`: **50/50** at the time — the
+  17 NEST-034 checks pinned reject-only (`NESTING_VERIFY_REPAIR=0` before
   import) plus 33 repair checks: success with both predicates proven at
   the new coordinate, trapped candidate bounded rejection, off-sheet
   push rejection, coincident/degenerate rejection, empty-sheet pull-in,
@@ -748,6 +759,17 @@ baseline (122.5 vs 129.0 s).
   pre-measurement: a candidate mask cached across loop iterations (would
   report a clean position computed from the *old* one) and a degenerate
   push vector silently accepting the still-overlapping original.
+
+  **Later correction.** Mutation testing against `nesting_strategy.py` found
+  that two of the 17 NEST-034 checks could not fail as written: the
+  touching-pair case was settled by the bbox screen before the area tolerance
+  ran, and the registration case's fixture placed the two candidate
+  registrations 1.5 mm apart — close enough that both rejected, so the
+  de-registration bug they were meant to catch was undetectable. Both were
+  rewritten (a sub-tolerance sliver the screen admits; a 10×1 bar on a 10×10
+  plate, whose registrations land disjointly) and the suite is now 55 checks,
+  wired into `run.sh`. The two pre-measurement bugs above were real and are
+  unaffected.
 - Pure pytest **647/647** (11.8 s).
 - `test_rotation_determinism` (gate + repair ON): **34/34, status 0** —
   widths 0/4/8/16 all 48/48 at one digest (`a86e7043032993bd`), seeds
@@ -853,7 +875,7 @@ work existed) — re-nesting that fixture remains a pending user decision
   `sys.exit(main())` 222), `tests/freecad_harness/probe_overlay_geometry_cost.py`
   (module `_LOG` + tail try/except + `_LOG.close()`),
   `tests/freecad_harness/test_tool_clearance.py` (slice-scan pattern 229–278).
-- Old broken `/tmp/opencode/step3a.py`: bugs are
+- Old broken probe: bugs are
   `nesting_strategy.NestingStrategy` (class is `PlacementOptimizer`),
   wrong mask signature (missing `probe`), `cam_replay.get_nested_containers`
   (lives in `freecad_helpers`), seed defined but never set.

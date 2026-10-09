@@ -259,6 +259,7 @@ downstream of them stays in millimetres. Two files, two interpreters:
 | `test_panel_construction.py` | the real `NestingPanel()` **builds** | `freecad` (GUI), wired into `run.sh` |
 | `test_tooltip_assets.py` | the Candidate Step tooltip's diagram actually loads, measured by rendering it | `freecadcmd`, wired into `run.sh` |
 | `test_tool_clearance.py` | the nest leaves the tool room to swing | `freecadcmd`, wired into `run.sh` |
+| `test_verify_stage.py` | `_verify_stage` re-checks accepted rows on un-simplified geometry, and `_repair_candidate` moves a rejected row to a legal position rather than dropping it | `freecadcmd`, wired into `run.sh` |
 | `probe_layout_restore.py` | the reload half — the controller reading the right dial, and the panel coming back showing what the layout recorded | `freecad` (GUI), run by hand |
 | `probe_unit_panel.py` | `length_field.py` and the real `NestingPanel` | `freecad` (GUI), run by hand |
 | `probe_target_sheets.py` | the "Stop At Sheets" dial, panel → coordinator → a real GA run | `freecad` (GUI), run by hand |
@@ -362,6 +363,41 @@ around it silently.
 `FreeCAD.newDocument` is *not* enough — measured: a bare interpreter segfaults 3/3
 with no output, `newDocument` segfaults too, and only `openDocument` of a real file
 works (2/2). The suite's own docstrings say so at the point of use.
+
+### The verify gate, and why its suite uses synthetic polygons
+
+`test_verify_stage.py` (55 checks, under a second) covers `_verify_stage`
+(NEST-034) and `_repair_candidate` (NEST-036). Neither had a gated check in this
+repository at all, which is worth stating plainly: the collision-defect fix was
+validated by a smoke script kept outside the repo, and a fixed bug with no
+committed test is a bug that can come back unnoticed.
+
+The suite is synthetic on purpose. With 54 real parts and a real GA run, a
+registration or tolerance regression does not fail — it returns *fewer parts*,
+which is how the 1.9979 mm defect in `test_tool_clearance` sat behind a green
+gate. The predicate is arithmetic and its inputs are constructible, so the
+checks can say what the tolerance **is** rather than only that something
+overlapped.
+
+**Two of the checks had to be rewritten after mutation testing found them
+vacuous.** Both were inherited from the original smoke script, and both passed
+while being unable to fail:
+
+| check | why it could not fail | fix |
+|---|---|---|
+| "exact touch accepted" | an exactly-touching pair is dropped by the bbox screen's strict `>` before the area test runs — so it pinned the *screen*, not the tolerance, and a gate built on `intersects` would also have passed it | added a 1e-9 mm sliver whose bbox the screen admits, so the area comparison is what decides |
+| "registration: identical overlap rejected" | this fixture's two centroids are 1.5 mm apart, so a correctly-registered and a self-registered candidate still overlapped each other and **both** rejected — no verdict could tell them apart | added a 10×1 bar on a 10×10 plate, whose centroids are 4.5 mm apart: more than the bar is tall, so the two registrations land disjointly and give opposite verdicts |
+
+The second one mattered more. De-registration — translating the candidate about
+its own centroid instead of the mask's — is the specific bug NEST-034 exists to
+prevent, and the original check could not detect it.
+
+Six mutations were injected into `nesting_strategy.py` to confirm the suite
+bites; all six are now caught (`intersects` instead of area, self-centroid
+registration, repair never returning a position, an always-empty bounds window,
+a de-incremented counter, and the repair disabled outright). The first two
+survived the pre-fix suite. `nesting_strategy.py` was restored byte-identical
+afterwards.
 
 ### Rebuilding the nested fixture
 
@@ -1025,7 +1061,7 @@ schema version in step with the reader; the harness refuses a mismatch.
 
 | tier | runner | corpus | cost | what it catches |
 |---|---|---|---|---|
-| 1 | `run.sh` | synthetic, 450×350, 18 parts | ~10 s | packing regressions, instrumentation drift, unit formatting |
+| 1 | `run.sh` | synthetic, 450×350, 18 parts | ~10 s | packing regressions, instrumentation drift, unit formatting, verify-gate arithmetic |
 | 2 | `run_heavy.sh` | heavy synthetic, 1200×600, 122 parts | ~3.5 min | throughput on a single cold nest |
 | 2 | `run_ga.sh` | heavy synthetic, GA | ~1 min | throughput across layouts and generations |
 | 3 | `run_ga.sh GA_CORPUS=n70` | n70 (gitignored), GA | ~3 min | the configuration actually run |

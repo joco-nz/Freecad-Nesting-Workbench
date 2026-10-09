@@ -59,13 +59,14 @@ TOOLTIP_STATUS="$HARNESS_DIR/.last_status_tooltip"
 PANELBUILD_STATUS="$HARNESS_DIR/.last_status_panelbuild"
 ROTATIONDET_STATUS="$HARNESS_DIR/.last_status_rotationdet"
 PERSIST_STATUS="$HARNESS_DIR/.last_status_persist"
+VERIFYSTAGE_STATUS="$HARNESS_DIR/.last_status_verifystage"
 rm -f "$BENCH_STATUS" "$TEST_STATUS" "$GA_STATUS" "$PANEL_STATUS" \
       "$UNITS_STATUS" "$PYTEST_STATUS" "$REPLAY_STATUS" "$DRESSUP_STATUS" \
       "$LEADIN_STATUS" "$LEADINCMD_STATUS" \
       "$ORDER_STATUS" "$STARTPOINT_STATUS" "$BOUNDARY_STATUS" \
       "$RIGID_STATUS" "$SUBNAME_STATUS" "$CLEARANCE_STATUS" \
       "$TOOLTIP_STATUS" "$PANELBUILD_STATUS" "$PERSIST_STATUS" \
-      "$ROTATIONDET_STATUS"
+      "$ROTATIONDET_STATUS" "$VERIFYSTAGE_STATUS"
 
 cd "$REPO_ROOT"
 "$FREECADCMD" "$HARNESS_DIR/nest_benchmark.py" || true
@@ -139,13 +140,22 @@ cd "$REPO_ROOT"
 # seed that must change the result -- so neither "the pool does not matter" nor
 # "the rng is dead" can pass. NEST-032.
 "$FREECADCMD" "$HARNESS_DIR/test_rotation_determinism.py" || true
+# The verify gate and its repair-push, on synthetic polygons -- the cheapest
+# suite here, under a second, because the predicate is arithmetic and the
+# fixtures are constructible. In the gate for the same reason as the seeding
+# one above: a gate that re-checks accepted placements on un-simplified
+# geometry, and whose repair decides whether a rejected row is a dead end or
+# only a simplification artefact, is precisely the arithmetic that returns
+# *fewer parts* when it is wrong rather than raising. NEST-034, NEST-036.
+"$FREECADCMD" "$HARNESS_DIR/test_verify_stage.py" || true
 
 for f in "$BENCH_STATUS" "$TEST_STATUS" "$GA_STATUS" "$PANEL_STATUS" \
          "$UNITS_STATUS" "$REPLAY_STATUS" "$DRESSUP_STATUS" "$ORDER_STATUS" \
          "$LEADIN_STATUS" "$LEADINCMD_STATUS" \
          "$STARTPOINT_STATUS" "$BOUNDARY_STATUS" "$RIGID_STATUS" \
          "$SUBNAME_STATUS" "$CLEARANCE_STATUS" "$TOOLTIP_STATUS" \
-         "$PANELBUILD_STATUS" "$PERSIST_STATUS" "$ROTATIONDET_STATUS"; do
+         "$PANELBUILD_STATUS" "$PERSIST_STATUS" "$ROTATIONDET_STATUS" \
+         "$VERIFYSTAGE_STATUS"; do
     if [ ! -f "$f" ]; then
         echo "harness: DID NOT RUN -- did not write $f" >&2
         exit 3
@@ -289,6 +299,12 @@ fi
 PERSIST=$(cat "$PERSIST_STATUS")
 if [ "$PERSIST" -ne 0 ]; then
     echo "layout-persistence regression test FAILED (status $PERSIST)" >&2
+    [ "$STATUS" -eq 0 ] && STATUS=1
+fi
+
+VERIFYSTAGE=$(cat "$VERIFYSTAGE_STATUS")
+if [ "$VERIFYSTAGE" -ne 0 ]; then
+    echo "verify-stage regression test FAILED (status $VERIFYSTAGE)" >&2
     [ "$STATUS" -eq 0 ] && STATUS=1
 fi
 
