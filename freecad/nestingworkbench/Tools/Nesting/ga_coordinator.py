@@ -1282,6 +1282,7 @@ class GACoordinator:
                               # (calculate_efficiency), so sync the placed
                               # geometry across.
                               original_part.polygon = placed_part.shape.polygon
+                              original_part.verify_polygon = placed_part.shape.verify_polygon
                               original_part._angle = placed_part.shape._angle
                           s.parts[i].shape = original_part
                  self._record_layout_time(

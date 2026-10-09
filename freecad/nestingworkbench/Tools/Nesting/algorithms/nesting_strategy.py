@@ -21,6 +21,43 @@ from . import genetic_utils
 from .minkowski_engine import MinkowskiEngine
 
 
+# NEST-034 fix -- verify-on-accept (default on). When a candidate passes the
+# SIMPLIFIED mask collision check, re-check it against the un-simplified
+# buffered profile (Shape.verify_polygon) before accepting it, so spacing is
+# measured on the geometry that is actually drawn. The mask's stacked DP
+# simplification can consume the whole spacing budget while reporting a
+# clean sheet; this gate closes that hole. Set
+# NESTING_VERIFY_ON_ACCEPT=0 to A/B against the old behaviour.
+VERIFY_ON_ACCEPT = os.environ.get(
+    "NESTING_VERIFY_ON_ACCEPT", "1").strip().lower() not in ("0", "false", "off", "")
+
+# NEST-036 repair-push. When the verify gate rejects a mask-accepted
+# candidate, the mask's simplification optimism -- not a real dead end -- is
+# usually why: the NFP proposes positions where the SIMPLIFIED polygons
+# graze, and at simplification 0.3 that grazing carries 0.05-1.0 mm of true
+# penetration, so a reject-only gate dropped ~99% of candidates and starved
+# the search (8/54 parts placed). Repair pushes such a candidate out of
+# penetration by the measured depth and re-tests BOTH predicates (mask and
+# verify, bounds included) at the new coordinate; only when the bounded loop
+# cannot find a legal nearby position does the row fall back to rejection.
+# The gate itself is untouched: a repaired row is accepted only after the
+# same verify predicate passed. Set NESTING_VERIFY_REPAIR=0 for the
+# reject-only behaviour (bit-exact to the pre-repair gate).
+VERIFY_REPAIR = os.environ.get(
+    "NESTING_VERIFY_REPAIR", "1").strip().lower() not in ("0", "false", "off", "")
+
+# Bounded so a boxed-in candidate (pushes that cancel or oscillate) costs a
+# few exact checks and then rejects, instead of searching forever. The
+# measured penetration at sim 0.3 is 0.05-1.0 mm; the first step covers
+# depth*1.25 + 0.01, so one or two iterations converge in the common case.
+_REPAIR_MAX_ATTEMPTS = 6
+
+# How far past the sheet edge a bounds repair lands when pulling an
+# overhanging candidate on-sheet: the overshoot the collision pushes use as
+# their floor, so both repair legs step by the same quantum.
+_REPAIR_EDGE_MARGIN = 0.01
+
+
 def _candidate_geometry_key(prefix, x, y):
     """Build the complete run-local candidate geometry cache key."""
     return (prefix, float(x), float(y))
@@ -230,6 +267,390 @@ def _rings_geometry(rings):
     """
     polys = [Polygon(r) for r in rings]
     return polys[0] if len(polys) == 1 else GeometryCollection(polys)
+
+
+def _push_vector(cand, inter, partner):
+    """One partner's repair step: away from the overlap sliver, by its depth.
+
+    Direction is from the penetration's own centroid toward the candidate's
+    body -- for a shallow sliver that is the contact normal, and unlike a
+    partner-centroid direction it is also correct when the candidate is
+    inside a hole of the partner (the sliver sits at the hole wall, so the
+    vector points into the hole, away from the material). Depth is
+    sliver-area over sliver-perimeter times two: a l x d rectangle has
+    area l*d and perimeter ~2l, so 2A/P ~ d. The 1.25 factor and the 0.01 mm
+    floor absorb the estimate's error; an undershoot is corrected by the
+    next iteration's fresh intersection rather than by a bigger margin,
+    because overshoot costs density while undershoot only costs one more
+    pass. None when no direction exists (concentric shapes) -- the caller
+    rejects the row, which is the pre-repair behaviour.
+    """
+    ic = inter.centroid
+    cc = cand.centroid
+    dx = cc.x - ic.x
+    dy = cc.y - ic.y
+    norm = math.hypot(dx, dy)
+    if norm < 1e-9:
+        pc = partner.centroid
+        dx, dy = cc.x - pc.x, cc.y - pc.y
+        norm = math.hypot(dx, dy)
+        if norm < 1e-9:
+            return None
+    depth = 0.0
+    if inter.length > 1e-12:
+        depth = 2.0 * inter.area / inter.length
+    step = depth * 1.25 + 0.01
+    return (dx / norm * step, dy / norm * step)
+
+
+def _repair_candidate(x, y, rotated_verify, rotated_poly, rotated_centroid,
+                      sheet, existing_verify, existing_polygons,
+                      area_tolerance, bin_polygon,
+                      max_attempts=_REPAIR_MAX_ATTEMPTS):
+    """NEST-036 repair-push: move one rejected candidate to a legal position.
+
+    Called for a row the verify stage just failed -- by the bounds leg
+    (verify bbox overhanging the sheet, the empty-sheet corner-flush case)
+    or by the exact collision check. Returns ``((x, y), attempts)`` when
+    BOTH predicates -- the mask's and the verify's, bounds and
+    sheet-containment legs included -- hold at the final coordinate, or
+    ``(None, attempts)`` when the bounded loop gives up. The coordinates
+    are plain floats: the caller never lets this touch the engine's shared
+    candidate array, it only reports the new position back.
+
+    Bounds are an interval intersection, not a push: the position window
+    in which BOTH geometries sit strictly on the sheet is derived from
+    their bboxes (which differ), and the candidate is clamped into it --
+    when the window is empty the part cannot sit on this sheet at this
+    angle at all, and the caller has other rotations to try. Collisions
+    are a push: away from the penetration sliver by its measured depth.
+    Both are re-tested every iteration because either move can break what
+    the other proved -- the clamp can shove the candidate into a partner,
+    a collision push can shove it off the sheet. Re-testing both is what
+    lets the caller promise that a kept row's final coordinate passes
+    everything downstream re-checks.
+    """
+    vx0, vy0, vx1, vy1 = rotated_verify.bounds
+    mx0, my0, mx1, my1 = rotated_poly.bounds
+    cx, cy = rotated_centroid.x, rotated_centroid.y
+    ev_bounds = [polygon.bounds for polygon in existing_verify]
+    mp_bounds = [polygon.bounds for polygon in existing_polygons]
+    n_verify = len(existing_verify)
+    n_mask = len(existing_polygons)
+    attempts = 0
+    # The position window in which BOTH geometries sit strictly on the
+    # sheet -- their bboxes differ, so one coordinate has to satisfy both.
+    # Strict [0, w] x [0, h] rather than the stage's +-area_tolerance
+    # window: a bbox strictly inside the sheet makes the sheet-difference
+    # leg structurally true, and everything the stage accepts lies inside
+    # this window too. Invariant across iterations (only x/y move), so an
+    # empty window means no position exists for this part at this angle.
+    win_x0 = max(cx - vx0, cx - mx0)
+    win_x1 = min(sheet.width + cx - vx1, sheet.width + cx - mx1)
+    win_y0 = max(cy - vy0, cy - my0)
+    win_y1 = min(sheet.height + cy - vy1, sheet.height + cy - my1)
+    if win_x0 > win_x1 or win_y0 > win_y1:
+        return None, attempts
+
+    while attempts < max_attempts:
+        # Bounds legs (arithmetic only): clamp into the window -- the
+        # repair for an overhanging candidate is to pull it on-sheet, and
+        # both geometries move by the same coordinate.
+        bx, by = x, y
+        if x < win_x0:
+            x = min(win_x0 + _REPAIR_EDGE_MARGIN, win_x1)
+        elif x > win_x1:
+            x = max(win_x1 - _REPAIR_EDGE_MARGIN, win_x0)
+        if y < win_y0:
+            y = min(win_y0 + _REPAIR_EDGE_MARGIN, win_y1)
+        elif y > win_y1:
+            y = max(win_y1 - _REPAIR_EDGE_MARGIN, win_y0)
+        if x != bx or y != by:
+            # Pulled on-sheet: the collision legs must be re-proven at the
+            # new coordinate before this position can be reported clean.
+            attempts += 1
+            continue
+        mbx0, mby0 = x + mx0 - cx, y + my0 - cy
+        mbx1, mby1 = x + mx1 - cx, y + my1 - cy
+        # Rebuilt every iteration: after a push, a lazily-built candidate
+        # mask would test the PREVIOUS position against the NEW bbox and
+        # the sheet rect, silently passing rows that still penetrate.
+        cand_mask = translate(rotated_poly, xoff=x - cx, yoff=y - cy)
+        # Unreachable while the clamp above holds (both bboxes are then
+        # strictly inside the sheet); kept as the difference-parity check
+        # it is, in case the window is ever loosened. Mirrors the mask
+        # stage's needs_sheet branch.
+        if (mbx0 < 0.0 or mby0 < 0.0
+                or mbx1 > sheet.width or mby1 > sheet.height):
+            if bin_polygon is None:
+                return None, attempts
+            if cand_mask.difference(bin_polygon).area > area_tolerance:
+                return None, attempts
+
+        vbx0, vby0 = x + vx0 - cx, y + vy0 - cy
+        vbx1, vby1 = x + vx1 - cx, y + vy1 - cy
+        cand_verify = translate(rotated_verify, xoff=x - cx, yoff=y - cy)
+        push_x = 0.0
+        push_y = 0.0
+        violators = 0
+        for k in range(n_verify):
+            push = None
+            violation = False
+            eb = ev_bounds[k]
+            if (vbx1 > eb[0] and vbx0 < eb[2]
+                    and vby1 > eb[1] and vby0 < eb[3]):
+                existing = existing_verify[k]
+                if existing.intersects(cand_verify):
+                    inter = cand_verify.intersection(existing)
+                    if inter.area > area_tolerance:
+                        violation = True
+                        push = _push_vector(cand_verify, inter, existing)
+            # The mask leg runs only when the verify leg found nothing for
+            # this partner: one push per partner, from the geometry that
+            # actually violates (verify is the bigger polygon, so its depth
+            # dominates when both do -- and the next iteration re-checks
+            # whichever one still bites).
+            if not violation and k < n_mask:
+                mb = mp_bounds[k]
+                if (mbx1 > mb[0] and mbx0 < mb[2]
+                        and mby1 > mb[1] and mby0 < mb[3]):
+                    existing_m = existing_polygons[k]
+                    if existing_m.intersects(cand_mask):
+                        inter_m = cand_mask.intersection(existing_m)
+                        if inter_m.area > area_tolerance:
+                            violation = True
+                            push = _push_vector(cand_mask, inter_m, existing_m)
+            if not violation:
+                continue
+            if push is None:
+                # A real penetration with no usable direction (concentric
+                # shapes): unrepairable, reject exactly as the gate did.
+                return None, attempts
+            push_x += push[0]
+            push_y += push[1]
+            violators += 1
+
+        if violators == 0:
+            return (x, y), attempts
+        x += push_x
+        y += push_y
+        attempts += 1
+    return None, attempts
+
+
+def _verify_stage(valid, points, rotated_verify, rotated_centroid, sheet,
+                  existing_verify, area_tolerance, probe,
+                  rotated_poly=None, existing_polygons=None,
+                  bin_polygon=None):
+    """NEST-034 verify-on-accept: re-check accepted rows on un-simplified geometry.
+
+    `valid` is the mask's decision. Every row still True here was accepted on
+    SIMPLIFIED polygons whose stacked DP error can exceed the spacing budget
+    (measured: two stacked DP stages compose to 4x the per-stage tolerance),
+    so the mask can pass a placement whose drawn part sits closer than
+    spacing. `rotated_verify` is the candidate's un-simplified buffered
+    profile, already rotated by the same rigid motion as the mask polygon;
+    `existing_verify` holds the placed parts' verify polygons in sheet frame.
+
+    `points` are MASK centroids, so the candidate's verify polygon must
+    receive the identical translation the mask candidate got
+    (``points[i] - rotated_centroid``) -- rotating/translating it about its
+    own centroid would de-register it by the centroid offset between the two
+    polygons. When the two origins coincide the offset is zero and both
+    translations are the same arithmetic.
+
+    The predicate is the mask's own, unchanged: bounds within the same
+    tolerance window, collision when intersection area exceeds
+    `area_tolerance`. An empty `existing_verify` means an empty sheet, where
+    only the bounds leg can still reject (the un-simplified polygon's bbox
+    is not the mask's bbox). `valid` is updated in place; nothing returned.
+
+    NEST-036 repair (VERIFY_REPAIR): either rejection -- bounds or
+    collision -- is first offered to `_repair_candidate`, which pulls an
+    overhanging row on-sheet, pushes a penetrating row out of penetration,
+    and re-proves BOTH predicates at the new coordinate. Only when that
+    bounded loop fails does the row reject as before, so with the repair
+    off the decisions here are bit-identical to the reject-only gate.
+    Bounds repair matters most on an empty sheet, where the engine's only
+    candidates are corner-flush (exact in mask space; the verify bbox
+    overhangs by the DP error) and an unrepaired bounds leg would reject
+    every rotation of an otherwise placeable part. The repaired coordinates
+    never touch `points` -- the caller may be holding the engine's shared
+    candidate cache -- they leave through the probe under the private key
+    `_verify_repaired`, which `_evaluate_rotation` pops before the probe's
+    keys are copied anywhere else, so without a probe (or without the mask
+    geometry `rotated_poly`/`existing_polygons`) the repair is skipped and
+    this function rejects exactly as before -- the probe-less call also
+    makes a repair pointless, since a kept row's new coordinate could not
+    reach the scorer.
+    """
+    if rotated_verify is None:
+        return
+    acc = np.flatnonzero(valid)
+    if acc.size == 0:
+        return
+
+    t_verify = time.perf_counter()
+    candidates = int(acc.size)
+    bounds_rejections = 0
+    screen_pairs = 0
+    exact_checks = 0
+    rejections = 0
+    repairs = 0
+    bounds_repairs = 0
+    repair_failures = 0
+    repair_attempts = 0
+    repair_ms = 0.0
+    repaired_positions = None
+    repair_enabled = (
+        VERIFY_REPAIR
+        and probe is not None
+        and rotated_poly is not None
+        and existing_polygons is not None
+    )
+
+    # Verify extents relative to the MASK centroid (translation semantics
+    # above): candidate i's verify bbox is points[i] + these offsets.
+    vx0, vy0, vx1, vy1 = rotated_verify.bounds
+    rminx, rminy = vx0 - rotated_centroid.x, vy0 - rotated_centroid.y
+    rmaxx, rmaxy = vx1 - rotated_centroid.x, vy1 - rotated_centroid.y
+
+    px = points[acc, 0]
+    py = points[acc, 1]
+    in_sheet = (
+        (px + rminx >= -area_tolerance)
+        & (px + rmaxx <= sheet.width + area_tolerance)
+        & (py + rminy >= -area_tolerance)
+        & (py + rmaxy <= sheet.height + area_tolerance)
+    )
+    bad_bounds = np.flatnonzero(~in_sheet)
+    if bad_bounds.size:
+        if repair_enabled:
+            # Bounds rejection first offered to the repair: pull the
+            # overhanging candidate on-sheet (empty-sheet corner-flush
+            # candidates fail here by construction -- flush in mask space,
+            # the verify bbox grows past the wall by the DP error). The
+            # repair re-proves bounds AND collisions at the new coordinate,
+            # so a bounds-repaired row never reaches the collision leg
+            # below with unproven partners.
+            for j in bad_bounds:
+                index = int(acc[j])
+                t_repair = time.perf_counter()
+                new_pos, attempts = _repair_candidate(
+                    float(points[index, 0]), float(points[index, 1]),
+                    rotated_verify, rotated_poly, rotated_centroid,
+                    sheet, existing_verify, existing_polygons,
+                    area_tolerance, bin_polygon,
+                )
+                repair_ms += (time.perf_counter() - t_repair) * 1000
+                repair_attempts += attempts
+                if new_pos is not None:
+                    repairs += 1
+                    bounds_repairs += 1
+                    if (new_pos[0] != float(points[index, 0])
+                            or new_pos[1] != float(points[index, 1])):
+                        if repaired_positions is None:
+                            repaired_positions = {}
+                        repaired_positions[index] = new_pos
+                else:
+                    valid[index] = False
+                    bounds_rejections += 1
+                    repair_failures += 1
+        else:
+            bounds_rejections = int(bad_bounds.size)
+            valid[acc[bad_bounds]] = False
+    acc = acc[in_sheet]
+
+    if acc.size and existing_verify:
+        ev_bounds = np.asarray(
+            [polygon.bounds for polygon in existing_verify], dtype=np.float64
+        )
+        e_minx, e_miny = ev_bounds[:, 0], ev_bounds[:, 1]
+        e_maxx, e_maxy = ev_bounds[:, 2], ev_bounds[:, 3]
+        px = points[acc, 0]
+        py = points[acc, 1]
+        c_minx = px + rminx
+        c_miny = py + rminy
+        c_maxx = px + rmaxx
+        c_maxy = py + rmaxy
+        chunk = 4096
+        for start in range(0, acc.size, chunk):
+            sl = slice(start, start + chunk)
+            ov = (
+                (c_maxx[sl, None] > e_minx[None, :])
+                & (c_minx[sl, None] < e_maxx[None, :])
+                & (c_maxy[sl, None] > e_miny[None, :])
+                & (c_miny[sl, None] < e_maxy[None, :])
+            )
+            screen_pairs += int(ov.sum())
+            for r_local in np.flatnonzero(ov.any(axis=1)):
+                index = int(acc[start + r_local])
+                cand_verify = translate(
+                    rotated_verify,
+                    xoff=float(points[index, 0] - rotated_centroid.x),
+                    yoff=float(points[index, 1] - rotated_centroid.y),
+                )
+                hit = False
+                for e_pos in np.flatnonzero(ov[r_local]):
+                    exact_checks += 1
+                    existing = existing_verify[int(e_pos)]
+                    if existing.intersects(cand_verify):
+                        if cand_verify.intersection(existing).area > area_tolerance:
+                            hit = True
+                            break
+                if hit:
+                    if repair_enabled:
+                        t_repair = time.perf_counter()
+                        new_pos, attempts = _repair_candidate(
+                            float(points[index, 0]), float(points[index, 1]),
+                            rotated_verify, rotated_poly, rotated_centroid,
+                            sheet, existing_verify, existing_polygons,
+                            area_tolerance, bin_polygon,
+                        )
+                        repair_ms += (time.perf_counter() - t_repair) * 1000
+                        repair_attempts += attempts
+                        if new_pos is not None:
+                            repairs += 1
+                            if (new_pos[0] != float(points[index, 0])
+                                    or new_pos[1] != float(points[index, 1])):
+                                if repaired_positions is None:
+                                    repaired_positions = {}
+                                repaired_positions[index] = new_pos
+                        else:
+                            valid[index] = False
+                            rejections += 1
+                            repair_failures += 1
+                    else:
+                        valid[index] = False
+                        rejections += 1
+
+    verify_ms = (time.perf_counter() - t_verify) * 1000
+    if probe is not None:
+        probe['verify_candidates'] = probe.get('verify_candidates', 0) + candidates
+        probe['verify_bounds_rejections'] = probe.get(
+            'verify_bounds_rejections', 0) + bounds_rejections
+        probe['verify_screen_pairs'] = probe.get(
+            'verify_screen_pairs', 0) + screen_pairs
+        probe['verify_exact_checks'] = probe.get(
+            'verify_exact_checks', 0) + exact_checks
+        probe['verify_rejections'] = probe.get('verify_rejections', 0) + rejections
+        probe['verify_ms'] = probe.get('verify_ms', 0.0) + verify_ms
+        if repairs or repair_failures:
+            probe['verify_repairs'] = probe.get('verify_repairs', 0) + repairs
+            probe['verify_bounds_repairs'] = probe.get(
+                'verify_bounds_repairs', 0) + bounds_repairs
+            probe['verify_repair_failures'] = probe.get(
+                'verify_repair_failures', 0) + repair_failures
+            probe['verify_repair_attempts'] = probe.get(
+                'verify_repair_attempts', 0) + repair_attempts
+            probe['verify_repair_ms'] = probe.get(
+                'verify_repair_ms', 0.0) + repair_ms
+        if repaired_positions:
+            existing_side = probe.get('_verify_repaired')
+            if existing_side:
+                existing_side.update(repaired_positions)
+            else:
+                probe['_verify_repaired'] = repaired_positions
 
 
 class CandidateGeometryKeyTracker:
@@ -455,6 +876,18 @@ class PlacementOptimizer:
         """
         if part.original_polygon is None and part.polygon is not None:
             part.original_polygon = part.polygon
+        if getattr(part, 'verify_polygon', None) is None:
+            # NEST-034: no un-simplified geometry for this shape (verify
+            # build failed at creation, reload/legacy wrapper). Fall back to
+            # the mask polygon -- perfectly registered by construction, and
+            # _evaluate_rotation skips the stage when the two are the same
+            # object, so this part keeps exactly today's behaviour.
+            part.verify_polygon = part.original_polygon
+        if getattr(part, 'verify_original_polygon', None) is None:
+            # Pristine candidate source: same registration argument. When
+            # the original itself was just adopted from polygon (reload
+            # path), this lands on the same object and disables the stage.
+            part.verify_original_polygon = part.verify_polygon
             
         # Pre-group placed parts by (master_label, angle)
         placed_parts_grouped = defaultdict(list)
@@ -651,6 +1084,19 @@ class PlacementOptimizer:
                           'collision_hole_probe_ms'):
                 self._perf_stats[_key] = self._perf_stats.get(
                     _key, 0.0) + res.get(f'_{_key}', 0.0)
+            # NEST-034 verify-on-accept counters. .get()-defaulted like the
+            # ms keys above: they are absent from the perf initialiser, and
+            # a bare [] += here would raise inside the rotation future loop
+            # where quiet=True swallows it and the run still looks healthy.
+            for _key in ('verify_candidates', 'verify_bounds_rejections',
+                         'verify_screen_pairs', 'verify_exact_checks',
+                         'verify_rejections', 'verify_fallback_pairs',
+                         'verify_repairs', 'verify_bounds_repairs',
+                         'verify_repair_failures',
+                         'verify_repair_attempts', 'verify_repair_ms',
+                         'verify_ms'):
+                self._perf_stats[_key] = self._perf_stats.get(
+                    _key, 0) + res.get(f'_{_key}', 0)
             self._perf_stats['rotation_wall_ms'] += res.get(
                 '_t_wall_ms', 0)
             self._perf_stats['candidate_evaluation_wall_ms'] += res.get(
@@ -794,6 +1240,26 @@ class PlacementOptimizer:
         rotated_poly = rotate(part.original_polygon, angle, origin='centroid')
         if not rotated_poly: return {'metric': float('inf')}
 
+        # NEST-034 verify-on-accept: the candidate's un-simplified twin,
+        # derived from the PRISTINE build-frame source -- the same contract
+        # original_polygon has for the mask, so a part that was placed in an
+        # earlier evaluation is re-derived from scratch rather than
+        # double-rotated. Rotated about the ORIGINAL polygon's centroid --
+        # the exact point origin='centroid' resolved to on the line above --
+        # so mask and verify polygons receive one rigid motion and stay
+        # registered. Skipped when the part carries no pristine verify
+        # source (the find_best_placement fallback made it the mask polygon
+        # itself) or when the gate is off.
+        rotated_verify = None
+        if VERIFY_ON_ACCEPT:
+            verify_source = getattr(part, 'verify_original_polygon', None)
+            if (verify_source is not None
+                    and verify_source is not part.original_polygon):
+                origin_center = part.original_polygon.centroid
+                rotated_verify = rotate(
+                    verify_source, angle,
+                    origin=(origin_center.x, origin_center.y))
+
         # Candidate positions are centroid positions — express the rotated
         # bounds relative to the centroid for corner seeds and bounds checks.
         centroid = rotated_poly.centroid
@@ -828,12 +1294,26 @@ class PlacementOptimizer:
                 candidate_geometry_cache=self._candidate_geometry_cache,
                 geometry_key_prefix=geometry_key_prefix,
                 performance_logging=self.performance_logging,
+                rotated_verify=rotated_verify,
             )
+            # NEST-036 repair-push side channel: rows the verify stage kept
+            # alive by moving them. pts_arr is the engine's own candidate
+            # cache array, so the move lands on a copy that scoring and
+            # best-extraction read -- the cache (and the geometry-key
+            # recording below, which reflects where the mask actually built
+            # its translated polygons) stays on the pristine positions.
+            repaired = validity_probe.pop('_verify_repaired', None)
             t_validity = _time.perf_counter()
+            score_pts = pts_arr
+            if repaired:
+                score_pts = pts_arr.copy()
+                for _idx, (_rx, _ry) in repaired.items():
+                    score_pts[_idx, 0] = _rx
+                    score_pts[_idx, 1] = _ry
             best_idx, metric = MinkowskiEngine.score_gravity(
-                pts_arr, valid_mask, direction, rng=rng)
+                score_pts, valid_mask, direction, rng=rng)
             if best_idx is not None:
-                best = {'x': float(pts_arr[best_idx, 0]), 'y': float(pts_arr[best_idx, 1]),
+                best = {'x': float(score_pts[best_idx, 0]), 'y': float(score_pts[best_idx, 1]),
                         'angle': angle, 'metric': metric}
 
         # Notify better result found
@@ -866,7 +1346,7 @@ class PlacementOptimizer:
     def _exact_candidate_mask(
         rotated_poly, points, sheet, area_tolerance=1e-7, probe=None,
         candidate_geometry_cache=None, geometry_key_prefix=None,
-        performance_logging=False,
+        performance_logging=False, rotated_verify=None,
     ):
         """Validate NFP candidates against the actual transformed polygons.
 
@@ -928,6 +1408,22 @@ class PlacementOptimizer:
             probe['mask_calls'] = 0
             probe['mask_batch_candidates'] = 0
             probe['mask_batch_max'] = 0
+            # NEST-034 verify-on-accept. Initialised here so a run reports
+            # 0 rather than omitting them (gate off, empty sheet, no
+            # survivors); _verify_stage then adds its own counts.
+            probe['verify_candidates'] = 0
+            probe['verify_bounds_rejections'] = 0
+            probe['verify_screen_pairs'] = 0
+            probe['verify_exact_checks'] = 0
+            probe['verify_rejections'] = 0
+            probe['verify_fallback_pairs'] = 0
+            probe['verify_ms'] = 0.0
+            # NEST-036 repair-push counters, same 0-not-omitted rationale.
+            probe['verify_repairs'] = 0
+            probe['verify_bounds_repairs'] = 0
+            probe['verify_repair_failures'] = 0
+            probe['verify_repair_attempts'] = 0
+            probe['verify_repair_ms'] = 0.0
         if not valid.any():
             return valid
 
@@ -941,6 +1437,16 @@ class PlacementOptimizer:
             if probe is not None:
                 probe['sheet_candidates'] = int(valid.sum())
                 probe['collision_candidates'] = int(valid.sum())
+            # Empty sheet: the mask had no collision partner, but the
+            # verify geometry can still reject a bounds breach -- the
+            # un-simplified polygon's bbox is not the mask's bbox. That is
+            # exactly the empty-sheet corner-flush case NEST-036's repair
+            # must see, so the mask geometry travels along even though
+            # there are no partners.
+            _verify_stage(valid, points, rotated_verify, rotated_centroid,
+                          sheet, [], area_tolerance, probe,
+                          rotated_poly=rotated_poly,
+                          existing_polygons=[])
             return valid
 
         # ---- Measurement-only: interior-ring population of the collision mask.
@@ -1298,6 +1804,29 @@ class PlacementOptimizer:
                 # outright, so this counter is the sheet yield that filling
                 # would destroy.
                 probe['mask_hole_exploiting_placements'] += 1
+
+        # NEST-034 verify-on-accept: survivors of the mask check are
+        # re-checked on un-simplified geometry. Runs after every mask
+        # rejection, so it only ever sees candidates the mask accepted.
+        if rotated_verify is not None:
+            existing_verify = []
+            fallback_pairs = 0
+            for shape, poly in zip(existing_shapes, existing_polygons):
+                verify = getattr(shape, 'verify_polygon', None)
+                if verify is None:
+                    # No un-simplified geometry for this shape: pair is
+                    # checked on the mask polygon -- today's behaviour.
+                    verify = poly
+                    fallback_pairs += 1
+                existing_verify.append(verify)
+            if probe is not None:
+                probe['verify_fallback_pairs'] = probe.get(
+                    'verify_fallback_pairs', 0) + fallback_pairs
+            _verify_stage(valid, points, rotated_verify, rotated_centroid,
+                          sheet, existing_verify, area_tolerance, probe,
+                          rotated_poly=rotated_poly,
+                          existing_polygons=existing_polygons,
+                          bin_polygon=bin_polygon)
 
         if probe is not None:
             probe['candidate_geometry_ms'] = probe.get(

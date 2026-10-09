@@ -314,6 +314,39 @@ def create_single_nesting_part(shape_to_populate, shape_obj, spacing, deflection
     final_buffered_polygon = translate(buffered_polygon, xoff=-buffered_centroid.x, yoff=-buffered_centroid.y)
     final_unbuffered_polygon = translate(final_polygon_unbuffered, xoff=-buffered_centroid.x, yoff=-buffered_centroid.y)
 
+    # NEST-034 (verify-on-accept): the UNSIMPLIFIED counterpart of
+    # final_buffered_polygon. The mask polygons above pass through stacked
+    # simplification stages (profile DP inside get_2d_profile_from_obj, buffer
+    # DP at the .simplify above, and the mask-level DP downstream), and the
+    # composed error can exceed the spacing budget while the mask still
+    # reports a clean sheet -- the drawn part then sits closer than spacing.
+    # This polygon skips every simplification: profile extracted at tolerance
+    # 0, buffered by the same spacing/2, recentered by the same shift, so it
+    # shares final_buffered_polygon's build frame and receives identical
+    # rigid motions afterwards. Never simplified, never re-buffered.
+    verify_polygon = None
+    try:
+        verify_profile = get_2d_profile_from_obj(
+            shape_obj, up_direction, deflection, 0.0, verbose=verbose)
+        if verify_profile is not None and not verify_profile.is_empty:
+            if not verify_profile.is_valid:
+                verify_profile = make_valid(verify_profile)
+                if isinstance(verify_profile, MultiPolygon):
+                    verify_profile = max(verify_profile.geoms, key=lambda p: p.area)
+            buffered_verify = verify_profile.buffer(spacing / 2.0, join_style=1)
+            if buffered_verify is not None and not buffered_verify.is_empty:
+                verify_polygon = translate(
+                    buffered_verify,
+                    xoff=-buffered_centroid.x, yoff=-buffered_centroid.y)
+    except Exception as exc:
+        # A failed verify build must not fail the run: the accept gate
+        # degrades to today's mask geometry for this shape (counted as
+        # verify_fallback_pairs at the check).
+        verify_polygon = None
+        if verbose:
+            FreeCAD.Console.PrintWarning(
+                f"  -> verify polygon build failed for '{shape_obj.Label}': {exc}\n")
+
     # The source_centroid is the pivot point for the final part placement.
     # It must map the new Polygon Centroid (Origin) back to the 3D Geometry.
     
@@ -348,6 +381,8 @@ def create_single_nesting_part(shape_to_populate, shape_obj, spacing, deflection
     shape_to_populate.deflection = float(deflection)
     shape_to_populate.simplification = float(simplification)
     shape_to_populate.unbuffered_polygon = final_unbuffered_polygon
+    shape_to_populate.verify_polygon = verify_polygon
+    shape_to_populate.verify_original_polygon = verify_polygon
     shape_to_populate.source_centroid = source_centroid + rotated_offset
     
     if verbose:

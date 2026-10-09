@@ -694,6 +694,11 @@ class ShapePreparer:
                 shape_instance.polygon = master_wrapper.polygon
                 shape_instance.original_polygon = master_wrapper.original_polygon
                 shape_instance.unbuffered_polygon = master_wrapper.unbuffered_polygon
+                shape_instance.verify_polygon = master_wrapper.verify_polygon
+                shape_instance.verify_original_polygon = (
+                    master_wrapper.verify_original_polygon
+                    if master_wrapper.verify_original_polygon is not None
+                    else master_wrapper.verify_polygon)
                 shape_instance.source_centroid = master_wrapper.source_centroid
                 shape_instance.spacing = spacing
 

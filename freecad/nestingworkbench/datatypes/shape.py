@@ -89,6 +89,16 @@ class Shape:
         self.polygon = None # The current, transformed polygon for collision checks
         self.original_polygon = None # The un-rotated buffered polygon, used as a base for rotation
         self.unbuffered_polygon = None # The un-rotated, un-buffered polygon for area calculation
+        # NEST-034 (verify-on-accept): the buffered polygon of the UNSIMPLIFIED
+        # profile, in the same build frame as original_polygon. Two flavours,
+        # mirroring polygon/original_polygon exactly:
+        #   verify_original_polygon -- pristine build-frame source; never
+        #     mutated, used to derive per-angle candidates (so a part that
+        #     was placed before is re-evaluated from scratch, like the mask)
+        #   verify_polygon -- follows every rotation/translation of
+        #     self.polygon, so already-placed parts read back in sheet frame
+        self.verify_original_polygon = None
+        self.verify_polygon = None
         self.source_centroid = None # The original pivot point from the FreeCAD geometry
 
         self.label_text = None # Will hold the text for the Draft.ShapeString object
@@ -141,7 +151,8 @@ class Shape:
                 setattr(result, k, FreeCAD.Vector(v))
             elif isinstance(v, FreeCAD.Placement):
                 setattr(result, k, FreeCAD.Placement(v))
-            elif k in ['polygon', 'original_polygon', 'unbuffered_polygon']:
+            elif k in ['polygon', 'original_polygon', 'unbuffered_polygon',
+                       'verify_polygon', 'verify_original_polygon']:
                 # Shapely polygons are immutable, but deepcopying is safer.
                 setattr(result, k, copy.deepcopy(v, memo))
             else:
@@ -232,7 +243,18 @@ class Shape:
             self._angle = angle
             center = self.original_polygon.centroid
             self.polygon = rotate(self.original_polygon, angle, origin=center) # Always rotate from the true original
-            
+            if self.verify_original_polygon is not None:
+                # NEST-034: re-derive from the PRISTINE verify source with
+                # the same rigid motion (same angle, same center), exactly
+                # as .polygon is re-derived from original_polygon -- so a
+                # part rotated again after a previous placement cannot
+                # double-rotate its check geometry.
+                self.verify_polygon = rotate(
+                    self.verify_original_polygon, angle, origin=center)
+            elif self.verify_polygon is not None:
+                self.verify_polygon = rotate(
+                    self.verify_polygon, angle, origin=center)
+
             if reposition:
                 self.move_to(current_bl_x, current_bl_y)
 
@@ -243,6 +265,9 @@ class Shape:
         if not self.polygon:
             return
         self.polygon = translate(self.polygon, xoff=dx, yoff=dy)
+        if self.verify_polygon is not None:
+            # NEST-034: same translation keeps the check polygon registered.
+            self.verify_polygon = translate(self.verify_polygon, xoff=dx, yoff=dy)
 
     def move_to(self, x, y):
         """
