@@ -188,7 +188,18 @@ def test_a_clockwise_arc_takes_the_clockwise_way_round():
 
 
 def test_an_arc_without_a_centre_falls_back_to_its_chord():
-    """Malformed input degrades to something, rather than raising."""
+    """Malformed input degrades to something, rather than raising.
+
+    Pinned deliberately, and the fallback is not equivalent to the arc: a chord
+    lies inside it, so it reports *more* clearance than the truth and can only
+    lose a conflict, never invent one. Measured on a quarter arc at r = 6 with a
+    neighbour 0.300 mm away, the chorded path reports 2.0573 mm -- a false clean.
+
+    That is why this is a last resort rather than a mode. Asserting it here puts
+    the behaviour on the record as a decision rather than a silent default: if a
+    real path ever reaches it, `R`-form arcs are the likely cause, and they need
+    the centre derived from the radius rather than the chord accepted.
+    """
     geometry = cut_polyline(_line([_Cmd("G3", X=10.0, Y=0.0)]))
     assert geometry is not None
     assert geometry.length == pytest.approx(10.0, abs=1e-6)

@@ -115,13 +115,35 @@ COINCIDENT_MM = 1e-6
 
 #: Chords per arc when an arc is flattened to a polyline.
 #:
-#: An arc's clearance to a straight edge is underestimated by a chord, and the
-#: error is largest on a small arc close to the middle of a long one -- which is
-#: the shape a corner lead-in makes. 24 chords over a quarter turn bounds the
-#: sagitta at `r * (1 - cos(pi/48))`, which is under 0.001 mm at the 6 mm radii
-#: these lead-ins use, three orders below the 0.6 mm margin they are tested
+#: Sampling rather than chording matters most at mid-span: the chord of a `theta`
+#: sweep cut into `n` pieces sags by `r * (1 - cos(theta / 2n))` at its worst
+#: point, which is a small arc's middle -- the shape a corner lead-in makes. The
+#: round holes are `theta = 90` at r = 5.8992, where 24 chords puts the sagitta at
+#: **0.00316 mm**, under 200x below the 0.6 mm margin these paths are tested
 #: against. Sampling less finely to save time would be buying a rounding error
 #: against a threshold it cannot affect.
+#:
+#: That figure is for a quarter turn and does not carry to a wide sweep, which
+#: is the case to watch: the sagitta grows with `theta`. The widest arc on the
+#: fixture sweeps 343.8 degrees at r = 8.7321, where 24 chords puts it at
+#: **0.0681 mm** -- still under the margin, but 21x worse than the corner radii
+#: 24 was chosen for. A program that starts emitting wide arcs wants this
+#: revisited rather than assumed. (Its 52.3926 mm sampled length against a
+#: 37.8687 mm chord is the same fact as a length excess; see `CutMove`.)
+#:
+#: Which way that error points is the reason `_arc_points` samples at all rather
+#: than falling back, and the sign is worth stating because it is the one that
+#: makes a fallback dangerous. A chord lies *inside* the arc, so it pulls the
+#: path back toward the centre of curvature and **away** from whatever the lead-in
+#: was about to reach: chording **overstates** clearance, which reads as clean.
+#: Measured on a quarter arc at r = 6 with the neighbour 0.300 mm from the true
+#: arc, the reported clearance becomes **2.0573 mm** past the crown and
+#: **1.4573 mm** on the concave side -- a false clean on a real crossing, not a
+#: false alarm. The error is zero only at the arc's endpoints, where the chord
+#: and the arc agree.
+#:
+#: So: never widen this to "just use the chord when the centre is missing". Fix
+#: the centre instead. See the fallback at `_arc_points`.
 ARC_CHORDS = 24
 
 #: A polyline shorter than this is a point, not a path, and a point's distance
@@ -262,11 +284,30 @@ def cut_polyline(path, chords=ARC_CHORDS):
 
 
 def _arc_points(command, x0, y0, x1, y1, chords):
-    """Sample a `G2`/`G3` from its `I`/`J` centre. Falls back to the chord."""
+    """Sample a `G2`/`G3` from its `I`/`J` centre. Falls back to the chord.
+
+    Two things this assumes, neither enforced, both worth knowing before changing
+    either one:
+
+    * **`G17` only.** `I`/`J` are centre offsets in the command's own plane, and
+      the sweep is unwrapped as `G2` clockwise in XY. That is right for `G17` and
+      wrong for `G18`/`G19`, where projecting into XY flips the apparent
+      direction. FreeCAD's post-processor emits `G17` for 2D profiling, and this
+      module works in XY throughout -- it dropped Z-modality tracking on purpose
+      -- so the exposure is a 3D toolpath, which is not what this reads.
+    * **Centre offsets, never `R`.** An `R`-form arc carries a radius rather than
+      a centre, so the fallback below takes it. Measured on the committed nested
+      fixture: **166 arcs, all `I`/`J`, zero fallbacks.** So the branch is correct
+      today and the fallback is close to dead code -- which is exactly why it must
+      not be left unguarded, because chording reads as clean. See `ARC_CHORDS`.
+    """
     params = command.Parameters
     i = params.get("I")
     j = params.get("J")
     if i is None or j is None:
+        # An `R`-form arc, or a degenerate centre. Not equivalent to the arc --
+        # it overstates the clearance this module exists to measure -- so it is a
+        # last resort rather than a mode.
         return [(x0, y0), (x1, y1)]
     cx, cy = x0 + float(i), y0 + float(j)
     radius = math.hypot(float(i), float(j))
@@ -275,9 +316,14 @@ def _arc_points(command, x0, y0, x1, y1, chords):
 
     start = math.atan2(y0 - cy, x0 - cx)
     end = math.atan2(y1 - cy, x1 - cx)
-    # G2 turns clockwise, so `end` must fall *below* `start`; unwrap in that
-    # direction rather than taking the short way round, which for a
+    # G2 turns clockwise in G17, so `end` must fall *below* `start`; unwrap in
+    # that direction rather than taking the short way round, which for a
     # counter-clockwise G3 of more than half a turn is the wrong arc entirely.
+    # Getting this backwards is invisible to every cheap check -- the arc still
+    # starts and ends where the gcode says and the radius is unchanged, because
+    # radius is a property of the centre offset and not of the sweep -- so it
+    # would only show up as a corner arc drawn the long way round. Pinned by
+    # `test_a_clockwise_arc_takes_the_clockwise_way_round`.
     if command.Name == "G2":
         while end >= start:
             end -= 2 * math.pi

@@ -3797,6 +3797,55 @@ is left is lead-in reach, which spacing addresses and the audit relocates.
 deliberate division of labour: the nester packs for tool clearance, the
 recipe owns lead reach, and the audit reconciles the two afterwards.
 
+**An earlier attempt to close this gap inside the nester was built, measured
+and abandoned** — branch `wip/cam-boundary-abandoned` (commit `f7cb001`), kept
+for reference and not merged. Worth knowing about before anyone re-derives it,
+because it is a week of work and it failed for an instructive reason rather
+than a structural one.
+
+The intent was to let the user's own CAM job define the footprint the nester
+packs against, by unioning the tool's swept area along every cutting move into
+the silhouette:
+
+```
+footprint = (silhouette ⊕ spacing/2) ∪ swept_area
+```
+
+That is the right shape for the problem — the sweep is bidirectional, and the
+plan measured both directions on the committed fixture: **5.4 / 5.5 / 18.1 mm**
+of cut reaching *outside* the part, and **150.0 mm²** reaching *inside*
+`SimpleSpacer`'s nestable void. Placements landing on a cut bar leaked at 18 of
+19 rotation angles, peaking near 25°.
+
+It reached 9,300 lines across 30 files, green throughout: 940 pytest, 186
+feature checks, ten status files at 0. Then the arc reader was fixed, and the
+justification went with it. The 5.4/5.5/18.1 mm figures were **G2/G3 direction
+errors** — every corner arc drawn as 270° instead of 90°. Corrected, the
+excursion fell to 1.25 / 1.27 / 1.29 mm against a 3.0 mm spacing reserve, with
+**zero crossings**: on this fixture the feature is a no-op.
+
+Two findings from it survive the abandonment and are worth not re-learning:
+
+* **The false-geometry trap.** The broken arcs made the sweep appear to punch
+  689.5 mm² of bars across the void, leaving nineteen rings where the silhouette
+  has thirteen — including a 7732.6 mm² near-circle at roundness 0.9937, in the
+  same red as a real boundary hole. A subtraction term was written, tested and
+  merged on that reading before being reverted. Fabricated nestable void is the
+  same failure mode NEST-034 exists to close, reached by a different road.
+* **Cache keys.** With a composite footprint, `Shape.nfp_cache` can serve no-fit
+  polygons computed against a boundary no longer in use — silently, since the
+  mask still verifies against `polygon`. `clear_caches()` does not clear
+  `nfp_cache`, by design. The branch's answer is a `(source, had_cut, stamp)`
+  tuple in every key, with a per-run counter, because the job name can stay
+  fixed while the geometry moves underneath it. That hazard is latent here
+  independently of whether the boundary feature ever returns.
+
+The branch's `cam-boundary-plan.md` (1,175 lines) holds the full measurement
+record, including a `major_arc_fraction` diagnostic and 34 tests for an arc
+reader. Neither is wanted here: `lead_in_audit._arc_points` already reads arcs
+correctly, and `test_a_clockwise_arc_takes_the_clockwise_way_round` pins the
+direction the branch had to discover the hard way.
+
 ### Two fixture traps, recorded because both produced correct refusals
 
 * **Replay labels are not reproducible across runs.** FreeCAD appends a counter
