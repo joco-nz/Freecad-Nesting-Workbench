@@ -3690,10 +3690,11 @@ which answers perfectly well on a class whose dialog code is broken. It runs on
 the `freecad` binary for the same reason `test_panel_construction.py` does, and
 it is the only gated check of the menu-vs-toolbar decision.
 
-`LeadOut` is false on all 98 fixture operations, so lead-out coverage is built
-rather than found: the harness turns it on for a real two-ended operation and
-asserts the lead-out is `RadiusOut` long, that both kinds are reported, and that
-the joint test rejects what the lead-in alone accepts. Two earlier attempts at
+`LeadOut` is true on 28 of the fixture's 110 operations (28 lead-out runs), so
+lead-out coverage is now largely *found* rather than built. The harness
+nonetheless still builds it, on a real two-ended operation, and asserts the
+lead-out is `RadiusOut` long, that both kinds are reported, and that the joint
+test rejects what the lead-in alone accepts. Two earlier attempts at
 this check passed for the wrong reason and are recorded in the file -- one ran
 against an already-fixed job and saw only a lead-out; one assumed a 400 mm
 lead-out could never be cleared, which is false because the walk reaches the
@@ -3751,6 +3752,50 @@ each passed for the wrong reason:
   "cancel after two polls" lands somewhere different depending on how many
   candidates each operation happened to try. The gate now triggers the cancel
   from the progress seam, which is deterministic.
+
+### Boundary vs lead reach — measured, and deliberately not fixed in the nester
+
+The polygon the nester reserves is the part contour buffered by
+`PartSpacing/2` — **1.5 mm** at the fixture's 3.0 mm spacing. A `LeadInOut`
+extends the cut path **3.0 mm** (`RadiusIn`/`RadiusOut`) beyond that same
+contour. The lead therefore **overshoots the reserved envelope by 1.5 mm**,
+which is why a lead can reach a neighbour's cut path at all: the parts were
+packed so their *collision polygons* do not overlap, and the lead runs
+outside its own.
+
+To see it, show the `bound_*` outlines in the re-nested fixture — those are
+the collision polygons, drawn red by `Shape` from `self.polygon` — with the
+CAM cut path over them. The green cut path leaving a red boundary that is not
+its own is this, not a rendering artefact.
+
+**This is not fixed in the nester, on purpose.** Buffering the collision
+polygon by `spacing/2 + RadiusIn` would contain every lead, but it hardcodes a
+CAM recipe radius into packing: the nester would spend density on a number
+that is the user's craft, and that `check_tool_clearance` and this audit both
+deliberately leave alone. The user already holds two levers at the right
+layer, and the measurement says they are the effective ones:
+
+* **more `PartSpacing`**, and
+* **dropping `LeadOut`** where a lead-in is all the operation needs.
+
+Measured split of the 12 flagged operations at the 0.6 mm tool-radius margin:
+
+| | count | operations |
+|---|--:|---|
+| lead-out only — clears entirely without the lead-out | **7** | `BottomStrap_1`, `_2`, `_13`, `_15`, `_21`, `_25`, `_26` |
+| both ends in conflict | 1 | `BottomStrap_12` |
+| lead-in only | 3 | `BottomStrap_23`, `_8`, `SimpleSpacer_1` |
+| pierce off the sheet edge, no conflict | 1 | `TopStrap_9` |
+
+**Five of the six exact crossings (distance 0) are lead-outs**, so dropping
+lead-outs removes the worst class outright — and it takes `BottomStrap_25`
+with it, taking the "needs doing by hand" tail from 3 operations to 2. What
+is left is lead-in reach, which spacing addresses and the audit relocates.
+
+**Recorded here so it is not later mistaken for an oversight.** The 1.5 mm /
+3.0 mm overshoot is legible in the code and reads like a bug. It is a
+deliberate division of labour: the nester packs for tool clearance, the
+recipe owns lead reach, and the audit reconciles the two afterwards.
 
 ### Two fixture traps, recorded because both produced correct refusals
 

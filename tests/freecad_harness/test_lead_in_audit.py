@@ -161,7 +161,7 @@ def check_scan(doc, job):
                     if r.kind == "lead-out")
     check(lead_outs == 28,
           "the lead-outs were found too (%d of them -- the fixture has "
-          "LeadOut true on two dressups)" % lead_outs)
+          "LeadOut true on 28 of its 110 dressups)" % lead_outs)
 
     # Multi-wire operations exist on this fixture, and one lead-in per wire is
     # the case a single-lead-in reader gets wrong.
