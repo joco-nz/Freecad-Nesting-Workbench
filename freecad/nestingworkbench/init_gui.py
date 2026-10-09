@@ -36,6 +36,7 @@ class NestingWorkbench(FreeCADGui.Workbench):
         from freecad.nestingworkbench.commands import command_export_sheets
         from freecad.nestingworkbench.commands import command_create_cam_job
         from freecad.nestingworkbench.commands import command_replay_cam
+        from freecad.nestingworkbench.commands import command_audit_lead_ins
         from freecad.nestingworkbench.commands import command_create_silhouette
         # Create Menu (Dropdown)
         #
@@ -51,6 +52,7 @@ class NestingWorkbench(FreeCADGui.Workbench):
             'Nesting_Export',
             'Nesting_CreateCAMJob',
             'Nesting_ReplayCAMSetup',
+            'Nesting_AuditLeadIns',
             'Nesting_CreateSilhouette'
         ])
         self.appendToolbar("Nesting", [
@@ -60,6 +62,11 @@ class NestingWorkbench(FreeCADGui.Workbench):
             'Nesting_Export',
             'Nesting_CreateCAMJob',
             'Nesting_ReplayCAMSetup',
+            # The lead-in check is deliberately NOT in the toolbar, though it is
+            # in the menu. It acts on a replayed job, so it is meaningless until
+            # a replay has run, and a toolbar button that is inert for most of a
+            # session is one people learn to click without reading. In the menu
+            # it sits next to the replay that produces the jobs it works on.
             'Nesting_CreateSilhouette'
         ])
 

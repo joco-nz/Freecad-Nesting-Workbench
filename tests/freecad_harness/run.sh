@@ -53,12 +53,15 @@ BOUNDARY_STATUS="$HARNESS_DIR/.last_status_boundary"
 RIGID_STATUS="$HARNESS_DIR/.last_status_rigid"
 SUBNAME_STATUS="$HARNESS_DIR/.last_status_subnames"
 CLEARANCE_STATUS="$HARNESS_DIR/.last_status_clearance"
+LEADIN_STATUS="$HARNESS_DIR/.last_status_leadin"
+LEADINCMD_STATUS="$HARNESS_DIR/.last_status_leadincmd"
 TOOLTIP_STATUS="$HARNESS_DIR/.last_status_tooltip"
 PANELBUILD_STATUS="$HARNESS_DIR/.last_status_panelbuild"
 ROTATIONDET_STATUS="$HARNESS_DIR/.last_status_rotationdet"
 PERSIST_STATUS="$HARNESS_DIR/.last_status_persist"
 rm -f "$BENCH_STATUS" "$TEST_STATUS" "$GA_STATUS" "$PANEL_STATUS" \
       "$UNITS_STATUS" "$PYTEST_STATUS" "$REPLAY_STATUS" "$DRESSUP_STATUS" \
+      "$LEADIN_STATUS" "$LEADINCMD_STATUS" \
       "$ORDER_STATUS" "$STARTPOINT_STATUS" "$BOUNDARY_STATUS" \
       "$RIGID_STATUS" "$SUBNAME_STATUS" "$CLEARANCE_STATUS" \
       "$TOOLTIP_STATUS" "$PANELBUILD_STATUS" "$PERSIST_STATUS" \
@@ -106,6 +109,17 @@ cd "$REPO_ROOT"
 # `spacing` and the CAM tool are independent controls and nothing related them:
 # a nest tighter than the tool is wide would be cut through without a word.
 "$FREECADCMD" "$HARNESS_DIR/test_tool_clearance.py" || true
+# Lead-ins reach outside their own part, and the committed fixture's worst one
+# clears a neighbour's cut path by 0.0598 mm -- which no intersection test
+# reports, because nothing actually crosses. Every earlier version of this code
+# read that geometry wrong in a way that produced a confident clean sheet, so
+# the gate asserts the measured distance rather than a count.
+"$FREECADCMD" "$HARNESS_DIR/test_lead_in_audit.py" || true
+# The command itself, on the GUI binary like `test_panel_construction.py`: it
+# imports FreeCADGui and builds a QMessageBox, and `GetResources()` would answer
+# perfectly well on a class whose dialog code was broken. Also the only gated
+# check of the menu-vs-toolbar decision.
+"$GUI_FREECAD" "$HARNESS_DIR/test_command_audit_lead_ins.py" || true
 # The Candidate Step tooltip's diagram: the file can exist and the string can
 # name it and Qt still draws a broken-image box, so this renders the real
 # tooltip offscreen and measures it. NEST-030's tooltip work.
@@ -128,6 +142,7 @@ cd "$REPO_ROOT"
 
 for f in "$BENCH_STATUS" "$TEST_STATUS" "$GA_STATUS" "$PANEL_STATUS" \
          "$UNITS_STATUS" "$REPLAY_STATUS" "$DRESSUP_STATUS" "$ORDER_STATUS" \
+         "$LEADIN_STATUS" "$LEADINCMD_STATUS" \
          "$STARTPOINT_STATUS" "$BOUNDARY_STATUS" "$RIGID_STATUS" \
          "$SUBNAME_STATUS" "$CLEARANCE_STATUS" "$TOOLTIP_STATUS" \
          "$PANELBUILD_STATUS" "$PERSIST_STATUS" "$ROTATIONDET_STATUS"; do
@@ -202,6 +217,18 @@ fi
 DRESSUP=$(cat "$DRESSUP_STATUS")
 if [ "$DRESSUP" -ne 0 ]; then
     echo "replay-dressup regression test FAILED (status $DRESSUP)" >&2
+    [ "$STATUS" -eq 0 ] && STATUS=1
+fi
+
+LEADIN=$(cat "$LEADIN_STATUS")
+if [ "$LEADIN" -ne 0 ]; then
+    echo "lead-in audit regression test FAILED (status $LEADIN)" >&2
+    [ "$STATUS" -eq 0 ] && STATUS=1
+fi
+
+LEADINCMD=$(cat "$LEADINCMD_STATUS")
+if [ "$LEADINCMD" -ne 0 ]; then
+    echo "lead-in command regression test FAILED (status $LEADINCMD)" >&2
     [ "$STATUS" -eq 0 ] && STATUS=1
 fi
 
