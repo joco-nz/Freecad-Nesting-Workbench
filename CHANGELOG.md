@@ -8,6 +8,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `Nesting > Check Lead-ins Against Nesting` finds the lead-ins and lead-outs of
+  a replayed CAM job that reach another part's cut path, and moves their start
+  points until they clear. Menu only, not the toolbar: it acts on a replayed
+  job, so a toolbar button is inert for most of a session. Offers report-only
+  first, which writes nothing.
+  A lead-in extends outside its own part by `RadiusIn`, and the nester placed
+  that part among others; nothing in the replay accounted for where it landed.
+  On the committed fixture the worst lead-in clears its neighbour's cut path by
+  **0.0598 mm** -- which no intersection test reports, because nothing actually
+  crosses, so the check uses a clearance margin and starts at the tool radius.
+  **Only `StartPoint` is changed**, and `UseStartPoint` so that `StartPoint` is
+  read at all -- with the flag off, `StartPoint` is not read. `StyleIn`,
+  `AngleIn`, `RadiusIn`, `InvertIn` and the rest are the user's craft and are
+  never touched; `InvertIn` in particular would mirror the lead-in to the other
+  side of the contour, which is a different cut rather than a relocated one.
+  `StartPoint` is the exception because it is the only property in a CAM recipe
+  that is an absolute coordinate, and so the only one nesting made meaningless.
+  Candidates walk outwards from the operation's own start point, alternating
+  clockwise and anticlockwise, so the accepted fix is the nearest one that works
+  -- on the fixture it fixed the offender on the first candidate, taking the
+  lead-in from 0.0598 mm to 3.3530 mm.
+  **Lead-in and lead-out are tested together**, since one start point places
+  both ends; accepting a candidate on the lead-in alone would fix the reported
+  conflict by creating an unreported one.
+  What cannot be fixed is **marked `CONFLICT_` and left alone** -- the dressup is
+  not skipped, it will still cut -- with a `LeadInConflict` property naming the
+  part in the way. The fix lands on the replayed job only, so re-running the
+  replay discards it.
+  The search runs in the Tasks panel with a working **Cancel**. The bar counts
+  candidates rather than operations, because the fastest fix is a single
+  candidate and an operations-based bar would jump straight to 100% and read as a
+  hang. Cancelling keeps whatever was already fixed -- each fix is checked on its
+  own -- and the operations it never reached are reported as not looked at
+  rather than marked, since nobody has said they conflict. See NEST-033.
 - The panel's length fields follow the document's unit system. Sheet size,
   thickness, part spacing, label size and height, simplify tolerance, candidate
   step, physics step and anneal amplitudes, and the Manual Nester influence

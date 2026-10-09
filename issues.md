@@ -83,6 +83,12 @@ the symbol when you edit the entry.
 | [NEST-028](#nest-028) | centring does nothing for a part that arrives pre-positioned | open | medium (unmeasured) | geometry |
 | [NEST-029](#nest-029) | the committed nested fixture predates NEST-007, so the gate cannot see that fix | open | medium (unmeasured) | test fixture |
 | [NEST-030](#nest-030) | nesting `spacing` and the CAM tool diameter are unrelated controls | resolved | low | CAM replay |
+| [NEST-031](#nest-031) | `random_seed` is plumbed and printed, but three drawing sites never receive it | resolved | medium (measured) | nesting / GA |
+| [NEST-032](#nest-032) | a seeded nest depended on the rotation pool width | resolved | medium (measured) | nesting / Minkowski |
+| [NEST-033](#nest-033) | lead-ins and lead-outs are placed on the nest and nothing accounted for it | resolved | medium (measured) | CAM replay |
+| [NEST-034](#nest-034) | parts land closer than `PartSpacing` allows while every collision check passes | resolved | high (measured) | nesting / geometry |
+| [NEST-035](#nest-035) | profile extraction at fine deflection can disagree with the part's own silhouette | open | medium (measured) | nesting / geometry |
+| [NEST-036](#nest-036) | verify-on-accept starves the NFP search at simplification ≥ 0.3 | resolved (repair-push) | high (measured) | nesting / search |
 
 Statuses for NEST-009 through NEST-021 were derived from each entry's own
 prose, cross-checked where a later entry supersedes an earlier one: NEST-018's
@@ -3483,3 +3489,703 @@ restored gives exit 0.
 **Still true, and now the only reproducibility caveat left:** `rotation_workers=0`
 passed as a *kwarg* resolves to `os.cpu_count()`, measured. Only the environment
 variable reaches 0. That is a separate trap, asserted by the suite.
+
+## NEST-033 — lead-ins and lead-outs are placed on the nest and nothing accounted for it
+
+`status: resolved` · `severity: medium (measured)` · `area: CAM replay`
+
+The user ran a nest, replayed their CAM onto it part by part, and asked what
+happens when a lead-in or lead-out reaches a cut path belonging to a *different*
+part. Found by being asked, not by reading the code -- but the code agrees, and
+the gap is exactly where the user said it was.
+
+### The gap, verified by reading before measuring
+
+`check_tool_clearance` compares part *outlines* against the tool diameter
+(NEST-030). `verify_replay` checks each operation has cutting motion and reaches
+its targets. Neither reads `LeadInOut` at all. A `LeadInOut` dressup extends
+its operation's cut path by `RadiusIn`/`RadiusOut` before the cut starts and
+after it ends, and those extensions are drawn among the neighbours the nester
+placed. Nothing in the replay relates them.
+
+### Measured on the committed fixture
+
+`replay-fixture-CAM-Nested.FCStd` replays to **98 operations, 98 LeadInOut
+dressups, 48 parts** on a 600 x 300 mm sheet in 6.3 s. Nearest approach of any
+lead-in to any other part's cut path:
+
+    DressupLeadInOut001_replay_nested_TopStrap_14 (part_TopStrap_14) lead-in
+      -> DressupLeadInOut001_replay_nested_TopStrap_7  (part_TopStrap_7) cut path
+      distance 0.0598 mm
+
+| margin | offending operations |
+|---|---:|
+| 0.0 mm -- exact intersection | **0** |
+| 0.6 mm -- tool radius | **1** |
+| 1.0 mm | 18 |
+| 2.0 mm | 32 |
+| 5.0 mm | 39 |
+
+**Exact intersection finds nothing on a job with a real interference**, because
+0.06 mm is touching to any tolerance a cutter has. So the criterion is a
+clearance margin, not an intersection -- and the margin is a judgement call,
+which is why it starts at the tool radius and is an argument.
+
+This is systematic, not one unlucky operation: the lead-ins on that fixture are
+4-10 mm long (`RadiusIn` 3.0 and 4.0 mm) while the tightest gap between any two
+parts' cut paths is **2.70 mm**. The lead-in is longer than the gap it has to
+fit into.
+
+### Resolved -- a check, and a fix that only moves the start point
+
+New: `Tools/Cam/lead_in_audit.py`, `commands/command_audit_lead_ins.py`
+(`Nesting_AuditLeadIns`, menu only -- it acts on a replayed job, so a toolbar
+button is inert for most of a session).
+
+**Only `StartPoint` changes, and `UseStartPoint` so that `StartPoint` is read.**
+`StyleIn`/`StyleOut`, `AngleIn`/`AngleOut`, `RadiusIn`/`RadiusOut`, `InvertIn`,
+`InvertOut`, `ExtendIn`/`ExtendOut` are never touched. `InvertIn` in particular:
+flipping it mirrors the lead-in to the other side of the contour, which is a
+different cut and not a relocated one.
+
+`StartPoint` is the single exception because it is the only property in a CAM
+recipe that is an **absolute coordinate**. Everything else describes the cut;
+this names a place on the part, and under a part the nester rotated it names
+somewhere the part no longer is. Not a value the user got wrong -- the one value
+nesting made meaningless, whose correct replacement depends on where the
+neighbours ended up and so does not exist until after the nest.
+
+Measured, because it is the least obvious thing here: **with `UseStartPoint`
+False, `StartPoint` is not read at all.** On the offender, setting it to the
+part's XMinYMin corner and then its XMaxYMax corner produced bit-identical
+toolpaths and the lead-in did not move. The fix therefore has to set the flag.
+
+The fix lands on the replayed job only, so re-running the replay discards it.
+Writing back would mutate the hand-crafted recipe over a nesting that may itself
+be re-run.
+
+**Search**: candidates walk outwards from the operation's own start point,
+**alternating clockwise and anticlockwise**, so the first candidate accepted is
+the nearest one in either direction -- a start 3 mm away anticlockwise should not
+lose to one 40 mm away clockwise. First fit. On the fixture it fixed the
+offender **on the first candidate**, in 0.08 s, taking the lead-in from
+0.0598 mm to **3.3530 mm**.
+
+**Lead-in and lead-out are tested together, always.** One start point places
+both ends of a Profile, so accepting a candidate on the lead-in alone would fix
+the reported conflict by creating an unreported one. Verified: with a 400 mm
+lead-out, 8 of 8 candidates clear the lead-in but only 1 clears both.
+
+**Unfixable is marked and left alone**, per the user's decision that this is
+their call: `CONFLICT_` prepended to the Label (a prefix, because
+`DressupLeadInOut001_replay_nested_TopStrap_14` is 44 characters and a suffix is
+what scrolls off a narrow tree column) plus a `LeadInConflict` property in the
+`"CAM Replay"` group naming the part in the way. The word is **not** `SKIP_`:
+the dressup is not excluded from the job, it will still cut, and it will cut
+through whatever it was cutting through. The property is the machine-readable
+half -- a Label is editable and cosmetic, so a report cannot rely on it.
+
+A failed search restores `StartPoint` from a snapshot taken before it started.
+A search that gave up halfway, with the start point on its last candidate, would
+have moved the user's cut without fixing it.
+
+### Two bugs in report-only, both of which hid a working fix
+
+Found by the user using it, not by a test. Both had the same shape: the search
+worked and its verdict was thrown away.
+
+**1. Every fixable conflict was reported as unfixable.** `resolve_audit` found
+the start point, set `FIXABLE`-worthy state, and returned `True` with a detail
+string -- but `resolve_conflicts` recorded only the failures, so the status fell
+through to `UNRESOLVED`. Report-only on the committed fixture, where the one
+conflict is fixable on the first candidate, said:
+
+    97 clear, 0 moved to a clear start point, **1 left for you to fix**
+
+and offered to mark it `CONFLICT_`. Read literally that says the feature cannot
+fix anything on this nest. Fixed by adding a `FIXABLE` status -- deliberately
+**not** `FIXED`, since nothing moved, and a report claiming "fixed" would be
+describing a change the document does not have. Measured, on the same job:
+
+    97 clear, **1 could be moved to a clear start point, 0 need doing by hand**
+
+**2. Report-only wrote `CONFLICT_` marks.** `mark_conflict` sets a Label and a
+property, and the unfixable path called it regardless of `dry_run`. So running
+the report to find out whether there was anything here marked every operation
+it could *not* fix -- the opposite of writing nothing, and the marks survive
+because nothing removes them.
+
+The existing "dry run writes nothing" test never caught this: the fixture's one
+conflict is fixable, so the unfixable path was never reached. The gate now
+asserts both halves separately, using a 2.0 mm margin and a two-candidate budget
+so the result is a genuine mix -- **30 fixable, 2 not** -- and checks that a dry
+run marks nothing while a real run marks the two. A single-scenario fixture
+cannot test a branch it does not reach.
+
+A third thing the tests now assert, learned the hard way: an attempt to build an
+unfixable case with a 400 mm or 1e6 mm `RadiusOut` **does not produce one**. The
+candidate walk reaches the sheet edge, where a lead-out that long points off the
+sheet into empty space and genuinely has nothing in the way. Unfixable is
+harder to construct than it looks.
+
+### Four silent wrong answers, each of which reported a clean sheet
+
+Every one of these was a version that ran, returned, and claimed no problem.
+
+1. **A cut is a feed move that changes XY, not a move at a cut-plane Z.**
+   Seeding the modal Z to `0.0` -- which is what "no Z seen yet" looks like --
+   makes the machine's unknown starting height indistinguishable from the cut
+   plane, so the first rapid is read as a cut and every number derived from it is
+   wrong. A Z test is doubly wrong: `FinalDepth` 1.5 with `StartDepth` 3 cuts at
+   several levels, and `ArcZ`/`LineZ`/`Helix` deliberately start *above* the cut
+   plane and ramp down, so a Z test drops exactly the moves that define the
+   lead-in it is looking for.
+
+2. **Arcs must be sampled from their `I`/`J` centre.** Chorded, a `G3`
+   semicircle is 5 mm inside the arc at mid-span. On this fixture the offender
+   clears its neighbour by **0.0598 mm sampled** and **0.8921 mm chorded** --
+   and 0.8921 is over the tool radius, so a chorded audit says the sheet is
+   fine. 24 chords per arc; the sagitta at the 6 mm radii here is under
+   0.001 mm, three orders below the margin being tested.
+
+3. **A base-vs-dressup walk must match on endpoints, not starts.** The base
+   Profile rapids to the contour and the dressup to the lead-in entry, so the
+   same move has a *different start* in each. Matching on starts failed on
+   **98 of 98** operations. Naive extraction -- "the moves before the first base
+   cut move" -- also failed on 25 of 98, the multi-wire ones.
+
+4. **A conflict found is not a clean operation.** Recording conflicts while
+   leaving `status` at its default made the scan hold the evidence of a real
+   interference and report a clean sheet, because `offending` filters on status.
+
+A fifth, in the search rather than the scan: the body's zero-length filter was
+`length > COINCIDENT_MM`, which also dropped the first arc of a re-started
+profile when it came out short (measured 0.8265 mm). Every later move matched one
+position early, reconciliation failed, and all 48 candidates were rejected as
+"could not read" while the operation was reported unfixable. A move is either
+zero-length or it is a move.
+
+### Cost
+
+Scan **72-96 ms** for 98 operations over 48 parts (`STRtree` over one geometry
+per operation; the pairwise form is 97x the work). One fix **0.08 s**, one
+candidate. Worst case bounded at 48 candidates per operation, ~1 s each, so the
+1.0 mm margin's 18 offenders is a worst case of ~18 s.
+
+### Gate
+
+`test_lead_in_audit.py`, gated, **110 checks**; `test_lead_in_audit.py` in
+pytest, **41 tests**; `test_lead_in_progress.py` in pytest, **20 tests**; and
+`test_command_audit_lead_ins.py`, gated, **43 checks** on the GUI binary, which
+is the only tier that can construct the panel at all. The harness asserts the *measured distance*, not a count:
+if the audit reports that conflict at any other figure, or not at all, arcs are
+being chorded. It also covers the dry run writing nothing at all, an
+unfixable operation being marked with one prefix rather than two, a failed
+search leaving the start point where it found it, and the joint lead-in/lead-out
+test above.
+
+`test_command_audit_lead_ins.py` exists because nothing else gated touched the
+command: `test_lead_in_audit.py` imports the module and calls `GetResources()`,
+which answers perfectly well on a class whose dialog code is broken. It runs on
+the `freecad` binary for the same reason `test_panel_construction.py` does, and
+it is the only gated check of the menu-vs-toolbar decision.
+
+`LeadOut` is false on all 98 fixture operations, so lead-out coverage is built
+rather than found: the harness turns it on for a real two-ended operation and
+asserts the lead-out is `RadiusOut` long, that both kinds are reported, and that
+the joint test rejects what the lead-in alone accepts. Two earlier attempts at
+this check passed for the wrong reason and are recorded in the file -- one ran
+against an already-fixed job and saw only a lead-out; one assumed a 400 mm
+lead-out could never be cleared, which is false because the walk reaches the
+sheet edge and points into empty space.
+
+### Progress and Cancel, and what the search is actually made of
+
+The audit's *scan* is 72-96 ms over 98 operations and needs no feedback. Its
+*search* is a FreeCAD recompute per candidate at about 22 ms, bounded at 48
+candidates per operation -- so one operation is 0.08 s when the first candidate
+works and about a second when none does, and the 32 offenders a 2.0 mm margin
+finds is tens of seconds of a frozen GUI with no way to stop it. `lead_in_progress.py`
+follows `replay_progress.py`, because it is the same situation: work on the GUI
+thread, so showing progress means pumping the event loop as well as drawing.
+
+**The bar counts candidates, not operations.** Operations is the obvious choice
+and the wrong one: the fixture's real offender is fixed on the *first* candidate,
+so an operations-based bar sits still for a whole second and jumps to 100% --
+which reads as a hung program rather than a fast one. Candidates tick every
+22 ms. The operation count is shown as text beside it, because "which part am I
+on" is the other thing worth knowing.
+
+**The candidate count resets per operation**, so 0-48 does not run five times
+over with no sign the operation changed.
+
+**Cancel is polled between candidates**, not between operations. One operation
+is up to a second of uninterruptible work, which is about how long a user
+decides they have had enough.
+
+**Cancelling keeps what was fixed, and commits the transaction anyway.** Each fix
+is applied and verified on its own, so stopping between them leaves the job
+consistent -- some operations moved, the rest untouched. Rolling back would
+throw away fixes that were checked and correct because the user got bored eight
+operations later. Aborting is reserved for a run that *failed*.
+
+**A cancelled operation is `SKIPPED`, never `UNRESOLVED`.** "Could not be fixed"
+and "was never tried" are different claims, and only the first is a statement
+about the user's recipe. Nothing skipped is marked `CONFLICT_`: nobody has said
+its lead-in conflicts with anything.
+
+**The report says "could be fixed", never "fixed", on a report-only run.** "3
+fixed" on a run that changed no properties is a lie about the document, and the
+tally in the panel is worded the same way.
+
+Two test traps hit while writing this, both recorded because the first version of
+each passed for the wrong reason:
+
+* **The panel's Cancel had to be polled, not read.** `task.cancelled` is a
+  property, so `cancel_check=task.cancelled` hands the engine the bool it
+  happened to be when the lambda was built -- `False`, for the whole run. That
+  is not hypothetical: it is what `command_replay_cam.py`'s Cancel did, and the
+  comment there explains it.
+* **A cancel triggered by counting polls is not deterministic here.**
+  `cancel_check` is read both between operations and between candidates, so
+  "cancel after two polls" lands somewhere different depending on how many
+  candidates each operation happened to try. The gate now triggers the cancel
+  from the progress seam, which is deterministic.
+
+### Two fixture traps, recorded because both produced correct refusals
+
+* **Replay labels are not reproducible across runs.** FreeCAD appends a counter
+  to a duplicate label, so `nested_BottomStrap_23` comes back as
+  `nested_BottomStrap_023` when the sheet already holds a `_23`, and a second
+  replay in one session numbers its objects `DressupLeadInOut007_...` rather
+  than `DressupLeadInOut001_...`. Harness lookups match on the internal `Name`.
+  Relabelling an operation is otherwise safe: `Operations.Group` holds objects,
+  and `display_label_of`/`nested_label_of` read the *Model* geometry's
+  `SourceObject`/`NestedLabel`, not the dressup's label.
+* **`part_*` geometry is in the part's frame.** `part_label_of` prefers
+  `SourceObject`, then `NestedLabel`, then the Model entry's own label, so a
+  message says `part_TopStrap_14` rather than `CAMPart_682`.
+
+### One shutdown trap, recorded because it hung the gate twice
+
+`test_command_audit_lead_ins.py` builds a document and a CAM job, so both are
+modified on exit and the Unsaved Document dialogue would block the session. The
+pattern is `probe_target_sheets.py`'s: **discard every document, then close the
+window**, because `FreeCAD.closeDocument` discards without prompting and
+`getMainWindow().close()` with `QApplication.quit()` ends the session on its own.
+
+**The order is load-bearing, and I got it backwards first.** An intermediate
+version closed the window first, because a `ReferenceError` appeared in the
+other order and I read it as the cause. It is not -- it is shutdown noise from a
+CAM job's tool bar reaching for a deleted `ViewObject`, after the checks and
+after the status file is written, with the exit code still 0.
+
+Measured on this binary, four minimal scripts, **rc taken from FreeCAD itself**:
+
+| order | rc |
+|---|---:|
+| `closeDocument`, then `window.close()` | **0** |
+| `window.close()`, then `closeDocument` | 124 -- hangs |
+| same, with a CAM job present | 124 -- hangs |
+| dialog built, `closeDocument` never called | 124 -- hangs |
+
+The middle version's own diagnosis was a trap: it read the *pipeline's* exit code
+from `grep -c`, which reports grep's status, so `0` meant "no matches" and was
+read as "clean". `closeDocument` before `window.close()` is what lets the session
+end; reordering is what causes the hang.
+
+---
+
+## NEST-034 — parts land closer than `PartSpacing` allows while every collision check passes
+
+`status: resolved` · `severity: high (measured)` · `area: nesting / geometry`
+
+The committed fixture has two parts whose real outlines sit **1.9979 mm** apart
+at `PartSpacing` 3.0; their buffered outlines overlap **2.6008 mm²**. The check
+that is supposed to reject that accepted the placement. Earlier work eliminated
+four hypotheses directly (a: the mask does test buffered polygons — the check
+is not running unbuffered; b: no pair is skipped; c: not a tolerance call — the
+overlap is 2.6 mm², orders above `AREA_TOL`; d: no bypass path — all three
+`Nester._attempt_placement_on_sheet` call sites funnel through the wrapped
+method).
+
+### Instrumented run — three layers, one verdict
+
+Probe `/tmp/opencode/step3a.py` (self-test: `step3a_selftest.py`, 27 checks),
+report `/tmp/opencode/step3a.txt`, status doc `collision-defect-status.md`.
+Run 2, exit 0, 69.4 s: seed 1234 via `NESTING_RANDOM_SEED` only, spacing 3.0,
+direction 45, generations 4, population 10, rotation steps 4, deflection 20,
+simplification 0.3, sheet 600x300 x 2 -> **2 sheets, 54 parts**.
+
+| layer | what it checks | result |
+|---|---|---|
+| L1 mask-time | every accepted candidate, rechecked fresh with the cache bypassed | **0** violations / 122,267 accepted, 113,104 exact pair checks |
+| L2 commit-time | committed polygon against everything already on the sheet | **0** / 1,998 commits, growth always exactly +1 |
+| L3a post-run, mask space | final `job.sheets` polygons, pairwise | **0** / 54 parts — tightest contact exactly tangent (raw gap 3.0) |
+| L3b post-run, slice space | final drawn footprints (`flatten_sheet`/`part_footprint`), buffered | **54 pairs**, areas up to **10.5350 mm²**, tightest raw gap **2.7526 mm** (`part_BottomStrap_26` / `part_TopStrap_8`) |
+
+Liveness is proven, not assumed: 2,162 mask calls, 1,998 commits, 0 spy errors,
+and run 1 vs run 2 probe totals are byte-identical apart from the L3a fix (the
+first run's L3a numbers were a probe bug — it re-buffered already-buffered
+polygons and reported 91 pairs at a 6.0 mm effective threshold; the mask-space
+scan pairs them as-is now).
+
+**The verdict, per the pre-registered rules: L3b > 0 with L3a = 0.** The check
+is correct on the geometry it is shown; the geometry it is shown is not the
+geometry that lands on the sheet. Mask-space outlines of all 54 parts are
+pairwise disjoint at spacing 3.0, while the tessellated footprints of those
+same parts overlap the spacing buffer in 54 places — this run's shortfall is
+0.2474 mm (2.7526 vs 3.0), the fixture's was 1.0021 mm (1.9979 vs 3.0). L1 = 0
+eliminates stale cache (f) and screen/arithmetic error (h); L2 = 0 eliminates
+mutation at commit (g). What remains is the polygon-source divergence itself:
+`_exact_candidate_mask` (`nesting_strategy.py:866`) tests `Shape.polygon`,
+which is the outline after `spacing/2` buffering (`shape_processor.py:289`) and
+simplification (here 0.3 @ 20° deflection), while the footprint the sheet
+actually gets is the tessellated source geometry
+(`cam_replay.py:1527` `flatten_sheet`, `:3647` `part_footprint`,
+`:3832` `tightest_part_gap`).
+
+### Not yet isolated
+
+The probe proves the two geometries diverge and by how much at the tightest
+pair; it does **not** say which step contributes the error — simplification,
+tessellation deflection, or buffering a simplified outline. That is the next
+measurement: per-edge deviation between `Shape.polygon` and the footprint for
+the tightest pairs, then a fix chosen from it (oversize the buffer by the
+measured max deviation, or keep collision geometry unsimplified).
+
+Seed caveat: the adopted fixture's real seed is unknown; 1234 is best-effort
+reproduction. It reproduced the defect *class* anyway (54 violating pairs in a
+different, 2-sheet arrangement), so the divergence is systematic rather than a
+quirk of one nest.
+
+### Reproduced exactly on the user's own UI run (2026-10-08)
+
+The user nested the same source through the UI with their real settings —
+Candidate step 1.0 mm, Compactness 0.30, Rotation threads 4, Rotation Angle
+225 (the dial reads 45; `constants.py:dial_to_bearing` = `(270-45)%360`),
+Stop At Sheets 1 — and got a single sheet at 83.4% efficiency, seed
+1892920427 (their log). Driving the probe with exactly those parameters:
+
+| run | simplification | sheets | target | L1/L2/L3a | L3b pairs | tightest gap |
+|---|---|---|---|---|---|---|
+| faithful A | 0.3 | **1** | **MET** | 0/0/0 | **56** | **1.9979 mm** |
+| faithful B | 0.0 | 2 | not reached | 0/0/0 | **0** | 3.0000 mm |
+
+Run A reproduces the committed fixture's headline gap **to four decimals**
+with the stored simplification of 0.3 — so the fixture's parameters were
+right, and the live check passes on every layer while the output breaches
+PartSpacing in 56 pairs. Run B (same seed, only simplification changed)
+eliminates all 56.
+
+**Two consequences worth the entry:**
+
+1. **The shortfall (1.0021 mm) exceeds the simplification bound.** A 0.3 mm
+   Douglas-Peucker tolerance admits at most 0.6 mm on a pair (buffer() is
+   1-Lipschitz in Hausdorff distance). At least 0.4 mm comes from somewhere
+   else — tessellation/deflection, hole-ring handling (26,299
+   hole-exploiting placements), or simplify running more than once. Fixing
+   this needs that split measured, not assumed.
+2. **The single-sheet result is partly the defect working.** With truthful
+   geometry (simplification off) the same seed never reached 1 sheet in 4
+   generations (2 sheets, 465 s vs 29 s); the 1-sheet pack only fits
+   because the mask sees space that isn't there. Whether a *legal* 1-sheet
+   packing of this mix at spacing 3.0 exists is an open question — 8 seeded
+   runs have produced 0 of them, and the committed fixture's own 1-sheet
+   layout breaches by 1.0021 mm.
+
+Also: the panel **default** simplification is 1.0 mm (`ui_nesting.py:113`),
+a 2.0 mm worst-case bound — users on defaults are worse off than this
+fixture.
+
+### Dose-response ladder + determinism (batch 3, 2026-10-08)
+
+Same source, seed 3355455059, direction 225, candidate step 0.1 (except
+faithful A), target 1 sheet — shortfall as a function of simplification:
+
+| simplification | sheets | L3b pairs | worst shortfall |
+|---|---|---|---|
+| 0.3 (step 1.0, faithful A) | 1 | 56 | **1.0021 mm** (> 0.6 DP bound) |
+| 0.3 (step 0.1, run D) | 1 | 58 | 0.2840 mm (within bound) |
+| 0.001 (step 0.1, run F) | 1 | 1 | 0.0002 mm (within bound, ~legal) |
+| 0.0 (step 0.1, runs C+C2) | 2 | 0 | 0 (clean, but 1-sheet goal unreachable) |
+
+Monotonic dose-response confirms simplification drives the defect; the
+layout-dependent 1.0021 outlier (> the 0.6 bound at tol 0.3) means a second
+error source also contributes and must be decomposed before sizing any
+buffer oversize.
+
+Harness determinism proven (run C2 reproduces C's counters exactly), so
+each row is a controlled experiment.
+
+Two user-facing notes:
+
+1. **The panel cannot disable simplification** — `LengthField(mm_min=0.001)`
+   (`ui_nesting.py:850`) clamps a typed 0 to 0.001 mm and displays "0.00"
+   (`length_field.py:229`). The user's successful 1-sheet-at-honest-geometry
+   run depended on that 0.001: at a true 0.0 the same seed deterministically
+   never reaches 1 sheet in 4 generations.
+2. With step 0.1 + that 0.001, the user's workflow reaches a single sheet
+   **legal to within 0.2 µm** — so a good practical configuration exists
+   today, independently of the fix.
+
+### Resolved by measurement: the "second error source" was a per-stage bound (recommendation #1, 2026-10-08)
+
+Consequence 1 above claimed at least 0.4 mm of the 1.0021 came from
+outside simplification. **That was wrong: the 0.6 mm bound was applied to
+one Douglas-Peucker pass when two compose** — the profile is simplified
+before buffering (`shape_processor.py:98/195`) *and* the buffered polygon
+is simplified again (`:294`). Each stage is 1-Lipschitz in Hausdorff, so a
+pair can deviate by up to **4 × tol = 1.2 mm**, not 0.6.
+
+`/tmp/opencode/step3b.py` (14/14 self-test) re-ran faithful A and split
+every violating pair's shortfall into telescoping rungs measured on that
+run's real artifacts — recomputed `get_2d_profile_from_obj` variants, the
+stored `unbuffered_polygon`/`original_polygon`/`polygon`, and the drawn
+`part_footprint` slices. Registration: Kabsch between `original_polygon`
+and `polygon` (54/54, max residual 2.3e-13), buffer recompute vs stored
+artifact max HD 1.5e-14, telescope residual 9e-16, mask↔foot match max
+centroid offset 1.11 mm. All 56 faithful-A pairs, total shortfall
+6.0378 mm:
+
+| rung | sum (mm) | reading |
+|---|---|---|
+| placement vs unsimplified profile (3 − g_p0) | **+6.1279** | the layout through the pipeline's own unsimplified profiles |
+| early DP (`:98/195`) | **−3.8443** | DP shrinks outlines → apparent gaps open |
+| third DP on unbuffered (`:298`) | **0.0000** | visual-only; re-simplifying an already-DP'd ring is a no-op |
+| buffer + DP-on-buffered (`:294`) | **−2.6602** | mask stage opens apparent gaps further |
+| mask vs drawn solid (`part_footprint`, Deflection 0.05) | **+6.4143** | the mask-vs-reality divergence = the defect |
+
+- **Drawn geometry tracks the unsimplified profile**: Σ(g_p0 − g_draw) =
+  −0.0901 mm over all 56 pairs (worst pair 0.0013). The profile path at
+  deflection 0.1 is marginally *conservative* vs the solid slice — not a
+  defect source.
+- **Simplification overstates pair gaps by Σ +6.5045** (profile stage
+  +3.8443, buffer stage +2.6602) — masks passed (L1 = L2 = L3a = 0) while
+  drawn reality breached by 6.0378.
+- **Worst pair (CAMPart_760/762, TopStrap × TopStrap, the fixture's
+  1.9979)**: draw 1.9979 → unsimplified profile 1.9992 → after early DP
+  2.5688 (**+0.5696**) → after buffer stage the mask reads 3.0000
+  (**+0.4312**) → shortfall 1.0021 = 0.5696 + 0.4312 + 0.0013. Each stage
+  inside its own 0.6 pair bound; stacked bound 1.2 ≥ 1.0008. **No third
+  source.** The dose-response ladder re-checks against 4 × tol: 1.2 vs
+  1.0008, 1.2 vs 0.284, 0.004 vs 0.0002, 0 vs 0 — all fit.
+
+Correction to consequence 1: the "≥ 0.4 mm from somewhere else" was an
+artifact of comparing a two-stage pipeline against a one-stage bound.
+Hole-ring handling and tessellation were exonerated by the rungs above
+(their contribution lands in the −0.09 total draw-vs-profile residual).
+
+Consequence 2 (the 1-sheet pack is partly the defect working) stands
+unchanged.
+
+**Fix sizing for the follow-up (#3), from these measurements:** verify-on-
+accept against the unsimplified profile (reuses L1's plumbing; exact to
+≈0.01 mm; measured +43% runtime); or a conservative mask restored with
+`buffer(2 × tol + ε)` (superset of the true buffered outline; exact
+legality; zero runtime; worst-case false-reject conservatism ≈ 1.2 mm at
+tol 0.3); or raw buffer oversize ≥ 4 × tol (1.2 mm at 0.3 — **4.0 mm at
+the panel default 1.0**, so only usable with simplification lowered in
+lockstep). Baseline: simplification off = exact but ~2.3× runtime and the
+1-sheet goal unreachable.
+
+Probe: `/tmp/opencode/step3b.py` + `step3b_selftest.py`; report
+`/tmp/opencode/step3b.txt`.
+
+### Resolution: verify-on-accept implemented and measured (2026-10-08)
+
+Recommendation #3 option 1, ordered by the user ("implement #3 as
+proposed"), landed across `shape_processor.py`, `shape.py`,
+`shape_preparer.py`, `ga_coordinator.py`, `nesting_strategy.py`: each
+master also carries an unsimplified buffered twin
+(`verify_original_polygon` pristine + `verify_polygon` registered with
+`polygon` through every rotation/translation), and
+`_exact_candidate_mask` re-tests every mask-accepted candidate against it
+at both exits — same `area_tolerance`, same bounds window, candidate
+translated by the mask's own centroid delta, per-pair fallback to the
+mask polygon counted (`verify_fallback_pairs`), identity skipped.
+Gate: `NESTING_VERIFY_ON_ACCEPT` (default on; `=0` reproduces pre-fix
+bit-exactly). Unit smoke `/tmp/opencode/test_verify_stage.py` 17/17
+registration/semantics/counter checks.
+
+Measured (step3a, all exit 0, probe-to-probe):
+
+| run | config | gate | placed | L3b | tightest gap | elapsed |
+|---|---|---|---|---|---|---|
+| G1 | faithful A (sim 0.3, step 1.0) | on | **8/54**, target not reached | **0** | 3.0000 | **347.2 s** |
+| G3 | faithful A | off | 54/54, MET | 56 | 1.9979 | 31.4 s |
+| G2 | run F (sim 0.001, step 0.1) | on | **54/54, MET** | **0** | 3.0000 | 129.0 s |
+| pre-fix F | run F | — | 54/54, MET | 1 | 2.9998 | 140.2 s |
+
+- **Defect closed**: the L1 = L2 = L3a = 0 ∧ L3b > 0 signature is gone
+  (56 → 0 and 1 → 0); tightest drawn gap exactly 3.0000 mm wherever the
+  run completes.
+- **Control G3 = pre-fix faithful A bit-exactly** (`accepted_candidates`
+  61,666 = 61,666, commit 54/54, mask calls 214 = 214, defect
+  reproduced) → the gate is the only behavioural delta.
+- **The user's practical workflow (clamped simplification 0.001) is fully
+  preserved and slightly faster**: 54/54, 1 sheet, 129.0 s vs 140.2 s
+  instrumented; verify rejected 3.3% of 88,176 candidates;
+  `fallback_pairs` 0 → verify geometry live everywhere.
+- **Follow-up filed as NEST-036, now resolved**: at simplification 0.3 the
+  honest gate starved the search (8/54, ~11× runtime) because the NFP only
+  proposes mask-grazing positions while the mask is optimistic by
+  0.05–1.0 mm per pair — generation and verification disagreed on nearly
+  every contact. Fixed by repair-push (bounded bounds+collision repair
+  before rejecting): faithful A 54/54, 1 sheet, 114.9 s, all defect
+  layers 0. Escapes still available: `NESTING_VERIFY_ON_ACCEPT=0`
+  (pre-fix bit-exactly) or `NESTING_VERIFY_REPAIR=0` (reject-only).
+
+---
+
+## NEST-035 — profile extraction at fine deflection can disagree with the part's own silhouette
+
+- **Status:** open
+- **Severity:** medium (measured)
+- **Area:** nesting / geometry
+- **Found:** 2026-10-08, as a measurement caveat inside NEST-034's
+  recommendation #1
+
+`get_2d_profile_from_obj` (`shape_processor.py:14`) is asked for the same
+body at two `tessellation_quality` values and returns two polygons that
+cannot both be right. TopStrap, both calls with `simplification=0`
+(`/tmp/opencode/probe_bb.py`):
+
+| deflection | vertices | area (mm²) | bounds |
+|---|---|---|---|
+| 0.1 | 133 | 1079.2125 | (−10, −30, 10, 30) |
+| 0.01 | 187 | 1076.6200 | (−10, −30, 10, 30) |
+
+- Hausdorff between them: **0.8787 mm** (centroid-aligned: 0.8186 — so it
+  is not a centering shift; identical bounds, BoundBox stable before and
+  after, repeat calls bit-exact regardless of call order). BottomStrap
+  (0.0019) and SimpleSpacer (0.0164) are unaffected.
+- **The fine profile is the wrong one.** A slice of the solid is always a
+  subset of its silhouette, so pair gaps measured on slices must satisfy
+  g_slice ≥ g_silhouette − ε. Step3b measured g_fine = 3.4895 against the
+  drawn slice gap g_draw = 1.9979 for CAMPart_760/762 — a 1.49 mm
+  violation of that inequality (draw tracks the *coarse* profile to
+  0.0013 mm). The fine mesh-silhouette path is structurally diverging on
+  this body, deterministically.
+- **Vertex counts also depend on document mesh state**: the same coarse
+  call returns 133 vertices on a freshly opened document and 260 after a
+  nest has run (same area 1079.21) — `obj.Shape.copy()` inherits
+  triangulation state. Harmless for collision (the stored
+  `original_polygon` reproduced a recomputed buffer to HD 1.5e-14), but
+  any tool that re-extracts profiles for comparison will see
+  state-dependent geometry.
+
+Practical impact today: the UI and the nest only ever use one
+`deflection` value (0.1), so the two variants never meet inside a run —
+this bit NEST-034's decomposition probe, which needed a finer profile as
+a truth proxy, and any future A/B that re-extracts profiles at a different
+deflection. Suspected locus: the mesh silhouette tracing
+(`shape_processor.py:106`+) bridging or skipping narrow features as
+triangle density changes.
+
+Reproduce: `/tmp/opencode/probe_bb.py` (freecadcmd; report
+`/tmp/opencode/probe_bb.txt`).
+
+---
+
+## NEST-036 — verify-on-accept starves the NFP search at simplification ≥ 0.3
+
+- **Status:** resolved (repair-push implemented + measured 2026-10-09)
+- **Severity:** high (measured)
+- **Area:** nesting / search
+
+Follow-up to NEST-034's resolution: with the verify-on-accept gate on
+(default), a faithful-A nest (simplification 0.3, step 1.0, seed
+1892920427) places only **8 of 54 parts** and takes **347 s vs 31 s** for
+the same seed with the gate off — while producing a perfectly legal
+layout (L3b 0, tightest gap 3.0000 mm).
+
+**Mechanism (measured, cross-checked against NEST-034's decomposition):**
+
+- The Minkowski engine proposes candidates **on the NFP boundary**, i.e.
+  positions where the *simplified mask* polygons graze. Pre-fix faithful
+  A's 56 violating pairs ≈ one grazing contact per placed part, all of
+  them breached — that is NEST-034 itself. Non-grazing neighbours were
+  legal, hence only 56.
+- At simplification 0.3 the mask is optimistic by 0.05–1.0 mm per pair
+  (two stacked DP passes, `4 × tol` bound), so a mask-grazing candidate
+  has true gap ≤ 3.0 almost surely. Any penetration × contact length is
+  orders above `area_tolerance` 1e-7 → the verify gate rejects it.
+  Measured: **99.3% of mask-accepted rows rejected** (615,475 of
+  619,639; survivors 4,164; `fallback_pairs` 0 → geometry live).
+- The search then starves and the futile retry/fill loops dominate:
+  mask calls 214 → 2,964, candidate rows 67,655 → 720,930, commit
+  attempts 54 → 2,664.
+
+So generation and verification disagree on nearly every contact at high
+simplification: the gate is measuring truth correctly, but the candidate
+set contains (almost) no positions where truth holds. At simplification
+0.001 (the user's practical config) the optimism is µm-scale, 96.7% of
+candidates pass, and the same gate closes NEST-034 with the full 54-part
+1-sheet pack intact (129 s vs 140 s pre-fix).
+
+**Fix (implemented, user-ordered): repair-push** — a rejection is first
+offered to a bounded repair loop (`_repair_candidate` in
+`nesting_strategy.py`, `_REPAIR_MAX_ATTEMPTS = 6`, env gate
+`NESTING_VERIFY_REPAIR` default ON, no GUI). Two legs, one loop:
+
+- *Bounds*: clamp the candidate into the interval intersection in which
+  BOTH the verify and the mask bbox sit strictly on the sheet (0.01 mm
+  edge margin); an empty window (part wider than the sheet at this
+  angle) still rejects. This leg is what fixes the starvation itself —
+  on a fresh sheet the engine's only candidates are the 4 corner-flush
+  positions, exact in mask space while the verify bbox overhangs by the
+  DP error, so reject-only (and collision-only repair) killed *every
+  rotation* of otherwise placeable parts (instrumented replay: 28
+  empty-sheet kills, rotation-determinism 44/48; after bounds repair:
+  0 kills, 48/48).
+- *Collision*: push away from the penetration sliver (direction = sliver
+  centroid → candidate body, hole-safe; depth = 2·area/perimeter × 1.25
+  + 0.01 floor, vector-summed over violators).
+
+Every iteration re-proves BOTH predicates (mask + verify, bounds +
+sheet-difference) at the new coordinate; failure falls back to
+rejection, so the gate's correctness is unchanged — a kept row's final
+coordinate passed everything downstream re-checks. Repaired coordinates
+never touch the engine's shared candidate array: they leave through the
+probe key `_verify_repaired`, popped by `_evaluate_rotation`, scored on
+a copy. `NESTING_VERIFY_REPAIR=0` restores reject-only bit-exactly
+(control on final code ≡ G1: 8/54, every deterministic counter
+identical).
+
+**Measured** (faithful A = sim 0.3, step 1.0, seed 1892920427; run F =
+sim 0.001, step 0.1, seed 3355455059):
+
+| | pre-fix (gate off) | reject-only | gate + repair |
+|---|---|---|---|
+| faithful A | 54/54, tightest **1.9979 mm (defect)**, 29.4 s | **8/54**, 347.2 s | **54/54, 1 sheet MET**, all defect layers 0, tightest 3.0000, **114.9 s** |
+| run F | 54/54, tightest 2.9998, 140.2 s | 54/54, 129.0 s | **54/54**, all 0, tightest 3.0000, **122.5 s** |
+
+Cost breakdown faithful A: 57,899 repairs (330 bounds + 57,569
+collision), 1,617 irreparable → rejected, 91,181 attempts (1.58 per
+repair), repair CPU 261 s ⊂ verify 328 s ≈ 65 s wall of the 114.9 s;
+NFP+GA+commit ≈ 33 s wall ≈ pre-fix. 3.9× the pre-fix runtime, but the
+pre-fix layout carried the 1.9979 mm defect; 3.0× *faster* than
+reject-only and 54 parts instead of 8.
+
+Validation: unit smoke 50/50 (17 NEST-034 checks pinned reject-only + 33
+repair checks), pytest 647/647, `test_rotation_determinism` 34/34
+status 0 (widths 0/4/8/16 all 48/48 one digest; env-seeded GA 81.9 %,
+48/48 placed).
+
+Alternate fix directions (not taken): #3 option 2 pairing (restore masks
+with `buffer(2 × tol + ε)` so generation is honest by construction) and
+option 3 (raw oversize) remain documented in
+`collision-defect-status.md` — sizing is a density-vs-strictness policy
+call (worst-case conservatism ≈ 1.2 mm at tol 0.3, 4.0 mm at 1.0).
+Escape hatches unchanged: `NESTING_VERIFY_ON_ACCEPT=0` (pre-fix
+bit-exactly), `NESTING_VERIFY_REPAIR=0` (reject-only bit-exactly), or
+the user's clamped simplification 0.001.
+
+Evidence: `collision-defect-status.md` → "Repair-push implemented —
+NEST-036 fix"; probe reports `/tmp/opencode/step3a_fixA.txt` (G1),
+`step3a_fixA_off.txt` (G3), `step3a_fixF.txt` (G2),
+`step3a_fixR1b.txt` (repair faithful A), `step3a_fixR2b.txt` (repair run
+F), `step3a_fixR3off2.txt` (repair-off control ≡ G1),
+`probe_rotdet_after.txt` (empty-kills 0 diagnostic),
+`test_verify_stage.txt` (50/50 unit smoke).
