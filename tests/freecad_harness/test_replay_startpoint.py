@@ -721,13 +721,22 @@ def check_unsplit_step_is_reported(doc):
 
 
 def run_fixture_checks():
-    """The committed fixture, whose one real user-set start point must carry.
+    """The committed fixture, whose user-set start points must carry.
 
     Everything above is a fixture built for this file. This is a real job on real
     geometry, and it is the only check here that would catch a regression in the
-    98-operation case where 97 operations have `UseStartPoint` False -- which is
+    110-operation case where 108 operations have `UseStartPoint` False -- which is
     exactly the shape of the committed fixture, and exactly the shape in which a
     bug in the gating would hide.
+
+    **Every reader is checked against its own start point.** The fixture holds two
+    operations that read one -- `Profile004` and `Profile006`, both profiling the
+    same source part from different vertices -- and an earlier version of this
+    check compared every replayed copy against `readers[0]`'s point. That reported
+    `Profile006`'s copies as 53.1475 mm from where they should be, when in fact
+    each was carried exactly: the copy was being measured against the wrong
+    source's coordinate. Matching a copy to its own source is the whole check, and
+    getting it wrong produces a confident, precise, false failure.
     """
     if not os.path.exists(FIXTURE):
         emit("no fixture at %s -- skipping the committed-fixture check" % FIXTURE)
@@ -759,31 +768,37 @@ def run_fixture_checks():
 
     emit("fixture: %d operation(s) read a start point, of %d in the job"
          % (len(readers), len(seen)))
-    check(len(readers) == 1,
-          "the fixture was expected to hold exactly one operation reading a start "
-          "point, got %d (%s). If the fixture changed, re-measure rather than "
-          "trust this number." % (len(readers), [o.Label for o in readers]))
+    check(len(readers) >= 1,
+          "the fixture was expected to hold at least one operation reading a start "
+          "point, got %d. If the fixture changed, re-measure rather than trust "
+          "this number." % len(readers))
     if not readers:
         FreeCAD.closeDocument(doc.Name)
         return
 
-    source_op = readers[0]
-    source_point = FreeCAD.Vector(source_op.StartPoint)
-    source_entry = source_op.Base[0][0]
-    emit("  %s reads StartPoint %s" % (source_op.Label, source_point))
-    # **Not on the part, and that is correct.** Measured 5.02 mm off its own
-    # source part. A user picks a start point with the mouse near a feature, not
-    # by snapping to a vertex, and CAM resolves it to the nearest point on the
-    # wire. So the check here is that the point *moved with the part*, not that
-    # it landed on a surface -- and it is why the production check tests against
-    # the part's bounding box rather than a distance to its faces.
-    source_offset = distance_to_shape(source_point, source_entry.Shape)
-    emit("    %.4f mm from its own source part -- a user-placed point, not a "
-         "snapped vertex" % source_offset)
-    check(source_offset < 20.0,
-          "the fixture's start point is %.4f mm from its own part, which is far "
-          "enough that this check would not be measuring what it claims"
-          % source_offset)
+    # One reference per reader: (operation, its own point, its own base). A copy
+    # is checked against the reader it came from, never against `readers[0]` --
+    # see the docstring for the false failure that produced.
+    references = []
+    for source_op in readers:
+        source_point = FreeCAD.Vector(source_op.StartPoint)
+        source_entry = source_op.Base[0][0]
+        emit("  %s reads StartPoint %s" % (source_op.Label, source_point))
+        # **Not on the part, and that is correct.** Measured 5.02 mm off its own
+        # source part. A user picks a start point with the mouse near a feature,
+        # not by snapping to a vertex, and CAM resolves it to the nearest point
+        # on the wire. So the check here is that the point *moved with the part*,
+        # not that it landed on a surface -- and it is why the production check
+        # tests against the part's bounding box rather than a distance to its
+        # faces.
+        source_offset = distance_to_shape(source_point, source_entry.Shape)
+        emit("    %.4f mm from its own source part -- a user-placed point, not a "
+             "snapped vertex" % source_offset)
+        check(source_offset < 20.0,
+              "%s's start point is %.4f mm from its own part, which is far enough "
+              "that this check would not be measuring what it claims"
+              % (source_op.Label, source_offset))
+        references.append((source_op, source_point, source_entry))
 
     layout, _warnings = cam_replay.resolve_layout_group(doc)
     check(layout is not None, "no layout was found in the fixture")
@@ -810,20 +825,40 @@ def run_fixture_checks():
             targets = [entry[0] for entry in (getattr(rop, "Base", None) or [])]
             if len(targets) != 1:
                 continue
-            expected = expected_start_point(targets[0], source_entry,
-                                            source_point, rop)
-            if expected is None:
-                continue
-            off = FreeCAD.Vector(rop.StartPoint).sub(expected).Length
-            if off < 1e-6:
+            target = targets[0]
+
+            # Find the reader this copy came from: the one whose own start point,
+            # carried by the same transform, lands where this copy's does. There
+            # is exactly one, because two readers profiling the same part from
+            # different vertices carry to different places -- and if there were
+            # not, the copy would be unmatchable and reported below.
+            matched = None
+            best = None
+            for source_op, source_point, source_entry in references:
+                expected = expected_start_point(target, source_entry,
+                                                source_point, rop)
+                if expected is None:
+                    continue
+                off = FreeCAD.Vector(rop.StartPoint).sub(expected).Length
+                if best is None or off < best[0]:
+                    best = (off, source_op, expected)
+                if off < 1e-6:
+                    matched = source_op
+                    break
+
+            if matched is not None:
                 carried += 1
-                emit("    %-40s StartPoint=%s" % (
-                    rop.Label, tuple(round(v, 3) for v in rop.StartPoint)))
+                emit("    %-40s StartPoint=%s  (from %s)"
+                     % (rop.Label, tuple(round(v, 3) for v in rop.StartPoint),
+                        matched.Label))
             else:
+                off, source_op, expected = best
                 emit("  NOT CARRIED: %s is %.4f mm from where it should be "
-                     "(%s, expected %s)"
-                     % (rop.Label, off, rop.StartPoint, expected))
-        # The other 96 operations must not produce a word about start points.
+                     "(%s, expected %s, against %s)"
+                     % (rop.Label, off, rop.StartPoint, expected,
+                        source_op.Label))
+        # The operations that do not read a start point must not produce a word
+        # about one.
         if outcome.verification is not None:
             noise = [w for w in outcome.verification.warnings
                      if "not on any part it targets" in w]
