@@ -1061,14 +1061,59 @@ schema version in step with the reader; the harness refuses a mismatch.
 
 | tier | runner | corpus | cost | what it catches |
 |---|---|---|---|---|
-| 1 | `run.sh` | synthetic, 450×350, 18 parts | ~10 s | packing regressions, instrumentation drift, unit formatting, verify-gate arithmetic |
+| 1 | `run.sh` | synthetic, 450×350, 18 parts | **16.4 min** | packing regressions, instrumentation drift, unit formatting, verify-gate arithmetic |
 | 2 | `run_heavy.sh` | heavy synthetic, 1200×600, 122 parts | ~3.5 min | throughput on a single cold nest |
 | 2 | `run_ga.sh` | heavy synthetic, GA | ~1 min | throughput across layouts and generations |
 | 3 | `run_ga.sh GA_CORPUS=n70` | n70 (gitignored), GA | ~3 min | the configuration actually run |
 
-`run.sh` is the fast contract and runs on every commit. The rest cost minutes, so
-they are separate and opt-in. Tiers 1 and 2 have committed baselines; tier 3
-cannot, because the n70 corpus is a gitignored customer part.
+`run.sh` is the complete contract and runs on every commit. The rest cost
+minutes, so they are separate and opt-in. Tiers 1 and 2 have committed
+baselines; tier 3 cannot, because the n70 corpus is a gitignored customer part.
+
+### Where `run.sh`'s 16 minutes actually go
+
+This table used to say `run.sh` costs **~10 s**. That was the *benchmark's*
+cost and never the gate's. Measured by timing each suite individually, in
+`run.sh`'s own order (2026-10-10, one run, this machine):
+
+| suite | s | share |
+|---|--:|--:|
+| `test_lead_in_audit.py` | **661** | **67%** |
+| `test_rotation_determinism.py` | **209** | **21%** |
+| `test_replay_order.py` | 23 | 2% |
+| pytest (647 tests) | 14 | 1% |
+| `nest_benchmark.py` | 13 | 1% |
+| `test_tool_clearance.py` | 13 | 1% |
+| `test_replay_startpoint.py` | 10 | 1% |
+| `test_command_audit_lead_ins.py` | 8 | 1% |
+| `test_ga_loop.py` | 6 | — |
+| `test_panel_construction.py` | 6 | — |
+| `test_replay_subnames.py` | 4 | — |
+| `test_replay_flatten.py` / `_dressups` / `_boundary` | 3 each | — |
+| `test_master_promotion.py`, `_document_units`, `_panel_teardown`, `_shape_preparer_rigid`, `_layout_persistence`, `test_verify_stage.py` | **1 each** | <1% |
+| **total** | **981** | |
+
+**Eighteen of the twenty-one invocations cost 111 s between them; the other
+three cost 870.** That asymmetry is the whole shape of the gate, and it is worth
+stating before anyone decides anything about it — because the obvious move,
+making the expensive suite optional, is the one move this harness exists to
+refuse (`run.sh:27`).
+
+Neither heavy suite is redundant, and the cost is in the work rather than in
+the assertions:
+
+* **`test_lead_in_audit.py`** is the *only* gate for NEST-033. The scan itself
+  measures **0.149 s**; the cost is the fix path, which walks candidate start
+  points and recomputes FreeCAD for each — the slowest operation on the fixture
+  needs **63 candidates**. One replay of `replay-fixture-CAM-Nested.FCStd`
+  measures **9 s warm / 13 s cold**, and the suite does 17 of them.
+* **`test_rotation_determinism.py`** runs three Physics configurations rather
+  than one deliberately: injecting each of the seven draw sites individually
+  found **two that a single configuration cannot see**.
+
+So neither should be demoted. What the table does support is a cheaper inner
+loop — everything except these two is already under two minutes — and a cost
+figure that is true, so nobody goes looking for a mystery.
 
 **A single cold nest and a GA run are different regimes, and optimising one
 tells you almost nothing about the other.** Measured on the n70 configuration:
