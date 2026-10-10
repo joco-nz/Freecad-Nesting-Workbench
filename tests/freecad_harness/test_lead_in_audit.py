@@ -485,27 +485,37 @@ def check_cancel_mid_operation_restores_the_start_point(doc, job):
     # Find an operation whose search genuinely takes several candidates. The
     # known offender is fixed on candidate **1**, so a cancel at candidate 3
     # never fires and the test would assert that a completed fix was a
-    # cancelled one. Which operation is slowest is measured here rather than
+    # cancelled one. Which operation is hard is measured here rather than
     # assumed: a dry run restores everything, so it is safe to run first.
+    #
+    # The survey stops as soon as one operation has needed HARD_CANDIDATES,
+    # rather than resolving all 110 to keep the maximum. That maximum was never
+    # what this check asserts on -- see the note on `_stop_when_hard` for the
+    # measurement, and for why computing it cost a quarter of the gate.
     survey = lead_in_audit.scan_job(fresh, margin=2.0)
-    lead_in_audit.resolve_conflicts(survey, dry_run=True)
-    hardest = None
+    lead_in_audit.resolve_conflicts(survey, dry_run=True,
+                                    cancel_check=_stop_when_hard(survey))
+    hardest = None          # the best seen so far, for the failure message
+    chosen = None           # the first that actually clears the bar
     for candidate in survey.fixable:
         counts_tried = _candidates_tried(candidate.detail)
         if counts_tried is None:
             continue
         if hardest is None or counts_tried > hardest[0]:
             hardest = (counts_tried, candidate)
+        if counts_tried >= HARD_CANDIDATES and chosen is None:
+            chosen = (counts_tried, candidate)
+    hardest = chosen if chosen is not None else hardest
     if not check(hardest is not None,
                  "a dry run found some fixable operation to work with"):
         return
 
     how_many, template = hardest
-    emit("  slowest operation needs %.0f candidate(s): %s"
-         % (how_many, template.label))
-    if not check(how_many >= 3,
-                 "and it needs at least 3, so a mid-operation cancel is real "
-                 "(needs %.0f)" % how_many):
+    emit("  using %s, which needs %.0f candidate(s)"
+         % (template.label, how_many))
+    if not check(how_many >= HARD_CANDIDATES,
+                 "and it needs at least %d, so a mid-operation cancel is real "
+                 "(needs %.0f)" % (HARD_CANDIDATES, how_many)):
         return
 
     dressup = template.dressup
@@ -562,6 +572,46 @@ def _stop_after(n):
     def check_cancel():
         state["seen"] += 1
         return state["seen"] > n
+
+    return check_cancel
+
+
+#: How many candidates an operation must need before a mid-operation cancel is a
+#: real event. The check only ever asserts "at least this many"; the value is a
+#: floor, not a measurement of the fixture's worst case.
+HARD_CANDIDATES = 3
+
+
+def _stop_when_hard(survey):
+    """A `cancel_check` that ends a survey once one operation needs enough tries.
+
+    The survey runs to answer "is there an operation whose search genuinely takes
+    several candidates?". It used to answer a harder question -- *which* operation
+    takes the most -- by resolving all 110 and keeping the maximum. Measured on
+    the committed fixture, that is **142.8 s**, which was two thirds of a 223 s
+    check and about a quarter of the whole gate; and it bought nothing, because
+    the check asserts a floor of `HARD_CANDIDATES` and **24 of the 27 fixable
+    operations clear it** (63, 51, 50, 22, 19, 13, ...). The maximum is not what
+    makes this check meaningful; the existence of one hard operation is.
+
+    So the survey stops as soon as it has one. `resolve_conflicts` documents
+    `cancel_check` as stopping *between operations*, which is what makes this
+    cheap and safe: by the time it is polled, the previous operation has finished
+    and is already in `survey.fixable`, so the operation that triggered the stop
+    is the one the test goes on to use. Returning False while `fixable` is empty
+    lets the first operation run.
+
+    Cancelling does leave the survey partial, which is why nothing downstream
+    reads it: the check re-scans and re-prepares from `fresh` before touching the
+    operation. A dry run writes nothing either way, so stopping early cannot
+    leave a mark.
+    """
+    def check_cancel():
+        for candidate in survey.fixable:
+            tried = _candidates_tried(candidate.detail)
+            if tried is not None and tried >= HARD_CANDIDATES:
+                return True
+        return False
 
     return check_cancel
 
