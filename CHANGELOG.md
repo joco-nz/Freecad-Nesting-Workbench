@@ -1,6 +1,6 @@
 # Changelog
 
-All notable changes to the FreeCAD Nesting Workbench will be documented in this file.
+All notable changes to Jet-Nesting will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
@@ -139,6 +139,7 @@ asks what the job cannot say. One job per sheet, every sheet replayed.
 
 ### Changed
 
+- Display name changed from "Nesting" to **Jet-Nesting** in the workbench dropdown, menu bar, toolbar, task panel title, Addon Manager listing, and README. Internal identifiers (`NestingWorkbench` class, `Preferences/NestingWorkbench` path, command names `Nesting_*`, property groups, icon filenames) are deliberately unchanged to preserve user settings and saved document compatibility.
 - A replayed source step is now cut **once per target part** rather than once over
   all of them. FreeCAD's Profile is superlinear in the number of Base entries it
   holds, so a single 23-target operation was paying for 23 targets and achieving

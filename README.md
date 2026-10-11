@@ -1,4 +1,4 @@
-# FreeCAD Nesting Workbench
+# Jet-Nesting
 
 A workbench for 2D nesting of shapes in FreeCAD, utilizing the Minkowski Sum algorithm for efficient packing.
 
@@ -10,7 +10,7 @@ A workbench for 2D nesting of shapes in FreeCAD, utilizing the Minkowski Sum alg
 Select the 3D parts or 2D shapes you wish to nest from the Tree View or 3D View.
 
 ### 2. Running the Nester
-Click the **Run Nesting** icon (or access via the Nesting menu). This opens the Nesting Task Panel.
+Click the **Run Nesting** icon (or access via the **Jet-Nesting** menu). This opens the Jet-Nesting Task Panel.
 
 ### 3. Configuring Options
 

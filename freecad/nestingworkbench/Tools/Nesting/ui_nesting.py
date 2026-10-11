@@ -134,7 +134,7 @@ class NestingPanel(QtWidgets.QWidget):
     def __init__(self, parent=None):
         super(NestingPanel, self).__init__(parent)
         FreeCAD.Console.PrintMessage("NestingPanel initialized.\n")
-        self.setWindowTitle("Nesting Tool")
+        self.setWindowTitle("Jet-Nesting Tool")
         self.selected_shapes_to_process = []
         self.hidden_originals = []
         self.current_layout = None

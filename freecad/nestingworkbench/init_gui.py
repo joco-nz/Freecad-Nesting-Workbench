@@ -13,8 +13,8 @@ class NestingWorkbench(FreeCADGui.Workbench):
     """
     Defines the Nesting Workbench.
     """
-    MenuText = "Nesting"
-    ToolTip = "A workbench for 2D nesting of shapes."
+    MenuText = "Jet-Nesting"
+    ToolTip = "Jet-Nesting: 2D nesting of shapes, CAM replay and lead-in auditing."
     # Absolute path: the workbench selector reads this at registration time,
     # before Initialize() has added the icon directory to the search path.
     Icon = os.path.join(ICONS_DIR, "Nesting_Workbench.svg")
@@ -45,7 +45,7 @@ class NestingWorkbench(FreeCADGui.Workbench):
         # applies the user's own CAM setup to a nest -- and keeping them as
         # separate entries is what lets the replay stay independent of that
         # command, which is somebody else's work.
-        self.appendMenu(["Nesting"], [
+        self.appendMenu(["Jet-Nesting"], [
             'Nesting_Run',
             'Nesting_StackSheets',
             'Nesting_ManualNester',
@@ -55,7 +55,7 @@ class NestingWorkbench(FreeCADGui.Workbench):
             'Nesting_AuditLeadIns',
             'Nesting_CreateSilhouette'
         ])
-        self.appendToolbar("Nesting", [
+        self.appendToolbar("Jet-Nesting", [
             'Nesting_Run',
             'Nesting_StackSheets',
             'Nesting_ManualNester',
