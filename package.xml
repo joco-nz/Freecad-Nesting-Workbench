@@ -5,11 +5,12 @@
   <version>1.0.2</version>
   <date>2026-08-29</date>
   <maintainer email="petersfinewoodcraft@gmail.com">Steve Peters</maintainer>
+  <maintainer email="james@snaggingpixels.com">James Walker</maintainer>
   <license file="LICENSE">LGPL-2.1-or-later</license>
   <license file="LICENSE-Assets">OFL-1.1</license>
-  <url type="repository" branch="main">https://github.com/StevePeters-US/Freecad-Nesting-Workbench</url>
-  <url type="readme">https://raw.githubusercontent.com/StevePeters-US/Freecad-Nesting-Workbench/main/README.md</url>
-  <url type="bugtracker">https://github.com/StevePeters-US/Freecad-Nesting-Workbench/issues</url>
+  <url type="repository" branch="Jet-Nesting">https://github.com/joco-nz/Freecad-Nesting-Workbench</url>
+  <url type="readme">https://raw.githubusercontent.com/joco-nz/Freecad-Nesting-Workbench/Jet-Nesting/README.md</url>
+  <url type="bugtracker">https://github.com/joco-nz/Freecad-Nesting-Workbench/issues</url>
   <icon>Resources/icons/Nesting_Workbench.svg</icon>
 
   <content>
