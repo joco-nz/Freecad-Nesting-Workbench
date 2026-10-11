@@ -8,9 +8,35 @@
 #   tests/freecad_harness/run.sh                              # gate vs committed baseline
 #   NEST_BENCH_OUT=/tmp/b.json tests/freecad_harness/run.sh   # record
 #   NEST_BENCH_BASELINE=... tests/freecad_harness/run.sh      # gate vs another baseline
+#   tests/freecad_harness/run.sh --jobs 4                     # parallel (default 4)
 #
 # FREECADCMD overrides the interpreter if freecadcmd is not where this expects.
 set -eu
+
+# Parse --jobs N
+JOBS=4
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --jobs)
+            JOBS="$2"
+            shift 2
+            ;;
+        --jobs=*)
+            JOBS="${1#*=}"
+            shift
+            ;;
+        *)
+            echo "usage: $0 [--jobs N]" >&2
+            exit 2
+            ;;
+    esac
+done
+
+# Validate jobs is a positive integer
+case "$JOBS" in
+    ''|*[!0-9]*) echo "error: --jobs requires a positive integer" >&2; exit 2 ;;
+    *) [ "$JOBS" -ge 1 ] || { echo "error: --jobs must be >= 1" >&2; exit 2; } ;;
+esac
 
 HARNESS_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 REPO_ROOT=$(CDPATH= cd -- "$HARNESS_DIR/../.." && pwd)
@@ -22,10 +48,8 @@ if [ ! -x "$FREECADCMD" ]; then
     exit 2
 fi
 
-# The GUI binary, for the one check that has to build the panel: `freecadcmd`
-# has no `FreeCADGui.UiLoader`, so `Gui::QuantitySpinBox` cannot be made there.
-# Required rather than optional, because a gate that quietly skips a check is
-# the same failure as having no gate at all.
+# The GUI binary, for the two checks that need FreeCADGui:
+# test_command_audit_lead_ins.py and test_panel_construction.py
 GUI_FREECAD=${GUI_FREECAD:-/home/james/freecad_env/usr/bin/freecad}
 if [ ! -x "$GUI_FREECAD" ]; then
     echo "freecad (GUI) not found at $GUI_FREECAD" >&2
@@ -39,6 +63,7 @@ fi
 : "${NEST_BENCH_BASELINE:=$HARNESS_DIR/baseline/synthetic_v1.json}"
 export NEST_BENCH_BASELINE
 
+# Status files (one per suite + aggregates)
 BENCH_STATUS="$HARNESS_DIR/.last_status"
 TEST_STATUS="$HARNESS_DIR/.last_status_test"
 GA_STATUS="$HARNESS_DIR/.last_status_ga"
@@ -59,7 +84,9 @@ TOOLTIP_STATUS="$HARNESS_DIR/.last_status_tooltip"
 PANELBUILD_STATUS="$HARNESS_DIR/.last_status_panelbuild"
 ROTATIONDET_STATUS="$HARNESS_DIR/.last_status_rotationdet"
 PERSIST_STATUS="$HARNESS_DIR/.last_status_persist"
-VERIFYSTAGE_STATUS="$HARNESS_DIR/.last_status_verifystage"
+VERIFYSTAGE_STATUS="$HARNESS_DIR/.last_status_verifystate"
+
+# Clean previous status files
 rm -f "$BENCH_STATUS" "$TEST_STATUS" "$GA_STATUS" "$PANEL_STATUS" \
       "$UNITS_STATUS" "$PYTEST_STATUS" "$REPLAY_STATUS" "$DRESSUP_STATUS" \
       "$LEADIN_STATUS" "$LEADINCMD_STATUS" \
@@ -69,106 +96,76 @@ rm -f "$BENCH_STATUS" "$TEST_STATUS" "$GA_STATUS" "$PANEL_STATUS" \
       "$ROTATIONDET_STATUS" "$VERIFYSTAGE_STATUS"
 
 cd "$REPO_ROOT"
-"$FREECADCMD" "$HARNESS_DIR/nest_benchmark.py" || true
-"$FREECADCMD" "$HARNESS_DIR/test_master_promotion.py" || true
-"$FREECADCMD" "$HARNESS_DIR/test_ga_loop.py" || true
-"$FREECADCMD" "$HARNESS_DIR/test_panel_teardown.py" || true
-"$FREECADCMD" "$HARNESS_DIR/test_document_units.py" || true
-# The three replay checks. These need real FreeCAD objects -- analytic surfaces,
-# actual dressup proxies, an actual Operations list -- because what they guard
-# is precisely the things a stand-in cannot show: that a dressed operation is
-# absent from the list it is dressed up in, and that the post-processor emits
-# that list verbatim. Neither is expressible in pytest.
-#
-# The order check is the odd one out: the other two build their own geometry and
-# neither nests a part in a hole, so the ordering step returned before its write
-# in every gated run. It is the only one that runs the committed fixture, which
-# is the only one with nesting in it -- which is exactly why a bug in the
-# ordering write sat behind a green gate (NEST-015).
-"$FREECADCMD" "$HARNESS_DIR/test_replay_flatten.py" || true
-"$FREECADCMD" "$HARNESS_DIR/test_replay_dressups.py" || true
-"$FREECADCMD" "$HARNESS_DIR/test_replay_order.py" || true
-# A characterisation test, and the only gated file whose subject is currently
-# wrong: it asserts that the replay copies a Profile's StartPoint verbatim onto
-# the nested copy, measured, so that an unintended change fails here. It is in
-# the gate for the same reason `test_replay_dressups.py` is -- the warning
-# asserted there is the mitigation, and here there is not even that. Flipping
-# START_POINT_IS_COPIED_VERBATIM in that file is the whole of the change when
-# the replay is fixed.
-"$FREECADCMD" "$HARNESS_DIR/test_replay_startpoint.py" || true
-# Boundary is unsupported: dropped from the replay and reported once per source
-# dressup. The write half of layout persistence is below.
-"$FREECADCMD" "$HARNESS_DIR/test_replay_boundary.py" || true
-# The nester centres a part with a rigid transform, and must not re-fit the
-# geometry doing it: transformShape, not transformGeometry. NEST-007.
-"$FREECADCMD" "$HARNESS_DIR/test_shape_preparer_rigid.py" || true
-# A sub-element name that resolves is not the same as a name that means the same
-# thing: getElement raises only when a name is absent, so `Face3` on a copy with
-# fewer faces than the source answered fine and profiled the wrong feature.
-# Compared against the source geometry; NEST-027.
-"$FREECADCMD" "$HARNESS_DIR/test_replay_subnames.py" || true
-# `spacing` and the CAM tool are independent controls and nothing related them:
-# a nest tighter than the tool is wide would be cut through without a word.
-"$FREECADCMD" "$HARNESS_DIR/test_tool_clearance.py" || true
-# Lead-ins reach outside their own part, and the committed fixture's worst one
-# clears a neighbour's cut path by 0.0598 mm -- which no intersection test
-# reports, because nothing actually crosses. Every earlier version of this code
-# read that geometry wrong in a way that produced a confident clean sheet, so
-# the gate asserts the measured distance rather than a count.
-"$FREECADCMD" "$HARNESS_DIR/test_lead_in_audit.py" || true
-# The command itself, on the GUI binary like `test_panel_construction.py`: it
-# imports FreeCADGui and builds a QMessageBox, and `GetResources()` would answer
-# perfectly well on a class whose dialog code was broken. Also the only gated
-# check of the menu-vs-toolbar decision.
-"$GUI_FREECAD" "$HARNESS_DIR/test_command_audit_lead_ins.py" || true
-# The Candidate Step tooltip's diagram: the file can exist and the string can
-# name it and Qt still draws a broken-image box, so this renders the real
-# tooltip offscreen and measures it. NEST-030's tooltip work.
-"$FREECADCMD" "$HARNESS_DIR/test_tooltip_assets.py" || true
-# The panel constructing at all. This is the only gated check that builds it,
-# and it has to run on the GUI binary: LengthField makes Gui::QuantitySpinBox
-# through FreeCADGui.UiLoader, which freecadcmd does not have. It exists because
-# a one-line setToolTip on the wrapper instead of the widget shipped in a commit
-# whose gate was green -- nothing gated built the panel. No Xvfb needed.
-"$GUI_FREECAD" "$HARNESS_DIR/test_panel_construction.py" || true
-# The write half of layout persistence: a layout records the algorithm that ran,
-# the direction that algorithm's dial held, whether that direction was used, and
-# each part's raw rotation override. The reload half needs a panel and lives in
-# `probe_layout_restore.py`, run by hand on the `freecad` binary.
-"$FREECADCMD" "$HARNESS_DIR/test_layout_persistence.py" || true
-# A seeded nest must not depend on the rotation pool width. Four widths, plus a
-# seed that must change the result -- so neither "the pool does not matter" nor
-# "the rng is dead" can pass. NEST-032.
-"$FREECADCMD" "$HARNESS_DIR/test_rotation_determinism.py" || true
-# The verify gate and its repair-push, on synthetic polygons -- the cheapest
-# suite here, under a second, because the predicate is arithmetic and the
-# fixtures are constructible. In the gate for the same reason as the seeding
-# one above: a gate that re-checks accepted placements on un-simplified
-# geometry, and whose repair decides whether a rejected row is a dead end or
-# only a simplification artefact, is precisely the arithmetic that returns
-# *fewer parts* when it is wrong rather than raising. NEST-034, NEST-036.
-"$FREECADCMD" "$HARNESS_DIR/test_verify_stage.py" || true
 
-for f in "$BENCH_STATUS" "$TEST_STATUS" "$GA_STATUS" "$PANEL_STATUS" \
-         "$UNITS_STATUS" "$REPLAY_STATUS" "$DRESSUP_STATUS" "$ORDER_STATUS" \
-         "$LEADIN_STATUS" "$LEADINCMD_STATUS" \
-         "$STARTPOINT_STATUS" "$BOUNDARY_STATUS" "$RIGID_STATUS" \
-         "$SUBNAME_STATUS" "$CLEARANCE_STATUS" "$TOOLTIP_STATUS" \
-         "$PANELBUILD_STATUS" "$PERSIST_STATUS" "$ROTATIONDET_STATUS" \
-         "$VERIFYSTAGE_STATUS"; do
-    if [ ! -f "$f" ]; then
-        echo "harness: DID NOT RUN -- did not write $f" >&2
-        exit 3
+# Build the test list: each entry is "interpreter|script|status_file|description"
+# Interpreter: "cmd" for freecadcmd, "gui" for GUI_FREECAD
+# The suites are independent - each writes its own status file.
+# We split them into JOBS groups and run each group in background.
+
+# Heavy suites first for better load balancing
+set -- \
+    "cmd|$HARNESS_DIR/test_lead_in_audit.py|$LEADIN_STATUS|lead-in audit" \
+    "cmd|$HARNESS_DIR/test_rotation_determinism.py|$ROTATIONDET_STATUS|rotation determinism" \
+    "cmd|$HARNESS_DIR/test_replay_order.py|$ORDER_STATUS|replay order" \
+    "cmd|$HARNESS_DIR/test_replay_startpoint.py|$STARTPOINT_STATUS|replay startpoint" \
+    "cmd|$HARNESS_DIR/test_tool_clearance.py|$CLEARANCE_STATUS|tool clearance" \
+    "cmd|$HARNESS_DIR/nest_benchmark.py|$BENCH_STATUS|nest benchmark" \
+    "cmd|$HARNESS_DIR/test_master_promotion.py|$TEST_STATUS|master promotion" \
+    "cmd|$HARNESS_DIR/test_ga_loop.py|$GA_STATUS|GA loop" \
+    "cmd|$HARNESS_DIR/test_panel_teardown.py|$PANEL_STATUS|panel teardown" \
+    "cmd|$HARNESS_DIR/test_document_units.py|$UNITS_STATUS|document units" \
+    "cmd|$HARNESS_DIR/test_replay_flatten.py|$REPLAY_STATUS|replay flatten" \
+    "cmd|$HARNESS_DIR/test_replay_dressups.py|$DRESSUP_STATUS|replay dressups" \
+    "cmd|$HARNESS_DIR/test_replay_boundary.py|$BOUNDARY_STATUS|replay boundary" \
+    "cmd|$HARNESS_DIR/test_shape_preparer_rigid.py|$RIGID_STATUS|shape preparer rigid" \
+    "cmd|$HARNESS_DIR/test_replay_subnames.py|$SUBNAME_STATUS|replay subnames" \
+    "gui|$HARNESS_DIR/test_command_audit_lead_ins.py|$LEADINCMD_STATUS|lead-in command" \
+    "cmd|$HARNESS_DIR/test_tooltip_assets.py|$TOOLTIP_STATUS|tooltip assets" \
+    "gui|$HARNESS_DIR/test_panel_construction.py|$PANELBUILD_STATUS|panel construction" \
+    "cmd|$HARNESS_DIR/test_layout_persistence.py|$PERSIST_STATUS|layout persistence" \
+    "cmd|$HARNESS_DIR/test_verify_stage.py|$VERIFYSTAGE_STATUS|verify stage"
+
+# Total tests
+TOTAL=$#
+
+# Distribute tests into JOBS groups (round-robin for simplicity)
+# Each group gets its own temp script to run
+GROUP_DIR=$(mktemp -d)
+trap 'rm -rf "$GROUP_DIR"' EXIT INT TERM
+
+i=0
+while [ $# -gt 0 ]; do
+    entry="$1"
+    shift
+    group=$((i % JOBS))
+    echo "$entry" >> "$GROUP_DIR/group_$group"
+    i=$((i + 1))
+done
+
+# Run each group in background
+pids=""
+for g in $(seq 0 $((JOBS - 1))); do
+    if [ -f "$GROUP_DIR/group_$g" ]; then
+        (
+            while IFS='|' read -r interp script status_file desc; do
+                if [ "$interp" = "gui" ]; then
+                    runner="$GUI_FREECAD"
+                else
+                    runner="$FREECADCMD"
+                fi
+                "$runner" "$script" || true
+            done < "$GROUP_DIR/group_$g"
+        ) &
+        pids="$pids $!"
     fi
 done
 
-STATUS=$(cat "$BENCH_STATUS")
-TESTS=$(cat "$TEST_STATUS")
+# Wait for all groups
+for pid in $pids; do
+    wait "$pid"
+done
 
-# The harness's own statistics -- the code that decides whether a run is
-# comparable -- live in harness_common.py and are pure Python, so they belong in
-# the fast suite rather than only behind a freecadcmd run. Runs the whole tests/
-# tree so one command is the whole contract.
+# Pure-Python pytest suite (runs after all freecadcmd suites)
 PYTHON=${PYTHON:-python3}
 if "$PYTHON" -c 'import pytest' 2>/dev/null; then
     if "$PYTHON" -m pytest -q tests/ >/dev/null 2>&1; then
@@ -183,135 +180,122 @@ else
 fi
 
 # Every check below folds into $STATUS, and the verdict is printed last, once
-# $STATUS is final. It used to be printed first, which meant a red gate read
-#
-#     harness: PASS
-#     replay-flatten regression test FAILED (status 1)
-#
-# -- a verdict of PASS immediately above the line explaining it. The exit code
-# was always correct, so this never failed a build; it just made a failing run
-# read like a passing one to anyone skimming, which is the exact moment a gate
-# is worth having.
-#
-# The perf gate is a separate concern from the regression tests: both are
-# reported, and the run fails if either did.
-if [ "$TESTS" -ne 0 ]; then
-    echo "master-promotion regression test FAILED (status $TESTS)" >&2
-    [ "$STATUS" -eq 0 ] && STATUS=1
+# $STATUS is final.
+STATUS=0
+
+# Check that all status files were written
+for f in "$BENCH_STATUS" "$TEST_STATUS" "$GA_STATUS" "$PANEL_STATUS" \
+         "$UNITS_STATUS" "$REPLAY_STATUS" "$DRESSUP_STATUS" "$ORDER_STATUS" \
+         "$LEADIN_STATUS" "$LEADINCMD_STATUS" \
+         "$STARTPOINT_STATUS" "$BOUNDARY_STATUS" "$RIGID_STATUS" \
+         "$SUBNAME_STATUS" "$CLEARANCE_STATUS" "$TOOLTIP_STATUS" \
+         "$PANELBUILD_STATUS" "$PERSIST_STATUS" "$ROTATIONDET_STATUS" \
+         "$VERIFYSTAGE_STATUS" "$PYTEST_STATUS"; do
+    if [ ! -f "$f" ]; then
+        echo "harness: DID NOT RUN -- did not write $f" >&2
+        exit 3
+    fi
+done
+
+# Aggregate
+if [ "$(cat "$TEST_STATUS")" -ne 0 ]; then
+    echo "master-promotion regression test FAILED (status $(cat "$TEST_STATUS"))" >&2
+    STATUS=1
 fi
 
-GA=$(cat "$GA_STATUS")
-if [ "$GA" -ne 0 ]; then
-    echo "GA-loop integration test FAILED (status $GA)" >&2
-    [ "$STATUS" -eq 0 ] && STATUS=1
+if [ "$(cat "$GA_STATUS")" -ne 0 ]; then
+    echo "GA-loop integration test FAILED (status $(cat "$GA_STATUS"))" >&2
+    STATUS=1
 fi
 
-PANEL=$(cat "$PANEL_STATUS")
-if [ "$PANEL" -ne 0 ]; then
-    echo "panel-teardown regression test FAILED (status $PANEL)" >&2
-    [ "$STATUS" -eq 0 ] && STATUS=1
+if [ "$(cat "$PANEL_STATUS")" -ne 0 ]; then
+    echo "panel-teardown regression test FAILED (status $(cat "$PANEL_STATUS"))" >&2
+    STATUS=1
 fi
 
-UNITS=$(cat "$UNITS_STATUS")
-if [ "$UNITS" -ne 0 ]; then
-    echo "document-unit regression test FAILED (status $UNITS)" >&2
-    [ "$STATUS" -eq 0 ] && STATUS=1
+if [ "$(cat "$UNITS_STATUS")" -ne 0 ]; then
+    echo "document-unit regression test FAILED (status $(cat "$UNITS_STATUS"))" >&2
+    STATUS=1
 fi
 
-REPLAY=$(cat "$REPLAY_STATUS")
-if [ "$REPLAY" -ne 0 ]; then
-    echo "replay-flatten regression test FAILED (status $REPLAY)" >&2
-    [ "$STATUS" -eq 0 ] && STATUS=1
+if [ "$(cat "$REPLAY_STATUS")" -ne 0 ]; then
+    echo "replay-flatten regression test FAILED (status $(cat "$REPLAY_STATUS"))" >&2
+    STATUS=1
 fi
 
-DRESSUP=$(cat "$DRESSUP_STATUS")
-if [ "$DRESSUP" -ne 0 ]; then
-    echo "replay-dressup regression test FAILED (status $DRESSUP)" >&2
-    [ "$STATUS" -eq 0 ] && STATUS=1
+if [ "$(cat "$DRESSUP_STATUS")" -ne 0 ]; then
+    echo "replay-dressup regression test FAILED (status $(cat "$DRESSUP_STATUS"))" >&2
+    STATUS=1
 fi
 
-LEADIN=$(cat "$LEADIN_STATUS")
-if [ "$LEADIN" -ne 0 ]; then
-    echo "lead-in audit regression test FAILED (status $LEADIN)" >&2
-    [ "$STATUS" -eq 0 ] && STATUS=1
+if [ "$(cat "$LEADIN_STATUS")" -ne 0 ]; then
+    echo "lead-in audit regression test FAILED (status $(cat "$LEADIN_STATUS"))" >&2
+    STATUS=1
 fi
 
-LEADINCMD=$(cat "$LEADINCMD_STATUS")
-if [ "$LEADINCMD" -ne 0 ]; then
-    echo "lead-in command regression test FAILED (status $LEADINCMD)" >&2
-    [ "$STATUS" -eq 0 ] && STATUS=1
+if [ "$(cat "$LEADINCMD_STATUS")" -ne 0 ]; then
+    echo "lead-in command regression test FAILED (status $(cat "$LEADINCMD_STATUS"))" >&2
+    STATUS=1
 fi
 
-ORDER=$(cat "$ORDER_STATUS")
-if [ "$ORDER" -ne 0 ]; then
-    echo "replay-order regression test FAILED (status $ORDER)" >&2
-    [ "$STATUS" -eq 0 ] && STATUS=1
+if [ "$(cat "$ORDER_STATUS")" -ne 0 ]; then
+    echo "replay-order regression test FAILED (status $(cat "$ORDER_STATUS"))" >&2
+    STATUS=1
 fi
 
-STARTPOINT=$(cat "$STARTPOINT_STATUS")
-if [ "$STARTPOINT" -ne 0 ]; then
-    echo "replay-start-point regression test FAILED (status $STARTPOINT)" >&2
-    [ "$STATUS" -eq 0 ] && STATUS=1
+if [ "$(cat "$STARTPOINT_STATUS")" -ne 0 ]; then
+    echo "replay-start-point regression test FAILED (status $(cat "$STARTPOINT_STATUS"))" >&2
+    STATUS=1
 fi
 
-BOUNDARY=$(cat "$BOUNDARY_STATUS")
-if [ "$BOUNDARY" -ne 0 ]; then
-    echo "replay-boundary regression test FAILED (status $BOUNDARY)" >&2
-    [ "$STATUS" -eq 0 ] && STATUS=1
+if [ "$(cat "$BOUNDARY_STATUS")" -ne 0 ]; then
+    echo "replay-boundary regression test FAILED (status $(cat "$BOUNDARY_STATUS"))" >&2
+    STATUS=1
 fi
 
-RIGID=$(cat "$RIGID_STATUS")
-if [ "$RIGID" -ne 0 ]; then
-    echo "shape-preparer-rigidity regression test FAILED (status $RIGID)" >&2
-    [ "$STATUS" -eq 0 ] && STATUS=1
+if [ "$(cat "$RIGID_STATUS")" -ne 0 ]; then
+    echo "shape-preparer-rigidity regression test FAILED (status $(cat "$RIGID_STATUS"))" >&2
+    STATUS=1
 fi
 
-SUBNAME=$(cat "$SUBNAME_STATUS")
-if [ "$SUBNAME" -ne 0 ]; then
-    echo "replay-subname-agreement regression test FAILED (status $SUBNAME)" >&2
-    [ "$STATUS" -eq 0 ] && STATUS=1
+if [ "$(cat "$SUBNAME_STATUS")" -ne 0 ]; then
+    echo "replay-subname-agreement regression test FAILED (status $(cat "$SUBNAME_STATUS"))" >&2
+    STATUS=1
 fi
 
-CLEARANCE=$(cat "$CLEARANCE_STATUS")
-if [ "$CLEARANCE" -ne 0 ]; then
-    echo "tool-clearance regression test FAILED (status $CLEARANCE)" >&2
-    [ "$STATUS" -eq 0 ] && STATUS=1
+if [ "$(cat "$CLEARANCE_STATUS")" -ne 0 ]; then
+    echo "tool-clearance regression test FAILED (status $(cat "$CLEARANCE_STATUS"))" >&2
+    STATUS=1
 fi
 
-TOOLTIP=$(cat "$TOOLTIP_STATUS")
-if [ "$TOOLTIP" -ne 0 ]; then
-    echo "tooltip-assets regression test FAILED (status $TOOLTIP)" >&2
-    [ "$STATUS" -eq 0 ] && STATUS=1
+if [ "$(cat "$TOOLTIP_STATUS")" -ne 0 ]; then
+    echo "tooltip-assets regression test FAILED (status $(cat "$TOOLTIP_STATUS"))" >&2
+    STATUS=1
 fi
 
-PANELBUILD=$(cat "$PANELBUILD_STATUS")
-if [ "$PANELBUILD" -ne 0 ]; then
-    echo "panel-construction regression test FAILED (status $PANELBUILD)" >&2
-    [ "$STATUS" -eq 0 ] && STATUS=1
+if [ "$(cat "$PANELBUILD_STATUS")" -ne 0 ]; then
+    echo "panel-construction regression test FAILED (status $(cat "$PANELBUILD_STATUS"))" >&2
+    STATUS=1
 fi
 
-ROTATIONDET=$(cat "$ROTATIONDET_STATUS")
-if [ "$ROTATIONDET" -ne 0 ]; then
-    echo "rotation-determinism regression test FAILED (status $ROTATIONDET)" >&2
-    [ "$STATUS" -eq 0 ] && STATUS=1
+if [ "$(cat "$ROTATIONDET_STATUS")" -ne 0 ]; then
+    echo "rotation-determinism regression test FAILED (status $(cat "$ROTATIONDET_STATUS"))" >&2
+    STATUS=1
 fi
 
-PERSIST=$(cat "$PERSIST_STATUS")
-if [ "$PERSIST" -ne 0 ]; then
-    echo "layout-persistence regression test FAILED (status $PERSIST)" >&2
-    [ "$STATUS" -eq 0 ] && STATUS=1
+if [ "$(cat "$PERSIST_STATUS")" -ne 0 ]; then
+    echo "layout-persistence regression test FAILED (status $(cat "$PERSIST_STATUS"))" >&2
+    STATUS=1
 fi
 
-VERIFYSTAGE=$(cat "$VERIFYSTAGE_STATUS")
-if [ "$VERIFYSTAGE" -ne 0 ]; then
-    echo "verify-stage regression test FAILED (status $VERIFYSTAGE)" >&2
-    [ "$STATUS" -eq 0 ] && STATUS=1
+if [ "$(cat "$VERIFYSTAGE_STATUS")" -ne 0 ]; then
+    echo "verify-stage regression test FAILED (status $(cat "$VERIFYSTAGE_STATUS"))" >&2
+    STATUS=1
 fi
 
-PYTEST_RC=$(cat "$PYTEST_STATUS")
-if [ "$PYTEST_RC" -ne 0 ]; then
-    echo "pytest suite FAILED (status $PYTEST_RC)" >&2
-    [ "$STATUS" -eq 0 ] && STATUS=1
+if [ "$(cat "$PYTEST_STATUS")" -ne 0 ]; then
+    echo "pytest suite FAILED (status $(cat "$PYTEST_STATUS"))" >&2
+    STATUS=1
 fi
 
 case "$STATUS" in
