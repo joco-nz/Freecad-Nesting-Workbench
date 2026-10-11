@@ -431,7 +431,7 @@ class ManualNesterToolObserver:
             # Clicked on empty space
             self.selected_obj = None
 
-    def handle_move(self, pos, snap=False, _shift_held=False):
+    def handle_move(self, pos, shift_held=False, ctrl_held=False):
         """Process mouse movement during an active drag or free-grab."""
         if not self.selected_obj:
             return
@@ -501,8 +501,8 @@ class ManualNesterToolObserver:
                                    sv_x * cv_x + sv_y * cv_y)
             angle_deg = math.degrees(angle_rad)
 
-            # Snap to 45° increments with Ctrl
-            if snap:
+            # Snap to 45° increments with Shift
+            if shift_held:
                 step = 45.0
                 angle_deg = round(angle_deg / step) * step
 
@@ -1356,10 +1356,24 @@ class ManualNesterToolObserver:
 
         FreeCAD.Console.PrintMessage("Manual Nester: Transformations cancelled and new items removed.\n")
 
+    def _wait_for_physics_worker(self, timeout=1.0):
+        """Wait for any running physics frame to complete before teardown."""
+        if self._pending_physics_future is not None:
+            try:
+                import concurrent.futures
+                concurrent.futures.wait([self._pending_physics_future], timeout=timeout)
+            except Exception:
+                pass
+            self._pending_physics_future = None
+
     def cleanup(self):
         """Removes the event callbacks from the view and restores original visibilities."""
         self._stop_physics_timer()
-        self._physics_executor.shutdown(wait=False)
+        self._wait_for_physics_worker()
+        
+        if self._physics_executor is not None:
+            self._physics_executor.shutdown(wait=False)
+            self._physics_executor = None
         self._detach_all_coin_disp_nodes()
         # Remove Coin3D radius indicator first
         self._hide_radius_indicator()

@@ -329,7 +329,7 @@ class InputManager:
         if not self.is_implicit_drag and not self.is_free_grab:
             return False
 
-        self._emit("move", pos, ctrl, shift)
+        self._emit("move", pos, shift, ctrl)
 
         if self.mode != "IDLE" or self.is_free_grab:
             return True
