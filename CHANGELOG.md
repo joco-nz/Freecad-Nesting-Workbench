@@ -283,6 +283,14 @@ asks what the job cannot say. One job per sheet, every sheet replayed.
 - The Manual Nester's influence radius can now display values above the field's
   maximum when set from Ctrl+scroll, instead of showing a number that disagreed
   with the radius actually in use.
+- **README: described a nonexistent "Transform Parts (Experimental)" command and a
+  nonexistent SVG export format.** The README's `## Other Tools` section has been
+  corrected: the working command is **Manual Nester** with three modes (Push parts
+  Physics / Valid placement only / Auto-rotate to fit), export is DXF only, and
+  the two missing features **Replay CAM Setup onto Nesting** and **Check Lead-ins
+  Against Nesting** are now documented. **Stack Sheets** is now correctly described
+  as **Stack/Unstack Sheets** (a toggle). See NEST-007 for the Manual Nester's
+  existence and NEST-033 for the lead-in check.
 
 ### Notes
 - A step left **whole** rather than split -- one operation covering every part it

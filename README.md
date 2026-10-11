@@ -77,11 +77,38 @@ Click **Run Nesting** at the bottom of the panel.
 
 ## Other Tools
 
-*   **Stack Sheets:** Stacks the sheets at origin.
-*   **Export Sheets:** Export the nested sheets to DXF or SVG files.
-*   **Create CAM Job:** Generates a Path/CAM job from the nested layout, organizing parts, labels, and outlines for machining.
-*   **Create Silhouette:** Generates a 2D projection (outline) of a 3D part which can be used in a cam job.
-*   **Transform Parts:** (Experimental) A manual tool to move/rotate nested parts. **NOTE: This tool is currently under construction and may not function correctly.**
+Most of these want a `Layout_*` group selected in the tree; the two CAM
+commands want a CAM job instead.
+
+*   **Stack/Unstack Sheets:** Toggles every sheet between stacked at the
+    origin and spread out in nesting order.
+*   **Export Sheets as DXF:** Writes each sheet to its own DXF file, and
+    offers to delete the 2D views it generates on the way out.
+*   **Create CAM Job:** Generates a Path/CAM job from the nested layout,
+    organizing parts, labels, and outlines for machining.
+*   **Replay CAM Setup onto Nesting:** Carries **your own** CAM setup onto
+    the nested copies — your Profile and Drilling operations, your LeadInOut
+    and other dressups, your per-feature settings, in your order. Select the
+    CAM job; the layout in the document is found for you, and one job is
+    produced per sheet. Nothing is classified for you: which features belong
+    in which operation was decided in the CAM workbench, before nesting ran.
+    A replayed `StartPoint` moves with the geometry it belongs to, and the
+    replay warns when a point lands off every part it targets.
+*   **Check Lead-ins Against Nesting:** Finds the lead-ins and lead-outs on a
+    replayed job that reach into another part's cut path, and moves their
+    start points until they clear. **It offers report-only first, which writes
+    nothing** — read the report, then decide. Only `StartPoint` is changed;
+    the rest of the recipe is left as you set it. Anything it cannot fix is
+    marked `CONFLICT_` rather than silently skipped. Menu only, not on the
+    toolbar, because it does nothing until a replay has run.
+*   **Create Silhouette:** Generates a 2D projection (outline) of a 3D part
+    which can be used in a cam job.
+*   **Manual Nester:** Drag parts in the 3D view to move them; **OK** saves,
+    **Cancel** reverts. Three modes: **Push parts (Physics)** — dragging
+    shoves neighbours aside, and is the default; **Valid placement only** —
+    the part only moves where it does not overlap anything;
+    **Auto-rotate to fit** — pushes neighbours and rotates the dragged part
+    for tighter fitment.
 
 ## License
 
