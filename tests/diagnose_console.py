@@ -144,7 +144,9 @@ try:
     L(f"Sheets: {len(sheets)}  Placed: {sum(len(s.parts) for s in sheets)}  Unplaced: {len(unplaced)}  Time: {wt:.2f}s")
     for i,s in enumerate(sheets):
         L(f" Sheet {i+1}: {len(s.parts)} parts, {s.used_area:.0f}mm² used ({(s.used_area/(s.width*s.height)*100):.1f}%)")
-        for p in s.parts: L(f"   {p.shape.id} @ ({p.placement.Base.x:.1f},{p.placement.Base.y:.1f}) a={p.angle}")
+        for p in s.parts: 
+            plc = p.shape.placement
+            L(f"   {p.shape.id} @ ({plc.Base.x:.1f},{plc.Base.y:.1f}) a={p.angle}")
     for p in unplaced: L(f" UNPLACED: {p.id} area={p.area:.1f}")
     
     result = {
@@ -153,7 +155,7 @@ try:
         "sheets": len(sheets), "placed": sum(len(s.parts) for s in sheets), "unplaced": len(unplaced),
         "unplaced_ids": [p.id for p in unplaced], "wall_time": wt, "sheets_detail": [
             {"idx":i, "n":len(s.parts), "area":s.used_area, "eff":s.used_area/(s.width*s.height)*100,
-             "parts":[{"id":p.shape.id,"x":p.placement.Base.x,"y":p.placement.Base.y,"a":p.angle} for p in s.parts]}
+             "parts":[{"id":p.shape.id,"x":p.shape.placement.Base.x,"y":p.shape.placement.Base.y,"a":p.angle} for p in s.parts]}
             for i,s in enumerate(sheets)]
     }
     
