@@ -5,6 +5,14 @@ All notable changes to Jet-Nesting will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.3] - 2026-10-13
+
+### Fixed
+- **Cross-platform deterministic nesting**: Fixed non-deterministic tie-breaking in `score_gravity()` that caused 180° rotation flips between Linux/macOS/Windows. The metric is now rounded to 10 decimal places and ties are broken by preferring the candidate closest to origin, ensuring identical results across platforms with same library versions.
+
+### Added
+- Cross-platform diagnostic tools (`tests/diagnose_console.py`, `tests/diagnose_nesting.py`, `tests/compare_nesting_results.py`, `tests/run_diagnose.sh`) for verifying nesting reproducibility across platforms.
+
 ## [Unreleased]
 
 ### Added
