@@ -82,12 +82,37 @@ try:
     
     from freecad.nestingworkbench.Tools.Nesting.shape_preparer import ShapePreparer
     from freecad.nestingworkbench.datatypes.shape import Shape
+    from freecad.nestingworkbench.freecad_helpers import recursive_delete
     Shape.clear_nfp_cache(); Shape.clear_caches()
     
-    prep = ShapePreparer(doc, {})
-    parts = prep.prepare_parts(tops, {p.Label:1 for p in tops}, {})
+    # Build required parameters for ShapePreparer.prepare_parts()
+    # ui_global_settings
+    ui_params = {
+        "spacing": 5.0,
+        "deflection": 0.05,
+        "simplification": 0.1,
+        "rotation_steps": 4,
+        "add_labels": False,
+        "font_path": "",
+        "verbose": True,
+    }
+    # quantities: label -> dict with quantity, rotation_steps, up_direction, fill_sheet
+    quantities = {p.Label: {"quantity": 1, "rotation_steps": 4, "up_direction": "Z+", "fill_sheet": False} for p in tops}
+    # master_shapes_map: label -> FreeCAD object
+    master_shapes_map = {p.Label: p for p in tops}
+    
+    # Create layout and parts groups (needed by prepare_parts)
+    layout_group = doc.addObject("App::DocumentObjectGroup", "DiagLayout")
+    parts_group = doc.addObject("App::DocumentObjectGroup", "PartsToPlace")
+    layout_group.addObject(parts_group)
+    
+    prep = ShapePreparer(doc, {}, create_doc_objects=True)
+    parts = prep.prepare_parts(ui_params, quantities, master_shapes_map, layout_group, parts_group)
     L(f"Prepared {len(parts)} instances")
     for p in parts: L(f"  {p.id} area={p.area:.1f} holes={len(p.polygon.interiors) if p.polygon else 0}")
+    
+    # Clean up the temporary groups
+    recursive_delete(doc, layout_group)
     
     from freecad.nestingworkbench.Tools.Nesting.nesting_logic import nest
     trials = []
