@@ -15,15 +15,17 @@ from datetime import datetime
 # When pasted in console, __file__ doesn't exist. Use FreeCAD's module path.
 try:
     import freecad.nestingworkbench
-    WB_ROOT = os.path.dirname(os.path.dirname(freecad.nestingworkbench.__file__))
+    # Module is at .../Freecad-Nesting-Workbench/freecad/nestingworkbench/__init__.py
+    # Workbench root is two levels up from freecad/nestingworkbench/
+    WB_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(freecad.nestingworkbench.__file__)))
 except ImportError:
     # Fallback: check common install locations
     for base in (
-        os.path.join(FreeCAD.getUserAppDataDir(), "Mod", "Jet-Nesting"),
-        os.path.join(FreeCAD.getHomePath(), "Mod", "Jet-Nesting"),
-        "/usr/share/freecad/Mod/Jet-Nesting",
-        "/usr/local/share/freecad/Mod/Jet-Nesting",
-        os.path.expanduser("~/.local/share/FreeCAD/Mod/Jet-Nesting"),
+        os.path.join(FreeCAD.getUserAppDataDir(), "Mod", "Freecad-Nesting-Workbench"),
+        os.path.join(FreeCAD.getHomePath(), "Mod", "Freecad-Nesting-Workbench"),
+        "/usr/share/freecad/Mod/Freecad-Nesting-Workbench",
+        "/usr/local/share/freecad/Mod/Freecad-Nesting-Workbench",
+        os.path.expanduser("~/.local/share/FreeCAD/Mod/Freecad-Nesting-Workbench"),
     ):
         if os.path.isdir(base):
             WB_ROOT = base
@@ -36,7 +38,7 @@ except ImportError:
                 WB_ROOT = os.path.dirname(os.path.dirname(cand))
                 break
         else:
-            raise RuntimeError("Could not locate Jet-Nesting workbench. "
+            raise RuntimeError("Could not locate Freecad-Nesting-Workbench. "
                                "Is it installed? Try: import freecad.nestingworkbench")
 
 FIXTURE = os.path.join(WB_ROOT, "tests", "Test_Files", "replay-fixture.FCStd")
