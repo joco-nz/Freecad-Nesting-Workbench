@@ -65,6 +65,13 @@ try:
     
     doc = FreeCAD.openDocument(FIXTURE)
     L(f"Loaded {doc.Name} ({len(doc.Objects)} objects)")
+    L("ALL OBJECTS IN DOCUMENT:")
+    for o in doc.Objects:
+        L(f"  {o.Name:30} {o.TypeId:25} Label={o.Label} HasShape={hasattr(o,'Shape')}")
+        if hasattr(o, 'Shape') and o.Shape:
+            L(f"    -> Shape: {type(o.Shape).__name__} Vol={o.Shape.Volume:.1f} Area={o.Shape.Area:.1f}")
+        if hasattr(o, 'Group') and o.Group:
+            L(f"    -> Group children: {[c.Name for c in o.Group]}")
     
     SKIP = {"App::Origin","App::Line","App::Plane","App::Point","App::Part",
             "PartDesign::Line","PartDesign::Plane","PartDesign::Point",
