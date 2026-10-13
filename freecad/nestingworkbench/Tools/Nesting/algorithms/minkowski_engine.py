@@ -603,18 +603,27 @@ class MinkowskiEngine:
         pts_np: (N, 2) float array of candidate positions
         valid:  (N,) bool mask — invalid positions get metric=inf
         direction: (gx, gy) unit vector pointing toward preferred side
-        rng: optional random.Random — when given, ties for the best score are
-             broken randomly instead of always taking the first index
+        rng: DEPRECATED — kept for API compatibility, no longer used.
+             Ties are now broken deterministically to ensure cross-platform
+             reproducibility (previously used rng.randrange() which differed
+             due to floating-point noise in metric calculations).
         Returns: (best_idx, metric) or (None, inf) when no valid candidates exist.
         """
         gx, gy = direction
         scores = np.where(valid, -(pts_np[:, 0] * gx + pts_np[:, 1] * gy), np.inf)
-        metric = float(scores.min())
+        # Round metric to 10 decimal places to eliminate floating-point noise
+        # that causes different candidates to tie on different platforms
+        # (OpenBLAS vs Accelerate, AVX2 vs NEON, GEOS precision differences)
+        metric = round(float(scores.min()), 10)
         if not np.isfinite(metric):
             return None, float('inf')
-        tied = np.flatnonzero(scores == metric)
-        if rng is not None and len(tied) > 1:
-            best_idx = int(tied[rng.randrange(len(tied))])
+        # Use rounded scores for tie detection
+        tied = np.flatnonzero(np.round(scores, 10) == metric)
+        if len(tied) > 1:
+            # Deterministic tie-break: prefer candidate closest to origin
+            # (minimizes travel distance, stable across platforms)
+            dists = pts_np[tied, 0]**2 + pts_np[tied, 1]**2
+            best_idx = int(tied[np.argmin(dists)])
         else:
             best_idx = int(tied[0])
         return best_idx, metric
