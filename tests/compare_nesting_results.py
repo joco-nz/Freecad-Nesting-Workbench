@@ -89,6 +89,77 @@ def compare_sheets(s1, s2):
     return diffs
 
 
+def normalize_result(r):
+    """Normalize different JSON formats to a common structure."""
+    # macOS console format
+    if "sheets_detail" in r:
+        sheets = []
+        for s in r.get("sheets_detail", []):
+            parts = []
+            for p in s.get("parts", []):
+                parts.append({
+                    "id": p.get("id"),
+                    "x": p.get("x"),
+                    "y": p.get("y"),
+                    "a": p.get("a"),
+                })
+            sheets.append({"n": s.get("n"), "area": s.get("area"), "eff": s.get("eff"), "parts": parts})
+        return {
+            "platform": r.get("platform"),
+            "freecad": r.get("freecad"),
+            "shapely": r.get("shapely"),
+            "geos": r.get("geos"),
+            "numpy": r.get("numpy"),
+            "sheets": r.get("sheets"),
+            "placed": r.get("placed"),
+            "unplaced": r.get("unplaced"),
+            "unplaced_ids": r.get("unplaced_ids"),
+            "wall_time": r.get("wall_time"),
+            "sheets_detail": sheets,
+        }
+    # Linux freecadcmd format
+    elif "sheet_details" in r:
+        sheets = []
+        for s in r.get("sheet_details", []):
+            parts = []
+            for p in s.get("placements", []):
+                parts.append({
+                    "id": p.get("part_id"),
+                    "x": p.get("x"),
+                    "y": p.get("y"),
+                    "a": p.get("angle"),
+                })
+            sheets.append({"n": s.get("parts"), "area": s.get("used_area"), "eff": s.get("efficiency_pct"), "parts": parts})
+        # Extract platform info
+        plat = r.get("platform", {})
+        if isinstance(plat, dict):
+            platform_str = f"{plat.get('system','?')}-{plat.get('machine','?')}"
+            freecad_ver = plat.get("freecad", "?")
+            shapely_ver = plat.get("shapely", "?")
+            geos_ver = plat.get("geos", "?")
+            numpy_ver = plat.get("numpy", "?")
+        else:
+            platform_str = str(plat)
+            freecad_ver = r.get("freecad", "?")
+            shapely_ver = r.get("shapely", "?")
+            geos_ver = r.get("geos", "?")
+            numpy_ver = r.get("numpy", "?")
+        return {
+            "platform": platform_str,
+            "freecad": freecad_ver,
+            "shapely": shapely_ver,
+            "geos": geos_ver,
+            "numpy": numpy_ver,
+            "sheets": r.get("sheets_used"),
+            "placed": r.get("parts_placed"),
+            "unplaced": r.get("parts_unplaced"),
+            "unplaced_ids": r.get("unplaced_ids"),
+            "wall_time": r.get("wall_time_s"),
+            "sheets_detail": sheets,
+        }
+    return r
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("file1", nargs="?", help="First JSON file (or - for stdin)")
@@ -108,6 +179,10 @@ def main():
     else:
         ap.print_help()
         return 1
+    
+    # Normalize both results to common format
+    r1 = normalize_result(r1)
+    r2 = normalize_result(r2)
     
     print(f"Comparing:")
     print(f"  1: {r1.get('platform', 'unknown')}  FreeCAD {r1.get('freecad', '?')}  Shapely {r1.get('shapely', '?')}  GEOS {r1.get('geos', '?')}")

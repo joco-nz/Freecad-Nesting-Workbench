@@ -110,6 +110,7 @@ def run_diagnostic():
     # Discover parts (same logic as harness)
     SKIP_TYPEIDS = {
         "App::Origin", "App::Line", "App::Plane", "App::Point", "App::Part",
+        "App::DocumentObjectGroup",
         "PartDesign::Line", "PartDesign::Plane", "PartDesign::Point",
         "PartDesign::CoordinateSystem",
     }
@@ -138,9 +139,16 @@ def run_diagnostic():
     for o in tops:
         log(f"  {o.Label} ({o.Name})")
     
-    # Build parts list with quantities (all qty=1 for this fixture)
-    parts = tops
-    quantities = {p.Label: 1 for p in parts}
+    # Build quantities dict with full spec
+    quantities = {p.Label: {"quantity": 1, "rotation_steps": 4, "up_direction": "Z+", "fill_sheet": False} for p in tops}
+    master_shapes_map = {p.Label: p for p in tops}
+    
+    # Create layout and parts groups (needed by prepare_parts)
+    from freecad.nestingworkbench.freecad_helpers import recursive_delete
+    from shapely.geometry import Polygon
+    layout_group = doc.addObject("App::DocumentObjectGroup", "DiagLayout")
+    parts_group = doc.addObject("App::DocumentObjectGroup", "PartsToPlace")
+    layout_group.addObject(parts_group)
     
     log_section("PREPARING SHAPES")
     # Import the nesting modules
@@ -151,8 +159,17 @@ def run_diagnostic():
     Shape.clear_nfp_cache()
     Shape.clear_caches()
     
-    preparer = ShapePreparer(doc, {})
-    prepared_parts = preparer.prepare_parts(parts, quantities, {})
+    ui_params = {
+        "spacing": 5.0,
+        "deflection": 0.05,
+        "simplification": 0.1,
+        "rotation_steps": 4,
+        "add_labels": False,
+        "font_path": "",
+        "verbose": True,
+    }
+    preparer = ShapePreparer(doc, {}, create_doc_objects=True)
+    prepared_parts = preparer.prepare_parts(ui_params, quantities, master_shapes_map, layout_group, parts_group)
     log(f"Prepared {len(prepared_parts)} part instances")
     
     for i, p in enumerate(prepared_parts):
@@ -162,6 +179,9 @@ def run_diagnostic():
             log(f"      interiors={len(p.polygon.interiors)}")
             for j, interior in enumerate(p.polygon.interiors):
                 log(f"        hole[{j}]: area={Polygon(interior).area:.3f}, verts={len(interior.coords)}")
+    
+    # Clean up the temporary groups
+    recursive_delete(doc, layout_group)
     
     log_section("RUNNING NESTING")
     from freecad.nestingworkbench.Tools.Nesting.nesting_logic import nest
@@ -222,7 +242,8 @@ def run_diagnostic():
         log(f"  Used area: {sheet.used_area:.3f}")
         log(f"  Efficiency: {(sheet.used_area / (sheet.width * sheet.height) * 100):.1f}%")
         for p in sheet.parts:
-            log(f"  - {p.shape.id} at ({p.placement.Base.x:.3f}, {p.placement.Base.y:.3f}) angle={p.angle}")
+            plc = p.shape.placement
+            log(f"  - {p.shape.id} at ({plc.Base.x:.3f}, {plc.Base.y:.3f}) angle={p.angle}")
     
     if unplaced:
         log(f"\nUNPLACED ({len(unplaced)}):")
@@ -265,8 +286,8 @@ def run_diagnostic():
                 "placements": [
                     {
                         "part_id": p.shape.id,
-                        "x": p.placement.Base.x,
-                        "y": p.placement.Base.y,
+                        "x": p.shape.placement.Base.x,
+                        "y": p.shape.placement.Base.y,
                         "angle": p.angle,
                     }
                     for p in s.parts
