@@ -74,6 +74,7 @@ try:
             L(f"    -> Group children: {[c.Name for c in o.Group]}")
     
     SKIP = {"App::Origin","App::Line","App::Plane","App::Point","App::Part",
+            "App::DocumentObjectGroup",
             "PartDesign::Line","PartDesign::Plane","PartDesign::Point",
             "PartDesign::CoordinateSystem"}
     cands = [o for o in doc.Objects if o.TypeId not in SKIP and hasattr(o,"Shape") and o.Shape and not o.Shape.isNull()]
