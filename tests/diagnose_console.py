@@ -70,11 +70,14 @@ try:
             "PartDesign::Line","PartDesign::Plane","PartDesign::Point",
             "PartDesign::CoordinateSystem"}
     cands = [o for o in doc.Objects if o.TypeId not in SKIP and hasattr(o,"Shape") and o.Shape and not o.Shape.isNull()]
+    L(f"Candidates with Shape: {len(cands)}")
+    for o in cands:
+        L(f"  {o.Name} ({o.TypeId}) Label={o.Label} Shape={type(o.Shape).__name__}")
     tops = [o for o in cands if not any(
         other.Name!=o.Name and getattr(other,"Group",None) and any(getattr(c,"Name",None)==o.Name for c in other.Group)
         for other in cands)]
     L(f"Top-level parts: {len(tops)}")
-    for o in tops: L(f"  {o.Label} Vol={o.Shape.Volume:.1f} Area={o.Shape.Area:.1f}")
+    for o in tops: L(f"  {o.Name} ({o.TypeId}) Label={o.Label} Vol={o.Shape.Volume:.1f} Area={o.Shape.Area:.1f}")
     
     # Ensure workbench is on sys.path (needed for installed location)
     if WB_ROOT not in sys.path:
