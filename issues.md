@@ -4716,3 +4716,157 @@ the first version of this** and failed only once it was rewritten to record
 the dialog and inspects the returned tuple and the widget in it — removing the
 spin box from the layout fails it, which is the difference between a control
 that exists and a setting the user can reach.
+
+## NEST-041 — the lead-in audit's own coverage depended on a fixture the user can change with a click
+
+`status: resolved` · `severity: medium (test integrity)` · `area: tests`
+
+The same lesson NEST-037 recorded from the other direction: a check that
+depends on the fixture is a check that can be made to fail by editing the
+fixture.
+
+### The shape of it
+
+`DressupLeadInOut001` in the committed fixture had its lead-out turned off —
+`LeadOut` true to false, `StyleIn` `Line` to `Perpendicular`. That is a
+legitimate thing for a user to do; it is two fields in a dialog. It replays into
+**26 copies**, and the lead-in audit suite went from **195 checks, 0 failures**
+to **189 checks, 5 failures**, none of them about a defect:
+
+    runs found                170 -> 144      (144 + 26 = 170)
+    lead-outs found            28 -> 2
+    index entries             280 -> 254      (254 + 26 = 280)
+    distinct run identities   170 -> 144      (144 + 26 = 170)
+
+Every one of them was `== 28` or `== 170` written down in the file, and every one
+of them moved by exactly the number of copies that one flag had been removed
+from.
+
+### What it was really costing
+
+The failure was visible; the quiet part was not. With the fixture carrying two
+lead-outs, a reader that lost lead-outs **outright** would still fail — two is
+enough for that — but a reader that lost *some* of them, or only the last one,
+would have passed. The suite's lead-out coverage had quietly gone from 28 runs
+to 2 without anyone being told, and the 28 was never a fact about the code.
+
+### The fix
+
+**The expectation is read off the job, not written down.** `_lead_out_dressups`
+counts the dressups that carry `LeadOut`, and the suite asserts the scan found
+exactly that many. This is not circular in the way it looks: it counts dressup
+*flags*, not wires, so it cannot agree with a reader that has lost them — if the
+scan finds fewer than the flags ask for, the check fails.
+
+**The suite builds its own lead-outs.** `_enable_lead_outs` turns six on, so the
+census and the index run over **8** rather than over whatever the file happens to
+supply. That is the NEST-037 move again: the off-sheet check now *builds* its
+pierce, and the lead-out census now builds its lead-outs.
+
+**The lead-in count stays pinned at 142, deliberately.** Measured: turning
+lead-outs on changes the lead-out count and nothing else, so 142 is a property of
+the fixture rather than of the moment, and pinning it pins something real.
+
+Result: 144 runs and 254 index entries on the fixture as it stands, 150 and 260
+where the suite adds its own — and no number in these checks can go stale.
+
+### The commit message this came out of
+
+The check for this that had already gone wrong is worth recording. Commit
+`56baaa4` originally ended by calling the dirty fixture *"byte-different but
+semantically identical to HEAD"*. It was identical on operations, shapes and
+paths — because that is what had been compared — and different on the one
+property that mattered, on a dressup, which nothing in that comparison looked
+at. The claim was amended rather than left standing.
+
+The full comparison, every property of all 710 objects, finds **35 value
+differences across 9 property names**: 23 are `Proxy` reprs containing memory
+addresses, which differ on every load in both directions; 1 is `Job.CycleTime`;
+4 are master `Visibility` plus the shape caches FreeCAD wrote when it recomputed
+— hiding the six masters reproduces `Layout_000`'s geometry to the last digit
+(`255759.176919`, 683 faces), so that is the visibility and nothing more; and 3
+are the fixture edit itself and its effect on the dressup's path. One object was
+edited in substance.
+
+**Nothing in the workbench or the tests reads `Layout_000`'s aggregate shape,
+`MasterShapes001._Part_ShapeCache`, or the masters' visibility**, so none of that
+reaches a suite. A comparison that only looks at the objects it already
+expected is not a comparison.
+
+---
+
+## NEST-042 — turning a lead-out on detaches its own lead-in, and the audit then reports the two as clashing
+
+`status: open` · `severity: medium` · `area: CAM / lead-in audit`
+
+Found by NEST-041's own change. Making the suite build its own lead-outs instead
+of reading the count off the fixture put lead-outs onto six dressups the fixture
+had left without one, and three of them immediately produced a conflict against
+**their own operation** — the one thing the suite asserts can never happen.
+
+### The repro, and it needs no replay
+
+Turning `LeadOut` on and changing **nothing else** is enough. It reproduces on
+the **main Job**, with its 7 operations and one dressup touched:
+
+    source dressup   DressupLeadInOut  ->  Profile  ->  Model-BottomStrap
+    sub-elements     Edge23, Edge24
+    settings         LeadIn=True  LeadOut=False  RadiusIn=3.0  RadiusOut=0.9
+                     StyleIn=Perpendicular
+    operation        UseStartPoint=False  StartAt=OutOfEdge  StartPoint=(0,0,0)
+
+    main Job, as the fixture stands                     0 self-conflicts
+    main Job, after LeadOut=True                        1  (lead-in, wire 0, 0.000000 mm)
+    main Job, after Document.recompute(force=True)      1  (unchanged)
+
+So this is **not** a replay defect, and not a stale path. The replay reproduces
+it: the same dressup, on the first three nested copies, gives the **same
+0.688830 mm** gap three times over —
+
+    Profile_replay_nested_BottomStrap_1   CAMPart_713   gap 0.688830
+    Profile_replay_nested_BottomStrap_2   CAMPart_714   gap 0.688830
+    Profile_replay_nested_BottomStrap_3   CAMPart_715   gap 0.688830
+
+— which is the replay being faithful rather than the replay being wrong. The
+identical gap to six decimals at four different positions on the sheet is also
+why this is geometry and not arithmetic.
+
+### What the audit cannot filter
+
+`_crosses_away_from_attachment` drops intersection points sitting on the run's
+own endpoints, within `COINCIDENT_MM = 1e-6`. That filter is right: it asks
+whether the attachment is *where it should be*, and here it is not.
+
+    lead-in endpoints   (73.003278, 47.384872) and (71.054481, 45.361248)
+    its own body starts (70.486888, 45.751537)
+    gap                 0.688830 mm  ->  0.66-0.69 mm from both endpoints
+
+The audit is therefore reporting something real. What it is *framing* as a clash
+with the operation it belongs to is the part that is wrong — or the lead-in
+really is detached, and the report is honest about a CAM setup that will cut
+badly.
+
+### Narrow, and `StartAt=OutOfEdge` is the thing to look at
+
+`DressupLeadInOut001` — `RadiusOut=3.0`, eight edges on the same
+`Model-BottomStrap` — is **clean** with `LeadOut` turned on. Not "lead-outs are
+broken"; this dressup. And it carries no authored start point (`UseStartPoint`
+false, `StartPoint` is `(0, 0, 0)`), so Path chooses a start vertex and switching
+a lead-out on has to move that choice while the operation's geometry stays put.
+
+### Open, and deliberately not narrowed further
+
+Left open, not fixed and not papered over. The index check no longer builds
+lead-outs — it never needed them, since its expectation is derived and the
+dedicated census check carries the wider coverage — and this is written down
+instead. What is **not** settled: whether a lead-in that stops 0.688830 mm short
+of its contour is Path failing to re-derive the start, or the audit reading a
+regenerated path it should have re-read. One loose end, deliberately recorded
+rather than guessed at: in the replay the same dressup also produced a
+self-conflict on its **lead-out, wire 1**, which does **not** appear on the main
+Job. That half is unexplained and is the first thing to check if this is picked
+up.
+
+**A metric measured and thrown away**, so it is not measured again: the lead-out
+rows of a replayed conflict report an "attachment gap" of ~38 mm against wire 0's
+start while the run sits on wire 1. Wrong wire; means nothing.

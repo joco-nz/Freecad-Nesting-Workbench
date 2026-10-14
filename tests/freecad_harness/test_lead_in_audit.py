@@ -184,6 +184,57 @@ def replay(doc):
     return None
 
 
+#: How many extra lead-outs the suite turns on for itself. Six on top of
+#: whatever the fixture asks for, which is currently 2.
+BUILT_LEAD_OUTS = 6
+
+
+def _lead_out_dressups(job):
+    """How many `LeadInOut` dressups on this job ask for a lead-out.
+
+    The lead-out census is read off the job rather than written down, so that
+    turning a lead-out off in the fixture -- one click in the CAM workbench --
+    cannot quietly turn four checks red here without saying why.
+
+    **Not circular.** This counts dressup *flags*, not wires, so it cannot agree
+    with a reader that has lost lead-outs: if the scan finds fewer than the
+    flags ask for, the check fails.
+    """
+    count = 0
+    for entry in getattr(getattr(job, "Operations", None), "Group", []) or []:
+        _op, dressups = cam_replay.walk_stack(entry)
+        for dressup in dressups or []:
+            if getattr(dressup, "LeadOut", False):
+                count += 1
+    return count
+
+
+def _enable_lead_outs(job, want=BUILT_LEAD_OUTS):
+    """Turn lead-outs on for `want` dressups that have them off. Returns how many.
+
+    The fixture decides how many lead-outs a replay carries, and it now decides
+    **two**. Two is enough to catch a reader that loses lead-outs outright and
+    not enough to notice one that loses some of them, so the suite builds its
+    own rather than being at the mercy of the file -- the same reason
+    `_force_a_pierce_at_the_sheet_edge` builds its own pierce.
+
+    Measured on this fixture: turning six back on leaves the lead-in count at
+    **142**, so this adds lead-outs without disturbing anything else.
+    """
+    pairs = lead_in_audit.lead_in_out_dressups(job)
+    off = [pair for pair in pairs if not getattr(pair[0], "LeadOut", False)]
+    changed = 0
+    for dressup, _operation in off[:want]:
+        dressup.LeadOut = True
+        dressup.StyleOut = "Perpendicular"
+        dressup.RadiusOut = 5.0
+        dressup.recompute()
+        changed += 1
+    if changed:
+        job.Document.recompute()
+    return changed
+
+
 # -- the read half on a real job ------------------------------------------
 
 def check_scan(doc, job):
@@ -201,15 +252,26 @@ def check_scan(doc, job):
                        for d, why in result.unreadable[:3])))
 
     runs = sum(len(a.lead_runs) for a in result.audits)
-    # 142 lead-ins and 28 lead-outs on this fixture, one per operation at least.
-    check(runs == 170,
-          "every lead run was found (got %d across 110 operations: 142 "
-          "lead-ins and 28 lead-outs)" % runs)
+    lead_ins = sum(1 for a in result.audits for r in a.lead_runs
+                   if r.kind == "lead-in")
     lead_outs = sum(1 for a in result.audits for r in a.lead_runs
                     if r.kind == "lead-out")
-    check(lead_outs == 28,
-          "the lead-outs were found too (%d of them -- the fixture has "
-          "LeadOut true on 28 of its 110 dressups)" % lead_outs)
+    want_outs = _lead_out_dressups(job)
+
+    # **142 lead-ins, and not derived.** The lead-in count is the same whether
+    # or not a dressup asks for a lead-out -- measured, not assumed -- so it is
+    # a property of the fixture rather than of this moment, and pinning it is
+    # pinning something real. It was 142 when the fixture also carried 28
+    # lead-outs.
+    check(lead_ins == 142,
+          "every lead-in was found (%d of 142, one per operation at least)"
+          % lead_ins)
+    check(lead_outs == want_outs,
+          "every lead-out that was asked for was found (%d, and %d dressups "
+          "ask for one)" % (lead_outs, want_outs))
+    check(runs == 142 + want_outs,
+          "every lead run was found (got %d across 110 operations: %d "
+          "lead-ins and %d lead-outs)" % (runs, lead_ins, lead_outs))
 
     # Multi-wire operations exist on this fixture, and one lead-in per wire is
     # the case a single-lead-in reader gets wrong.
@@ -1249,20 +1311,31 @@ def check_lead_runs_are_indexed_too(doc, job):
     emit("== lead runs are indexed, not only bodies ==")
     # Its own replay, because an earlier check turned `LeadOut` on for one of
     # the shared job's operations and left it there.
+    #
+    # **No lead-outs are built here, unlike in
+    # `check_the_census_with_built_lead_outs`.** Enabling `LeadOut` on this
+    # particular dressup makes its own lead-in stop attaching to its own body
+    # and the scan then reports the two as clashing, which trips the
+    # own-operation check below. That is NEST-042 and it is not this check's
+    # subject; the census check carries the wider lead-out coverage, and this
+    # one still asserts that both of the fixture's lead-outs are indexed.
     fresh = replay(FreeCAD.openDocument(FIXTURE))
     prepared, index, _unreadable = lead_in_audit._prepare(fresh, None)
     bodies = [e for e in index.entries if e[4] == lead_in_audit.ROLE_BODY]
     lead_ins = [e for e in index.entries if e[4] == lead_in_audit.ROLE_LEAD_IN]
     lead_outs = [e for e in index.entries if e[4] == lead_in_audit.ROLE_LEAD_OUT]
+    want_outs = _lead_out_dressups(fresh)
+    want_total = 110 + 142 + want_outs
 
     check(len(bodies) == 110, "every body is indexed (%d)" % len(bodies))
     check(len(lead_ins) == 142,
           "every lead-in is indexed (%d)" % len(lead_ins))
-    check(len(lead_outs) == 28,
-          "every lead-out is indexed (%d)" % len(lead_outs))
-    check(len(index.entries) == 280,
-          "so the index holds 280 entries in all (%d)"
-          % len(index.entries))
+    check(len(lead_outs) == want_outs,
+          "every lead-out that was asked for is indexed (%d, and %d dressups "
+          "ask for one)" % (len(lead_outs), want_outs))
+    check(len(index.entries) == want_total,
+          "so the index holds %d entries in all (%d)"
+          % (want_total, len(index.entries)))
 
     # Each run must be able to recognise its own entry, or it reports itself at a
     # distance of zero.
@@ -1270,9 +1343,9 @@ def check_lead_runs_are_indexed_too(doc, job):
     for dressup, op, _part, _margin, runs, _body in prepared:
         for run in runs:
             seen.add((id(op), run.run_index))
-    check(len(seen) == 170,
-          "every run carries a distinct (operation, run_index) (%d of 170)"
-          % len(seen))
+    check(len(seen) == 142 + want_outs,
+          "every run carries a distinct (operation, run_index) (%d of %d)"
+          % (len(seen), 142 + want_outs))
 
     # And the junction test has to actually drop the attachment on real
     # geometry, where a lead-in's end sits on its own wire at exactly 0.
@@ -1887,10 +1960,54 @@ def main():
     # already moved start points on it.
     check_own_body_is_not_drawn_across_the_gap_between_wires(doc, job)
     check_lead_runs_are_indexed_too(doc, job)
+    check_the_census_with_built_lead_outs(doc)
     check_the_sheet_edge_is_checked(doc, job)
     check_command_is_importable()
 
     return finish()
+
+
+# -- the census, with lead-outs the suite built ---------------------------
+
+def check_the_census_with_built_lead_outs(doc):
+    """The same census as `check_scan`, on a job the suite gave more lead-outs.
+
+    `check_scan` reads the shared job, which several later checks depend on and
+    which `check_lead_out_is_judged_too` already mutates, so it cannot be
+    touched here. This is the same count on its own replay with six lead-outs
+    turned on -- which is the point: the fixture now carries two, and a reader
+    that silently loses *some* lead-outs would pass on two and fail on eight.
+
+    The lead-in count is asserted again, unchanged, because turning a lead-out on
+    has to add a lead-out and nothing else.
+    """
+    emit("")
+    emit("== the census holds up with lead-outs the suite built ==")
+    fresh = replay(FreeCAD.openDocument(FIXTURE))
+    if not check(fresh is not None, "the fixture replays a second time"):
+        return
+
+    had = _lead_out_dressups(fresh)
+    built = _enable_lead_outs(fresh)
+    now = _lead_out_dressups(fresh)
+    emit("   the fixture asks for %d lead-out(s); this turned %d more on"
+         % (had, built))
+    check(now == had + built,
+          "turning %d lead-out(s) on left %d asking for one" % (built, now))
+
+    result = lead_in_audit.scan_job(fresh)
+    lead_ins = sum(1 for a in result.audits for r in a.lead_runs
+                   if r.kind == "lead-in")
+    lead_outs = sum(1 for a in result.audits for r in a.lead_runs
+                    if r.kind == "lead-out")
+    check(lead_ins == 142,
+          "the built lead-outs did not disturb the lead-ins (%d of 142)"
+          % lead_ins)
+    check(lead_outs == now,
+          "all %d of them were found (%d)" % (now, lead_outs))
+    check(now > had,
+          "this check is pointless as written: the fixture already asks for %d "
+          "lead-outs, so nothing was actually added" % had)
 
 
 def finish():

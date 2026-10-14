@@ -239,6 +239,13 @@ asks what the job cannot say. One job per sheet, every sheet replayed.
 
 ### Changed
 
+- The committed replay fixture no longer asks for a lead-out on
+  `DressupLeadInOut001` (`LeadOut` false, `StyleIn` perpendicular). A replay of
+  it now carries **2** lead-outs where it carried 28. The lead-in audit's test
+  suite no longer hardcodes the lead-out count: it reads the number of dressups
+  that ask for one off the job it is checking, and turns six more on itself, so
+  the figure cannot go stale when the fixture changes and lead-out coverage does
+  not depend on the file. See issues.md NEST-041.
 - Display name changed from "Nesting" to **Jet-Nesting** in the workbench dropdown, menu bar, toolbar, task panel title, Addon Manager listing, and README. Internal identifiers (`NestingWorkbench` class, `Preferences/NestingWorkbench` path, command names `Nesting_*`, property groups, icon filenames) are deliberately unchanged to preserve user settings and saved document compatibility.
 - A replayed source step is now cut **once per target part** rather than once over
   all of them. FreeCAD's Profile is superlinear in the number of Base entries it
@@ -391,6 +398,17 @@ asks what the job cannot say. One job per sheet, every sheet replayed.
   Against Nesting** are now documented. **Stack Sheets** is now correctly described
   as **Stack/Unstack Sheets** (a toggle). See NEST-007 for the Manual Nester's
   existence and NEST-033 for the lead-in check.
+
+### Known issues
+- **Turning a lead-out on can detach its own lead-in**, leaving it 0.688830 mm
+  off the contour it belongs to, after which the lead-in audit reports the run
+  as clashing with its own operation. Found by making the test suite build its
+  own lead-outs rather than read the count off the fixture (NEST-041).
+  **It is not a replay defect and not a stale path** -- it reproduces on the
+  main Job with one dressup touched and survives a forced recompute, and the
+  replay reproduces the identical gap on every copy. The repro is narrow:
+  `DressupLeadInOut` on `Model-BottomStrap`, edges `Edge23`/`Edge24`,
+  `RadiusOut=0.9`, `StartAt=OutOfEdge`. Open; see issues.md NEST-042.
 
 ### Notes
 - A step left **whole** rather than split -- one operation covering every part it

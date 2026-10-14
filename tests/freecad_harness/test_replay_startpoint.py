@@ -885,11 +885,141 @@ def run_fixture_checks():
     FreeCAD.closeDocument(doc.Name)
 
 
+#: How far a carried start point's distance to its part may differ from the
+#: source point's. A rigid motion preserves that distance, so this is an
+#: equality. Measured on the fixture: **0.0000 mm** with the bridge corrected,
+#: **0.854 mm** and **0.0835 mm** with the pre-NEST-040 bridge, so anything in
+#: between is a tolerance that tests nothing.
+FRAME_BRIDGE_TOLERANCE_MM = 0.05
+
+
+def _placement_only_bridge(clone, source_geometry):
+    """`source_to_clone_placement` exactly as it was before NEST-040.
+
+    Placements alone. Kept here so the check below can put the defect back and
+    be shown to notice, rather than being a test that has only ever passed.
+    """
+    source_shape = getattr(source_geometry, "Shape", None)
+    clone_shape = getattr(clone, "Shape", None)
+    if source_shape is None or clone_shape is None:
+        return None
+    if source_shape.isNull() or clone_shape.isNull():
+        return None
+    return clone_shape.Placement.multiply(source_shape.Placement.inverse())
+
+
+def _carry_displacements(doc, job):
+    """Every carried start point's distance to its part, against its source's.
+
+    Returns `[(label, was, now)]`. The pairing is by operation name, so it does
+    not go through `source_to_clone_placement` -- a check that computed the
+    expected position with the function under test would agree with it by
+    construction, which is how this defect survived the start-point fix.
+    """
+    sources = {o.Name: o for o in doc.Objects if cam_replay.is_operation(o)}
+    layout, _warnings = cam_replay.resolve_layout_group(doc)
+    outcomes = cam_replay.replay_layout(doc, layout, job)
+    rows, warnings = [], []
+    for outcome in outcomes:
+        result = outcome.result
+        if result is None:
+            continue
+        warnings.extend(result.warnings)
+        for rop in result.operations:
+            if not cam_replay.geometry_frame_point_in_use(rop, "StartPoint"):
+                continue
+            source_op = sources.get(rop.Name.split("_replay")[0])
+            if source_op is None or not source_op.Base:
+                continue
+            targets = [entry[0] for entry in (getattr(rop, "Base", None) or [])]
+            if len(targets) != 1:
+                continue
+            was = distance_to_shape(source_op.StartPoint, source_op.Base[0][0].Shape)
+            now = distance_to_shape(rop.StartPoint, targets[0].Shape)
+            rows.append((rop.Label, was, now))
+    return rows, warnings
+
+
+def run_fixture_bridge_checks():
+    """The carried start point must keep its source's distance to its part.
+
+    The nesting side bakes its frame shift into the *geometry*, so the
+    placements either side of the bridge do not add up to the transform. On the
+    committed fixture that shift is 0.74-2.09 mm depending on the part, and
+    reading placements alone put every carried start point that far out of
+    place. Nothing noticed: the point was still on the part, so the NEST-024
+    check was happy, and the harness above computed its expectation with the
+    function under test, so it agreed with the defect.
+    """
+    if not os.path.exists(FIXTURE):
+        return
+    from freecad.nestingworkbench.Tools.Cam import replay_progress  # noqa: F401
+
+    def open_and_replay():
+        document = FreeCAD.openDocument(FIXTURE)
+        jobs = [o for o in document.Objects if cam_replay.is_cam_job(o)]
+        return document, (jobs[0] if jobs else None)
+
+    original = cam_replay.source_to_clone_placement
+
+    doc, job = open_and_replay()
+    try:
+        check(job is not None, "no job in the fixture for the bridge check")
+        if job is None:
+            return
+        rows, warnings = _carry_displacements(doc, job)
+        check(rows, "the fixture carried no start point, so this check measured "
+                    "nothing at all")
+        emit("bridge: %d carried start point(s) on the fixture" % len(rows))
+        for label, was, now in rows:
+            emit("  %-44s own %.6f  carried %.6f  diff %.6f"
+                 % (label[:44], was, now, abs(now - was)))
+            check(abs(now - was) <= FRAME_BRIDGE_TOLERANCE_MM,
+                  "%s sits %.6f mm from its own part where its source's sat "
+                  "%.6f mm. The start point was carried by a transform that does "
+                  "not agree with the geometry it was authored against, so the "
+                  "toolpath begins by plunging away from where it was meant to."
+                  % (label, now, was))
+        noisy = [w for w in warnings if "from its own part" in w]
+        check(not noisy,
+              "the replay reported %d displaced start point(s) of its own: %s"
+              % (len(noisy), noisy[:1]))
+    finally:
+        FreeCAD.closeDocument(doc.Name)
+
+    # And the same check with the defect put back, which is the only thing that
+    # makes the one above mean anything.
+    cam_replay.source_to_clone_placement = _placement_only_bridge
+    try:
+        doc, job = open_and_replay()
+        try:
+            rows, warnings = _carry_displacements(doc, job)
+            off = [r for r in rows if abs(r[2] - r[1]) > FRAME_BRIDGE_TOLERANCE_MM]
+            warned = [w for w in warnings if "from its own part" in w]
+            emit("bridge: with the placement-only bridge back, %d of %d carried "
+                 "point(s) displace and %d warning(s) are raised"
+                 % (len(off), len(rows), len(warned)))
+            check(off,
+                  "the placement-only bridge did not displace any start point on "
+                  "the fixture, so this file cannot show the defect it exists to "
+                  "catch. Either the fixture changed or the geometry is no longer "
+                  "nesting-side-baked.")
+            check(len(warned) >= len(off) > 0,
+                  "the replay warned about %d displaced point(s) but %d were "
+                  "measured. The warning has to cover the case."
+                  % (len(warned), len(off)))
+        finally:
+            FreeCAD.closeDocument(doc.Name)
+    finally:
+        cam_replay.source_to_clone_placement = original
+
+
 if __name__ in ("__main__", "test_replay_startpoint"):
     status = 0
     try:
         run()
         run_fixture_checks()
+        run_fixture_bridge_checks()
     except Exception:
         traceback.print_exc()
         _failures.append("raised")
