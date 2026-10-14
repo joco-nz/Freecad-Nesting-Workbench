@@ -16,6 +16,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **A replayed job's start point is no longer carried to the wrong place on the
+  part.** `source_to_clone_placement` built the transform from the two
+  placements alone, but the nesting side bakes its frame shift into the
+  *geometry*: `shape_preparer._handle_new_master` resets the master's placement
+  to identity after `bake_rigid` has moved the vertices, so all 54 `part_*`
+  objects in the fixture carry an identity placement and the shift where
+  placements cannot see it -- 0.74 to 2.09 mm depending on the part.
+  Every carried `StartPoint` landed that far out. Measured on the fixture, a
+  replayed cut path sat **2.094006 mm** from the rigid image of its source's, a
+  pure X translation, and `Profile004`'s start point sat **2.725067 mm** from its
+  own cut path where the source's sat **0.636008 mm**. The rotation is still read
+  from the placements, which are correct; the translation is now measured between
+  the two solids, which is the only place the baked shift is visible. The 110
+  replayed paths now sit within **0.0336 mm** of their source's -- the replay was
+  never wrong, only the carry was. A pair that is not the same part moved now
+  returns `None` rather than a guess, and a replay reports any carried point
+  whose distance to its part no longer matches its source's. See issues.md
+  NEST-040.
 - **A lead-in reaching another lead-in or lead-out is no longer reported as a
   clash with a cut path.** The audit has always tested lead runs against each
   other -- a lead-in is itself a cut path, and another operation's can run into

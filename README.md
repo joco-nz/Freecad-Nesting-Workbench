@@ -92,8 +92,10 @@ commands want a CAM job instead.
     CAM job; the layout in the document is found for you, and one job is
     produced per sheet. Nothing is classified for you: which features belong
     in which operation was decided in the CAM workbench, before nesting ran.
-    A replayed `StartPoint` moves with the geometry it belongs to, and the
-    replay warns when a point lands off every part it targets.
+    A replayed `StartPoint` moves with the geometry it belongs to. The replay
+    warns when a point lands off every part it targets, and when a carried
+    point ends up a different distance from its part than the point you set was
+    from yours — which is the sign that the move did not carry it faithfully.
 *   **Check Lead-ins Against Nesting:** Finds the lead-ins and lead-outs on a
     replayed job that reach into another part's cut path — **or into another
     lead-in or lead-out** — and moves their start points until they clear.

@@ -4717,6 +4717,166 @@ the dialog and inspects the returned tuple and the widget in it — removing the
 spin box from the layout fails it, which is the difference between a control
 that exists and a setting the user can reach.
 
+---
+
+## NEST-040 — a carried start point was placed by a transform that could not see the nesting side's frame shift
+
+`status: resolved` · `severity: high` · `area: CAM replay`
+
+Found by asking why a carried `StartPoint` sat **2.725067 mm** from its own cut
+path when its source's sat **0.636008 mm**, and declining to accept a warning as
+the answer. The warning was the plan. The warning was the symptom.
+
+### The shape of it
+
+`source_to_clone_placement` was `clone.Placement * source.Placement⁻¹`. That is
+the whole transform if both placements carry everything, and neither of them does.
+
+The nesting side moves a part from its CAM placement into its own master frame by
+**baking the move into the geometry**. `bake_rigid` has already moved the
+vertices by the time `shape_preparer._handle_new_master` resets
+`master_shape_obj.Placement` to `(0, 0, 0)` plus the up-direction rotation
+(`shape_preparer.py:430`). So all 54 `part_*` objects in the committed fixture
+carry an **identity placement** and carry the shift inside their shape —
+`combined_placement` is the container's placement times the child's, and the
+child's is identity, so the term is not there to be multiplied.
+
+Measured, model frame to nest frame, as a pure translation with the sizes
+unchanged to `0.000000000000 mm`:
+
+    BottomStrap  (0, +1.000898, -1)
+    SimpleSpacer (0, +2.089059, -1)
+    TopStrap     (0, +0.743587, -1)
+
+### Two symptoms, one cause
+
+Both were found by measuring rather than by being told.
+
+* The carried `StartPoint`. `Profile004`'s copies landed **2.725067 mm** from
+  their own cut path where the source's sat **0.636008 mm** — **2.087 mm** out.
+* The replayed cut path sat **2.094006 mm** (Hausdorff) from the rigid image of
+  the source's. A pure X translation: the Y bounds agreed to **0.003 mm** and the
+  best residual rotation about the centroid was **0.00 degrees**.
+
+The second one is the load-bearing measurement. **The replayed toolpaths were
+always correct.** Every one of the 110 replayed paths sits within **0.0336 mm**
+of the rigid image of its source's once the bridge is right, which is
+tessellation noise. Only the carry was wrong — a point that is supposed to
+identify *where along a contour* a cut begins, moved along it by 2 mm.
+
+### What did not notice, and why
+
+**The NEST-024 check was built for exactly this and could not see it.**
+`point_outside_targets` asks whether the carried point is on the part at all, and
+a point displaced *along* the part's face is still on it. It correctly reported
+`False` throughout.
+
+**The harness computed its expectation with the function under test.** Every
+start-point assertion in `test_replay_startpoint.py` called
+`source_to_clone_placement` to work out where the point should be, then compared
+the result to the replay. That is agreement by construction, and it is why this
+survived the fix for the start point it depends on. The check written here pairs
+copies to their source by **operation name** and compares against a quantity the
+function never touches: the source point's own distance to its own part.
+
+**Two pytest assertions were asserting the stand-in rather than the code.**
+`_Placement.multiply` in `test_flatten.py` added two offsets without applying
+the left factor's rotation -- correct only when the left factor is unrotated -- and
+`_Vector` had no `__eq__`, so `test_order_matters`' `!=` was an identity
+test that is always true. The two bases it compares are in fact equal under the
+broken composition, so that test had been passing for the wrong reason. Worse,
+`test_multiplies_container_by_child` pinned `(61, 2, 3)`, which is not what
+FreeCAD returns for a container yawed 37° holding a child offset by `(1, 2, 3)` --
+that is `(59.595, 2.199, 3)`. The stand-in is fixed and the expectation is now
+computed from the same trigonometry the real composition uses.
+
+### The fix
+
+The rotation is read from the placements, which are right. The translation is
+measured between the two solids, which is the only place the baked shift is
+visible:
+
+    R     = clone.Placement.Rotation · source.Placement.Rotation⁻¹
+    c_s   = source.Placement · centre(source's own bounding box)
+    c_c   = clone.Placement  · centre(clone's own bounding box)
+    X     = Placement(c_c − R·c_s, R)
+
+Taking the whole transform from the geometry instead would mean fitting a rigid
+motion between the solids, and the only way to do that is `transformGeometry`,
+which re-fits analytic surfaces into B-splines -- ruled out by the module
+docstring, and the reason `flatten_container` uses a `Placement` in the first
+place. Two bounding boxes cost **2.46 ms** per pair; the loose `Shape.BoundBox`
+is no cheaper at **2.49 ms** and agrees to **0.000000000 mm**, so the `copy()` is
+the cost and there is no cheaper primitive to reach for.
+
+**Returns `None` when the two are not the same part moved.** Their own extents
+have to agree to `RIGID_COPY_TOLERANCE_MM = 1e-3`; measured across all 110 pairs
+the delta is exactly `0.0 mm` -- the two solids are the same part, not two
+tessellations of it -- so that is three orders of magnitude of headroom over the
+observed noise and still sits 743× below the smallest shift the check has to see
+past. `None` leaves the point alone rather than carrying it wrong, and
+`point_outside_targets` then reports it as stranded -- the same channel a
+dropped point takes.
+
+### The warning
+
+Kept, as defence in depth, but it turned out not to need the toolpath at all. A
+rigid motion preserves the distance from a point to the solid it was authored
+against, so the carried point's distance to its copy must equal the source's to
+its part. Measured, with the defect present: **0.854 mm** and **0.0835 mm** of
+signal; with the bridge corrected: **0.0000 mm**. So the check is precise --
+`distToShape` -- where `point_outside_targets` is deliberately a bounding box,
+and that is affordable *because it is gated on a point having actually been
+carried*: 4 operations on the fixture rather than 110.
+
+The Z leg is **skipped rather than guessed**. `carried_geometry_frame_points`
+takes a carried point's Z from the copy's own `ClearanceHeight`, because that Z
+is a derived plunge height and not an authored coordinate, so the two points are
+not generally at the same height and a 3D distance across them would report the
+plunge height rather than a displacement. Where they differ by more than the
+tolerance the measurement returns `None`: a check that cannot be trusted is not a
+check.
+
+### The answers to the questions this raised
+
+**Was the CAM job supposed to be authored on the nesting side's master shapes?**
+No, and it could not have been. The job is authored before a nest exists, and a
+Path `Profile` needs an object in the Job's Model. It was also tested rather than
+argued: pointing the bridge at `master_shape_*` instead gives a worst error of
+**194.3995 mm** across the 110 operations, against **2.1180 mm** for `Model-*` and
+**0.0336 mm** corrected. The source path was generated from `Model-SimpleSpacer`
+and lives in that frame; naming a different twin of the same solid does not
+relocate it.
+
+**Should the nesting side stop baking the shift into geometry?** That would make
+the placement-only bridge correct, and it would fix the invariant at its source.
+It was not done: every saved layout and the committed fixture would need
+re-nesting, and the CAM side would stay blind to any future geometry-baked
+transform -- which is the failure mode that was just spent a day being diagnosed.
+The bridge is where the two frames meet, and it now measures the term it could
+not see.
+
+### Tests
+
+* `tests/test_cam_replay/test_flatten.py`, `TestSourceToClonePlacement` -- six
+  checks on stand-ins: a baked shift is carried, the placement-only bridge is
+  asserted to be the wrong answer by the size of its error, a part with no baked
+  shift reduces to what it always did, a non-rigid pair returns `None`, a
+  difference inside the tolerance does not, and the missing/null-shape cases.
+* `tests/freecad_harness/test_replay_startpoint.py`, `run_fixture_bridge_checks`
+  -- on the committed fixture, because that is the only place the defect exists:
+  every carried point keeps its source's distance to within **0.05 mm**, the
+  replay raises no displacement warning of its own, and **with the
+  placement-only bridge put back, 4 of 4 displace and 4 warnings are raised**.
+* Mutation-tested: nine mutations, nine caught. Reverting the bridge fails the
+  harness outright -- 5 failures -- and the six pytest checks kill the guard
+  neutered, the rotation discarded, the placements not applied to the centres,
+  the subtraction reversed, the warning's Z-skip removed, its in-use gate
+  removed and its tolerance comparison inverted.
+* Suites: pytest **693**, replay start point **69/69**, lead-in audit **195/195**,
+  command suite **54/54**.
+
+
 ## NEST-041 — the lead-in audit's own coverage depended on a fixture the user can change with a click
 
 `status: resolved` · `severity: medium (test integrity)` · `area: tests`

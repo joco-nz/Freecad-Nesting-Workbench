@@ -1195,6 +1195,21 @@ def combined_placement(container, part):
     `(60, 0, 0)` rotated 37 degrees and an identity child produced
     `Pos=(60, 0, 0) Yaw=37`; with the multiplication reversed the position
     would be rotated by the child's own rotation instead.
+
+    **This is the container's move, not the whole move from the CAM frame, and
+    the difference is not a rounding error.** The nester bakes a further,
+    per-part-type offset into the *geometry* rather than the placement -- by the
+    time `shape_preparer._handle_new_master` resets `master_shape_obj.Placement`
+    to `(0, 0, 0)` plus the up-direction rotation (`shape_preparer.py:430`),
+    `bake_rigid` has already moved the vertices. All 54 `part_*` objects in the
+    fixture carry an identity placement, so for them this product reduces to the
+    container placement alone.
+
+    Measured, model frame to nest frame: `BottomStrap` (0, +1.000898, -1),
+    `SimpleSpacer` (0, +2.089059, -1), `TopStrap` (0, +0.743587, -1). Anything
+    that has to get from a part's CAM placement to a flattened clone therefore
+    cannot read placements alone -- see `source_to_clone_placement`, which
+    measures that term from the solids instead.
     """
     container_placement = getattr(container, "Placement", None) or FreeCAD.Placement()
     part_placement = getattr(part, "Placement", None) or FreeCAD.Placement()
@@ -2871,14 +2886,95 @@ def geometry_frame_point_in_use(obj, name):
     return False
 
 
+#: How far two solids' own bounding-box extents may differ and still count as the
+#: same part moved. Measured across the fixture's 110 source/clone pairs the
+#: delta is exactly **0.0 mm** -- the two solids are the same part, not two
+#: tessellations of it -- so this is set by the other end: it sits **743x** below
+#: the smallest frame shift the check has to see past (**0.743587 mm**, on
+#: `TopStrap`), so it cannot mask the defect class it exists for. Kerf inflation,
+#: a scale and a reflection are all orders of magnitude above it.
+RIGID_COPY_TOLERANCE_MM = 1e-3
+
+
+def _local_measure(shape):
+    """`(centre, extents)` of `shape`'s own geometry, with the placement stripped.
+
+    Stripping it is the whole point. The question is how big a part is and where
+    it sits in its own frame, and two copies of one solid at different
+    orientations have different *world* boxes and the same local one -- asking
+    the world box would compare orientation against size.
+
+    Assigning `shape.Placement` moves a box without re-meshing anything, so this
+    stays cheap. Measured on the fixture: **2.46 ms** per pair, and the loose
+    `Shape.BoundBox` is no cheaper (2.49 ms) while agreeing to **0.000000000 mm**
+    -- the `copy()` is the cost, not the box, so there is no cheaper primitive to
+    reach for. Over a full replay that is **282 ms** across 110 calls, 2.2% of
+    the ~12.9 s run.
+
+    It is not cached, and that is a decision rather than an oversight. Only **3**
+    distinct source shapes are involved across those 110 calls, so a memo would
+    take the cost down by roughly 4x -- but the key has to be `id()`-based
+    (document objects are not safely hashable across a run) and would then keep
+    every shape it ever measured alive. That is global mutable state in a module
+    that has none, to save 1.6% of a replay. Revisit if the run time ever moves.
+
+    The alternative to measuring is fitting a rigid motion between the two
+    solids outright, which would mean `transformGeometry` -- it re-fits analytic
+    surfaces into B-splines, and the module docstring rules that out.
+    """
+    bare = shape.copy()
+    bare.Placement = FreeCAD.Placement()
+    box = bare.optimalBoundingBox()
+    return (FreeCAD.Vector((box.XMin + box.XMax) / 2.0,
+                            (box.YMin + box.YMax) / 2.0,
+                            (box.ZMin + box.ZMax) / 2.0),
+            (box.XMax - box.XMin, box.YMax - box.YMin, box.ZMax - box.ZMin))
+
+
 def source_to_clone_placement(clone, source_geometry):
     """The rigid motion taking `source_geometry`'s frame to `clone`'s.
 
-    `flatten_container` folds the container placement, the part's own placement,
-    the Z normalisation and the sheet-origin shift into the flattened object's
-    placement, and a nested copy is the same underlying geometry rigidly moved
-    (module docstring constraints 5 and 6). So this is the whole transform and
-    nothing else is needed.
+    **The rotation comes from the placements. The translation does not.**
+
+    `clone.Placement * source.Placement^-1` used to be this entire function, and
+    it is wrong by a per-part frame shift. The nesting side bakes the move from a
+    part's CAM placement into the nest's master frame as *geometry*, not as a
+    placement: `bake_rigid` has already moved the vertices by the time
+    `shape_preparer._handle_new_master` resets `master_shape_obj.Placement` to
+    `(0, 0, 0)` plus the up-direction rotation (`shape_preparer.py:430`). So all
+    54 `part_*` objects in the fixture carry an **identity** placement and carry
+    the shift inside their shape, where `combined_placement` cannot see it and
+    neither could this function.
+
+    Measured, model frame to nest frame:
+
+        BottomStrap  (0, +1.000898, -1)
+        SimpleSpacer (0, +2.089059, -1)
+        TopStrap     (0, +0.743587, -1)
+
+    What that cost, both measured on the fixture:
+
+    * a carried `StartPoint` landed **2.087 mm** from where its source's own
+      was -- `Profile004` sat 2.725067 mm from its cut path against a correct
+      0.636008 mm;
+    * the replayed cut path sat **2.094006 mm** (Hausdorff) from the rigid image
+      of the source's. A pure X translation: the Y bounds agreed to 0.003 mm and
+      the best residual rotation about the centroid was 0.00 degrees.
+
+    So the rotation is read from the placements, which are right, and the
+    translation is measured between the two solids, which is the only place the
+    baked shift is visible. With that, the carried point keeps its source's own
+    distance to its own cut path to **0.000587 mm** worst over the fixture, and
+    every one of the 110 replayed paths sits within **0.0336 mm** of the rigid
+    image of its source's -- which is also the evidence that the replay itself
+    was never wrong, only the carry.
+
+    **Returns None when the two are not the same part moved.** If the solids'
+    own extents differ by more than `RIGID_COPY_TOLERANCE_MM` then no rigid
+    motion maps one onto the other and any answer would be a guess. `None`
+    leaves the point alone rather than carrying it wrong, and
+    `point_outside_targets` then reports it as stranded -- the same channel that
+    catches a point the replay failed to carry at all.
 
     **`Shape.Placement`, not `Placement`.** `PathJob.Create` puts a
     `draftobjects.clone.Clone` in the Model, and Draft's Clone restores
@@ -2886,8 +2982,8 @@ def source_to_clone_placement(clone, source_geometry):
     placement (`draftobjects/clone.py:122-148`), so the two are not guaranteed
     to agree.
 
-    Returns None when either side has no shape to read, which is the only case
-    where this cannot be formed.
+    Returns None when either side has no shape to read, and when the two are not
+    the same part moved.
     """
     source_shape = getattr(source_geometry, "Shape", None)
     clone_shape = getattr(clone, "Shape", None)
@@ -2895,7 +2991,18 @@ def source_to_clone_placement(clone, source_geometry):
         return None
     if source_shape.isNull() or clone_shape.isNull():
         return None
-    return clone_shape.Placement.multiply(source_shape.Placement.inverse())
+
+    source_centre, source_extents = _local_measure(source_shape)
+    clone_centre, clone_extents = _local_measure(clone_shape)
+    if max(abs(a - b) for a, b in zip(source_extents, clone_extents)) \
+            > RIGID_COPY_TOLERANCE_MM:
+        return None
+
+    rotation = clone_shape.Placement.multiply(
+        source_shape.Placement.inverse()).Rotation
+    origin = source_shape.Placement.multVec(source_centre)
+    target = clone_shape.Placement.multVec(clone_centre)
+    return FreeCAD.Placement(target.sub(rotation.multVec(origin)), rotation)
 
 
 def carried_geometry_frame_points(source_op, transform, target_op=None):
@@ -3291,10 +3398,11 @@ def replay_recipe(recipe, job, clones, tool_cache=None,
             # `label_for` is the clone this unit targets, and None for a unit that
             # was left whole -- see the note on `units`.
             unit_remap = dict(remap)
+            carried = {}
             if label_for is not None and source_geometry is not None:
                 transform = source_to_clone_placement(label_for, source_geometry)
-                unit_remap.update(
-                    carried_geometry_frame_points(item.source, transform, new_op))
+                carried = carried_geometry_frame_points(item.source, transform, new_op)
+                unit_remap.update(carried)
 
             apply_properties(new_op, item.properties, remap=unit_remap or None)
 
@@ -3306,6 +3414,16 @@ def replay_recipe(recipe, job, clones, tool_cache=None,
                         "Could not set Base on '%s': %s" % (new_op.Label, exc)
                     )
                     continue
+
+            # Only the points this unit actually carried, so a unit left whole
+            # over several parts -- which has no single transform at all -- is
+            # not measured against one. After `Base`, because the measurement is
+            # to the copy's own solid and until then there is nothing to measure
+            # against. See `carried_point_displacement`.
+            for name in carried:
+                note = carried_point_displacement(item.source, new_op, name)
+                if note is not None:
+                    result.warnings.append(note)
 
             result.operations.append(new_op)
             created.append(new_op)
@@ -4431,6 +4549,114 @@ def point_outside_targets(operation, name, margin=COVERAGE_MARGIN_MM):
                 and y0 - margin <= point.y <= y1 + margin):
             return False
     return True
+
+
+#: How far a carried point's distance to its part may differ from the source
+#: point's and still count as carried. A rigid motion preserves the distance
+#: from a point to the solid that point was authored against, so this is an
+#: equality rather than an approximation.
+#:
+#: Measured on the fixture, with the frame shift in `source_to_clone_placement`
+#: present: the residual is **0.0000 mm** on all 4 carried points, against
+#: **0.854 mm** and **0.0835 mm** of signal. So this sits three orders of
+#: magnitude above the noise and 8x below the smallest signal -- the smallest
+#: margin is stated rather than hidden because it is the one that would decide a
+#: borderline case, and a tolerance nearer the signal than this would start
+#: warning on arithmetic noise.
+CARRIED_POINT_TOLERANCE_MM = 0.01
+
+
+def _target_solid(operation):
+    """The first non-null solid `operation`'s `Base` names, or None."""
+    base = getattr(operation, "Base", None)
+    if not base or not isinstance(base, (list, tuple)):
+        return None
+    for entry in base:
+        try:
+            target = entry[0]
+        except (TypeError, IndexError):
+            continue
+        shape = getattr(target, "Shape", None)
+        if shape is not None and not shape.isNull():
+            return shape
+    return None
+
+
+def _distance_to_target(operation, name):
+    """3D distance from `operation`'s `name` to the solid it targets, or None.
+
+    None rather than a number whenever the measurement cannot be made, so a
+    caller cannot mistake "not measurable" for "no displacement".
+    """
+    shape = _target_solid(operation)
+    if shape is None:
+        return None
+    try:
+        point = FreeCAD.Vector(getattr(operation, name))
+        import Part  # local, as `moves_to_line` does; the module needs no Part
+        return Part.Vertex(point.x, point.y, point.z).distToShape(shape)[0]
+    except Exception:
+        return None
+
+
+def carried_point_displacement(source_op, target_op, name):
+    """Warn when a carried point sits a different distance from its own part.
+
+    A rigid motion preserves the distance from a point to the solid that point
+    was authored against. So for any point the replay carried -- a
+    `GEOMETRY_FRAME_POINTS` value the operation actually reads -- the source's
+    distance to its part and the copy's distance to its part must agree. When
+    they do not, the point was put somewhere the geometry it came from does not
+    agree with. That is a silent failure: the toolpath still cuts, it just
+    begins by plunging somewhere it was not asked to.
+
+    **This is the check that would have caught the frame shift.**
+    `source_to_clone_placement` was wrong by 0.74-2.09 mm, and on the fixture
+    that moved this measurement by **0.854 mm** and **0.0835 mm**, against
+    **0.0000 mm** once the bridge was corrected. The NEST-024 check beside it
+    could not see it: `point_outside_targets` asks whether the point is on the
+    part at all, and a point displaced along the part's face is still on it.
+
+    **Precise, where `point_outside_targets` is deliberately a bounding box.**
+    That one runs for every operation on every replay, and `distToShape`
+    measured 548-943 ms across the fixture for an answer a box gives as well.
+    This one is gated on a point having actually been carried -- **4 operations**
+    on the fixture -- so the precise test costs roughly 24 ms and buys a
+    comparison the box cannot make at all.
+
+    **Z is skipped rather than guessed.** `carried_geometry_frame_points` takes
+    a carried point's Z from the copy's own `ClearanceHeight`, because that Z is
+    a derived plunge height and not an authored coordinate. The two points are
+    therefore not generally at the same height, and a 3D distance between them
+    would report the difference in plunge height rather than any displacement in
+    XY. When they differ by more than the tolerance the measurement does not
+    mean what it would say, and None is returned: a check that cannot be
+    trusted is not a check.
+    """
+    if not geometry_frame_point_in_use(target_op, name):
+        return None
+    try:
+        carried = FreeCAD.Vector(getattr(target_op, name))
+        source = FreeCAD.Vector(getattr(source_op, name))
+    except Exception:
+        return None
+    if abs(carried.z - source.z) > CARRIED_POINT_TOLERANCE_MM:
+        return None
+    was = _distance_to_target(source_op, name)
+    now = _distance_to_target(target_op, name)
+    if was is None or now is None:
+        return None
+    if abs(now - was) <= CARRIED_POINT_TOLERANCE_MM:
+        return None
+    return (
+        "Operation '%s' carries '%s' from '%s', but it sits %.4f mm from its own "
+        "part where the source's sat %.4f mm -- a %.4f mm difference. The point "
+        "was moved by a transform that does not agree with the geometry it was "
+        "authored against, so the toolpath begins by plunging away from where "
+        "it was meant to. Check the part's placement before running."
+        % (getattr(target_op, "Label", "?"), name,
+           getattr(source_op, "Label", "?"), now, was, abs(now - was))
+    )
 
 
 def verify_replay(result, extra_warnings=(), clones=None, stock=None):
