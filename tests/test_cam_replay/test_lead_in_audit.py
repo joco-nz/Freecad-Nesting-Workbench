@@ -39,6 +39,7 @@ from freecad.nestingworkbench.Tools.Cam.lead_in_audit import (
     LeadRun,
     OffSheet,
     OperationAudit,
+    _CutIndex,
     _off_sheet,
     body_geometry,
     cut_moves,
@@ -676,6 +677,10 @@ def _result(audits, unreadable=()):
     result.unreadable = list(unreadable)
     result.seconds = 0.1
     result.sheet = None      # no stock: the off-sheet check did not run
+    # The clearance factor. `AuditResult.__init__` always sets it, and this
+    # helper bypasses the constructor, so it is set here too -- `reverify`
+    # reads it back to re-scan at the same sensitivity the scan used.
+    result.clearance = 1.0
     return result
 
 
@@ -697,8 +702,688 @@ def _audit(status, detail="", conflicts=()):
     return audit
 
 
-def _conflict(distance=0.0598, part="part_TopStrap_7"):
-    return Conflict(LeadRun("lead-in", 0, [], None), distance, None, None, part)
+def _conflict(distance=0.0598, part="part_TopStrap_7", role="body"):
+    return Conflict(LeadRun("lead-in", 0, [], None), distance, None, None, part,
+                    role)
+
+
+# -- the index has to be corrected as the search moves things ---------------
+
+def test_a_neighbour_fixed_earlier_is_advertised_where_it_is_now():
+    """The defect `index_after` exists for, in the geometry that produces it.
+
+    One operation's fix moves its lead-in onto a neighbour's lead-in. The
+    neighbour is searched next, and if the index still carries the *first*
+    operation's pre-fix geometry -- 20.0 mm away, where it is clear -- the
+    neighbour is cleared against a lead-in that is not there and the run
+    finishes with two lead-ins crossing and a report that says everything is
+    fine.
+
+    Measured on this one: the neighbour's lead run is **0.0 mm** from the fixed
+    operation's new lead-in and **20.0 mm** from its old one. That gap is the
+    whole defect, and it is why the index has to be corrected on the way in
+    rather than reconciled at the end.
+    """
+    LineString, _polygon = _shapely()
+    mine, theirs = object(), object()
+    dressup = _Dressup()
+
+    # `theirs` cuts a vertical line; `mine`'s lead-in is somewhere else.
+    theirs_lead_in = LineString([(20.0, 0.0), (20.0, 10.0)])
+    before_fix = LineString([(0.0, 5.0), (0.0, 10.0)])
+    after_fix = LineString([(18.0, 5.0), (20.0, 5.0)])
+    assert before_fix.distance(theirs_lead_in) == pytest.approx(20.0)
+    assert after_fix.distance(theirs_lead_in) == pytest.approx(0.0)
+
+    index = _CutIndex()
+    index.add("mine", dressup, mine, _square_geometry(0.0, 20.0))
+    index.add("mine", dressup, mine, before_fix,
+              role=lead_in_audit.ROLE_LEAD_IN, run_index=0)
+    index.add("theirs", dressup, theirs, theirs_lead_in,
+              role=lead_in_audit.ROLE_LEAD_IN, run_index=0)
+    index.build()
+
+    # The neighbour's own run, asked whether it is clear.
+    run = LeadRun("lead-in", 0, [], theirs_lead_in, run_index=0)
+    assert lead_in_audit.conflicts_for([run], theirs, "theirs", index, 0.6) == []
+
+    # `mine` is fixed: its lead-in lands on the neighbour's.
+    index.replace("mine", dressup, mine, _square_geometry(0.0, 20.0),
+                  [LeadRun("lead-in", 0, [], after_fix, run_index=0)])
+
+    clashes = lead_in_audit.conflicts_for([run], theirs, "theirs", index, 0.6)
+    assert len(clashes) == 1
+    assert clashes[0].role == lead_in_audit.ROLE_LEAD_IN
+    assert clashes[0].other_part == "mine"
+
+
+def test_replacing_an_operation_leaves_its_neighbours_alone():
+    """`replace` is by identity, so one operation's fix cannot rewrite another's.
+
+    Two operations cutting overlapping regions is what the same-part filter used
+    to exclude, and this is where that would have bitten: a rewrite matched on
+    the part label would have overwritten the second operation's entries and
+    deleted its lead runs.
+    """
+    _LineString, _polygon = _shapely()
+    mine, theirs = object(), object()
+    dressup = _Dressup()
+    LineString, _polygon = _shapely()
+    run = LeadRun("lead-in", 0, [], LineString([(6.0, 0.0), (0.0, 0.0)]),
+                  run_index=0)
+
+    index = _CutIndex()
+    index.add("mine", dressup, mine, _square_geometry(0.0, 0.0))
+    index.add("theirs", dressup, theirs, _square_geometry(50.0, 50.0))
+    index.build()
+
+    index.replace("mine", dressup, mine, _square_geometry(10.0, 0.0), [run])
+
+    assert len(index.entries) == 3
+    untouched = [e for e in index.entries if e[2] is theirs]
+    assert len(untouched) == 1
+    assert untouched[0][3].bounds == (50.0, 50.0, 60.0, 60.0)
+
+
+def test_replacing_swaps_an_operations_entries_rather_than_adding_to_them():
+    """Three entries for one operation would mean the old body still advertised."""
+    LineString, _polygon = _shapely()
+    operation = object()
+    dressup = _Dressup()
+
+    index = _CutIndex()
+    index.add("mine", dressup, operation, _square_geometry(0.0, 0.0))
+    index.add("mine", dressup, operation, LineString([(6.0, 0.0), (0.0, 0.0)]),
+              role=lead_in_audit.ROLE_LEAD_IN, run_index=0)
+    index.build()
+
+    index.replace("mine", dressup, operation, _square_geometry(10.0, 0.0), [])
+    assert len(index.entries) == 1
+    assert index.entries[0][4] == lead_in_audit.ROLE_BODY
+    assert index.entries[0][3].bounds == (10.0, 0.0, 20.0, 10.0)
+
+
+def test_the_index_is_rebuilt_before_the_next_query_not_by_the_replace():
+    """`replace` marks it stale; the query does the work.
+
+    Splitting it this way is what makes a candidate whose recompute failed cost
+    nothing: there is no query, so there is no rebuild.
+    """
+    _LineString, _polygon = _shapely()
+    operation = object()
+    dressup = _Dressup()
+    index = _CutIndex()
+    index.add("mine", dressup, operation, _square_geometry(0.0, 0.0))
+    index.build()
+    assert index._stale is False
+
+    index.replace("mine", dressup, operation, _square_geometry(10.0, 0.0), [])
+    assert index._stale is True
+
+    # Querying is what clears it.
+    index.near(_square_geometry(0.0, 0.0).centroid, 0.6)
+    assert index._stale is False
+
+
+class _Paths:
+    """The two attributes `index_after` reads."""
+
+    def __init__(self, path):
+        self.Path = path
+
+
+def test_index_after_returns_none_when_the_paths_cannot_be_reconciled():
+    """It leaves the index alone rather than replacing it with a guess.
+
+    An operation whose lead-ins cannot be told from its cut has no runs to
+    publish. Writing an entry with none would advertise "this operation has no
+    lead-in", which is a claim nobody checked and one the rest of the scan would
+    then rely on.
+    """
+    _LineString, _polygon = _shapely()
+    dressup = _Dressup()
+    operation = _Paths(_Path([_Cmd("G1", X=3.0, Y=3.0)]))
+    index = _CutIndex()
+    index.add("mine", dressup, operation, _square_geometry(0.0, 0.0))
+    index.build()
+    before = list(index.entries)
+
+    # A dressup path that is not the base path plus a lead-in: `lead_runs`
+    # refuses it, which is how the audit reports an operation it cannot judge.
+    bad_dressup = _Paths(_Path([_Cmd("G1", X=99.0, Y=99.0)]))
+    assert lead_in_audit.index_after(operation, bad_dressup, "mine",
+                                     index) is None
+    assert index.entries == before
+
+
+def test_index_after_republishes_an_operations_runs():
+    """The ordinary case: the same call that refuses also does the rewrite."""
+    _LineString, _polygon = _shapely()
+    operation = _Paths(SQUARE)
+    dressup = _Paths(_with_lead_in())
+
+    index = _CutIndex()
+    index.add("mine", dressup, operation, _square_geometry(0.0, 0.0))
+    index.build()
+
+    runs = lead_in_audit.index_after(operation, dressup, "mine", index)
+    assert runs is not None
+    assert len(runs) == 1
+    assert runs[0].kind == lead_in_audit.ROLE_LEAD_IN
+    # Body plus the one run, and the run is published with its role.
+    assert len(index.entries) == 2
+    assert sorted(e[4] for e in index.entries) == [lead_in_audit.ROLE_BODY,
+                                                   lead_in_audit.ROLE_LEAD_IN]
+
+
+# -- the clearance the user dials -----------------------------------------
+
+class _Job:
+    """Just enough of an operation/dressup pair for `_prepare` to read."""
+
+    def __init__(self):
+        self.Path = _Path([])
+
+
+class _Prepared:
+    """Stands up `_prepare`'s five dependencies, so its arithmetic can be tested.
+
+    `_prepare` reaches the job through module-level names, and the thing under
+    test is the multiplication between them rather than any of them, so they
+    are stood in for here rather than a whole replay built.
+
+    Used as a context manager, because patching module attributes and restoring
+    them by hand is how a test leaves the module broken for the next one.
+    """
+
+    _NAMES = ("lead_in_out_dressups", "cut_moves", "lead_runs",
+              "tool_radius_of", "_operation_cut_geometry")
+
+    def __init__(self, tool_radius=0.6):
+        self.tool_radius = tool_radius
+        self.pairs = [(_Job(), _Job())]
+        self._saved = None
+
+    def __enter__(self):
+        pairs, radius = self.pairs, self.tool_radius
+        # Resolved here rather than captured from the caller: the test's
+        # `_LineString` is a local, and a closure over it would be a NameError
+        # at the moment the stub is installed rather than where it is written.
+        line = _shapely()[0]
+        self._saved = {name: getattr(lead_in_audit, name)
+                       for name in self._NAMES}
+        lead_in_audit.lead_in_out_dressups = lambda job: pairs
+        lead_in_audit.tool_radius_of = lambda op, job=None: radius
+        lead_in_audit.cut_moves = lambda path: []
+        lead_in_audit.lead_runs = lambda base, dress: ([[]], [], [object()])
+        lead_in_audit._operation_cut_geometry = \
+            lambda body, path, op: line([(0.0, 0.0), (1.0, 0.0)])
+        return self
+
+    def __exit__(self, *exc):
+        for name, value in (self._saved or {}).items():
+            setattr(lead_in_audit, name, value)
+        self._saved = None
+        return False
+
+    def margin_at(self, margin, clearance):
+        with self:
+            prepared, _index, _unreadable = lead_in_audit._prepare(
+                None, margin, clearance)
+        return prepared[0][3]
+
+
+def test_the_clearance_scales_the_margin_it_is_measured_against():
+    """One multiplication, applied to the margin, is the whole mechanism.
+
+    Both checks read the figure that comes out of `_prepare` and neither
+    re-derives it, so scaling there scales the neighbour clearance, the edge
+    clearance and the search's acceptance test together. Pinned on `_prepare`
+    because that is the only place the factor is applied, and a second
+    multiplication anywhere else would silently square it.
+    """
+    _LineString, _polygon = _shapely()
+    prepared = _Prepared(tool_radius=0.6)
+    assert [prepared.margin_at(None, c) for c in (0.0, 1.0, 2.5)] == \
+        [0.0, 0.6, 1.5]
+
+
+def test_the_clearance_scales_an_explicit_margin_too():
+    """`scan_job(job, margin=2.0, clearance=1.5)` means 3.0 mm, not "2.0, but the
+    other check disagrees".
+
+    One rule with no special cases. If the factor applied only to a derived
+    tool radius, a caller passing an explicit margin would get two checks at two
+    different sensitivities and no way to see it.
+    """
+    _LineString, _polygon = _shapely()
+    assert _Prepared(tool_radius=0.6).margin_at(2.0, 1.5) == pytest.approx(3.0)
+
+
+def test_the_result_carries_the_clearance_so_the_search_cannot_lose_it():
+    """The one that would have been silent.
+
+    `resolve_conflicts` rebuilds the index from scratch and reads `margin` back
+    off the result. Without the factor carried alongside it, a run at 2x would
+    have its candidates tested at 1x -- so a report saying "40 operations need
+    doing by hand at 2x" would have been produced by a search that accepted only
+    what was already clear at 1x, and nothing would have said so.
+    """
+    _LineString, _polygon = _shapely()
+    seen = []
+    saved_scan = lead_in_audit.scan_job
+    lead_in_audit.scan_job = lambda job, margin=None, progress=None, \
+        clearance=1.0: seen.append(clearance) or _result([])
+    try:
+        result = _result([_audit(OperationAudit.FIXED)])
+        result.clearance = 2.5
+        lead_in_audit.reverify(result)
+        assert seen == [2.5]
+    finally:
+        lead_in_audit.scan_job = saved_scan
+
+
+def test_the_search_rebuilds_its_index_at_the_same_clearance_the_scan_used():
+    """The whole point of carrying it, checked where the bug would land.
+
+    `resolve_conflicts` builds a fresh index from the job before searching. If
+    it used the default factor there, every candidate would be tested against a
+    *different* sensitivity from the one the scan reported -- so at 2x the
+    search would accept only what was already clear at 1x, and the report would
+    still say 2x.
+
+    Behavioural, not structural: with no operations to search the call runs to
+    completion without a FreeCAD job, and `_prepare` is recorded directly.
+    Asserting on the source instead would catch the same edit, but would not
+    catch the one where the value is read from somewhere else.
+    """
+    _LineString, _polygon = _shapely()
+    seen = []
+    saved_prepare = lead_in_audit._prepare
+
+    def _record(job, margin, clearance=1.0):
+        seen.append((margin, clearance))
+        return [], _CutIndex(), []
+
+    lead_in_audit._prepare = _record
+    try:
+        result = _result([_audit(OperationAudit.CLEAN)])
+        result.margin = 0.6
+        result.clearance = 2.5
+        lead_in_audit.resolve_conflicts(result, dry_run=True)
+    finally:
+        lead_in_audit._prepare = saved_prepare
+
+    assert seen == [(0.6, 2.5)]
+
+
+def test_a_result_with_no_clearance_recorded_is_treated_as_the_default():
+    """Defensive, because `describe_result` prints the figure.
+
+    A result built by anything that predates the factor has no `clearance`
+    attribute, and a report that raised on one would turn a missing dial into a
+    crash in the reporting path.
+    """
+    _LineString, _polygon = _shapely()
+    audit = _audit(OperationAudit.CLEAN)
+    result = _result([audit])
+    del result.clearance
+    lines = lead_in_audit.describe_result(result)
+    assert any("clearance of" in line for line in lines)
+
+
+def test_the_report_states_the_clearance_it_used():
+    """The counts are a function of it, so a headline without it is unreadable.
+
+    The same job reports 40 offending operations at 1x and rather more at 2x.
+    A report quoting either number without saying which it was measured at
+    makes them incomparable, and a number nobody can compare is decoration.
+    """
+    _LineString, _polygon = _shapely()
+    audit = _audit(OperationAudit.CLEAN)
+    result = _result([audit])
+    result.job = None
+    # No tool readable and no explicit margin: the factor alone, still stated.
+    result.margin = None
+    assert "1.00 x tool radius" in lead_in_audit.describe_result(result)[0]
+
+
+def test_the_report_states_the_clearance_in_millimetres_when_a_tool_is_readable(
+        monkeypatch):
+    """The production path, and the one a reader actually acts on.
+
+    "2.50 x tool radius" is a ratio; a plasma operator's question is how many
+    millimetres, and the factor only means something next to a tool. This is
+    the branch every real run takes, because `scan_job` leaves `margin` as None
+    so that each operation uses its own tool.
+
+    `tool_radius_of` falls back to the job's widest tool, so the widest is the
+    figure to quote: it is the largest clearance actually in force.
+    """
+    _LineString, _polygon = _shapely()
+    result = _result([_audit(OperationAudit.CLEAN)])
+    result.margin = None
+    result.clearance = 2.5
+
+    from freecad.nestingworkbench.Tools.Cam import cam_replay
+    monkeypatch.setattr(cam_replay, "tool_diameters",
+                        lambda job: [("plasma", 1.2), ("mill", 6.0)])
+    line = lead_in_audit.describe_result(result)[0]
+    # 6.0 mm diameter -> 3.0 mm radius -> 7.5 mm at 2.5x.
+    assert "7.5000 mm" in line
+    assert "2.50 x tool radius" in line
+
+
+def test_a_default_clearance_reads_as_the_tool_radius_rather_than_a_ratio(
+        monkeypatch):
+    """At 1.0 the report says what it means instead of restating the default.
+
+    "1.00 x tool radius" is a number the reader has to multiply before it means
+    anything; "the tool radius (3.0000 mm)" is the clearance. Both carry the
+    factor's value -- this is wording, not a second source of truth.
+    """
+    _LineString, _polygon = _shapely()
+    result = _result([_audit(OperationAudit.CLEAN)])
+    result.margin = None
+    result.clearance = 1.0
+
+    from freecad.nestingworkbench.Tools.Cam import cam_replay
+    monkeypatch.setattr(cam_replay, "tool_diameters", lambda job: [("mill", 6.0)])
+    assert "the tool radius (3.0000 mm)" in lead_in_audit.describe_result(result)[0]
+
+
+def test_an_explicit_margin_is_reported_in_millimetres():
+    """A caller who passed millimetres wants millimetres back, not a factor."""
+    _LineString, _polygon = _shapely()
+    result = _result([_audit(OperationAudit.CLEAN)])
+    result.margin = 0.75
+    result.clearance = 2.0
+    assert "1.5000 mm" in lead_in_audit.describe_result(result)[0]
+
+
+# -- a lead run is named as a lead run -------------------------------------
+
+def test_a_clash_with_a_lead_run_is_not_described_as_a_clash_with_a_cut_path():
+    """The mis-description, stated as a test because it was the bug.
+
+    `mark_conflict` used to build its sentence from the part name and the
+    literal words "cut path". A lead-in that reached another operation's
+    *lead-in* was therefore marked as reaching a cut path -- sending the
+    operator to a contour that was never touched while the two lead runs
+    actually crossing went unexamined. On plasma that is the difference between
+    looking at the right thing and posting the job.
+    """
+    run = LeadRun("lead-in", 2, [], None)
+    clash = Conflict(run, 0.0, None, None, "part_TopStrap_14",
+                     lead_in_audit.ROLE_LEAD_IN)
+    assert "lead-in" in clash.what
+    assert clash.summary().endswith("part_TopStrap_14's lead-in")
+    assert "crosses" in clash.summary()
+
+    dressup = _Dressup()
+    lead_in_audit.mark_conflict(dressup, "part_TopStrap_14", clash)
+    text = getattr(dressup, lead_in_audit.PROP_CONFLICT)
+    assert "part_TopStrap_14's lead-in" in text
+    assert "cut path" not in text
+
+
+def test_a_clash_with_a_body_is_still_described_as_a_cut_path():
+    """The other half: the fix must not lose what it had."""
+    clash = _conflict(distance=0.0598, part="part_TopStrap_7")
+    assert "cut path" in clash.what
+    assert "0.0598" in clash.summary()
+    # And the margin clause still rides along for the report line.
+    assert clash.describe(0.6).endswith("(margin 0.6000 mm)")
+
+
+def test_a_lead_in_crossing_another_parts_lead_out_is_a_conflict():
+    """The mirror of the lead-in case: a lead-out is a neighbour too.
+
+    `RadiusOut` leads away from the cut just as `RadiusIn` leads into it, and
+    on a part with two wires the lead-out of one wire lands in the gap beside
+    the lead-in of another. The index carries both roles, so this is the same
+    test with the other word in it -- and it is the one a body-only index
+    cannot see at all.
+    """
+    LineString, _polygon = _shapely()
+    mine = LineString([(0.0, 0.0), (0.0, 10.0)])
+    theirs = LineString([(-4.0, 5.0), (4.0, 5.0)])   # cuts straight across
+    run = LeadRun("lead-out", 0, [], mine, run_index=0)
+    index = _Index([_entry("other", theirs, object(),
+                           role=lead_in_audit.ROLE_LEAD_OUT)])
+    conflicts = lead_in_audit.conflicts_for([run], object(), "mine", index, 0.6)
+    assert len(conflicts) == 1
+    assert conflicts[0].role == lead_in_audit.ROLE_LEAD_OUT
+    assert "lead-out" in conflicts[0].summary()
+
+
+def test_the_report_counts_lead_run_clashes_in_the_headline():
+    """Zero is a measurement the reader is entitled to.
+
+    It used to be silently zero on every layout this was developed against,
+    which is indistinguishable from "not checked" -- and that is how a check
+    that never fires survives for years.
+    """
+    run_clash = _conflict(distance=0.0, part="part_TopStrap_14",
+                          role=lead_in_audit.ROLE_LEAD_IN)
+    body_clash = _conflict(distance=0.0598, part="part_SimpleSpacer_1")
+    audits = [
+        _audit(lead_in_audit.OperationAudit.UNRESOLVED,
+               conflicts=[run_clash, body_clash]),
+        _audit(lead_in_audit.OperationAudit.UNRESOLVED,
+               conflicts=[_conflict(distance=0.2, part="part_Bracket_2")]),
+    ]
+    lines = "\n".join(lead_in_audit.describe_result(_result(audits),
+                                                   dry_run=True))
+    assert "1 reaches another operation's lead-in or lead-out." in lines
+
+
+def test_the_headline_agrees_with_itself_about_one_and_many():
+    """`1 reach` is the kind of thing that ships because nobody read it aloud.
+
+    Two assertions because both shapes come from one expression and only the
+    plural case catches a missing conditional: with everything saying "reach",
+    the singular still has to be exercised on its own.
+    """
+    _LineString, _polygon = _shapely()
+    clash = _conflict(distance=0.0, part="part_TopStrap_14",
+                      role=lead_in_audit.ROLE_LEAD_IN)
+    one = lead_in_audit.describe_result(
+        _result([_audit(lead_in_audit.OperationAudit.UNRESOLVED,
+                        conflicts=[clash])]), dry_run=True)[0]
+    many = lead_in_audit.describe_result(
+        _result([_audit(lead_in_audit.OperationAudit.UNRESOLVED,
+                        conflicts=[clash, clash])]), dry_run=True)[0]
+    assert "1 reaches another operation's lead-in or lead-out." in one
+    assert "2 reach another operation's lead-in or lead-out." in many
+
+
+def test_the_report_has_a_section_of_its_own_for_lead_run_clashes():
+    """Same margin and same fix, but not the same sentence.
+
+    Reaching a cut path re-cuts material. Crossing another lead run bridges the
+    arc across a kerf it has already opened, which on plasma or waterjet drops
+    the flame and errors the controller. The operator decides whether to post
+    the job differently in the two cases, so a report that reads alike for them
+    has thrown away the one thing they need.
+    """
+    run_clash = _conflict(distance=0.0, part="part_TopStrap_14",
+                          role=lead_in_audit.ROLE_LEAD_IN)
+    audit = _audit(lead_in_audit.OperationAudit.UNRESOLVED,
+                   conflicts=[run_clash])
+    lines = lead_in_audit.describe_result(_result([audit]), dry_run=True)
+    body = "\n".join(lines)
+    assert "another operation's lead-in or lead-out, rather than its cut path" \
+        in body
+    assert "kerf" in body
+    assert "part_TopStrap_14's lead-in" in body
+
+
+def test_a_clean_report_still_says_the_lead_run_count_is_zero():
+    """Stated even when there is nothing, because that is the measurement."""
+    audit = _audit(lead_in_audit.OperationAudit.CLEAN)
+    lines = lead_in_audit.describe_result(_result([audit]))
+    assert "0 reach another operation's lead-in or lead-out." in lines[0]
+
+
+# -- the end of a run re-reads the sheet -----------------------------------
+
+class _RecheckDressup(_Dressup):
+    """A dressup with a `Name`, which is how `reverify` pairs the two passes.
+
+    Pairing is by `Name` rather than identity because a re-scan builds its own
+    `OperationAudit` objects from the job: they are different objects
+    describing the same operation, and matching on identity would find none.
+    """
+
+    def __init__(self, name="Dressup001"):
+        _Dressup.__init__(self, "Dressup001")
+        self.__dict__["Name"] = name
+
+
+def _recheck_audit(status, conflicts=()):
+    audit = _audit(status, detail="moved the start point to (1.0, 2.0)",
+                   conflicts=conflicts)
+    audit.dressup = _RecheckDressup()
+    return audit
+
+
+def test_reverify_leaves_a_fix_alone_when_the_finished_job_agrees(monkeypatch):
+    """The common case, and the one that must not cost a false alarm."""
+    _LineString, _polygon = _shapely()
+    fixed = _recheck_audit(lead_in_audit.OperationAudit.FIXED)
+    result = _result([fixed])
+
+    monkeypatch.setattr(lead_in_audit, "scan_job", lambda job, margin=None,
+                        progress=None, clearance=1.0: _result(
+                            [_recheck_audit(lead_in_audit.OperationAudit.CLEAN)]))
+    assert lead_in_audit.reverify(result) == []
+    assert fixed.status == lead_in_audit.OperationAudit.FIXED
+
+
+def test_reverify_does_not_re_word_an_operation_that_was_already_unresolved(
+        monkeypatch):
+    """Confirmed is not corrected, and the report must not say otherwise.
+
+    An earlier version appended "Re-checked against the finished job" to every
+    `UNRESOLVED` audit, including the hand-jobs the re-read never had any
+    reason to doubt. On a sheet with twenty of them the line became noise, and
+    it implied a change that had not happened.
+    """
+    _LineString, _polygon = _shapely()
+    stuck = _recheck_audit(lead_in_audit.OperationAudit.UNRESOLVED,
+                           conflicts=[_conflict(distance=0.0,
+                                                part="part_TopStrap_14")])
+    before = stuck.detail
+    monkeypatch.setattr(lead_in_audit, "scan_job", lambda job, margin=None,
+                        progress=None, clearance=1.0: _result([
+                            _recheck_audit(
+                                lead_in_audit.OperationAudit.UNRESOLVED,
+                                conflicts=[_conflict(distance=0.0,
+                                                    part="part_TopStrap_14")])]))
+    assert lead_in_audit.reverify(_result([stuck])) == []
+    assert stuck.detail == before
+
+
+def test_reverify_downgrades_a_fix_the_finished_job_does_not_support(monkeypatch):
+    """The safety net, and the reason the run cannot claim a clean sheet.
+
+    Every per-operation check in the search is honest about what it was given.
+    What none of them can see is the operation *after* it -- one fix moves a
+    lead-in into its neighbour, and the neighbour's own search is the only thing
+    between that and a clean report. So the claim is re-read at the end, and an
+    operation that does not hold up is marked rather than passed off as fixed.
+    """
+    _LineString, _polygon = _shapely()
+    fixed = _recheck_audit(lead_in_audit.OperationAudit.FIXED)
+    result = _result([fixed])
+
+    still_bad = _conflict(distance=0.0, part="part_TopStrap_14",
+                          role=lead_in_audit.ROLE_LEAD_IN)
+    monkeypatch.setattr(lead_in_audit, "scan_job", lambda job, margin=None,
+                        progress=None, clearance=1.0: _result([
+                            _recheck_audit(lead_in_audit.OperationAudit.UNRESOLVED,
+                                           conflicts=[still_bad])]))
+
+    downgraded = lead_in_audit.reverify(result)
+    assert list(downgraded) == [fixed]
+    assert fixed.status == lead_in_audit.OperationAudit.UNRESOLVED
+    assert "Re-checked against the finished job" in fixed.detail
+    # And it is marked, because the user has just been told not to look.
+    assert fixed.dressup.Label.startswith(CONFLICT_PREFIX)
+
+
+def test_reverify_re_reads_the_findings_not_only_the_status(monkeypatch):
+    """A status alone would leave the report describing the pre-fix conflict.
+
+    The audit carries a `conflicts` list and an `off_sheet` list, and both were
+    measured at the original start point. Reporting `FIXED` alongside them means
+    the summary counts a problem the operation no longer has -- the same
+    quiet-checker failure, running the other way.
+    """
+    _LineString, _polygon = _shapely()
+    fixed = _recheck_audit(lead_in_audit.OperationAudit.FIXED,
+                           conflicts=[_conflict(distance=0.4,
+                                               part="part_Old_1")])
+    fixed.off_sheet = []
+    result = _result([fixed])
+
+    monkeypatch.setattr(lead_in_audit, "scan_job", lambda job, margin=None,
+                        progress=None, clearance=1.0: _result(
+                            [_recheck_audit(lead_in_audit.OperationAudit.CLEAN)]))
+    lead_in_audit.reverify(result)
+    assert fixed.conflicts == []
+    assert fixed.off_sheet is None
+
+
+def test_reverify_only_looks_at_operations_the_run_moved(monkeypatch):
+    """A `CLEAN` or `SKIPPED` audit was not touched, so re-reading it can only
+    restate the opening scan -- and a re-scan of 110 operations is not free."""
+    _LineString, _polygon = _shapely()
+    clean = _recheck_audit(lead_in_audit.OperationAudit.CLEAN)
+    result = _result([clean])
+
+    monkeypatch.setattr(lead_in_audit, "scan_job", lambda job, margin=None,
+                        progress=None, clearance=1.0: _result([]))
+    assert lead_in_audit.reverify(result) == []
+
+
+def test_a_dry_run_never_re_reads_the_job():
+    """"Report only writes nothing at all" includes not going looking again.
+
+    The guard is the call site in `resolve_conflicts`, so this reads the source
+    rather than the behaviour: a dry run and a real run are told apart by one
+    `if`, and this says the one is load-bearing rather than incidental.
+
+    On the AST rather than on the text, because a textual match on
+    `resolve_conflicts` breaks the moment anyone wraps the call in a `try` --
+    which is exactly what happened here, and it would have looked like the guard
+    had been deleted.
+    """
+    import ast
+    import inspect
+    import textwrap
+
+    tree = ast.parse(textwrap.dedent(inspect.getsource(
+        lead_in_audit.resolve_conflicts)))
+    guarded = False
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.If):
+            continue
+        test = node.test
+        is_not_dry_run = (isinstance(test, ast.UnaryOp)
+                          and isinstance(test.op, ast.Not)
+                          and isinstance(test.operand, ast.Name)
+                          and test.operand.id == "dry_run")
+        if not is_not_dry_run:
+            continue
+        for child in ast.walk(node):
+            if (isinstance(child, ast.Call)
+                    and isinstance(child.func, ast.Name)
+                    and child.func.id == "reverify"):
+                guarded = True
+    assert guarded, ("resolve_conflicts must not call reverify() in a dry run; "
+                     "'report only writes nothing' includes not re-reading")
 
 
 def test_fixable_is_distinct_from_fixed_and_unresolved():
@@ -961,23 +1646,114 @@ def test_a_lead_in_that_only_touches_the_link_it_fabricated_is_not_a_crossing():
 
 # -- the sheet edge --------------------------------------------------------
 
+#: The tool radius these are measured against, in mm.
+EDGE_MARGIN_MM = 0.6
+
+
+def _sheet_100():
+    LineString, Polygon = _shapely()
+    return Polygon([(0, 0), (100, 0), (100, 100), (0, 100)])
+
+
+def test_the_distance_is_to_the_edge_and_not_to_the_polygon():
+    """The bug that made a sheet clearance impossible to express.
+
+    Shapely's `distance` between two geometries of different dimensions is 0
+    whenever they intersect, so a point *inside* a polygon measures 0 mm from
+    it. `_signed_distance` therefore used to return 0 for every pierce point on
+    the material, whether it was 5 mm from the edge or 150 mm -- which is why
+    the margin had to be 0, and why "is this pierce too near the edge?" could
+    not be asked at all.
+
+    The centre of this sheet is 50 mm from every edge and must measure so.
+    """
+    _LineString, _polygon = _shapely()
+    sheet = _sheet_100()
+    assert lead_in_audit._signed_distance((50.0, 50.0), sheet) == \
+        pytest.approx(50.0, abs=1e-6)
+    assert lead_in_audit._signed_distance((5.0, 50.0), sheet) == \
+        pytest.approx(5.0, abs=1e-6)
+    # Outside the sheet the sign flips and the magnitude is the real gap.
+    assert lead_in_audit._signed_distance((-3.0, 50.0), sheet) == \
+        pytest.approx(-3.0, abs=1e-6)
+
+
 def test_a_pierce_point_off_the_sheet_is_found():
     """The sheet-edge case, which is a different failure from a clash."""
-    LineString, Polygon = _shapely()
-    sheet = Polygon([(0, 0), (100, 0), (100, 100), (0, 100)])
+    LineString, _polygon = _shapely()
+    sheet = _sheet_100()
     # Starts 2 mm outside, runs 5 mm in to the contour at x=5.
     run = LeadRun("lead-in", 0, [], LineString([(-2.0, 50.0), (5.0, 50.0)]))
-    found = _off_sheet([run], sheet)
+    found = _off_sheet([run], sheet, EDGE_MARGIN_MM)
     assert len(found) == 1
     assert found[0].distance == pytest.approx(-2.0, abs=1e-6)
     assert "2.0000 mm off the edge" in found[0].describe()
 
 
-def test_a_pierce_point_on_the_sheet_is_not_found():
-    LineString, Polygon = _shapely()
-    sheet = Polygon([(0, 0), (100, 0), (100, 100), (0, 100)])
+def test_a_pierce_point_on_the_sheet_and_clear_of_the_edge_is_not_found():
+    LineString, _polygon = _shapely()
+    sheet = _sheet_100()
+    # 2 mm in, comfortably more than the 0.6 mm margin.
     run = LeadRun("lead-in", 0, [], LineString([(2.0, 50.0), (5.0, 50.0)]))
-    assert _off_sheet([run], sheet) == []
+    assert _off_sheet([run], sheet, EDGE_MARGIN_MM) == []
+
+
+def test_a_pierce_point_inside_the_margin_is_found_though_it_is_on_the_sheet():
+    """The case the clearance exists for.
+
+    The pierce is on the material, so nothing is off the sheet -- but it is
+    0.3 mm from the edge with a 0.6 mm tool, so two thirds of the kerf is
+    hanging over air. That is not a hole in the material, it is a hole on the
+    boundary of one, and it is the thing the operator has to know about before
+    posting the job.
+    """
+    LineString, _polygon = _shapely()
+    sheet = _sheet_100()
+    run = LeadRun("lead-in", 0, [], LineString([(0.3, 50.0), (5.0, 50.0)]))
+    found = _off_sheet([run], sheet, EDGE_MARGIN_MM)
+    assert len(found) == 1
+    # Positive: on the sheet, and said to be.
+    assert found[0].distance == pytest.approx(0.3, abs=1e-6)
+    assert found[0].off_the_sheet is False
+    said = found[0].describe()
+    assert "0.3000 mm inside the edge" in said
+    assert "0.6000 mm tool radius" in said
+    # And it must not claim to be off the sheet, which is a different failure.
+    assert "off the edge" not in said
+
+
+def test_the_margin_is_the_only_thing_separating_clear_from_too_close():
+    """One geometry, two margins, opposite verdicts -- the clearance made explicit.
+
+    Pinned because it is the property that a regression to a hardcoded 0 would
+    silently undo: the same pierce point is a finding at one tool radius and
+    clean at a quarter of it.
+    """
+    LineString, _polygon = _shapely()
+    sheet = _sheet_100()
+    run = LeadRun("lead-in", 0, [], LineString([(0.3, 50.0), (5.0, 50.0)]))
+    assert len(_off_sheet([run], sheet, 0.6)) == 1
+    assert _off_sheet([run], sheet, 0.1) == []
+
+
+def test_a_run_that_skims_the_edge_after_piercing_clear_is_found():
+    """Pierces on the material, then the cut runs to within the margin.
+
+    The counterpart of `test_a_run_that_pierces_on_sheet_but_leaves_the_sheet_is_still_found`
+    for the clearance rather than the sign: the pierce is fine and the travel is
+    not, which is the case a pierce-only test misses.
+    """
+    LineString, _polygon = _shapely()
+    sheet = _sheet_100()
+    # Out to y=99.8 -- 0.2 mm *inside* the top edge -- and back. (100.2 would be
+    # off the sheet, which is the neighbouring test and the opposite finding.)
+    run = LeadRun("lead-in", 0, [],
+                  LineString([(50.0, 50.0), (50.0, 99.8), (52.0, 50.0)]))
+    found = _off_sheet([run], sheet, EDGE_MARGIN_MM)
+    assert len(found) == 1
+    assert found[0].distance == pytest.approx(0.2, abs=1e-6)
+    assert found[0].pierce_off is False
+    assert "runs to within 0.2000 mm" in found[0].describe()
 
 
 def test_the_pierce_point_is_the_end_away_from_the_contour():
@@ -987,11 +1763,11 @@ def test_the_pierce_point_is_the_end_away_from_the_contour():
     construction and says nothing. Testing the wrong end would flag every
     lead-out on the sheet.
     """
-    LineString, Polygon = _shapely()
-    sheet = Polygon([(0, 0), (100, 0), (100, 100), (0, 100)])
+    LineString, _polygon = _shapely()
+    sheet = _sheet_100()
     # Starts on the contour at x=5, exits to x=102 -- 2 mm off the far edge.
     run = LeadRun("lead-out", 0, [], LineString([(5.0, 50.0), (102.0, 50.0)]))
-    found = _off_sheet([run], sheet)
+    found = _off_sheet([run], sheet, EDGE_MARGIN_MM)
     assert len(found) == 1
     assert found[0].distance == pytest.approx(-2.0, abs=1e-6)
 
@@ -1004,18 +1780,89 @@ def test_a_run_that_pierces_on_sheet_but_leaves_the_sheet_is_still_found():
     it comes back. The distance reported is the worst point of the run, not the
     pierce point's.
     """
-    LineString, Polygon = _shapely()
-    sheet = Polygon([(0, 0), (100, 0), (100, 100), (0, 100)])
+    LineString, _polygon = _shapely()
+    sheet = _sheet_100()
     run = LeadRun("lead-in", 0, [],
                   LineString([(50.0, 50.0), (50.0, 104.0), (52.0, 50.0)]))
-    found = _off_sheet([run], sheet)
+    found = _off_sheet([run], sheet, EDGE_MARGIN_MM)
     assert len(found) == 1
     assert found[0].distance == pytest.approx(-4.0, abs=1e-6)
     # The wording has to say what actually happened. The pierce point is on the
     # sheet, so claiming it pierces off the edge would be wrong.
-    assert "leaves the sheet" in found[0].describe()
-    assert "pierces %.4f mm off" not in found[0].describe()
+    assert "runs %.4f mm off the edge" % 4.0 in found[0].describe()
     assert found[0].pierce_off is False
+
+
+def test_the_four_findings_each_read_as_what_they_are():
+    """All four combinations, because each is an instruction to the operator.
+
+    Before the clearance there were only two possible findings and one
+    sentence. Printing `-distance` for a positive one -- which is what the old
+    `describe` did -- says *"pierces -0.3000 mm off the edge"*, a number going
+    the wrong way, for a pierce that is on the material.
+    """
+    _LineString, _polygon = _shapely()
+    run = LeadRun("lead-in", 0, [], None)
+    margin = 0.6
+    off_pierce = lead_in_audit.OffSheet(run, -2.0, True, margin)
+    close_pierce = lead_in_audit.OffSheet(run, 0.3, True, margin)
+    off_run = lead_in_audit.OffSheet(run, -4.0, False, margin)
+    close_run = lead_in_audit.OffSheet(run, 0.2, False, margin)
+    assert "pierces 2.0000 mm off the edge" in off_pierce.describe()
+    assert "pierces only 0.3000 mm inside the edge" in close_pierce.describe()
+    assert "runs 4.0000 mm off the edge" in off_run.describe()
+    assert "runs to within 0.2000 mm" in close_run.describe()
+    # Every one of them quotes the margin it was measured against, so a reader
+    # can tell "0.3 mm from the edge" from "0.3 mm from the edge, and you have
+    # a 0.1 mm torch" without going back to the machine.
+    for finding in (close_pierce, close_run):
+        assert "0.6000 mm tool radius" in finding.describe()
+    # And none of the four says the opposite of the sign it carries.
+    assert not off_pierce.describe().startswith("pierces only")
+    assert "inside" not in off_pierce.describe()
+
+
+def test_both_call_sites_pass_the_tools_own_margin_to_the_edge_check():
+    """The wiring, checked where the behaviour cannot be reached.
+
+    `_conflicts_after` reads real toolpaths through FreeCAD, so nothing in this
+    tier can drive it and a hardcoded `0.0` there is invisible to every other
+    check here -- verified: reverting it to `0.0` passes all 80 of them. It
+    would also be exactly the bug this work fixed, reintroduced one line away
+    from the fix.
+
+    So the call is asserted on the AST rather than on behaviour. That is a
+    weaker claim than a behavioural test and is not pretending otherwise: the
+    behavioural backstop is
+    `tests/freecad_harness/test_lead_in_audit.py` →
+    `check_the_sheet_edge_is_checked`, which builds a real pierce point off the
+    edge and drives a real search over it.
+    """
+    import ast
+    import inspect
+    import textwrap
+
+    def calls(function):
+        found = []
+        for node in ast.walk(ast.parse(textwrap.dedent(
+                inspect.getsource(function)))):
+            if (isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Name)
+                    and node.func.id == "_off_sheet"):
+                found.append(node)
+        return found
+
+    for function, why in ((lead_in_audit.scan_job, "the read half"),
+                          (lead_in_audit._conflicts_after, "the search half")):
+        for node in calls(function):
+            args = [a for a in node.args if not isinstance(a, ast.Constant)]
+            assert len(args) == 3, (
+                "%s calls _off_sheet with %d arguments; the margin is required, "
+                "and a default is what let the old 0.0 hide there"
+                % (why, len(args)))
+            assert "margin" in ast.dump(args[-1]), (
+                "%s must pass the operation's tool radius as the edge margin, "
+                "not a constant" % why)
 
 
 def test_no_sheet_means_nothing_is_reported_rather_than_everything():
@@ -1028,16 +1875,16 @@ def test_no_sheet_means_nothing_is_reported_rather_than_everything():
     """
     LineString, _polygon = _shapely()
     run = LeadRun("lead-in", 0, [], LineString([(-5.0, 0.0), (1.0, 0.0)]))
-    assert _off_sheet([run], None) == []
+    assert _off_sheet([run], None, EDGE_MARGIN_MM) == []
 
 
 def test_an_operation_with_only_an_off_sheet_finding_is_still_needing_attention():
     """Either kind of finding has to be acted on, and either can be the only one."""
-    LineString, Polygon = _shapely()
-    sheet = Polygon([(0, 0), (100, 0), (100, 100), (0, 100)])
+    LineString, _polygon = _shapely()
+    sheet = _sheet_100()
     run = LeadRun("lead-in", 0, [], LineString([(-2.0, 50.0), (5.0, 50.0)]))
     audit = _audit(OperationAudit.UNRESOLVED, "no start point cleared it")
-    audit.off_sheet = _off_sheet([run], sheet)
+    audit.off_sheet = _off_sheet([run], sheet, EDGE_MARGIN_MM)
     assert audit.conflicts == []
     assert audit.needs_attention
     assert audit.worst is None            # no conflict, but not clean

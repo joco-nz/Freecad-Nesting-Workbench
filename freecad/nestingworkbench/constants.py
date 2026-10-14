@@ -55,6 +55,42 @@ PROP_PHYSICS_DIRECTION = "PhysicsDirection"
 # -- FreeCAD Preferences Path --
 PREFS_PATH = "User parameter:BaseApp/Preferences/NestingWorkbench"
 
+# -- Lead-in clearance --
+#
+#: The lead-in audit's clearance, as a multiple of the **tool radius**.
+#:
+#: Both of its checks -- a lead run reaching a neighbouring cut, and a pierce
+#: point reaching the sheet edge -- are the same question asked of two things:
+#: does the kerf have material on both sides of it? One number answers both, and
+#: that number is half the tool diameter, so a factor on the radius scales them
+#: together and keeps them consistent.
+#:
+#: 1.0 is the default and is **not** arbitrary: it is the smallest clearance
+#: that is physically meaningful -- a cut exactly touching its neighbour and no
+#: more. Lower finds only outright crossings; higher buys margin against
+#: lead-in placement, kerf wander and stock edge trim, at the cost of finding
+#: more.
+#:
+#: The unit is the radius rather than the diameter so that 1.0 means "the
+#: clearance this module has always used" rather than silently doubling it. A
+#: factor on the diameter would need a default of 0.5 to say the same thing,
+#: and a default below 1.0 on a *clearance* reads as a mistake.
+PROP_LEAD_IN_CLEARANCE = "LeadInClearance"
+
+#: Default, and the value used when the preference has never been set.
+DEFAULT_LEAD_IN_CLEARANCE = 1.0
+
+#: Bounds offered by the dialog, as multiples of the tool radius.
+#:
+#: Zero is allowed and meaningful -- it reduces the check to "does this cross
+#: anything", the one setting that finds the fewest problems -- so the floor is
+#: zero rather than some small positive number. The ceiling is a judgement
+#: call: ten radii is a wide margin on a plasma kerf and more than anybody
+#: nests to, and past it the dialog is expressing a preference rather than a
+#: constraint.
+MIN_LEAD_IN_CLEARANCE = 0.0
+MAX_LEAD_IN_CLEARANCE = 10.0
+
 # -- Algorithm Presets --
 # Rotation angle presets (degrees). Index 0 = coarsest, last = finest.
 PHYSICS_ROTATION_PRESETS = [360, 90, 45, 30, 15, 10, 5, 2, 1]

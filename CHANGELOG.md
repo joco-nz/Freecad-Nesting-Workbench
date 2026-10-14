@@ -15,12 +15,104 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **A lead-in reaching another lead-in or lead-out is no longer reported as a
+  clash with a cut path.** The audit has always tested lead runs against each
+  other -- a lead-in is itself a cut path, and another operation's can run into
+  it -- but `mark_conflict` built its sentence from the part name and the words
+  `cut path`, so the tree read *"comes within 0.0000 mm of part_TopStrap_14's
+  cut path"* for a clash with that part's *lead-in*. The operator was sent to a
+  contour that was never involved. Reports now give lead runs a section of their
+  own and the headline states the count, including when it is zero.
+  On plasma or waterjet this is the worse of the two failures: reaching a cut
+  path re-cuts material, while crossing another lead run bridges the arc across
+  a kerf it has already opened, drops the flame and errors the controller.
+  Same clearance margin and the same fix; a different sentence, because the
+  decision about whether to post the job is a different one.
+- **The fix no longer verifies candidates against geometry that has already
+  moved.** The sheet index was built once, before any start point moved, and
+  Shapely `STRtree` is immutable -- so after the first operation was fixed, every
+  subsequent candidate was checked against a neighbour advertised at where it
+  used to be. Measured on the fixture: moving one start point carried its lead-in
+  from **20.0 mm** away from a neighbour's lead-in to **0.0 mm** from it. The
+  neighbour's own search then cleared a run against a lead-in that was not there,
+  and the run finished reporting a clean sheet with two lead-ins crossing on it.
+  Every individual test passed, because each was honest about the index it was
+  given. The index now follows the operations as they are fixed; the rebuild
+  costs **0.0754 ms** over 280 entries, so the worst search pays 0.3%.
+- **A fix run re-reads the finished job before reporting.** An operation that
+  was moved but does not hold up is marked `CONFLICT_` rather than reported
+  fixed -- the cross-operation failure above cannot be caught per operation, so
+  the claim is checked at the end against a fresh scan.
+- `Check Lead-ins Against Nesting`'s search now walks the first stage's real
+  candidate ceiling rather than 8 in one check, so it can actually demonstrate
+  that a lead-out is judged together with its lead-in.
+- **Four stale measurement pins in the lead-in audit's test suite replaced with
+  assertions that test something.** None was re-pinned to whatever the code
+  currently prints, which asserts nothing and breaks again on the next re-nest.
+  The nearest-near-miss check now asserts the clash is *tighter than the largest
+  arc sag* — which is the property that catches chorded arcs, and is about the
+  reader rather than about the nest. The off-sheet check now **builds** its case
+  (`RadiusIn` raised until a pierce point leaves the stock, measured at 40 mm)
+  instead of relying on the fixture supplying one. The idempotence check now
+  asserts a **third** run moves nothing, since the tool converges in two.
+- **A pierce point closer to the sheet edge than the tool radius is now a
+  finding.** The edge gets the same clearance a neighbouring part's cut path
+  already got, read from the same number, for the same reason: **the kerf has to
+  have material on both sides of it.** A pierce 0.4 mm from the edge with a 0.6
+  mm tool puts two thirds of the kerf over air — on plasma the arc strikes across
+  a sliver, on waterjet the part loses its boundary. It is flagged for fixing on
+  the same terms as any other conflict. Fixing this required first correcting
+  the measurement it is based on; see below.
+- **The sheet-edge check was measuring the wrong distance, and the zero margin
+  was hiding it.** It measured a point's distance to the sheet *polygon* rather
+  than its *boundary*, and Shapely reports 0 between geometries of different
+  dimensions that intersect — so **every** pierce point on the material read
+  "0 mm from the edge". The check appeared to work only because the margin it was
+  given was `0.0` and `0 < 0` is False; that zero was a constraint imposed by the
+  bug rather than a decision about pierce points. Measured against the boundary,
+  the fixture's closest pierce point is 2.3105 mm. The margin is now the
+  operation's own tool radius and is required rather than defaulted, and the
+  report distinguishes four findings — off the sheet, within the tool radius of
+  it, pierces clear then runs off, pierces clear then skims — rather than
+  reporting all of them as "pierces off the edge". See NEST-038.
+- **A check loop that iterates zero times now fails loudly.** Four assertions in
+  the off-sheet check had silently stopped running when a re-nest left the
+  fixture with nothing to iterate — they were not counted at all, so the suite
+  went quieter rather than greener. A `group()` helper reports an empty group as
+  a check in its own right and yields the items, so there is no shape in which a
+  loop of checks can skip itself.
+
 ### Added
+- **An adjustable clearance on the lead-in check.** The report-or-fix dialog
+  carries a **Clearance** dial, a multiple of the tool radius, so the
+  sensitivity of every check can be turned up or down rather than fixed. Both
+  checks move together — a lead run reaching a neighbouring cut, and a pierce
+  point reaching the sheet edge — because they are the same question asked of
+  two things, and a dial that moved one and not the other would leave a report
+  whose halves disagree about what "too close" means.
+
+  **1.00 is the default, and is the clearance the check has always used**: a cut
+  exactly touching its neighbour, which is the smallest clearance that is
+  physically meaningful. Above it buys margin against lead-in placement and kerf
+  wander, and finds more; below it finds less; at 0.00 only outright crossings
+  are reported. The unit is the *radius* rather than the diameter precisely so
+  that 1.00 preserves existing behaviour instead of silently doubling it.
+
+  The value is remembered in preferences and clamped on the way in and out — a
+  parameter file can be hand-edited, and a negative clearance would make every
+  pierce point read as inside it. Cancelling the dialog leaves it unchanged.
+
+  The report states the clearance it used, because the counts are a function of
+  it: the same job reports 40 offending operations at 1.00 and rather more at
+  2.00, and a number nobody can compare is decoration.
+
 - `Nesting > Check Lead-ins Against Nesting` finds the lead-ins and lead-outs of
-  a replayed CAM job that reach another part's cut path, and moves their start
-  points until they clear. Menu only, not the toolbar: it acts on a replayed
-  job, so a toolbar button is inert for most of a session. Offers report-only
-  first, which writes nothing.
+  a replayed CAM job that reach another part's cut path **or another
+  operation's lead-in or lead-out**, and moves their start points until they
+  clear. Menu only, not the toolbar: it acts on a replayed job, so a toolbar
+  button is inert for most of a session. Offers report-only first, which writes
+  nothing.
   A lead-in extends outside its own part by `RadiusIn`, and the nester placed
   that part among others; nothing in the replay accounted for where it landed.
   On the committed fixture the worst lead-in clears its neighbour's cut path by

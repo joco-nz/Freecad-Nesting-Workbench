@@ -47,6 +47,7 @@ import os
 import sys
 import time
 import traceback
+from contextlib import contextmanager
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _REPO = os.path.abspath(os.path.join(_HERE, "..", ".."))
@@ -74,15 +75,16 @@ _checks = [0]
 #: The worst clash on the committed fixture, and what it measured against.
 #:
 #: These are **not** looked up by name when a check needs the offender --
-#: `_worst` finds it from the scan by what it is. The constants below are the
-#: *measurements* the scan is pinned to, and `_nearest_marginal` re-derives
-#: which operation they belong to. FreeCAD appends a counter to a duplicate
-#: label on every replay, so a name written here is stale by the third replay;
-#: a measured distance is not.
+#: `_worst` finds it from the scan by what it is. The constants below describe
+#: the scan rather than pin a measurement, and `_nearest_marginal` re-derives
+#: which operation is the interesting one. FreeCAD appends a counter to a
+#: duplicate label on every replay, so a name written here is stale by the
+#: third replay.
 #:
 #: The tightest clash is an exact crossing at 0.0000 mm, so it cannot be used to
-#: tell a sampled arc from a chorded one -- both give zero. `MARGINAL_DISTANCE_MM`
-#: is the nearest *near* miss, and it is that figure the distance check pins.
+#: tell a sampled arc from a chorded one -- both give zero. `MAX_ARC_SAG_MM` is
+#: what the near-miss check is measured against, and it is a property of the
+#: geometry reader rather than of the nest.
 VICTIM = "DressupLeadInOut001_replay_nested_BottomStrap_6"
 VICTIM_PART = "part_BottomStrap_6"
 NEIGHBOUR_PART = "part_TopStrap_1"
@@ -91,15 +93,31 @@ NEIGHBOUR_PART = "part_TopStrap_1"
 #: that a geometry regression which turns a crossing into a near miss is caught.
 CROSSING_DISTANCE_MM = 0.0
 
-#: The nearest near miss, at the default tool-radius margin. Measured on the
-#: current (re-nested) fixture: the nearest near miss is a lead-in on
-#: BottomStrap_23 at 0.0277 mm from a neighbour's cut path. (The pre-re-nest
-#: fixture measured 0.0437 mm; these are layout measurements, so they move when
-#: the sheet is re-nested and must be re-measured then -- see `probe_pins`.)
-MARGINAL_DISTANCE_MM = 0.0277
+#: The largest distance by which chording can hide a real clash, in mm.
+#:
+#: **This, and not a measurement, is what the near-miss check is for.** The
+#: point of the check is to prove arcs are sampled rather than chorded, and
+#: chording *loses* conflicts rather than inventing them -- it pulls a cut path
+#: up to `MAX_ARC_SAG_MM` inside the material, so anything closer than that than
+#: the true arc would be found clear by a chorded reader. So the assertion is
+#: that the nearest near miss is **tighter than the sag**: chord it, and that
+#: clash disappears with it.
+#:
+#: The figure is the `G3` of `DressupLeadInOut006_replay_nested_SimpleSpacer_2`
+#: on this fixture: a 52.3926 mm sampled path against a 37.8687 mm chord.
+#:
+#: It replaces `MARGINAL_DISTANCE_MM`, which pinned the exact nearest near miss
+#: at 0.0277 mm. That number is a fact about **the nest**, not about the code:
+#: commit `8f0c946` re-nested the fixture and moved it to 0.1481 mm, which
+#: failed the check for doing its job perfectly well. Re-pinning it would have
+#: been worse than useless -- it would assert whatever the layout happened to
+#: produce, and catch nothing. The inequality catches chording just as hard and
+#: survives the next re-nest. The exact figure is recorded in
+#: `tests/freecad_harness/baseline/`, which is where layout measurements live.
+MAX_ARC_SAG_MM = 14.5239
 
-#: Tolerances. The distance is checked tightly because it is a known number; the
-#: counts are checked loosely because they are structural.
+#: Tolerances. The crossing distance is checked tightly because it is exactly
+#: 0 by definition; the counts are checked loosely because they are structural.
 DISTANCE_TOL_MM = 0.0005
 
 
@@ -124,6 +142,36 @@ def check(condition, message, detail=None):
             emit("         %s" % line)
     _failures.append(message)
     return False
+
+
+@contextmanager
+def group(items, description):
+    """`check` a property of every item in `items`, and fail if there are none.
+
+    **A loop of `check(...)` calls over an empty list runs zero times.** Nothing
+    fails, nothing is counted, and the suite gets quieter without getting
+    greener -- which is the same failure as a stale pin wearing a passing
+    costume, and strictly worse, because nobody goes looking.
+
+    That is not hypothetical. Four assertions in
+    `check_the_sheet_edge_is_checked` sat inside a loop over the lead-ins that
+    pierce off the sheet edge, and when commit `8f0c946` re-nested the fixture
+    and left it with none, all four quietly stopped running. The suite showed
+    one red check instead of five, and the four that had vanished were not
+    counted at all.
+
+    So the emptiness is reported as a check of its own, **before** the loop, and
+    the items are yielded rather than iterated by the caller -- there is no
+    shape here that can skip it.
+
+        with group(offenders, "lead-ins piercing off the edge of the sheet") as o:
+            for audit, finding in o[:3]:
+                check(...)
+    """
+    items = list(items)
+    check(bool(items), "the %s were found (%d of them)"
+          % (description, len(items)))
+    yield items
 
 
 def replay(doc):
@@ -269,20 +317,19 @@ def check_known_conflict(result):
           "and it is a lead run (%s), not the cut path" % worst.run.kind)
 
     # The distance that actually proves arcs are sampled and not chorded: the
-    # nearest *near* miss. Chording a `G3` pulls the cut path up to 14.5239 mm
-    # inside the material on this fixture, so a chorded audit reports clear
-    # where a sampled one finds a clash.
+    # nearest *near* miss. See `MAX_ARC_SAG_MM` for why this is an inequality
+    # against the sag rather than a pin on the measurement.
     marginal = _nearest_marginal(result)
     if check(marginal is not None, "there is a near miss as well as a crossing"):
         distance, owner = marginal
-        check(abs(distance - MARGINAL_DISTANCE_MM) < DISTANCE_TOL_MM,
-              "the nearest near miss measures %.4f mm, as measured "
-              "independently (expected %.4f +/- %.4f, on %s)"
-              % (distance, MARGINAL_DISTANCE_MM, DISTANCE_TOL_MM, owner.label),
-              "A different figure means arcs are being chorded rather than "
-              "sampled. Measured on this fixture, the largest arc sag is "
-              "14.5239 mm: a 52.3926 mm sampled path against a 37.8687 mm "
-              "chord. Chording never invents a conflict, it only loses them.")
+        check(distance < MAX_ARC_SAG_MM,
+              "the nearest near miss is %.4f mm, tighter than the %.4f mm a "
+              "chorded reader could hide behind (on %s)"
+              % (distance, MAX_ARC_SAG_MM, owner.label),
+              "Above the largest arc sag, chording would swallow this clash: "
+              "the chord of a G3 cuts up to 14.5239 mm inside the true arc, so "
+              "the clash would be reported clear. Chording never invents a "
+              "conflict, it only loses them.")
 
     emit("  offender: %s (%s) at %.4f mm from %s"
          % (audit.label, audit.part, worst.distance, worst.other_part))
@@ -329,9 +376,13 @@ def check_margin_is_the_tool_radius(result, job):
     check(crossings >= 5,
           "margin 0.0 mm still finds the %d exact crossings -- a crossing is a "
           "clash at any margin" % crossings)
-    # Floors measured on the current (re-nested) fixture: 7 at margin 0.0,
-    # 12 at the tool radius (0.6), 39 at 2.0. These move when the sheet is
-    # re-nested; they are re-measured with the fixture (see `probe_pins`).
+    # **Floors, not pins.** A count is a fact about the nest and moves whenever
+    # the sheet is re-nested, so the exact figure cannot be asserted -- but a
+    # *floor* can, and it is what keeps a regression visible: if a change to the
+    # geometry reader stops finding clashes, the count drops through the floor
+    # whatever the layout is doing. Measured on the current (re-nested) fixture:
+    # 36 operations at margin 0.0, 40 at the tool radius, 52 at 3.0 -- so these
+    # floors sit well clear of the current values and survive the next re-nest.
     for margin, expected_min in ((0.0, 7), (0.6, 12), (2.0, 39)):
         at = lead_in_audit.scan_job(job, margin=margin)
         found = len(at.offending)
@@ -914,20 +965,213 @@ def check_own_body_is_not_drawn_across_the_gap_between_wires(doc, job):
           "mm of its start, which is enough for Shapely to call it a crossing.")
 
 
-def check_the_sheet_edge_is_checked(doc, job):
-    """A pierce point off the sheet is a different failure from a clash.
+#: How far to try extending `RadiusIn` past its authored value, in mm.
+#:
+#: The re-nested fixture has **no** lead run piercing off the sheet, where the
+#: one it replaced had three, and none within a kerf of the edge either -- the
+#: closest is 2.3105 mm. So both edge cases are **built** rather than found,
+#: exactly as `FORCED_RADIUS_IN_MM` builds the lead-in/lead-in one.
+#:
+#: A fixed radius cannot express them, because "off the material" and "on the
+#: material within a kerf of the edge" are two points on the same walk outwards,
+#: and which one a radius lands on depends on how that operation's lead-in is
+#: aimed. Measured: extending the *closest* operation by 4 mm takes its pierce
+#: from 2.3105 mm to 9.3223 mm -- **further** from the edge, because that
+#: lead-in points inward and a longer one reaches deeper into the nest. Of the
+#: 14 runs nearest the edge, 6 point outward; the best goes from 3.2169 mm to
+#: 0.3565 mm. So the radius is swept per operation rather than guessed, and the
+#: direction is tested first to keep the sweep short.
+FORCED_EDGE_EXTEND_MM = 40.0
 
-    Nothing on this fixture has a `Drilling`, so the case has to be found in the
-    geometry rather than built: three lead-ins on the 54-part fixture pierce off
-    the edge of the sheet, and the stock is 600 x 300 mm.
+#: The direction test: extend by this much and see whether the pierce point got
+#: closer to the edge. One recompute per candidate, against up to 160 in the
+#: sweep it decides whether to run.
+FORCED_EDGE_PROBE_MM = 4.0
+
+#: Sweep step, in mm. The window between "within a kerf of the edge" and "off
+#: the sheet" is about a millimetre wide, so a coarse step would step straight
+#: over the finding being looked for.
+FORCED_EDGE_STEP_MM = 0.25
+
+#: How many operations to try before giving up on finding one near the edge.
+FORCED_EDGE_TRIES = 14
+
+
+def _force_a_pierce_at_the_sheet_edge(job, want_off_sheet):
+    """Raise `RadiusIn` until a real pierce point reaches the sheet edge.
+
+    Returns `(dressup, saved_radius, applied_radius)` with the radius **left
+    applied** at the value that produced the finding, or `(None, None, None)`.
+    The caller reverts, so nothing here depends on the nest staying this tight
+    or this loose.
+
+    `want_off_sheet` picks which side of the edge to aim for: `True` for a
+    pierce on air, `False` for one still on the material but within the margin.
+    A candidate qualifies only when `_off_sheet` returns a finding whose sign
+    matches, so the two cases cannot be satisfied by the same radius.
+
+    Candidates are ranked nearest-the-edge-first, because a pierce that is
+    already near the boundary is the cheapest to move onto it. Then each is
+    **swept**, not set to a fixed radius, for the reason in
+    `FORCED_EDGE_EXTEND_MM`: the lead-ins point in different directions and the
+    same radius means something different to each of them.
+    """
+    try:
+        from shapely.geometry import Point
+    except ImportError:
+        return None, None, None
+
+    sheet = lead_in_audit.stock_polygon(job)
+    if sheet is None:
+        return None, None, None
+    prepared, index, _unreadable = lead_in_audit._prepare(job, None)
+    by_name = {entry[0].Name: entry for entry in prepared}
+
+    def pierce_distance(runs):
+        """How far the first run's pierce point is from the edge, or None."""
+        for run in runs:
+            geometry = run.geometry
+            if geometry is None:
+                continue
+            try:
+                coords = list(geometry.coords)
+                pierce = coords[0] if run.kind == lead_in_audit.ROLE_LEAD_IN \
+                    else coords[-1]
+                return Point(pierce[0], pierce[1]).distance(sheet.boundary)
+            except Exception:
+                continue
+        return None
+
+    ranked = []
+    seen_dressups = set()
+    for dressup, operation in lead_in_audit.lead_in_out_dressups(job):
+        entry = by_name.get(dressup.Name)
+        if entry is None or dressup.Name in seen_dressups:
+            continue
+        seen_dressups.add(dressup.Name)
+        try:
+            distance = pierce_distance(entry[4])
+        except Exception:
+            continue
+        if distance is not None:
+            ranked.append((distance, dressup, entry))
+    ranked.sort(key=lambda item: item[0])
+
+    for distance, dressup, entry in ranked[:FORCED_EDGE_TRIES]:
+        _d, op, part, margin, _runs, _body = entry
+        saved = float(dressup.RadiusIn)
+
+        def apply(radius):
+            dressup.RadiusIn = radius
+            dressup.recompute()
+            fresh = lead_in_audit.index_after(op, dressup, part, index)
+            return fresh, (lead_in_audit._off_sheet(fresh, sheet, margin)
+                           if fresh else [])
+
+        # Direction test first: only a lead-in that reaches *towards* the edge
+        # can be walked onto it, and a sweep through 40 mm of the wrong
+        # direction is 160 wasted recomputes.
+        probe, _found = apply(saved + FORCED_EDGE_PROBE_MM)
+        nearer = pierce_distance(probe) if probe else None
+        dressup.RadiusIn = saved
+        dressup.recompute()
+        lead_in_audit.index_after(op, dressup, part, index)
+        if nearer is None or nearer >= distance:
+            continue
+
+        radius = saved + FORCED_EDGE_STEP_MM
+        while radius <= saved + FORCED_EDGE_EXTEND_MM:
+            fresh, found = apply(radius)
+            for finding in found:
+                if finding.off_the_sheet is bool(want_off_sheet):
+                    return dressup, saved, radius
+            radius += FORCED_EDGE_STEP_MM
+        dressup.RadiusIn = saved
+        dressup.recompute()
+        lead_in_audit.index_after(op, dressup, part, index)
+    return None, None, None
+
+
+def check_the_sheet_edge_is_checked(doc, job):
+    """A pierce point too near the sheet edge is a different failure from a clash.
+
+    Nothing on this fixture has a `Drilling`, and after the re-nest nothing
+    pierces off the edge or lands within a kerf of it either -- the closest is
+    2.3105 mm. So both cases are **built**, by raising `RadiusIn` on a real
+    operation until its pierce point reaches the edge. See
+    `FORCED_EDGE_EXTEND_MM` for why the radius has to be swept rather than
+    chosen.
+
+    Building them is not a workaround; it is what makes this check possible at
+    all. The version that relied on the fixture supplying three offenders
+    stopped running four of its five assertions when the re-nest left it with
+    none, and a suite that quietly checks less is worse than a red one -- see
+    `group`.
     """
     emit("")
     emit("== the sheet edge is checked, and reports what it could not check ==")
     # Its own replay. The shared `job` has had its start points moved by
-    # `check_the_fix`, and the three offenders on this fixture are among them --
-    # so a scan of the fixed job finds the sheet clean, which is the right answer
+    # `check_the_fix`, and the operations near the edge are among them -- so a
+    # scan of the fixed job finds the sheet clean, which is the right answer
     # for a fixed job and the wrong thing to measure here.
-    result = lead_in_audit.scan_job(replay(FreeCAD.openDocument(FIXTURE)))
+    fresh_job = replay(FreeCAD.openDocument(FIXTURE))
+
+    near, near_saved, near_radius = _force_a_pierce_at_the_sheet_edge(
+        fresh_job, want_off_sheet=False)
+    if not check(near is not None,
+                 "a pierce point within a kerf of the edge was produced on real "
+                 "geometry (RadiusIn %.2f mm)" % (near_radius or 0.0)):
+        return
+    try:
+        result = lead_in_audit.scan_job(fresh_job)
+        _check_a_pierce_within_the_kerf_of_the_edge(result, near)
+    finally:
+        near.RadiusIn = near_saved
+        near.recompute()
+
+    target, saved_radius, applied = _force_a_pierce_at_the_sheet_edge(
+        fresh_job, want_off_sheet=True)
+    if not check(target is not None,
+                 "a pierce point off the edge was produced on real geometry "
+                 "(RadiusIn %.2f mm)" % (applied or 0.0)):
+        return
+    try:
+        result = lead_in_audit.scan_job(fresh_job)
+        _check_sheet_edge(result)
+        _check_the_edge_is_not_checked_when_there_is_no_stock()
+    finally:
+        target.RadiusIn = saved_radius
+        target.recompute()
+
+
+def _check_a_pierce_within_the_kerf_of_the_edge(result, target):
+    """The clearance case: on the material, too close to its edge to be useful.
+
+    This is the finding NEST-038 made expressible. The pierce is **not** off the
+    sheet, so every version of this check before the margin existed reported a
+    clean sheet here -- correctly, as far as it went, and uselessly.
+    """
+    audit = _find(result.audits, target.Name)
+    if not check(audit is not None and audit.off_sheet,
+                 "the scan reports it, though the pierce is on the material"):
+        return
+    worst = audit.worst_off_sheet
+    check(worst is not None and not worst.off_the_sheet,
+          "and says so: the distance is positive, %.4f mm inside the edge"
+          % (worst.distance if worst else 0.0))
+    said = worst.describe() if worst else ""
+    check("inside the edge" in said and "off the edge" not in said,
+          "and the wording does not claim it is off the sheet", said)
+    check("tool radius" in said,
+          "and quotes the tool radius it was measured against", said)
+    check(audit.status == lead_in_audit.OperationAudit.UNRESOLVED,
+          "and it is flagged for fixing, not reported clear (%s)"
+          % audit.status)
+    check(audit.needs_attention, "and needs_attention is true")
+
+
+def _check_sheet_edge(result):
+    """The assertions themselves, over whatever the scan found."""
     check(result.sheet is not None,
           "the stock outline was read from the job's own Stock")
     if result.sheet is not None:
@@ -938,29 +1182,35 @@ def check_the_sheet_edge_is_checked(doc, job):
               % (bounds[2] - bounds[0], bounds[3] - bounds[1]))
 
     off = [(a, o) for a in result.audits for o in (a.off_sheet or [])]
-    check(bool(off),
-          "lead-ins piercing off the sheet were found (%d of them)"
-          % len(off))
-    for audit, finding in off[:3]:
-        check(finding.distance < 0.0,
-              "%s: the pierce point is outside the sheet (%.4f mm)"
-              % (audit.label, finding.distance))
-        check("off the edge of the sheet" in finding.describe(),
-              "%s: and the report says so (%s)"
-              % (audit.label, finding.describe()))
-        # Both kinds of finding must set the status, or one of them is invisible.
-        check(audit.status == lead_in_audit.OperationAudit.UNRESOLVED,
-              "%s is reported as needing attention" % audit.label)
-        check(audit.needs_attention,
-              "%s: needs_attention is true" % audit.label)
+    with group(off, "lead runs reaching past the edge of the sheet") as found:
+        for audit, finding in found[:3]:
+            check(finding.distance < 0.0,
+                  "%s: the pierce point is outside the sheet (%.4f mm)"
+                  % (audit.label, finding.distance))
+            check("off the edge of the sheet" in finding.describe(),
+                  "%s: and the report says so (%s)"
+                  % (audit.label, finding.describe()))
+            # Both kinds of finding must set the status, or one of them is
+            # invisible.
+            check(audit.status == lead_in_audit.OperationAudit.UNRESOLVED,
+                  "%s is reported as needing attention" % audit.label)
+            check(audit.needs_attention,
+                  "%s: needs_attention is true" % audit.label)
 
     lines = lead_in_audit.describe_result(result, limit=3)
     joined_lines = "\n".join(lines)
     check("pierce off the edge of the sheet" in joined_lines,
           "the report has a section for it")
 
-    # And a job whose stock cannot be read must say the check did not run,
-    # rather than reporting a clean sheet that silently excludes the edge.
+
+def _check_the_edge_is_not_checked_when_there_is_no_stock():
+    """A job whose stock cannot be read must say the check did not run.
+
+    Reporting a clean sheet here would claim the edge is fine when nothing
+    looked at it -- which is the quiet-checker failure this whole module
+    exists to avoid, and the reason this half is kept even now that the first
+    half builds its own case.
+    """
     blank_doc = FreeCAD.openDocument(FIXTURE)
     blank = replay(blank_doc)
     stock = getattr(blank, "Stock", None)
@@ -1095,11 +1345,34 @@ def check_the_fix(doc, job):
           % (part, margin, worst[0] if worst else -1,
              worst[1] if worst else "?"))
 
-    # And running it again must be a no-op rather than a second move.
+    # And running it again must converge rather than oscillate.
+    #
+    # **The property is convergence, not "one pass is enough".** A search that
+    # moves an operation's lead-in can move it into a neighbour's path, and the
+    # neighbour's own search is the only thing that notices -- so an operation
+    # can be fixable only on a second pass, because its neighbour's final
+    # position is not known until the first one ends. `reverify` catches that at
+    # the end of each run rather than re-searching inside it, so the tool
+    # settles at two passes and stays there.
+    #
+    # Asserted as "the third run moves nothing", which is the anti-oscillation
+    # guarantee the original "a second run changes nothing" was reaching for.
+    # Pinned on the *second* run instead, it asserted single-pass convergence,
+    # which is a stronger claim than the design makes and which was false for a
+    # reason worth having.
     again = lead_in_audit.scan_job(job)
     lead_in_audit.resolve_conflicts(again)
-    check(again.counts().get(lead_in_audit.OperationAudit.FIXED, 0) == 0,
-          "a second run changes nothing (%s)" % again.counts())
+    second = again.counts().get(lead_in_audit.OperationAudit.FIXED, 0)
+    emit("  second run: %s" % again.counts())
+    third = lead_in_audit.scan_job(job)
+    lead_in_audit.resolve_conflicts(third)
+    third_fixed = third.counts().get(lead_in_audit.OperationAudit.FIXED, 0)
+    check(third_fixed == 0,
+          "the run converges: a third run moves nothing (%d moved, after %d on "
+          "the second)" % (third_fixed, second),
+          "A run that keeps moving operations is oscillating. Each pass fixes "
+          "what the previous pass disturbed, which means the search is not "
+          "measuring against the job as it now stands.")
 
 
 def check_no_tool_means_reported_not_guessed(doc, job):
@@ -1285,6 +1558,15 @@ def check_lead_out_is_judged_too(doc, job):
     # space and genuinely has nothing in the way. The real property is that the
     # joint test rejects candidates the lead-in alone would accept, and that is
     # what this measures.
+    #
+    # **The candidate budget is `MAX_CANDIDATES`, not the 8 this used to walk.**
+    # Eight is 8 mm of travel along the wire, which on the current layout is not
+    # enough to turn the lead-in away from `part_SimpleSpacer_1`: measured, the
+    # lead-in alone first clears at candidate **20**, so an 8-candidate window
+    # could only ever have read 0 of 8 and asserted its own premise was false.
+    # 48 is the first stage's own ceiling, so the check now asks whether the
+    # search's real budget is enough to demonstrate the property -- which is the
+    # question that was actually worth asking.
     emit("")
     emit("== a search cannot fix a lead-in by breaking its lead-out ==")
     fresh = replay(FreeCAD.openDocument(FIXTURE))
@@ -1325,14 +1607,23 @@ def check_lead_out_is_judged_too(doc, job):
         joint = 0
         inspected = 0
         for xy in lead_in_audit.geodesic_start_point_candidates(
-                body, 0, origin, limit=8):
+                body, 0, origin, limit=lead_in_audit.MAX_CANDIDATES):
             if not lead_in_audit._apply_start_point(op, xy):
                 continue
-            lead_ins, lead_outs, _body = lead_runs(
-                cut_moves(op.Path), cut_moves(target.Path))
-            if lead_ins is None:
+            # **Through `index_after`, exactly as `_conflicts_after` does it.**
+            # This loop used to re-read the paths and call `conflicts_for`
+            # against the index the run had built up front, which is a stale
+            # index the moment a candidate moves the operation -- so the
+            # candidate's own lead-in was measured against its old body, crossed
+            # it away from its new attachment, and every candidate was rejected.
+            # That is why this check read "0 of 8" for as long as it existed,
+            # and it is the defect this file now guards rather than a property
+            # of the layout. Measuring by hand instead of going through the
+            # production path would have kept it passing for the wrong reason
+            # again.
+            fresh_runs = lead_in_audit.index_after(op, target, part, index)
+            if fresh_runs is None:
                 continue
-            fresh_runs = lead_in_audit._wire_indices(lead_ins, lead_outs)
             inspected += 1
             only_in = [r for r in fresh_runs if r.kind == "lead-in"]
             if not lead_in_audit.conflicts_for(only_in, op, part, index, margin):
@@ -1374,6 +1665,183 @@ def moves_to_length(lead_outs):
 
 # -- the command ----------------------------------------------------------
 
+#: `RadiusIn` the check inflates to, in mm.
+#:
+#: The fixture has no lead-in/lead-in clash of its own -- the nest is tight
+#: enough that the lead-ins (3-4.8 mm) are longer than the gaps (2.70 mm)
+#: they have to fit into, but they all come to rest on a *body*. To exercise
+#: the lead-run half on real geometry, one lead-in is made long enough to span
+#: the gap and land across a neighbour's lead-in.
+#:
+#: 30 mm is measured, not guessed: at 20 mm the inflated lead-in still stops
+#: short of the neighbour's lead run, and at 30 it reaches it. It is set on a
+#: dressup the user owns and reverted afterwards, so nothing here depends on
+#: the nest staying this tight or this loose.
+FORCED_RADIUS_IN_MM = 30.0
+
+#: How many operations to try before giving up on finding one to inflate.
+FORCED_RADIUS_TRIES = 25
+
+
+def check_a_lead_in_crossing_a_lead_in_is_found_and_fixed():
+    """The half of this module that had never once fired.
+
+    A lead-in is not only a thing that reaches into other people's material --
+    it is itself a cut path, and another operation's lead-in can run into it.
+    On plasma or waterjet that is the worse of the two failures: reaching a
+    contour re-cuts material, while crossing another lead run bridges the arc
+    across a kerf it has already opened, drops the flame and errors the
+    controller.
+
+    **The fixture cannot supply this case on its own**, which is why the check
+    makes one. Scanning the 54-part nest at its own tool radius finds 49
+    conflicts and **none of them** against a lead run; the closest genuine pair
+    of lead runs is 11 same-operation lead-in/lead-out runs touching at the
+    closed loop's shared start point, which is where one run's attachment is.
+    A check that has never gone off cannot be relied on to go off, so the case
+    is built: `RadiusIn` is raised on a real operation until its lead-in spans
+    the gap onto a neighbour's lead-in, and then the ordinary scan has to find
+    it -- at the ordinary margin, with no special flag telling it to look.
+
+    And then the fix, because detection alone is half the ask: the search has
+    to move the start point until the crossing is gone, and a re-scan has to
+    agree. The re-scan is not a formality -- it is `reverify` in miniature,
+    and it is what would catch a fix accepted against a neighbour that had
+    already moved.
+    """
+    emit("")
+    emit("== a lead-in reaching another lead-in is found, and fixed ==")
+    fresh = replay(FreeCAD.openDocument(FIXTURE))
+    if not check(fresh is not None, "a fresh document replayed"):
+        return
+
+    survey = lead_in_audit.scan_job(fresh)
+    prepared, _index, _unreadable = lead_in_audit._prepare(fresh, None)
+    by_name = {entry[0].Name: entry for entry in prepared}
+
+    # Offenders first, nearest clash first: the tightest pairs are the ones a
+    # 30 mm lead-in is most likely to reach, and the walk is short.
+    offenders = [a for a in survey.audits if a.conflicts]
+    offenders.sort(key=lambda a: a.worst.distance)
+
+    target = None
+    inflated = None
+    for audit in offenders[:FORCED_RADIUS_TRIES]:
+        dressup = audit.dressup
+        saved = dressup.RadiusIn
+        dressup.RadiusIn = FORCED_RADIUS_IN_MM
+        dressup.recompute()
+        entry = by_name.get(dressup.Name)
+        if entry is None:
+            dressup.RadiusIn = saved
+            dressup.recompute()
+            continue
+        _d, op, part, margin, _stale_runs, _body = entry
+        # The runs `index_after` returns, not the ones `_prepare` captured
+        # before the inflation. An earlier version of this check used the stale
+        # list, and so reported a clash between a 3 mm lead-in and a neighbour
+        # that the 30 mm one had not reached -- found, printed, and then
+        # contradicted by the scan it went on to run.
+        runs = lead_in_audit.index_after(op, dressup, part, _index)
+        if runs is None:
+            # Restored on this path too, not only on the "no clash" one: a
+            # dressup left at 30 mm because we gave up reading it would go on
+            # to the checks below with a lead-in it does not really have.
+            dressup.RadiusIn = saved
+            dressup.recompute()
+            continue
+        hits = [c for c in lead_in_audit.conflicts_for(runs, op, part, _index,
+                                                        margin)
+                if c.role != lead_in_audit.ROLE_BODY]
+        if hits:
+            target, inflated = dressup, saved
+            emit("  forced on %s: RadiusIn %.1f -> %s"
+                 % (dressup.Label, FORCED_RADIUS_IN_MM,
+                    "; ".join(c.summary() for c in hits[:2])))
+            break
+        dressup.RadiusIn = saved
+        dressup.recompute()
+
+    if not check(target is not None,
+                 "a lead-in reaching another operation's lead-in was produced "
+                 "on real geometry"):
+        return
+
+    try:
+        result = lead_in_audit.scan_job(fresh)
+        trial = _find(result.audits, target.Name)
+        if not check(trial is not None and trial.status ==
+                     lead_in_audit.OperationAudit.UNRESOLVED,
+                     "the ordinary scan reports it at the ordinary margin "
+                     "(status %s)"
+                     % (trial.status if trial else "missing")):
+            return
+
+        run_clashes = [c for c in trial.conflicts
+                       if c.role != lead_in_audit.ROLE_BODY]
+        check(bool(run_clashes),
+              "and names it as a lead run, not a cut path (%d found, roles %s)"
+              % (len(run_clashes), sorted(set(c.role for c in trial.conflicts))))
+        if run_clashes:
+            said = run_clashes[0].summary()
+            check("cut path" not in said,
+                  "the sentence does not claim it is a cut path", said)
+            check("lead-in" in said or "lead-out" in said,
+                  "the sentence names the lead run", said)
+
+        report = "\n".join(lead_in_audit.describe_result(result, dry_run=True))
+        check("rather than its cut path" in report,
+              "and the report gives lead runs a section of their own")
+        # Matched on the invariant tail, not on "1 reach"/"2 reach": the
+        # headline agrees with itself about the verb, and a check pinned to one
+        # plural form would fail the day the count moved from 2 to 1.
+        headline = lead_in_audit.describe_result(result, dry_run=True)[0]
+        check("another operation's lead-in or lead-out." in headline,
+              "and the headline counts them (%d)"
+              % lead_in_audit._lead_run_conflicts(result))
+
+        # The fix, on the job as it stands.
+        lead_in_audit.resolve_conflicts(result, dry_run=False,
+                                        limit=lead_in_audit.MAX_CANDIDATES)
+        moved = _find(result.audits, target.Name)
+        check(moved is not None and moved.status !=
+              lead_in_audit.OperationAudit.UNRESOLVED,
+              "the search moved it clear (%s)"
+              % (moved.status if moved else "missing"))
+
+        after = lead_in_audit.scan_job(fresh)
+        recheck = _find(after.audits, target.Name)
+        check(recheck is not None and recheck.status ==
+              lead_in_audit.OperationAudit.CLEAN,
+              "and a fresh scan agrees it is clear (%s)"
+              % (recheck.status if recheck else "missing"))
+        check(lead_in_audit._lead_run_conflicts(after) == 0,
+              "with no lead-run clash left anywhere on the sheet (%d)"
+              % lead_in_audit._lead_run_conflicts(after))
+    finally:
+        lead_in_audit.clear_conflict(target)
+        target.RadiusIn = inflated
+        target.recompute()
+
+
+def check_the_lead_run_count_is_always_stated(job):
+    """Zero is a measurement the reader is entitled to.
+
+    It used to be silently absent on every layout this was developed against,
+    which is indistinguishable from "not checked" -- and is how a check that
+    never fires survives for years.
+    """
+    emit("")
+    emit("== the report states the lead-run count even when it is zero ==")
+    survey = lead_in_audit.scan_job(job)
+    lines = lead_in_audit.describe_result(survey)
+    emit("  %s" % lines[0])
+    check(any("another operation's lead-in or lead-out." in line
+              for line in lines),
+          "the headline says how many lead runs were reached (%d)"
+          % lead_in_audit._lead_run_conflicts(survey))
+
+
 def check_command_is_importable():
     emit("")
     emit("== the command registers ==")
@@ -1412,6 +1880,8 @@ def main():
     check_no_tool_means_reported_not_guessed(doc, job)
     check_unfixable_is_marked(doc, job)
     check_lead_out_is_judged_too(doc, job)
+    check_a_lead_in_crossing_a_lead_in_is_found_and_fixed()
+    check_the_lead_run_count_is_always_stated(job)
     # These read the geometry itself rather than a report, and they must run
     # before anything mutates the shared `job` -- `check_the_fix` above has
     # already moved start points on it.

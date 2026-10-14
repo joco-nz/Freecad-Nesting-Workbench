@@ -184,6 +184,122 @@ def check_the_command_is_registered():
     return command
 
 
+def check_the_clearance_dial_is_wired(command):
+    """`_ask` returns a mode *and* the clearance, and the dial is in the box.
+
+    The construction check below only proves the dialog does not raise. This
+    one clicks it: `clickedButton` is stubbed to return the Report-only button,
+    so `_ask` takes the path it takes when a user presses it and the tuple it
+    hands back can be inspected.
+
+    **The spin box has to be found, not merely constructed.** A clearance that
+    never reaches the layout is a setting the user can see and not change, and
+    the scan would silently keep running at the previous value -- which is the
+    same shape of defect as the rest of NEST-037 and NEST-038.
+    """
+    emit("")
+    emit("-- 4b. the clearance dial is on the dialog and comes back with it --")
+    from freecad.nestingworkbench import constants
+
+    original_exec = QtWidgets.QMessageBox.exec_
+    original_clicked = QtWidgets.QMessageBox.clickedButton
+    captured = {}
+
+    def _no_wait(self, *args, **kwargs):
+        captured["box"] = self
+        return 0
+
+    def _report_button(self):
+        # Whatever `_ask` added first with the AcceptRole is "Report only".
+        for button in self.buttons():
+            if button is not None and self.buttonRole(button) == \
+                    QtWidgets.QMessageBox.AcceptRole:
+                return button
+        return None
+
+    try:
+        QtWidgets.QMessageBox.exec_ = _no_wait
+        QtWidgets.QMessageBox.clickedButton = _report_button
+        try:
+            asked = command._ask()
+        finally:
+            QtWidgets.QMessageBox.exec_ = original_exec
+            QtWidgets.QMessageBox.clickedButton = original_clicked
+    except Exception:
+        check(False, "_ask() raised:\n%s" % traceback.format_exc())
+        return
+
+    check(isinstance(asked, tuple) and len(asked) == 2,
+          "_ask returns (mode, clearance), not a bare mode (%r)" % (asked,))
+    if not (isinstance(asked, tuple) and len(asked) == 2):
+        return
+    mode, clearance = asked
+    check(mode == "report", "pressing Report only reports (got %r)" % mode)
+    check(constants.MIN_LEAD_IN_CLEARANCE <= clearance
+          <= constants.MAX_LEAD_IN_CLEARANCE,
+          "the clearance is inside its bounds (%.3f)" % clearance)
+
+    box = captured.get("box")
+    spins = []
+    if box is not None:
+        spins = box.findChildren(QtWidgets.QDoubleSpinBox)
+    check(len(spins) == 1,
+          "the dialog carries exactly one clearance control (%d found)"
+          % len(spins))
+    if spins and isinstance(asked, tuple):
+        check(abs(spins[0].value() - clearance) < 1e-9,
+              "and its value is what comes back (%.4f vs %.4f)"
+              % (spins[0].value(), clearance))
+        check(bool(spins[0].toolTip()),
+              "and it explains itself on hover")
+
+
+def check_the_clearance_is_remembered():
+    """The dial persists, and cannot be left holding nonsense.
+
+    Preferences outlive the document, so this value is read by the next FreeCAD
+    launch. A stored zero, a hand-edited negative or a NaN would all arrive
+    from a parameter file rather than from this code, and a negative margin
+    makes `_off_sheet` report every pierce point as inside the clearance.
+    """
+    emit("")
+    emit("-- 4c. the clearance is remembered, and clamped on the way in and out --")
+    from freecad.nestingworkbench import constants
+    from freecad.nestingworkbench.commands import command_audit_lead_ins
+
+    original = FreeCAD.ParamGet(constants.PREFS_PATH).GetFloat(
+        constants.PROP_LEAD_IN_CLEARANCE, -12345.0)
+    try:
+        stored = command_audit_lead_ins._store_clearance(2.5)
+        check(abs(stored - 2.5) < 1e-9, "2.5 is stored as given (%r)" % stored)
+        check(abs(command_audit_lead_ins._stored_clearance() - 2.5) < 1e-9,
+              "and read back (%r)" % command_audit_lead_ins._stored_clearance())
+
+        # A hand-edited parameter file is not this code's fault and must not
+        # become its problem.
+        FreeCAD.ParamGet(constants.PREFS_PATH).SetFloat(
+            constants.PROP_LEAD_IN_CLEARANCE, -5.0)
+        check(command_audit_lead_ins._stored_clearance()
+              == constants.MIN_LEAD_IN_CLEARANCE,
+              "a stored negative clamps to the floor (%r)"
+              % command_audit_lead_ins._stored_clearance())
+        FreeCAD.ParamGet(constants.PREFS_PATH).SetFloat(
+            constants.PROP_LEAD_IN_CLEARANCE, 9999.0)
+        check(command_audit_lead_ins._stored_clearance()
+              == constants.MAX_LEAD_IN_CLEARANCE,
+              "a stored absurd value clamps to the ceiling (%r)"
+              % command_audit_lead_ins._stored_clearance())
+        check(command_audit_lead_ins._store_clearance(float("nan"))
+              == constants.DEFAULT_LEAD_IN_CLEARANCE,
+              "and a NaN falls back to the default (%r)"
+              % command_audit_lead_ins._store_clearance(float("nan")))
+    finally:
+        FreeCAD.ParamGet(constants.PREFS_PATH).SetFloat(
+            constants.PROP_LEAD_IN_CLEARANCE, original)
+        FreeCAD.ParamGet(constants.PREFS_PATH).RemFloat(
+            constants.PROP_LEAD_IN_CLEARANCE)
+
+
 def check_the_dialog_builds(command):
     """`_ask` builds a QMessageBox; broken dialog code must fail here."""
     emit("")
@@ -478,6 +594,8 @@ def main():
     check_menu_lists_it_without_the_toolbar()
     if command is not None:
         check_the_dialog_builds(command)
+        check_the_clearance_dial_is_wired(command)
+        check_the_clearance_is_remembered()
         check_is_active_follows_selection(command)
     check_the_progress_panel_builds()
     check_cancel_stops_the_panel()

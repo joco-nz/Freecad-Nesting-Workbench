@@ -894,3 +894,36 @@ work existed) — re-nesting that fixture remains a pending user decision
 - `bound_*` objects are source bounds at origin (one per source label, drawn
   only from `shape_preparer.py:618`) — not per-part layout bounds; layer 3a's
   source is `job.sheets[].parts[].shape.polygon`.
+
+## CAM-replay addendum — NEST-037 (lead-in vs lead-in)
+
+A second, unrelated defect found while verifying the lead-in audit on the
+committed nest. Filed as [NEST-037](issues.md#nest-037); summarised here
+because it is the same shape as the defects above — **a checker that cannot
+report the thing it was built to report**:
+
+- The audit has always tested lead runs against each other. It had never fired
+  at a real tool radius: over the fixture's 170 runs the scan finds **49**
+  conflicts against bodies and **0** against lead runs at 0.6 mm, and 4 at
+  10 mm. A check that has never gone off cannot be relied on to go off, so the
+  harness now **builds the case** — `RadiusIn` to 30 mm on a real operation
+  until its lead-in spans the gap onto a neighbour's lead-in.
+- When it did fire, `mark_conflict` named the neighbour's **cut path** for a
+  clash with its **lead-in**, which is the exact mis-description
+  `Conflict.what` exists to prevent.
+- The fix stage verified every candidate against an index built before any
+  start point moved. Measured: one operation's lead-in went from **20.0 mm**
+  away from a neighbour's to **0.0 mm** from it, and the neighbour's search
+  cleared against the old position.
+- The sheet-edge check asked a *point* how far it was from a *polygon*, which
+  Shapely answers `0` whenever the point is inside. Every pierce point on the
+  material therefore read "0 mm from the edge" — see
+  [NEST-038](issues.md#nest-038).
+
+Same lesson as the layers above, one level up: **the absence of a complaint is
+not evidence of an absence.** A count that is silently zero, a sentence that is
+always the same, a check that has never fired, and a margin pinned to the only
+value the bug permitted all read identically to a clean result. The report now
+states the lead-run count, and states it when it is zero; the edge margin is
+the tool radius it should always have been, and `_signed_distance` measures to
+the boundary.

@@ -89,6 +89,9 @@ the symbol when you edit the entry.
 | [NEST-034](#nest-034) | parts land closer than `PartSpacing` allows while every collision check passes | resolved | high (measured) | nesting / geometry |
 | [NEST-035](#nest-035) | profile extraction at fine deflection can disagree with the part's own silhouette | open | medium (measured) | nesting / geometry |
 | [NEST-036](#nest-036) | verify-on-accept starves the NFP search at simplification ≥ 0.3 | resolved (repair-push) | high (measured) | nesting / search |
+| [NEST-037](#nest-037) | a lead-in reaching another lead-in was found but reported as a cut-path clash, and the search verified fixes against pre-move geometry | resolved | high (measured) | CAM replay |
+| [NEST-038](#nest-038) | the sheet-edge check measured distance to the polygon, so every pierce on the material read 0 mm from the edge and no clearance was expressible | resolved | high (measured) | CAM replay |
+| [NEST-039](#nest-039) | the lead-in clearance is fixed at the tool radius, so the user cannot turn the check up or down | resolved | low (by design) | CAM replay / UI |
 
 Statuses for NEST-009 through NEST-021 were derived from each entry's own
 prose, cross-checked where a later entry supersedes an earlier one: NEST-018's
@@ -4295,3 +4298,421 @@ NEST-036 fix", for the per-run probe reports (G1, G3, G2, repair faithful A,
 repair run F, repair-off control, empty-kills diagnostic — all scratch, not
 preserved); and `tests/freecad_harness/test_verify_stage.py` (55/50 checks),
 which is committed and reruns in under a second.
+
+## NEST-037 — a lead-in reaching another lead-in was reported as a cut-path clash, and the search verified fixes against geometry that had already moved
+
+`status: resolved` · `severity: high (measured)` · `area: CAM replay`
+
+Found by the user, on their own nest, after testing [NEST-033](#nest-033)
+against a layout tighter than the committed fixture: *"it does not seem to be
+testing for leadin/leadouts ALSO hitting each other. I have seen an instance
+where these crossed but did not interfere with another part."*
+
+Two defects, found together because they are two ways of not looking at the
+same thing.
+
+### 1. It was tested, and it was never once seen
+
+`_CutIndex` has always carried lead runs as entries alongside bodies, tagged
+with a `role`, and `conflicts_for` has always tested them. The check existed;
+nothing had ever watched it work.
+
+Measured over the 54-part fixture's 170 runs:
+
+| margin | conflicts against a body | conflicts against a lead run |
+|---|---:|---:|
+| 0.0 mm -- exact intersection | 40 | **0** |
+| 0.6 mm -- the operations' own tool radius | 49 | **0** |
+| 3.0 mm | 83 | **0** |
+| 10.0 mm | 242 | 4 |
+
+So the geometry path is right — at a margin wide enough to expose them, real
+FreeCAD output yields 3 lead-in and 1 lead-out clashes — and it has never fired
+at a margin anyone would use. The closest genuine pair is 11 same-operation
+lead-in/lead-out runs touching at the closed loop's shared start point, which
+is where one run's attachment is, and is correctly filtered. The fixture is a
+lead-in/lead-out-poor nest: the lead-ins (3–4.8 mm) are longer than the gaps
+(2.70 mm) they have to fit into, but they all come to rest on a *body*.
+
+### 2. When it did fire, it named the wrong thing
+
+`mark_conflict` built its sentence from the part name and the literal words
+`cut path`. A lead-in that reached another operation's **lead-in** was therefore
+marked `comes within 0.0000 mm of part_TopStrap_14's cut path` — the exact
+mis-description `Conflict`'s own docstring is written to prevent. The operator
+is sent to a contour that was never involved, while the two lead runs actually
+crossing go unexamined. On plasma that is the difference between looking at the
+right thing and posting the job. `Conflict.summary` is now the single sentence
+the report, the tree property and the log line all use, so they cannot drift.
+
+The report counted lead-run clashes nowhere, and every section heading said
+"another part's cut path". The headline now states the count — including when
+it is zero, which is the point: a silent zero is indistinguishable from a check
+that never ran.
+
+### 3. The search could not be trusted to fix one, even once found
+
+`resolve_conflicts` built the sheet index once and never corrected it. Shapely
+`STRtree` is immutable, so after the first operation's start point moved, every
+subsequent candidate was verified against a neighbour advertised at where it
+used to be.
+
+Measured on the fixture's own geometry: moving one operation's start point
+carried its lead-in from **20.0 mm** away from a neighbour's lead-in to
+**0.0 mm** from it. The neighbour's own search then cleared a run against a
+lead-in that was not there, and the run finished reporting a clean sheet with
+two lead-ins crossing on it. Every individual test in that run passed against
+the index it was given, which is why nothing caught it.
+
+The operation's **own** stale body entry turns out to be harmless, and it is
+worth recording why rather than leaving it to be rediscovered: a moved start
+point moves the attachment, but the contour passes through the attachment
+whichever vertex the body starts from, and `_attachment_points` knows that point
+is one of the run's own ends. The attachment is filtered either way. The
+neighbour's entry is the one that mattered.
+
+Fixed by `_CutIndex.replace` + `index_after`, which republish an operation's
+body and runs from what it cuts now, called from `_conflicts_after` on every
+applied candidate and from a `finally` on every path that restores. The rebuild
+is free enough to do per candidate: **0.0754 ms** over the fixture's 280
+entries, so the worst 384-candidate search pays **28.9 ms** against about
+8400 ms of FreeCAD recompute — 0.3%.
+
+`reverify` then re-reads the finished job at the end of a run and downgrades
+any `FIXED` that does not hold up, marking it `CONFLICT_`. It cannot be caught
+per-operation, because the failure is only visible across operations.
+
+### Effect on the committed harness
+
+`check_lead_out_is_judged_too` was failing at `0 of 8` candidates before this
+and passes now — but not for the reason it first appeared to. The candidate
+budget was the cause: 8 is 8 mm of travel, and the lead-in alone first clears
+at candidate **20** on the re-nested layout, so the check had been asserting
+its own premise was false. It now walks the first stage's real ceiling.
+
+### Not covered
+
+`reverify` **marks** an operation it cannot vouch for rather than searching it
+again, so the tool settles at **two passes**: one to fix, one to fix what the
+first disturbed, and a third to confirm nothing moved. Iterating to a fixed
+point inside one run would converge in a single call, at the cost of
+re-searching on a bad nest; the run is deliberately one pass with a working
+cancel, so it was left at that. The alternative is a `--until-stable` loop over
+`resolve_conflicts`.
+
+### A latent one, found while fixing the above — and it was worse than it looked
+
+An earlier draft of this entry reported *"six lead runs on the fixture have
+pierce points at exactly 0.0000 mm from the sheet edge, a knife-edge decided by
+a strict inequality"*. **That was wrong, and the number was the symptom of a
+real defect rather than of a marginal layout.**
+
+`_signed_distance` measured a point's distance to the **polygon**, not to its
+**boundary**. Shapely's `distance` between two geometries of different
+dimensions is 0 whenever they intersect, so **every** pierce point on the
+material measured 0 mm from the edge:
+
+    Point(300, 150).distance(sheet)          ->  0.0000   (the sheet's centre)
+    Point(300, 150).distance(sheet.boundary) -> 150.0000
+
+So it was not six runs on the boundary, it was all 170 reporting the same
+meaningless number. The off-sheet check appeared to work only because the margin
+it was given was `0.0` and `0 < 0` is False — an accident, and one that made
+the distance unusable the moment a margin was anything else. **"Is this pierce
+too near the edge?" was not a question this module could ask**, which is why
+`SHEET_MARGIN_MM` was `0.0` and read as a considered policy when it was really
+a constraint imposed by the bug.
+
+Measured against the boundary, the fixture's closest pierce point is
+**2.3105 mm** and the distribution is: 0 off the sheet, 0 inside a tool radius,
+1 within four radii, 169 clear. So nothing here was ever near the edge — the
+finding was the measurement.
+
+Now fixed (`_signed_distance` measures to `sheet.boundary`, and the margin is
+the operation's own tool radius), and the clearance is expressible:
+
+    margin = the operation's tool radius
+
+The pierce is a hole and the hole is the tool's own width. A pierce 0.4 mm from
+the edge with a 0.6 mm tool puts two thirds of the kerf on air — on plasma the
+arc strikes across a sliver, on a waterjet the kerf runs off the edge and the
+part loses its boundary. So the edge gets **the same clearance `conflicts_for`
+demands of a neighbour, from the same number, for the same reason: the kerf has
+to have material on both sides of it.** Four findings are now possible rather
+than one, and each is worded as what it is; printing the old `-distance` for a
+positive one would have said *"pierces -0.3000 mm off the edge"* for a pierce
+that is on the material.
+
+### The stale pins this uncovered, and what was done about them
+
+Four checks in `tests/freecad_harness/test_lead_in_audit.py` were failing
+before this work, all from commit `8f0c946` re-nesting the fixture. They were
+captured on pristine HEAD first. **None of them was re-pinned to whatever the
+code currently prints** -- that asserts nothing and breaks again on the next
+re-nest. Each was replaced by something that tests the property instead:
+
+| was | now | why that is not another pin |
+|---|---|---|
+| `nearest near miss = 0.0277 mm` | `nearest near miss < 14.5239 mm` | The pin's job is catching **chorded arcs**, and chording *loses* conflicts by pulling a cut path up to the largest arc sag inside the material. The meaningful statement is that the nearest near miss is **tighter than that sag** -- chord it and the clash vanishes with it. Catches chording just as hard, and is a property of the reader rather than of the nest. |
+| `lead-ins piercing off the sheet were found` | **built**, not pinned | See below. |
+| `the report has a section for it` | follows from the line above | It was never a separate pin; it asserted that a section existed for a finding set that was empty. |
+| `a second run changes nothing` | `a third run moves nothing` | See below. |
+
+**The off-sheet pair was not a stale pin. It was a silently vacuous test**, and
+that is the more interesting finding of the two. Four assertions sat inside a
+loop over the lead-ins that pierce off the edge:
+
+    check(bool(off), "lead-ins piercing off the sheet were found (%d of them)")
+    for audit, finding in off[:3]:
+        check(finding.distance < 0.0, ...)                  # never ran
+        check("off the edge of the sheet" in ..., ...)      # never ran
+        check(audit.status == UNRESOLVED, ...)              # never ran
+        check(audit.needs_attention, ...)                   # never ran
+
+When the re-nest left the fixture with none, all four stopped executing. They
+did not fail -- they were not counted at all, because the counter increments
+inside `check()`. The suite showed one red check where there had been five, and
+the four that had evaporated were invisible. **A re-pin to `0` would have been
+worse than useless**: it turns "we found none" into a permanent green check,
+keeps the loop empty, and hides the next regression behind it too.
+
+So the case is **built**, the same way the lead-run one is: `RadiusIn` is raised
+on a real operation until its pierce point leaves the stock. Measured -- the
+fixture's closest pierce points are **0.0000 mm** from the edge, sitting *on*
+it, so at 10 mm and 20 mm of `RadiusIn` nothing leaves the sheet and at 40 mm a
+lead-in goes **2.1190 mm** off it. That restores all five assertions to actually
+running and costs no pin.
+
+**The general tripwire.** The lesson is not specific to the off-sheet check, so
+it is now structural: `group()` reports an empty group as a check of its own
+and *yields* the items, so there is no shape in which a check loop can silently
+skip itself. Mutation-tested both ways -- with a vanishing phenomenon and the
+guard disabled, the four in-loop assertions stop running and the suite goes
+quiet again; with the guard they fail loudly.
+
+**`a second run changes nothing` asserted single-pass convergence**, which is a
+stronger claim than the design makes. An operation whose neighbour is fixed late
+in a run is fixable only on a second pass, because its neighbour's final
+position is not known until the first ends, and `reverify` catches and marks it
+rather than re-searching inside the run. The check now asserts the
+anti-oscillation guarantee it was reaching for: **a third run moves nothing**.
+It read `fixed: 5` before the index fix and `fixed: 1` after, and the remaining
+one is correct behaviour meeting an over-strict assertion.
+
+The suite went from **7 of 171** failing, to **4 of 183**, to **all 188
+passing**.
+
+Separately, `test_rotation_determinism.py` fails on pristine HEAD with *"seeds
+777 and 778 produced the same layout"* -- a nesting-seed issue, unrelated to
+this file and confirmed by stashing this work and re-running. Still open, and
+still not diagnosed.
+
+Evidence: `tests/freecad_harness/test_lead_in_audit.py` →
+`check_a_lead_in_crossing_a_lead_in_is_found_and_fixed`, which builds the case
+the fixture lacks — `RadiusIn` raised to 30 mm on a real operation until its
+lead-in spans the gap onto a neighbour's lead-in (measured: at 20 mm it still
+stops short) — then asserts the ordinary scan finds it at the ordinary margin,
+names it as a lead run, and that the search moves it clear with a fresh scan
+agreeing. `check_the_sheet_edge_is_checked` builds its own case the same way.
+Plus 19 pure-Python checks in
+`tests/test_cam_replay/test_lead_in_audit.py`, all mutation-tested: reverting
+`replace` to a no-op fails 5, restoring the hardcoded `cut path` sentence fails
+1, making `reverify` read without downgrading fails 1, and removing the dry-run
+guard on the call site fails 1. The `group()` tripwire is mutation-tested
+separately: with a vanishing phenomenon and the guard disabled, the four
+in-loop assertions stop running and the suite goes quiet — the defect
+reproduced exactly — where with the guard they fail loudly.
+
+## NEST-038 — the sheet-edge check measured to the polygon, so every pierce on the material read 0 mm from the edge
+
+`status: resolved` · `severity: high (measured)` · `area: CAM replay`
+
+Found while clearing the stale pins under [NEST-037](#nest-037), by asking a
+question the module could not answer: *how close to the sheet edge does this
+pierce point land?*
+
+### The measurement was meaningless, and the zero margin was the tell
+
+`_signed_distance` measured a point's distance to the **sheet polygon** rather
+than to its **boundary**. Shapely's `distance` between geometries of *different
+dimensions* is 0 whenever they intersect, so any point lying inside the sheet
+measures zero distance from it:
+
+    Point(300, 150).distance(sheet)          ->  0.0000
+    Point(300, 150).distance(sheet.boundary) -> 150.0000
+
+Consequence: **every** pierce point on the material reported 0 mm from the edge.
+Not six runs on a knife-edge — all 170, at the same meaningless number.
+
+The check still appeared to work, and this is the part worth dwelling on. It
+only ever *could*, because the margin it was given was `SHEET_MARGIN_MM = 0.0`
+and `0 < 0` is False. A margin of 0 was not a policy about pierce points; it was
+a **constraint imposed by the bug**, sitting in the source reading like a
+deliberate decision:
+
+    #: How far outside the stock a pierce point may be and still count as on the
+    #: sheet, in mm. Zero by default: a pierce point is a hole, and a hole whose
+    #: centre is off the material is not a hole in the material.
+
+That comment is not wrong as a statement. It is wrong as a *decision*, because
+the alternative it forecloses — a margin — would have misreported every finding
+on the sheet.
+
+Every finding the check actually produced was still correct: an off-sheet point
+does not intersect the polygon, so the two distance calls agree there. What was
+broken is the **inside** case, which is exactly the case you must be able to
+measure in order to implement a clearance.
+
+### What it prevented
+
+"Is this pierce within a kerf of the edge?" could not be expressed at all. A
+pierce 0.4 mm from the edge and one 150 mm from it were the same number, so
+there was no value of the margin that distinguished them. The user's report —
+*a pierce less than tool radius from the edge needs to be considered an issue* —
+was unanswerable until this was fixed, and fixing it was the work.
+
+Measured against the boundary, the fixture's closest pierce point is
+**2.3105 mm**:
+
+| distance from the edge | pierce points |
+|---|---:|
+| off the sheet | 0 |
+| inside a 0.6 mm tool radius | 0 |
+| within 4x the tool radius | 1 |
+| clear | 169 |
+
+So nothing on this nest was ever near the edge — the finding was entirely the
+measurement.
+
+### The change
+
+* `_signed_distance` measures to `sheet.boundary`.
+* The margin is the **operation's own tool radius**, carried on its audit and
+  **required** by `_off_sheet` — no default, because a default is what let the
+  old `0.0` hide there unnoticed.
+* The reasoning, which is the part that makes it a policy rather than a fudge:
+  the pierce is a hole and the hole is the tool's own width. A pierce 0.4 mm
+  from the edge with a 0.6 mm tool puts two thirds of the kerf on air — on
+  plasma the arc strikes across a sliver, on waterjet the kerf runs off the
+  edge and the part loses its boundary. **The edge gets the same clearance
+  `conflicts_for` demands of a neighbour, from the same number, for the same
+  reason: the kerf has to have material on both sides of it.**
+* `OffSheet` carries the margin and now distinguishes **four** findings rather
+  than one, each worded as what it is. Previously every finding was negative, so
+  one sentence covered everything; printing the old `-distance` for a positive
+  one says *"pierces -0.3000 mm off the edge"* for a pierce that is on the
+  material.
+* `worst_off_sheet` picks the **nearest** the edge, not the furthest outside. A
+  pierce 0.05 mm inside the edge is the worse finding, not the milder one.
+
+### Coverage, and one gap that had to be closed
+
+Nine pure-Python checks, mutation-tested. Reverting the distance to the polygon
+— i.e. putting the original bug back — fails **6** of them.
+
+The wiring is a separate matter. `_conflicts_after` reads real toolpaths through
+FreeCAD, so nothing in the pytest tier can drive it, and **hardcoding `0.0` there
+passed all 80 checks** while reintroducing this exact bug one line from the fix.
+That is asserted on the AST instead, with the harness named as the behavioural
+backstop, rather than left as an acknowledged hole.
+
+### Swept for the same bug elsewhere
+
+The trap is easy to repeat, so it was looked for across the workbench rather
+than assumed unique. Every other `.distance()` call site is between geometries
+of the *same* dimension, where Shapely computes the real gap:
+
+* `lead_in_audit.py` `conflicts_for`, and the `near()` linear fallback —
+  `LineString.distance(LineString)`. Correct as written.
+* `cam_replay.check_tool_clearance` → `tightest_part_gap` →
+  `Polygon.distance(Polygon)`. Correct as written.
+* `cam_replay`'s hole-nesting tests use `Polygon.contains(Point)`, which asks
+  containment rather than clearance and is unaffected.
+
+The `buffer(0)` calls under `Tools/Nesting/` are the standard Shapely idiom for
+repairing a self-intersecting polygon, not this bug. **The defect is confined to
+`_signed_distance`**, which was the only place asking a *point* how far it was
+from a *polygon* — and it was asking it in order to apply a clearance, which is
+the one use the answer is useless for.
+
+Evidence: `tests/test_cam_replay/test_lead_in_audit.py`, section "the sheet
+edge" — including `test_the_distance_is_to_the_edge_and_not_to_the_polygon`,
+which pins the Shapely behaviour itself so the bug cannot come back quietly, and
+`test_the_margin_is_the_only_thing_separating_clear_from_too_close`, which
+checks one pierce point against two margins and demands opposite verdicts.
+
+## NEST-039 — the lead-in clearance is fixed at the tool radius, so the user cannot turn the check up or down
+
+`status: resolved` · `severity: low (by design)` · `area: CAM replay / UI`
+
+Requested by the user after NEST-038, and it is the natural knob: *"make the edge
+checking value an adjustable factor of the tool diameter on the popup dialogue
+where the choice to report or report fix is — that would empower the user to
+adjust the sensitivity of starts to edges or other cuts."*
+
+### The shape of it
+
+One factor, applied **once**, in `_prepare`. Both checks read the margin that
+comes out of there and neither re-derives it — `conflicts_for` is handed
+`margin`, and `_off_sheet` reads it off the audit — so a single multiplication
+scales the neighbour clearance, the edge clearance and the search's acceptance
+test together. They cannot drift apart, which is the property that matters: a
+dial that moved one check and not the other would produce a report whose two
+halves disagree about what "too close" means.
+
+The factor multiplies an **explicit** `margin` too, so `scan_job(job,
+margin=2.0, clearance=1.5)` means 3.0 mm rather than "2.0, except the other
+check disagrees". One rule, no special cases.
+
+### Two decisions worth recording
+
+**The unit is the tool radius, not the diameter.** The request said diameter,
+and at 1.0 that would have silently doubled the clearance every existing user
+had. Scaling the radius and defaulting to 1.0 means **the default is exactly
+the behaviour this module has always had**, which is the only safe default for
+a setting that changes what a report says. 1.0 is not arbitrary either — it is
+the smallest clearance that is physically meaningful, a cut exactly touching its
+neighbour and no more.
+
+**The factor is carried on `AuditResult`, not re-derived.** `resolve_conflicts`
+rebuilds the index from scratch and reads `margin` back off the result. Had it
+used the default there, a run at 2x would have had every candidate tested at
+1x — so a report reading "40 operations need doing by hand at 2x" would have
+been produced by a search that accepted only what was already clear at 1x, and
+nothing would have said so. Mutation-tested: dropping `result.clearance` from
+that call fails the check written for it.
+
+### The dial itself
+
+Added to the report-or-fix `QMessageBox` through its grid, since `QMessageBox`
+has no `addWidget`. **Not** a second dialog: putting another modal between the
+user and the decision they were asked to make is worse than the slight
+impurity of reaching into the box's layout. The first version of this used a
+nested layout and raised `TypeError: QGridLayout.addLayout(): not enough
+arguments` — caught by the GUI suite, which is what that suite is for.
+
+* Range 0.00 – 10.00, step 0.25, two decimals. Zero is allowed because it means
+  something specific — report only outright crossings — rather than being an
+  invalid entry; the ceiling is a judgement call, and past ten radii the dial is
+  expressing a preference rather than a constraint.
+* Stored in preferences, **clamped on read as well as on write**. The value
+  comes from a user-editable parameter file that outlives any code, and a
+  negative margin makes `_off_sheet` report every pierce point as inside it.
+  NaN is handled separately, since it compares false against everything.
+* **Cancelling the dialog leaves the stored value alone.** Writing it on the way
+  out would let an abandoned dialog change a setting.
+* The report states the clearance in its headline — in millimetres when the job
+  has a readable tool, as a bare factor when it does not. The counts are a
+  function of it, so a headline without it quotes numbers that cannot be
+  compared with any other run.
+
+### Coverage
+
+Ten pure-Python checks, mutation-tested. The load-bearing one is
+`test_the_search_rebuilds_its_index_at_the_same_clearance_the_scan_used`:
+reverting the `_prepare` call in `resolve_conflicts` to the default **survived
+the first version of this** and failed only once it was rewritten to record
+`_prepare`'s arguments directly. Eleven GUI checks, including one that clicks
+the dialog and inspects the returned tuple and the widget in it — removing the
+spin box from the layout fails it, which is the difference between a control
+that exists and a setting the user can reach.

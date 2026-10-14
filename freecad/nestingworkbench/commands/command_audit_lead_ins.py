@@ -63,9 +63,57 @@ import FreeCAD
 import FreeCADGui
 from PySide import QtWidgets
 
+from freecad.nestingworkbench.constants import (
+    DEFAULT_LEAD_IN_CLEARANCE,
+    MAX_LEAD_IN_CLEARANCE,
+    MIN_LEAD_IN_CLEARANCE,
+    PREFS_PATH,
+    PROP_LEAD_IN_CLEARANCE,
+)
 from freecad.nestingworkbench.Tools.Cam import cam_replay
 from freecad.nestingworkbench.Tools.Cam import lead_in_audit
 from freecad.nestingworkbench.Tools.Cam import lead_in_progress
+
+
+def _stored_clearance():
+    """The remembered clearance, clamped into range.
+
+    Read from preferences so the setting survives closing the dialog and the
+    document, which is the point of making it a dial rather than a one-off.
+
+    **Clamped on read, not trusted.** The value comes from a user-editable
+    parameter file that outlives any code: a hand-edited `0`, a stored negative
+    from a version that meant something else, or a string will all arrive here.
+    `QDoubleSpinBox.setRange` clamps the widget, but a caller reading the
+    preference directly -- the next FreeCAD launch, another script -- must not
+    be handed a negative clearance, and a negative margin makes
+    `_off_sheet` report *every* pierce point as inside it.
+    """
+    try:
+        prefs = FreeCAD.ParamGet(PREFS_PATH)
+        value = float(prefs.GetFloat(PROP_LEAD_IN_CLEARANCE,
+                                     DEFAULT_LEAD_IN_CLEARANCE))
+    except Exception:
+        return DEFAULT_LEAD_IN_CLEARANCE
+    if value != value:            # NaN, which compares false against everything
+        return DEFAULT_LEAD_IN_CLEARANCE
+    return max(MIN_LEAD_IN_CLEARANCE, min(MAX_LEAD_IN_CLEARANCE, value))
+
+
+def _store_clearance(value):
+    """Remember the clearance. Returns the clamped value actually stored."""
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        value = DEFAULT_LEAD_IN_CLEARANCE
+    if value != value:
+        value = DEFAULT_LEAD_IN_CLEARANCE
+    value = max(MIN_LEAD_IN_CLEARANCE, min(MAX_LEAD_IN_CLEARANCE, value))
+    try:
+        FreeCAD.ParamGet(PREFS_PATH).SetFloat(PROP_LEAD_IN_CLEARANCE, value)
+    except Exception:
+        pass
+    return value
 
 
 class AuditLeadInsCommand:
@@ -77,8 +125,9 @@ class AuditLeadInsCommand:
             "MenuText": "Check Lead-ins Against Nesting",
             "ToolTip": (
                 "Find the lead-ins and lead-outs of a replayed CAM job that "
-                "reach another part's cut path, and move their start points "
-                "until they clear."
+                "reach another part's cut path, another operation's lead-in or "
+                "lead-out, or the edge of the sheet, and move their start "
+                "points until they clear."
             ),
         }
 
@@ -106,13 +155,18 @@ class AuditLeadInsCommand:
                 "Select one replayed CAM job.\n")
             return
 
-        mode = self._ask()
-        if mode is None:
+        asked = self._ask()
+        if asked is None:
             return
+        mode, clearance = asked
         dry_run = (mode == "report")
+        # Stored before the scan, not after: an abandoned run that crashed
+        # still leaves the user with the sensitivity they chose, so the next
+        # attempt starts where they left it rather than at the default.
+        clearance = _store_clearance(clearance)
 
         try:
-            result = lead_in_audit.scan_job(job)
+            result = lead_in_audit.scan_job(job, clearance=clearance)
         except Exception as exc:
             FreeCAD.Console.PrintError("Lead-in check failed: %s\n" % exc)
             import traceback
@@ -126,7 +180,7 @@ class AuditLeadInsCommand:
             self._report(result, dry_run)
             return
 
-        # The panel spans the search, not the scan. The scan is ~150 ms over 110
+        # The panel spans the search, not the scan. The scan is ~220 ms over 110
         # operations and needs no feedback; the search is a recompute per
         # candidate and does.
         todo = len(result.offending)
@@ -185,26 +239,69 @@ class AuditLeadInsCommand:
                 pass
 
     def _ask(self):
-        """`"report"` or `"fix"`, or None if cancelled.
+        """`(mode, clearance)`, or None if cancelled.
+
+        `mode` is `"report"` or `"fix"`. `clearance` is the factor the checks
+        ran at, as a multiple of each operation's tool radius.
 
         Report-only is the first button and the default, because it writes
         nothing and it answers the question the user actually has -- is there
         anything here -- before anything on their job moves.
         """
+        clearance = QtWidgets.QDoubleSpinBox()
+        clearance.setRange(MIN_LEAD_IN_CLEARANCE, MAX_LEAD_IN_CLEARANCE)
+        clearance.setDecimals(2)
+        clearance.setSingleStep(0.25)
+        clearance.setValue(_stored_clearance())
+        clearance.setSuffix("  x tool radius")
+        clearance.setToolTip(
+            "How much room a lead-in must keep from another cut, and from the "
+            "edge of the sheet.\n\n"
+            "1.00 is the smallest clearance that makes physical sense -- a cut "
+            "exactly touching its neighbour. Raise it to buy margin against "
+            "lead-in placement and kerf wander; lower it to report only "
+            "outright crossings.\n\n"
+            "Measured on your tool's radius, so it follows the tool the job "
+            "carries rather than a fixed number."
+        )
+
+        label = QtWidgets.QLabel("Clearance:")
+        label.setToolTip(clearance.toolTip())
+
         box = QtWidgets.QMessageBox(FreeCADGui.getMainWindow())
         box.setWindowTitle("Check lead-ins against nesting")
         box.setText(
             "Check whether this job's lead-ins and lead-outs reach another "
-            "part's cut path?"
+            "part's cut path, another lead-in or lead-out, or the sheet edge?"
         )
         box.setInformativeText(
             "A lead-in extends outside its own part, and the nester placed "
             "that part among others. Nothing in the replay accounts for where "
             "it lands.\n\n"
+            "Reaching another part's cut path re-cuts material that is not "
+            "its own. Reaching another lead-in or lead-out is different on "
+            "plasma or waterjet: the arc can drop across a kerf it has already "
+            "opened. A pierce too near the sheet edge puts part of the kerf "
+            "over air. All three are measured against the same clearance.\n\n"
             "Report only writes nothing. Fix moves the offending operations' "
             "start points -- and nothing else -- until they clear. Anything "
             "it cannot fix is marked CONFLICT_ and left alone."
         )
+        # QMessageBox has no addWidget, but its contents live in a real QGridLayout,
+        # so a control can be added to it. A separate dialog for one number
+        # would put a second modal between the user and the decision they were
+        # asked to make.
+        #
+        # Added to the grid directly rather than as a nested layout: QGridLayout
+        # is Qt's own layout here, not a QVBoxLayout, and `addLayout` on one
+        # wants a row and column. Adding the two widgets to a fresh row is the
+        # shape that works.
+        grid = box.layout()
+        where = grid.rowCount()
+        grid.addWidget(label, where, 0)
+        grid.addWidget(clearance, where, 1)
+        grid.setColumnStretch(1, 1)
+
         report = box.addButton("Report only", QtWidgets.QMessageBox.AcceptRole)
         fix = box.addButton("Report and fix", QtWidgets.QMessageBox.ApplyRole)
         box.addButton(QtWidgets.QMessageBox.Cancel)
@@ -212,9 +309,12 @@ class AuditLeadInsCommand:
         box.exec_()
         clicked = box.clickedButton()
         if clicked is report:
-            return "report"
+            return "report", float(clearance.value())
         if clicked is fix:
-            return "fix"
+            return "fix", float(clearance.value())
+        # Cancelled: the clearance is deliberately **not** returned, so a
+        # cancelled dialog leaves the stored preference alone. Writing it on
+        # the way out would let an abandoned dialog change a setting.
         return None
 
     def _report(self, result, dry_run):

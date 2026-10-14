@@ -21,31 +21,39 @@ The measurement, on the committed fixture
 
 `replay-fixture-CAM-Nested.FCStd` replays to **110 operations, 110 LeadInOut
 dressups, 54 parts** on a 600 x 300 mm sheet, with **142 lead-ins and 28
-lead-outs** -- 170 runs.
+lead-outs** -- 170 runs. The scan costs about **0.22 s**.
 
-    21 operations have a lead-in or lead-out reaching another part
-    5 of those cross outright, at a distance of exactly 0
-    3 operations pierce off the edge of the sheet
+    margin   offending   vs a body   vs a lead run   crossing outright
+    ------   --------   ----------   -------------   ----------------
+     0.0 mm        36           40              0                40
+     0.6 mm        40           49              0                40
+     3.0 mm        52           83              0                40
+    10.0 mm       105          242              4                40
 
-The worst clash:
+The worst clash, and the nearest near miss, are both on the same operation:
 
-    DressupLeadInOut001_replay_nested_BottomStrap_6  lead-in on wire 0
-      -> part_TopStrap_1's cut path
-      distance 0.0000 mm
+    DressupLeadInOut001_replay_nested_BottomStrap_1
+      lead-out on wire 0, 3.000 mm long
+        crosses part_SimpleSpacer_1's cut path        distance 0.0000 mm
+      lead-in  on wire 0 comes within 0.1481 mm of part_SimpleSpacer_1's cut path
 
-**A detector keyed on a near miss would have missed the five crossings**, and
-one keyed only on intersection would have reported 16 of the 21 and called the
-rest clean. Both criteria are needed, which is why there are two tests rather
-than one threshold: a crossing is a clash however large the margin, and a
-near miss is a clash however little it intersects.
+**A detector keyed on a near miss would have missed the 40 crossings**, and one
+keyed only on intersection would have reported 40 of the 40 and called the
+other nine clean. Both criteria are needed, which is why there are two tests
+rather than one threshold: a crossing is a clash however large the margin, and
+a near miss is a clash however little it intersects.
 
-    margin 0.0 mm (exact)  ->  5
-    margin 0.6 mm (radius) ->  21
+Why so many: the lead-ins on this fixture are 3.0 and 4.8 mm long -- those are
+the only two `RadiusIn` values on it -- and the tightest gap between any two
+parts' *cut paths* is 2.70 mm. The lead-in is longer than the gap it has to fit
+into, so this is a property of the layout rather than of any one operation.
 
-Why so many: the lead-ins on this fixture are 3-4.8 mm long, `RadiusIn` being
-3.0 and 4.8 mm, and the tightest gap between any two parts' *cut paths* is
-2.70 mm. The lead-in is longer than the gap it has to fit into, so this is a
-property of the layout rather than of any one operation.
+No lead run pierces off the edge of the sheet, and none lands within a tool
+radius of it either -- the closest is **2.3105 mm** -- so the edge check finds
+nothing on this fixture either. The two checks are independent and either can be
+the only one to fire on a real nest; neither is decorative. See `_off_sheet`,
+and NEST-038 for the measurement bug that had to be fixed before an edge
+*clearance* could exist at all.
 
 Two geometry bugs were found while measuring this, and both produced findings
 that did not exist. They are written up at `body_geometry` and
@@ -73,10 +81,47 @@ neighbours ended up, which does not exist until after the nest.
 
 See `geodesic_start_point_candidates` for how a replacement is searched for,
 and `NEST-033` for the issue this file answers.
+
+
+A lead-in is also a neighbour
+----------------------------
+
+A lead-in is not only a thing that reaches into other people's material. It is
+**itself a cut path**, drawn on the sheet where the nester put it, and another
+operation's lead-in can run into it. On a plasma or a waterjet that is a
+different failure from reaching a part's contour, and a worse one: reaching a
+contour re-cuts material that is not this part's, which is a scrapped feature,
+while crossing a lead run means the arc is bridged across a kerf it has already
+opened. The arc drops, the controller errors, and somebody has to recover it.
+
+The index has carried lead runs as entries since it was written -- bodies *and*
+runs, tagged with a `role` -- so the check was always there. It had never been
+seen, for two reasons worth recording:
+
+* **It never fired on the fixture.** The table above: at the operations' own
+  tool radius the scan finds **49** clashes against bodies and **0** against
+  lead runs. Raising the margin to 10 mm finds 4, which is enough to say the
+  geometry path works on real FreeCAD output and not enough to exercise it. The
+  closest genuine pair is 11 same-operation lead-in/lead-out runs touching at
+  the closed loop's shared start point, which is where one run's attachment is,
+  and are correctly filtered. A check that has never gone off cannot be relied
+  on to go off.
+* **It could have been reported as the wrong thing.** `mark_conflict` built its
+  sentence from the part name and the literal words "cut path", so a lead-in
+  that crossed another lead-in was marked as reaching a cut path -- which is the
+  exact mis-description `Conflict`'s own docstring is written to prevent, and
+  sent the operator to a contour that was never involved. See `Conflict.summary`.
+
+The search had a second, worse problem, which is that it could not be trusted
+to find these even when it did look: the sheet index was built once and never
+corrected, so every candidate was verified against geometry that had already
+moved. See `_CutIndex` and `reverify`. Filed as `NEST-037`.
 """
 import math
 
 import FreeCAD
+
+from freecad.nestingworkbench.constants import DEFAULT_LEAD_IN_CLEARANCE
 
 # -- what counts as a cut -------------------------------------------------
 #
@@ -582,11 +627,23 @@ class Conflict:
         return "%s's %s" % (self.other_part or
                             getattr(self.other_dressup, "Label", "?"), self.role)
 
-    def describe(self, margin):
+    def summary(self):
+        """The finding as one sentence, with no margin clause.
+
+        The sentence a report, a tree property and a log line all want, built
+        once so they cannot disagree about what was reached. `describe` is this
+        plus the margin, which is a fact about the *job* rather than about this
+        clash, and only makes sense next to a threshold.
+        """
         if self.distance <= 0.0:
             return "%s crosses %s" % (self.run.describe(), self.what)
-        return ("%s comes within %.4f mm of %s (margin %.4f mm)"
-                % (self.run.describe(), self.distance, self.what, margin))
+        return "%s comes within %.4f mm of %s" % (self.run.describe(),
+                                                  self.distance, self.what)
+
+    def describe(self, margin):
+        if self.distance <= 0.0:
+            return self.summary()
+        return "%s (margin %.4f mm)" % (self.summary(), margin)
 
 
 class OperationAudit:
@@ -660,7 +717,13 @@ class OperationAudit:
 
     @property
     def worst_off_sheet(self):
-        """The `OffSheet` furthest outside the sheet, or None."""
+        """The `OffSheet` nearest the edge of all, or None.
+
+        Nearest rather than furthest outside: a run that pierces 0.05 mm inside
+        the edge is the worse finding, not the milder one, and the report leads
+        with this one. Signed distance puts the two on one scale, so the
+        smallest is the closest to the edge whichever side of it it is.
+        """
         if not self.off_sheet:
             return None
         return min(self.off_sheet, key=lambda o: o.distance)
@@ -707,12 +770,12 @@ class OperationAudit:
 
 
 class OffSheet:
-    """A lead-in or lead-out whose pierce point is not on the material.
+    """A lead-in or lead-out whose pierce point is too near the sheet edge.
 
     A different failure from a `Conflict`, and kept apart from them on purpose.
     A `Conflict` is a lead-in running into another operation's cut -- two cuts
     in the same place. This is a lead-in running into nothing at all: the sheet
-    edge. Nothing is there to cut, so on a plasma or waterjet the pierce is a
+    edge. There is no material to cut, so on a plasma or waterjet the pierce is a
     flame-out and the lead-in is a scar on the air.
 
     `distance` is signed and in mm: **negative** means off the sheet by that
@@ -726,37 +789,85 @@ class OffSheet:
     one never pierces anything, the other pierces in the right place and then
     wanders off the material. Deriving the wording from the sign would tell the
     second one it pierces off the edge, which is the opposite of the truth.
+
+    **`margin` is the tool radius the clearance was measured against**, carried
+    so `describe` can tell the reader how much room there was. Four findings are
+    possible and all four are sentences a person has to act on differently:
+
+    | `pierce_off` | sign of `distance` | meaning |
+    |---|---|---|
+    | True | negative | pierces off the material entirely |
+    | True | positive | pierces on the material, inside the tool radius of the edge |
+    | False | negative | pierces clear, then runs off the edge |
+    | False | positive | pierces clear, then runs within the tool radius of the edge |
+
+    The two positive rows are new. Before the clearance existed the only
+    finding possible was a negative distance, so "pierces off the edge of the
+    sheet" was the whole of the vocabulary -- and printing `-distance` for a
+    positive one, as the old code would have, says *"pierces -0.4000 mm off the
+    edge"*, which reads as a number going the wrong way.
     """
 
-    __slots__ = ("run", "distance", "pierce_off")
+    __slots__ = ("run", "distance", "pierce_off", "margin")
 
-    def __init__(self, run, distance, pierce_off=True):
+    def __init__(self, run, distance, pierce_off=True, margin=None):
         self.run = run
         self.distance = distance
         #: Whether the pierce point itself is off the sheet. False means the run
-        #: pierces on the material and leaves it afterwards.
+        #: pierces on the material and leaves -- or skims -- it afterwards.
         self.pierce_off = pierce_off
+        #: The tool radius this was measured against, in mm. Only used to say
+        #: how much room there was; None means "not recorded", which reads as
+        #: the older wording rather than inventing a figure.
+        self.margin = margin
+
+    @property
+    def off_the_sheet(self):
+        """Whether any part of the run is on air, as opposed to merely close."""
+        return self.distance < 0.0
 
     def describe(self):
-        if not self.pierce_off:
-            return ("%s leaves the sheet by %.4f mm, though it pierces on it"
+        margin = "" if self.margin is None else \
+            ", inside its %.4f mm tool radius" % self.margin
+        if self.distance < 0.0:
+            if self.pierce_off:
+                return ("%s pierces %.4f mm off the edge of the sheet"
+                        % (self.run.describe(), -self.distance))
+            return ("%s pierces on the sheet but runs %.4f mm off the edge"
                     % (self.run.describe(), -self.distance))
-        return ("%s pierces %.4f mm off the edge of the sheet"
-                % (self.run.describe(), -self.distance))
+        if self.pierce_off:
+            return ("%s pierces only %.4f mm inside the edge of the sheet%s"
+                    % (self.run.describe(), self.distance, margin))
+        return ("%s pierces clear of the edge but runs to within %.4f mm of it%s"
+                % (self.run.describe(), self.distance, margin))
 
 
 class AuditResult:
     """Every operation examined, plus what the sheet-level scan cost."""
 
     __slots__ = ("job", "margin", "audits", "unreadable", "seconds",
-                 "cancelled", "sheet")
+                 "cancelled", "sheet", "clearance")
 
-    def __init__(self, job, margin, audits, unreadable, seconds, sheet=None):
+    def __init__(self, job, margin, audits, unreadable, seconds, sheet=None,
+                 clearance=DEFAULT_LEAD_IN_CLEARANCE):
         self.job = job
         self.margin = margin
         self.audits = audits
         self.unreadable = unreadable
         self.seconds = seconds
+        #: **The clearance factor this result was measured at**, as a multiple of
+        #: each operation's tool radius.
+        #:
+        #: Carried rather than re-derived, because `resolve_conflicts` rebuilds
+        #: the index from scratch and reads `margin` back off this object. It
+        #: would find the margin, multiply by the default, and test every
+        #: candidate against a *different* clearance from the one the scan
+        #: reported -- so a report saying "40 operations need doing by hand at
+        #: 2x" would have been produced by a search that accepted only what was
+        #: clear at 1x. Silent, and exactly the class of thing this file's
+        #: docstrings keep warning about, so it is pinned by a test rather than
+        #: left to be noticed.
+        self.clearance = clearance
         #: Whether a search stopped early. Set by `resolve_conflicts`; False
         #: after a scan, and False after a search that ran to the end.
         self.cancelled = False
@@ -878,7 +989,7 @@ class _CutIndex:
 
     One `STRtree` over one geometry per entry -- **280 entries on the committed
     fixture** -- so a lead-in is tested against the sheet rather than against the
-    rest one at a time. The whole scan of 110 operations costs about **150 ms**.
+    rest one at a time. The whole scan of 110 operations costs about **220 ms**.
 
     **Entries are bodies *and* lead runs, not bodies alone.** An index of
     bodies only cannot see a lead-in crossing another part's lead-in, because a
@@ -889,6 +1000,39 @@ class _CutIndex:
     is so a run can skip its own entry.
 
     The pairwise form would be 280 times the work for the same answer.
+
+    **The index has to keep up with the search, or the search verifies against
+    where things used to be.** A `STRtree` is immutable, and this one was built
+    once from the job as it stood before any start point moved. So an entry
+    stayed true only for operations nobody had touched.
+
+    Measured on the fixture's own geometry, that is not a rounding error: moving
+    one operation's start point carried its lead-in from **20.0 mm** away from a
+    neighbour's lead-in to **0.0 mm** from it -- the neighbour's own search then
+    cleared a run against the neighbour's *old* lead-in and accepted a start
+    point on a sheet where two lead-ins cross. Every individual test in that run
+    passed against the index it was given, which is why nothing caught it and
+    why `reverify` now re-reads the finished job.
+
+    The operation's **own** body is the one stale entry that does not bite, and
+    it is worth saying why rather than leaving it to be rediscovered. A moved
+    start point moves the attachment, but the contour passes through the
+    attachment whichever vertex the body starts from, and
+    `_attachment_points` knows that point is one of the run's own ends -- so the
+    attachment is filtered whether the indexed body is the old one or the new
+    one. And a lead-in that genuinely crosses its own contour crosses the
+    *current* contour too, so that finding is real either way. `replace`
+    rewrites the body as well as the runs because leaving a known-stale entry
+    behind is a debt, not a decision.
+
+    See `index_after`.
+
+    The rebuild is free enough to do per candidate. Measured over the fixture's
+    own 280 real entries, an `STRtree` build costs **0.0754 ms**, so the worst
+    search -- 384 candidates -- pays **28.9 ms** to have a correct index
+    throughout, against about 8400 ms of FreeCAD recompute for the same walk.
+    It is 0.3%. Building it lazily on the next `near` rather than in `replace`
+    means a candidate whose `_apply_start_point` failed costs nothing at all.
     """
 
     #: `role` values, shared with `Conflict`.
@@ -901,6 +1045,9 @@ class _CutIndex:
         self.entries = []
         self._geometries = []
         self._tree = None
+        #: Whether `_tree` is behind `entries`. Set by `replace`, cleared by the
+        #: rebuild `near` performs.
+        self._stale = False
 
     def add(self, part_label, dressup, operation, geometry, role=ROLE_BODY,
             run_index=-1):
@@ -910,7 +1057,62 @@ class _CutIndex:
                              run_index))
         self._geometries.append(geometry)
 
+    def _entries_for(self, part_label, dressup, operation, geometry, runs):
+        """The entries one operation contributes: its body, then each of its runs.
+
+        One place, so `replace` cannot rebuild an operation's runs differently
+        from the way `add` first laid them down -- a run that lost its `role` or
+        its `run_index` on the way through would be tested as a body, and a
+        lead-in reported against a cut path it never went near.
+        """
+        out = []
+        if geometry is not None and not geometry.is_empty:
+            out.append((part_label, dressup, operation, geometry, ROLE_BODY, -1))
+        for run in runs:
+            if run.geometry is None or run.geometry.is_empty:
+                continue
+            out.append((part_label, dressup, operation, run.geometry, run.kind,
+                        run.run_index))
+        return out
+
+    def replace(self, part_label, dressup, operation, geometry, runs):
+        """Rewrite `operation`'s entries from what it cuts *right now*.
+
+        Called with the geometry a candidate actually produced, before that
+        candidate is measured against anything. Without it the search is asking
+        "is this lead-in clear?" and getting an answer about a different
+        operation's lead-in from before the previous fix.
+
+        Operations not named keep their entries untouched, and those entries are
+        correct: nothing has moved them. The rewrite is by identity, so two
+        operations cutting the same part -- a Profile and a Drilling over one
+        region, which this file deliberately stopped treating as exempt -- do not
+        overwrite each other.
+
+        An operation with **no** entries yet is appended rather than ignored,
+        because a caller may reach `replace` for one whose entries were dropped
+        as empty. An operation whose runs have become unreadable keeps its body
+        entry and loses its runs, which is the truth: there is no lead-in there
+        to hit anything.
+        """
+        fresh = self._entries_for(part_label, dressup, operation, geometry, runs)
+        kept = []
+        seen = False
+        for entry in self.entries:
+            if entry[2] is operation:
+                if not seen:
+                    kept.extend(fresh)
+                    seen = True
+                continue
+            kept.append(entry)
+        if not seen:
+            kept.extend(fresh)
+        self.entries = kept
+        self._geometries = [entry[3] for entry in kept]
+        self._stale = True
+
     def build(self):
+        self._stale = False
         try:
             from shapely.strtree import STRtree
         except ImportError:
@@ -935,6 +1137,12 @@ class _CutIndex:
         itself, which is the right question -- the `STRtree` still filters on
         envelopes, and the exact distance test happens in `conflicts_for`.
         """
+        if self._stale:
+            # A candidate that was applied has just moved one operation's
+            # geometry. Rebuilding here rather than in `replace` is what makes
+            # the per-candidate cost disappear for a candidate whose recompute
+            # failed, and for every `replace` that is never followed by a query.
+            self.build()
         if self._tree is not None:
             try:
                 probe = geometry.buffer(margin) if margin > 0.0 else geometry
@@ -1136,13 +1344,24 @@ def conflicts_for(runs, operation, part_label, index, margin):
     return conflicts
 
 
-def _prepare(job, margin):
+def _prepare(job, margin, clearance=DEFAULT_LEAD_IN_CLEARANCE):
     """Read every LeadInOut operation's lead runs and build the sheet index.
 
     Returns `(prepared, index, unreadable)`. `prepared` is a list of
     `(dressup, operation, part_label, margin, runs, body)`; `body` is carried
     because the search needs the operation's own cut path to walk when it looks
     for a new start point.
+
+    **`clearance` multiplies every operation's margin**, and it is applied here
+    and only here. Both checks read the figure that comes out of this function
+    and nothing re-derives it: `conflicts_for` is handed `margin` directly, and
+    `_off_sheet` reads it off the audit. So one multiplication at the top scales
+    the neighbour clearance, the edge clearance and the search's acceptance test
+    together, and they cannot drift apart.
+
+    It multiplies an explicit `margin` as well as a derived one, so
+    `scan_job(job, margin=2.0, clearance=1.5)` means 3.0 mm rather than "2.0 mm,
+    except the other check disagrees". One rule, no special cases.
     """
     index = _CutIndex()
     prepared = []
@@ -1168,6 +1387,7 @@ def _prepare(job, margin):
             unreadable.append((dressup, "no tool radius could be read, so there "
                                        "was no clearance to test against"))
             continue
+        margin_for_op = margin_for_op * clearance
         geometry = _operation_cut_geometry(body, dressup.Path, operation)
         prepared.append((dressup, operation, part_label, margin_for_op, runs, body))
         index.add(part_label, dressup, operation, geometry)
@@ -1178,12 +1398,30 @@ def _prepare(job, margin):
     return prepared, index, unreadable
 
 
-def scan_job(job, margin=None, progress=None):
+def scan_job(job, margin=None, progress=None,
+             clearance=DEFAULT_LEAD_IN_CLEARANCE):
     """Find every lead-in and lead-out that reaches another part's cut path.
 
     `margin` is the clearance a lead-in must keep, in mm. `None` means each
     operation's own tool radius, falling back to the job's widest tool -- see
     `tool_radius_of` for why the operation's own tool and not the widest.
+
+    **`clearance` scales that margin**, as a multiple of it, and is what the
+    command's dialog exposes. 1.0 -- the default, and the value this module has
+    always used -- is the smallest clearance that is physically meaningful: a
+    cut exactly touching its neighbour and no more. Above 1.0 buys margin
+    against lead-in placement and kerf wander and finds more; below it finds
+    less, and at 0.0 only outright crossings are reported. See
+    `PROP_LEAD_IN_CLEARANCE`.
+
+    It scales **both** checks at once -- a lead run reaching a neighbouring cut
+    and a pierce point reaching the sheet edge -- because they are the same
+    question asked of two things, and a sensitivity dial that moved one and not
+    the other would produce a report whose two halves disagree about what
+    "too close" means. The value used is carried on the result as
+    `AuditResult.clearance`, because `resolve_conflicts` rebuilds the index from
+    scratch and would otherwise re-derive it at the default and quietly test the
+    search against a different clearance than the scan reported.
 
     Returns an `AuditResult`. **Nothing is modified**: this is the read half,
     and it is safe to run on a job someone is still editing. `resolve_conflicts`
@@ -1200,7 +1438,7 @@ def scan_job(job, margin=None, progress=None):
     command run after a replay, for three reasons: the fix writes to the job, so
     it must not be a surprise stage inside a replay someone is watching; it
     needs a report-only mode a pipeline stage cannot ask for; and it can take a
-    second on a bad nest -- the scan is 150 ms over 110 operations, but a fix
+    second on a bad nest -- the scan is 220 ms over 110 operations, but a fix
     recomputes FreeCAD per candidate, and nobody wants that appearing as a
     stalled replay with no explanation. The cost is that a replayed job is not
     checked until someone runs the check.
@@ -1208,7 +1446,7 @@ def scan_job(job, margin=None, progress=None):
     import time
     started = time.time()
 
-    prepared, index, unreadable = _prepare(job, margin)
+    prepared, index, unreadable = _prepare(job, margin, clearance)
 
     # Read once per job, not once per operation: the stock is the same polygon
     # for all 110, and building it involves discretising every wire of its shape.
@@ -1218,7 +1456,7 @@ def scan_job(job, margin=None, progress=None):
     audits = []
     for dressup, operation, part_label, margin_for_op, runs, body in prepared:
         conflicts = conflicts_for(runs, operation, part_label, index, margin_for_op)
-        off = _off_sheet(runs, sheet) if sheet_checked else None
+        off = _off_sheet(runs, sheet, margin_for_op) if sheet_checked else None
         # A conflict found by the scan and not yet acted on is UNRESOLVED, not
         # CLEAN. Leaving it at the default would let the scan record real
         # conflicts and still report a clean sheet, which is the one thing a
@@ -1237,7 +1475,7 @@ def scan_job(job, margin=None, progress=None):
                                      body=body, off_sheet=off, sheet=sheet))
 
     return AuditResult(job, margin, audits, unreadable, time.time() - started,
-                       sheet=sheet)
+                       sheet=sheet, clearance=clearance)
 
 
 # -- marking an operation the operator has to see -------------------------
@@ -1282,18 +1520,29 @@ def mark_conflict(dressup, part, worst=None):
 
     Sets `PROP_CONFLICT` to a sentence naming the part in the way, and prefixes
     the Label. Both are applied, and both are idempotent.
+
+    **It names what was actually reached, through `Conflict.what`.** This used to
+    build the sentence from `other_part` and the literal words "cut path", which
+    is exactly the mis-description `Conflict`'s own docstring is written to
+    prevent: an operation whose lead-in crossed another operation's *lead-in*
+    was marked "comes within 0.0000 mm of part_TopStrap_14's cut path", sending
+    the operator to look at a contour that was never touched while the two lead
+    runs actually crossing went unexamined. On plasma that is the difference
+    between looking at the right thing and posting the job.
+
+    `what` is asked rather than `role` compared, so the two cannot drift: there
+    is one sentence in this file that says what a conflict ran into, and both
+    the report and the property now use it.
     """
     where = ""
     if worst is not None:
-        where = (" -- %s comes within %.4f mm of %s's cut path"
-                 % (worst.run.describe(), worst.distance,
-                    worst.other_part or "?"))
+        where = " -- %s" % worst.summary()
     text = "Needs a manual start point%s" % where
     if not hasattr(dressup, PROP_CONFLICT):
         dressup.addProperty("App::PropertyString", PROP_CONFLICT, "CAM Replay",
-                            "Another part's cut path that this lead-in or "
-                            "lead-out reaches; the start point needs setting "
-                            "by hand")
+                            "Another operation's cut path, lead-in or "
+                            "lead-out that this one reaches; the start point "
+                            "needs setting by hand")
     setattr(dressup, PROP_CONFLICT, text)
     label = _strip_conflict(getattr(dressup, "Label", "") or "")
     new_label = CONFLICT_PREFIX + label
@@ -1722,85 +1971,119 @@ def resolve_audit(audit, index, job, step=CANDIDATE_STEP_MM,
                 # abandon a fix that was working.
                 pass
 
+    def resync():
+        """Put `operation`'s index entries back in step with its current paths.
+
+        Needed on every path that **restores**: `_conflicts_after` leaves the
+        index holding the last candidate tried, which on a give-up or a cancel
+        is a geometry this operation is no longer cutting. The next operation
+        searched would then be measured against a lead-in that is not there --
+        which is how a cancelled search left a later fix accepted on evidence
+        from a start point nobody kept.
+
+        Cheap enough to be unconditional, and it is unconditional: a `finally`
+        rather than a call at each of four exits, because the failure mode of
+        forgetting one is a silent wrong answer and the cost of being wrong here
+        is a whole class of them.
+        """
+        try:
+            index_after(operation, dressup, audit.part, index)
+        except Exception:
+            # A resync that cannot read leaves the index as it was, which is the
+            # pre-search state and therefore not worse than not having searched.
+            pass
+
     tried = 0
-    for wire in wires:
-        wire_moves = _wire_of_run(body, wire)
-        wire_origin = origin
-        if wire_moves and origin not in [(m.x0, m.y0) for m in wire_moves]:
-            # The offending wire is not the one the cut starts on. Anchor on
-            # this wire's own start so the walk begins on the wire being fixed
-            # rather than at a point that is not on it.
-            wire_origin = (wire_moves[0].x0, wire_moves[0].y0)
-        for xy in geodesic_start_point_candidates(body, wire, wire_origin,
-                                                  step=step, limit=budget - tried):
-            if should_cancel():
-                # Restored, not left on the last candidate tried. A search
-                # stopped halfway with `StartPoint` moved is worse than no
-                # search: it moved the user's cut and did not fix it.
-                _restore(operation, saved)
-                audit.status = OperationAudit.SKIPPED
-                audit.detail = ("the search was cancelled after %d candidate%s"
-                                % (tried, "" if tried == 1 else "s"))
-                announce(OperationAudit.SKIPPED)
-                return False, tried, audit.detail
-            tried += 1
-            announce()
-            if not _apply_start_point(operation, xy):
-                continue
-            remaining = _conflicts_after(operation, dressup, audit, index)
-            if remaining is None:
-                continue
-            if not remaining:
-                # Re-read the sheet finding from what was actually applied. The
-                # scan's copy was measured at the *original* start point, so
-                # carrying it forward would report a candidate as fixed while
-                # leaving the report claiming the pierce point is still off the
-                # edge.
-                audit.off_sheet = [] if audit.sheet is not None \
-                    else audit.off_sheet
-                audit.conflicts = []
-                if dry_run:
+    try:
+        for wire in wires:
+            wire_moves = _wire_of_run(body, wire)
+            wire_origin = origin
+            if wire_moves and origin not in [(m.x0, m.y0) for m in wire_moves]:
+                # The offending wire is not the one the cut starts on. Anchor on
+                # this wire's own start so the walk begins on the wire being
+                # fixed rather than at a point that is not on it.
+                wire_origin = (wire_moves[0].x0, wire_moves[0].y0)
+            for xy in geodesic_start_point_candidates(body, wire, wire_origin,
+                                                      step=step,
+                                                      limit=budget - tried):
+                if should_cancel():
+                    # Restored, not left on the last candidate tried. A search
+                    # stopped halfway with `StartPoint` moved is worse than no
+                    # search: it moved the user's cut and did not fix it.
                     _restore(operation, saved)
-                    audit.status = OperationAudit.FIXABLE
-                    audit.detail = ("a start point at (%.3f, %.3f) clears it, "
-                                    "found after %d candidate%s"
+                    audit.status = OperationAudit.SKIPPED
+                    audit.detail = ("the search was cancelled after %d "
+                                    "candidate%s"
+                                    % (tried, "" if tried == 1 else "s"))
+                    announce(OperationAudit.SKIPPED)
+                    return False, tried, audit.detail
+                tried += 1
+                announce()
+                if not _apply_start_point(operation, xy):
+                    continue
+                remaining = _conflicts_after(operation, dressup, audit, index)
+                if remaining is None:
+                    continue
+                if not remaining:
+                    # Re-read the sheet finding from what was actually applied.
+                    # The scan's copy was measured at the *original* start point,
+                    # so carrying it forward would report a candidate as fixed
+                    # while leaving the report claiming the pierce point is still
+                    # off the edge.
+                    audit.off_sheet = [] if audit.sheet is not None \
+                        else audit.off_sheet
+                    audit.conflicts = []
+                    if dry_run:
+                        _restore(operation, saved)
+                        audit.status = OperationAudit.FIXABLE
+                        audit.detail = ("a start point at (%.3f, %.3f) clears "
+                                        "it, found after %d candidate%s"
+                                        % (xy[0], xy[1], tried,
+                                           "" if tried == 1 else "s"))
+                        announce(OperationAudit.FIXABLE)
+                        return True, tried, audit.detail
+                    clear_conflict(dressup)
+                    audit.conflicts = []
+                    audit.status = OperationAudit.FIXED
+                    audit.detail = ("moved the start point to (%.3f, %.3f) "
+                                    "after %d candidate%s"
                                     % (xy[0], xy[1], tried,
                                        "" if tried == 1 else "s"))
-                    announce(OperationAudit.FIXABLE)
+                    announce(OperationAudit.FIXED)
                     return True, tried, audit.detail
-                clear_conflict(dressup)
-                audit.conflicts = []
-                audit.status = OperationAudit.FIXED
-                audit.detail = ("moved the start point to (%.3f, %.3f) after "
-                                "%d candidate%s" % (xy[0], xy[1], tried,
-                                                    "" if tried == 1 else "s"))
-                announce(OperationAudit.FIXED)
-                return True, tried, audit.detail
-        if tried >= budget:
-            break
+            if tried >= budget:
+                break
 
-    _restore(operation, saved)
-    if not dry_run:
-        # **Not in a dry run.** `mark_conflict` writes a Label and a property,
-        # and "report-only writes nothing" has to be literally true -- otherwise
-        # running the report to find out whether there is anything here leaves
-        # marks on every operation it could not fix.
-        #
-        # The harness caught this only after the `FIXABLE` status was added, and
-        # by then for a different reason: `check_dry_run_writes_nothing` passed
-        # because the fixture's one conflict *was* fixable, so this line was
-        # never reached. It now also asserts the marking happens on the real run.
-        mark_conflict(dressup, audit.part, audit.worst)
-    audit.status = OperationAudit.UNRESOLVED
-    audit.detail = ("no start point on wire%s %s cleared every lead-in and "
-                    "lead-out within %.4f mm after %d candidate%s; it %s"
-                    % ("s" if len(wires) != 1 else "",
-                       ", ".join(str(w) for w in wires), audit.margin, tried,
-                       "" if tried == 1 else "s",
-                       "is marked %s and was left as it was" % CONFLICT_PREFIX
-                       if not dry_run else "was left as it was"))
-    announce(OperationAudit.UNRESOLVED)
-    return False, tried, audit.detail
+        # Gave up. Inside the `try`, so `resync` runs *after* the restore
+        # rather than before it -- on this path the last candidate tried is
+        # still applied until this line, and a resync above it would publish a
+        # start point this operation is about to give back.
+        _restore(operation, saved)
+        if not dry_run:
+            # **Not in a dry run.** `mark_conflict` writes a Label and a
+            # property, and "report-only writes nothing" has to be literally
+            # true -- otherwise running the report to find out whether there is
+            # anything here leaves marks on every operation it could not fix.
+            #
+            # The harness caught this only after the `FIXABLE` status was added,
+            # and by then for a different reason: `check_dry_run_writes_nothing`
+            # passed because the fixture's one conflict *was* fixable, so this
+            # line was never reached. It now also asserts the marking happens on
+            # the real run.
+            mark_conflict(dressup, audit.part, audit.worst)
+        audit.status = OperationAudit.UNRESOLVED
+        audit.detail = ("no start point on wire%s %s cleared every lead-in and "
+                        "lead-out within %.4f mm after %d candidate%s; it %s"
+                        % ("s" if len(wires) != 1 else "",
+                           ", ".join(str(w) for w in wires), audit.margin, tried,
+                           "" if tried == 1 else "s",
+                           "is marked %s and was left as it was"
+                           % CONFLICT_PREFIX if not dry_run
+                           else "was left as it was"))
+        announce(OperationAudit.UNRESOLVED)
+        return False, tried, audit.detail
+    finally:
+        resync()
 
 
 #: Sentinel standing in for "still off the sheet" in the list `_conflicts_after`
@@ -1815,6 +2098,36 @@ def resolve_audit(audit, index, job, step=CANDIDATE_STEP_MM,
 _OFF_SHEET_MARKER = object()
 
 
+def index_after(operation, dressup, part, index):
+    """Re-read `operation` and put what it cuts **now** into `index`.
+
+    The one place the index is brought up to date, so every caller that has
+    just moved an operation goes through the same path. Two callers: the search,
+    after every applied candidate, and its restore-on-exit. The harness drives
+    the third -- an operation measured without this is measured against a
+    geometry it no longer has.
+
+    Returns the runs it read, or `None` when the paths could not be
+    reconciled -- in which case the index is left alone, because the honest
+    state of an unreadable operation is the one before it, and replacing it
+    with a guess would be worse than a stale entry.
+
+    **Call it *before* measuring, not after.** A candidate that is measured
+    against the previous geometry has been tested against the wrong question,
+    and nothing downstream can recover that.
+    """
+    lead_ins, lead_outs, body = lead_runs(cut_moves(operation.Path),
+                                         cut_moves(dressup.Path))
+    if lead_ins is None:
+        return None
+    runs = _wire_indices(lead_ins, lead_outs)
+    if not runs:
+        return None
+    index.replace(part, dressup, operation,
+                  _operation_cut_geometry(body, dressup.Path, operation), runs)
+    return runs
+
+
 def _conflicts_after(operation, dressup, audit, index):
     """Conflicts after a candidate was applied, or None if it could not be read.
 
@@ -1822,27 +2135,43 @@ def _conflicts_after(operation, dressup, audit, index):
     cached, because the whole question is whether the paths changed. `None` and
     `[]` are different answers: the first is "this candidate produced something
     unreadable, do not accept it", the second is "this candidate worked".
+
+    **It also puts what it read back into `index`, before measuring against it.**
+    The candidate is the thing that moved the operation, and `index` is what
+    every other operation is measured against, so leaving the index on the
+    pre-candidate geometry makes this measurement a statement about the past.
+
+    The error that matters is the neighbour's, not this operation's own: a
+    neighbour fixed earlier in the run is still advertised at where it used to
+    be, so a candidate can clear against the wrong lead-in and be accepted onto
+    a sheet where two lead-ins cross. Nothing downstream can catch that, because
+    every individual test passes against the index it was given -- which is why
+    `reverify` re-reads the finished job as well.
+
+    (`_CutIndex` says why this operation's own stale *body* is harmless.)
+
+    See `index_after`, which does the rewrite.
     """
-    lead_ins, lead_outs, _body = lead_runs(cut_moves(operation.Path),
-                                           cut_moves(dressup.Path))
-    if lead_ins is None:
-        return None
-    runs = _wire_indices(lead_ins, lead_outs)
-    if not runs:
+    runs = index_after(operation, dressup, audit.part, index)
+    if runs is None:
         return None
     conflicts = conflicts_for(runs, operation, audit.part, index, audit.margin)
     # **The sheet edge is part of "clear".** A candidate that leaves every
-    # neighbour alone but still pierces off the stock has not fixed the thing
-    # the user came here to fix, so it is not a fix. Checking only
-    # `conflicts_for` here would have made the search report success on a job
-    # whose lead-ins still run off the material -- and it would have been
-    # reported as `CONFLICT_`-free, so nothing would ever look at it again.
+    # neighbour alone but still pierces off the stock -- or too near its edge
+    # to keep the kerf on material -- has not fixed the thing the user came
+    # here to fix, so it is not a fix. Checking only `conflicts_for` here would
+    # have made the search report success on a job whose lead-ins still run off
+    # the material -- and it would have been reported as `CONFLICT_`-free, so
+    # nothing would ever look at it again.
+    #
+    # `audit.margin` rather than a constant, so the edge clearance is the same
+    # tool radius the neighbour clearance is, read from the same place.
     #
     # `audit.sheet` is None when the stock could not be read, and then
     # `audit.off_sheet` is None too: the check did not run, and inventing a
     # verdict for it would be the quiet-checker failure this file exists to
     # avoid.
-    if audit.sheet is not None and _off_sheet(runs, audit.sheet):
+    if audit.sheet is not None and _off_sheet(runs, audit.sheet, audit.margin):
         return conflicts if conflicts else [_OFF_SHEET_MARKER]
     return conflicts
 
@@ -1895,12 +2224,18 @@ def resolve_conflicts(result, step=CANDIDATE_STEP_MM, limit=MAX_CANDIDATES,
     everything already fixed: each fix is applied and verified on its own, so
     stopping between them leaves the job consistent, with the operations already
     moved moved and the rest untouched. The report says which is which.
+
+    **After the loop the whole job is re-read** and anything claimed clear that
+    is not clear is marked -- see `reverify`. It costs about 220 ms and it is
+    the only check in this module that looks at the sheet rather than at one
+    operation's neighbours.
     """
     import time
     started = time.time()
     result.cancelled = False
 
-    prepared, index, unreadable = _prepare(result.job, result.margin)
+    prepared, index, unreadable = _prepare(result.job, result.margin,
+                                     result.clearance)
     by_name = {}
     for entry in prepared:
         by_name[getattr(entry[0], "Name", None)] = entry
@@ -1939,9 +2274,103 @@ def resolve_conflicts(result, step=CANDIDATE_STEP_MM, limit=MAX_CANDIDATES,
                       dry_run=dry_run, progress=progress,
                       cancel_check=cancel_check)
 
+    if not dry_run:
+        try:
+            reverify(result)
+        except Exception:
+            # The re-read is a safety net, not part of the work. If it cannot
+            # run, every fix it would have checked is already applied and
+            # verified on its own, and letting this escape would abandon them:
+            # the command catches, aborts the transaction, and the user is left
+            # with a worse job than they started with. Losing the safety net is
+            # the right trade against losing the run.
+            pass
+
     result.unreadable = unreadable
     result.seconds = time.time() - started
     return result
+
+
+def reverify(result):
+    """Re-read the operations this run moved, and report what it finds now.
+
+    **The last line of defence, and the only one that reads the finished job.**
+
+    Everything above it reasons about one operation at a time and trusts the
+    bookkeeping: a search accepted a candidate because the conflicts it measured
+    were empty, and `resolve_conflicts` records that as `FIXED` without looking
+    again. That is the right thing to do per operation and the wrong thing to do
+    for the sheet, because the operations are not independent -- one fix moves a
+    lead-in into its neighbour's path, and the neighbour's own search is the only
+    thing standing between that and a clean report.
+
+    So this re-runs the scan over the whole job as it now stands and compares it
+    with what was claimed. An operation marked `FIXED` that is not clear is
+    **downgraded to `UNRESOLVED` and marked `CONFLICT_`**, because that is the
+    truth about it, and a report that said otherwise is the quiet-checker
+    failure this file exists to avoid -- worse than not running the fix at all,
+    because the user has been told not to look.
+
+    Which statuses are worth re-reading, and why the other three are not:
+
+    * `FIXED` -- the whole point. A move that did not stand is reported as one.
+    * `UNRESOLVED` -- was searched and left alone, so re-reading it can only
+      confirm the search's own verdict, and its findings are refreshed to match
+      what the operation cuts now rather than what it cut before the run. Kept
+      because the whole scan is about **220 ms** over 110 operations, and
+      because it is the half that would catch a search which gave up for the
+      wrong reason.
+    * `FIXABLE` -- skipped. A dry run moved nothing and this does not run in
+      one; re-reading it could only restate what the dry run already said, and
+      doing work in a mode whose contract is "writes nothing at all" is the
+      wrong habit to build.
+    * `CLEAN` and `SKIPPED` -- skipped. Nobody moved them, so a fresh scan of
+      the finished job would only repeat the opening scan.
+
+    Returns the list of audits it **downgraded** -- the `FIXED` ones that did
+    not hold up. An `UNRESOLVED` audit that is re-read as still `UNRESOLVED` is
+    confirmed rather than corrected and is not in the returned list, because a
+    caller reporting "N operations could not be verified" would be counting
+    hand-jobs it never doubted.
+    """
+    audits = [a for a in result.audits
+              if a.status in (OperationAudit.FIXED, OperationAudit.UNRESOLVED)]
+    if not audits:
+        return []
+
+    scanned = scan_job(result.job, result.margin, clearance=result.clearance)
+    by_name = {}
+    for audit in scanned.audits:
+        by_name[getattr(audit.dressup, "Name", None)] = audit
+
+    downgraded = []
+    for audit in audits:
+        fresh = by_name.get(getattr(audit.dressup, "Name", None))
+        if fresh is None:
+            # The operation is no longer readable at all. That is not "clear",
+            # and it is not the search's fault either; leaving the claim alone
+            # is the least wrong thing, and the unreadable list says so.
+            continue
+        audit.off_sheet = fresh.off_sheet
+        audit.conflicts = fresh.conflicts
+        if fresh.status == OperationAudit.CLEAN:
+            continue
+        was_fixed = audit.status == OperationAudit.FIXED
+        audit.status = OperationAudit.UNRESOLVED
+        mark_conflict(audit.dressup, audit.part, audit.worst)
+        # **The sentence is for the downgrade only.** An operation that was
+        # already `UNRESOLVED` and is re-read as still `UNRESOLVED` has been
+        # confirmed, not corrected, and telling it so would put "Re-checked
+        # against the finished job" on every hand-job on the sheet -- most of
+        # which the re-read never had any reason to doubt.
+        if was_fixed:
+            downgraded.append(audit)
+            if audit.detail and not audit.detail.endswith("."):
+                audit.detail += "."
+            audit.detail = ("%s Re-checked against the finished job and it is "
+                            "still not clear, so the move did not stand."
+                            % audit.detail)
+    return downgraded
 
 
 def _cancelled_already(cancel_check):
@@ -1961,10 +2390,23 @@ def _cancelled_already(cancel_check):
 
 # -- the sheet edge --------------------------------------------------------
 
-#: How far outside the stock a pierce point may be and still count as on the
-#: sheet, in mm. Zero by default: a pierce point is a hole, and a hole whose
-#: centre is off the material is not a hole in the material.
-SHEET_MARGIN_MM = 0.0
+#: How far inside the stock a pierce point may be and still count as on the
+#: sheet, in mm.
+#:
+#: **Gone, and deliberately.** This was `0.0` -- "a pierce point is a hole, and
+#: a hole whose centre is off the material is not a hole in the material" --
+#: which was the right instinct applied to a number that was not being measured.
+#: `_signed_distance` returned 0 for every pierce point on the material, so 0
+#: was the only margin that could not lie: a pierce 0.4 mm from the edge and one
+#: 150 mm from it both read 0. The check therefore could only ever ask "is it
+#: off the sheet?", never "is it too close to the edge?".
+#:
+#: The margin is now the operation's own tool radius, carried on its audit and
+#: required by `_off_sheet`, for the reason given there: the kerf is the tool's
+#: own width, so a pierce inside a tool radius of the edge puts part of the cut
+#: on air. It is the same clearance `conflicts_for` demands of a neighbour, read
+#: from the same number, and it is not configurable because there is nothing to
+#: configure -- the tool diameter is not a stylistic choice.
 
 
 def stock_polygon(job):
@@ -2026,8 +2468,15 @@ def stock_polygon(job):
         return faces[0]
 
 
-def _off_sheet(runs, sheet, margin=SHEET_MARGIN_MM):
-    """The `OffSheet`s among `runs` -- those reaching past the sheet edge.
+def _off_sheet(runs, sheet, margin):
+    """The `OffSheet`s among `runs` -- those too near the sheet edge.
+
+    `margin` is the operation's own tool radius, in mm, and **is required**.
+    It used to default to `SHEET_MARGIN_MM`, which was 0.0, and that default
+    was load-bearing in the worst way: see `_signed_distance`. Every pierce point
+    on the material measured 0 mm from the edge, so a margin of 0 was the only
+    value that could not misreport, and the clearance the whole rest of this
+    module measures neighbours against was never available here.
 
     An `OffSheet`'s `distance` is signed and in mm: negative off the sheet,
     positive inside, Shapely's own convention.
@@ -2036,12 +2485,23 @@ def _off_sheet(runs, sheet, margin=SHEET_MARGIN_MM):
     A lead-in's other end is on the contour it leads into, so it is on the sheet
     by construction and says nothing. For a lead-out the free end is the second
     one. It is the free end that has to be on material: that is where the torch
-    pierces, and a pierce outside the stock is air.
+    pierces.
+
+    **Why the tool radius is the margin.** The pierce point is a hole, and the
+    hole is the tool's own diameter wide. A pierce 0.4 mm from the edge with a
+    0.6 mm tool puts two thirds of the kerf off the material: on a plasma the
+    arc is striking across a sliver, and on a waterjet the kerf runs off the
+    edge and the part loses its boundary. The pierce is not "on the sheet" in
+    any sense the operator cares about at that distance -- it is on the edge,
+    with part of the cut hanging over it. So the same clearance that
+    `conflicts_for` demands of a neighbour is demanded of the stock boundary
+    too, from the same number, for the same reason: **the kerf has to have
+    material on both sides of it.**
 
     Also reported is the *whole* run, not just its end, when any part of it
-    falls outside. A lead-in that starts on the sheet and runs off it mid-way
-    has the same failure -- the torch is cutting air -- with a different cause,
-    and the two numbers are worth having.
+    comes within the margin. A lead-in that pierces clear and then runs off the
+    edge has the same failure -- the torch is cutting air -- with a different
+    cause, and the two numbers are worth having.
     """
     if sheet is None:
         return []
@@ -2060,38 +2520,113 @@ def _off_sheet(runs, sheet, margin=SHEET_MARGIN_MM):
         # Away from the contour: the start for a lead-in, the end for a lead-out.
         pierce = (coords[0][0], coords[0][1]) if lead_in \
             else (coords[-1][0], coords[-1][1])
-        try:
-            from shapely.geometry import Point
-            distance = Point(pierce[0], pierce[1]).distance(sheet)
-            inside = sheet.contains(Point(pierce[0], pierce[1]))
-        except Exception:
+        signed = _signed_distance(pierce, sheet)
+        if signed is None:
             continue
-        signed = distance if inside else -distance
         if signed < margin:
-            found.append(OffSheet(run, signed))
+            found.append(OffSheet(run, signed, margin=margin))
             continue
-        # The pierce point is on the sheet. Is any of the run off it? A lead-in
-        # that pierces on the sheet and then runs off it is cutting air just the
-        # same, and reports the same failure.
+        # The pierce point is clear of the edge. Is any of the run not? A lead-in
+        # that pierces on the material and then runs off it is cutting air just
+        # the same, and reports the same failure.
         worst = None
         for xy in coords:
             here = _signed_distance(xy, sheet)
             if here is not None and (worst is None or here < worst):
                 worst = here
         if worst is not None and worst < margin:
-            found.append(OffSheet(run, worst, pierce_off=False))
+            found.append(OffSheet(run, worst, False, margin=margin))
     return found
 
 
 def _signed_distance(xy, sheet):
-    """Distance from `xy` to the sheet edge: positive inside, negative outside."""
+    """Distance from `xy` to the sheet **edge**: positive inside, negative outside.
+
+    **To the boundary, not to the polygon.** Shapely's `distance` between two
+    geometries of *different dimensions* is 0 whenever they intersect, so a
+    point in the middle of the sheet measures 0 mm from it. Measured on the
+    600 x 300 mm fixture:
+
+        Point(300, 150).distance(sheet)             ->  0.0000   (the centre)
+        Point(300, 150).distance(sheet.boundary)    -> 150.0000
+
+    So this returned 0 for **every** pierce point on the material, whether it
+    was 5 mm from the edge or 150 mm. The off-sheet check still appeared to
+    work, because the only margin it ever had was 0 and `0 < 0` is False -- an
+    accident, and one that made the distance meaningless the moment the margin
+    became anything else. A pierce 0.4 mm from the edge and one in the middle of
+    the sheet were the same number, which is why "is this close to the edge?"
+    could not be asked at all.
+
+    Outside the sheet the two agree, because an outside point does not intersect
+    the polygon -- so every *previously reported* off-sheet finding was measured
+    correctly. What was broken was the inside case, which is precisely the case
+    that has to be measured to implement a clearance.
+    """
     try:
         from shapely.geometry import Point
         point = Point(xy[0], xy[1])
-        distance = point.distance(sheet)
+        distance = point.distance(sheet.boundary)
+        # Normalised so a point exactly on the edge reads +0.0 and takes the
+        # "on the sheet, inside the margin" branch below rather than "off it by
+        # -0.0". Both say the same thing here, and only one of them is a
+        # sentence a person can read.
         return distance if sheet.contains(point) else -distance
     except Exception:
         return None
+
+
+def _clearance_note(result):
+    """The clearance `result` was measured at, in words a report can print.
+
+    The factor alone is not enough on its own: "2x" means nothing without
+    knowing what it is a multiple of, and the thing it is a multiple of is the
+    job's own tool, which varies. So the note carries the factor *and* the
+    resulting millimetres for the job's widest tool -- the largest clearance
+    actually in force, since `tool_radius_of` falls back to it.
+
+    Falls back to the factor alone when no tool can be read, rather than
+    inventing a figure. `result.margin` is the caller's explicit override, and
+    is reported in millimetres on its own when it was given.
+    """
+    clearance = getattr(result, "clearance", DEFAULT_LEAD_IN_CLEARANCE)
+    try:
+        clearance = float(clearance)
+    except (TypeError, ValueError):
+        clearance = DEFAULT_LEAD_IN_CLEARANCE
+
+    explicit = getattr(result, "margin", None)
+    if explicit is not None:
+        try:
+            return "%.4f mm" % (float(explicit) * clearance)
+        except (TypeError, ValueError):
+            pass
+
+    widest = None
+    try:
+        from freecad.nestingworkbench.Tools.Cam import cam_replay
+        diameters = cam_replay.tool_diameters(result.job)
+        if diameters:
+            widest = max(float(value) for _label, value in diameters)
+    except Exception:
+        widest = None
+    if widest is None:
+        return "%.2f x tool radius" % clearance
+    if clearance == 1.0:
+        return "the tool radius (%.4f mm)" % (widest / 2.0)
+    return "%.2f x tool radius (%.4f mm)" % (clearance, widest / 2.0 * clearance)
+
+
+def _lead_run_conflicts(result):
+    """How many `Conflict`s in `result` reached another operation's lead run.
+
+    A count of findings, not of operations: one lead-in can cross two others,
+    and saying "2" when one operation has two problems reads as two
+    operations. Computed from `audit.conflicts` rather than counted as they are
+    found, so it describes the result the reader is about to be shown.
+    """
+    return sum(1 for audit in result.audits for conflict in audit.conflicts
+               if conflict.role != ROLE_BODY)
 
 
 def describe_result(result, limit=20, dry_run=False):
@@ -2110,28 +2645,60 @@ def describe_result(result, limit=20, dry_run=False):
     conflict was fixable reported all of them as unfixable, because the verdict
     the search had produced was thrown away and only `UNRESOLVED` survived. See
     `OperationAudit.FIXABLE`.
+
+    **It names lead runs as lead runs.** The wording below used to say only
+    "another part's cut path", which was the whole of the problem with an
+    operation whose lead-in crossed another operation's *lead-in*: the finding
+    was correct and the sentence was not, so a report that read "comes within
+    0.0000 mm of part_TopStrap_14's cut path" sent the operator to a contour
+    that was never involved. `Conflict.what` already answers it properly and is
+    what the per-operation lines use; these section headings now say the same
+    thing in the same words.
+
+    The distinction matters most on plasma and waterjet, where the two are not
+    the same failure: reaching a cut path re-cuts material, while crossing
+    another lead run can drop the arc across a kerf and put the controller into
+    an error. Same margin, same fix -- but the operator needs to know which one
+    they are looking at before deciding whether to post the job.
     """
     counts = result.counts()
     lines = []
     total = len(result.audits)
     clear = counts.get(OperationAudit.CLEAN, 0)
     skipped = counts.get(OperationAudit.SKIPPED, 0)
+    # Reported in the headline, because "0 lead-in clashes" is a measurement the
+    # reader is entitled to. It used to be silently zero on every fixture this
+    # was developed against, which is indistinguishable from "not checked".
+    runs = _lead_run_conflicts(result)
+    reaches = "%d %s another operation's lead-in or lead-out." % (
+        runs, "reaches" if runs == 1 else "reach")
+    # **The clearance the numbers were measured at, always.** The counts are a
+    # function of it -- the same job reports 40 operations at 1x and rather more
+    # at 2x -- so a headline that omits it is quoting numbers whose meaning the
+    # reader has to guess. Stated even at the default, because the default is
+    # the case nobody will remember choosing.
+    clearance = _clearance_note(result)
 
     if dry_run:
         fixable = counts.get(OperationAudit.FIXABLE, 0)
         unresolved = counts.get(OperationAudit.UNRESOLVED, 0)
-        headline = ("Checked %d lead-in/lead-out operation%s in %.2f s: "
+        headline = ("Checked %d lead-in/lead-out operation%s in %.2f s at a "
+                    "clearance of %s: "
                     "%d clear, %d could be moved to a clear start point, "
-                    "%d need doing by hand, %d skipped."
+                    "%d need doing by hand, %d skipped. %s"
                     % (total, "" if total == 1 else "s", result.seconds,
-                       clear, fixable, unresolved, skipped))
+                       clearance,
+                       clear, fixable, unresolved, skipped, reaches))
     else:
-        headline = ("Checked %d lead-in/lead-out operation%s in %.2f s: "
+        headline = ("Checked %d lead-in/lead-out operation%s in %.2f s at a "
+                    "clearance of %s: "
                     "%d clear, %d moved to a clear start point, "
-                    "%d need doing by hand, %d skipped."
+                    "%d need doing by hand, %d skipped. %s"
                     % (total, "" if total == 1 else "s", result.seconds,
+                       clearance,
                        clear, counts.get(OperationAudit.FIXED, 0),
-                       counts.get(OperationAudit.UNRESOLVED, 0), skipped))
+                       counts.get(OperationAudit.UNRESOLVED, 0), skipped,
+                       reaches))
     lines.append(headline)
 
     fixable = result.fixable
@@ -2139,8 +2706,9 @@ def describe_result(result, limit=20, dry_run=False):
         lines.append("")
         if dry_run:
             lines.append(
-                "These reach another part's cut path, and a start point was "
-                "found that clears them. Nothing has been changed:"
+                "These reach another operation's cut path, lead-in or "
+                "lead-out, and a start point was found that clears them. "
+                "Nothing has been changed:"
             )
         else:
             lines.append("Moved to a clear start point:")
@@ -2160,11 +2728,36 @@ def describe_result(result, limit=20, dry_run=False):
         if len(fixed) > limit:
             lines.append("  ... and %d more" % (len(fixed) - limit))
 
+    run_clashes = [a for a in result.audits
+                   if any(c.role != ROLE_BODY for c in a.conflicts)]
+    if run_clashes:
+        # Its own section, because on plasma and waterjet this is not the same
+        # failure as reaching a cut path. Reaching a cut path re-cuts material
+        # that is not this part's; crossing another lead run puts the arc
+        # across a kerf it has already opened, which drops the flame and puts
+        # the controller into an error the operator has to recover from. Same
+        # margin and the same fix, but the operator decides whether to post the
+        # job differently in the two cases, so the report must not read alike.
+        lines.append("")
+        lines.append("These reach another operation's lead-in or lead-out, "
+                     "rather than its cut path. The margin is the same and the "
+                     "start point moves the same way; on plasma or waterjet "
+                     "this is the one that can drop the arc across a kerf:")
+        for audit in run_clashes[:limit]:
+            clashes = [c for c in audit.conflicts if c.role != ROLE_BODY]
+            lines.append("  %s (%s) -- %s"
+                         % (audit.label, audit.part or "?",
+                            "; ".join(c.describe(audit.margin)
+                                      for c in clashes[:3])))
+        if len(run_clashes) > limit:
+            lines.append("  ... and %d more" % (len(run_clashes) - limit))
+
     off_sheet = [a for a in result.audits if a.off_sheet]
     if off_sheet:
         lines.append("")
-        lines.append("These pierce off the edge of the sheet, where there is no "
-                     "material to pierce into:")
+        lines.append("These pierce off the edge of the sheet, or within their own "
+                     "tool radius of it, where the kerf has no material on "
+                     "both sides:")
         for audit in off_sheet[:limit]:
             worst = audit.worst_off_sheet
             lines.append("  %s (%s) -- %s"
@@ -2175,7 +2768,8 @@ def describe_result(result, limit=20, dry_run=False):
         lines.append("")
         lines.append("The sheet edge was not checked: no stock outline could be "
                      "read from this job, so a pierce point off the material "
-                     "would not have been reported.")
+                     "or within a kerf of its edge would not have been "
+                     "reported.")
 
     unresolved = result.unresolved
     if unresolved:
@@ -2190,7 +2784,8 @@ def describe_result(result, limit=20, dry_run=False):
             lines.append(
                 "No start point on these clears every lead-in and lead-out. "
                 "Each is marked %s in the tree and its LeadInConflict property "
-                "says which part; they were left exactly as they were:"
+                "says what it reaches -- a cut path, a lead-in or a lead-out; "
+                "they were left exactly as they were:"
                 % CONFLICT_PREFIX)
         for audit in unresolved[:limit]:
             lines.append("  %s" % audit.describe())

@@ -95,12 +95,21 @@ commands want a CAM job instead.
     A replayed `StartPoint` moves with the geometry it belongs to, and the
     replay warns when a point lands off every part it targets.
 *   **Check Lead-ins Against Nesting:** Finds the lead-ins and lead-outs on a
-    replayed job that reach into another part's cut path, and moves their
-    start points until they clear. **It offers report-only first, which writes
-    nothing** — read the report, then decide. Only `StartPoint` is changed;
-    the rest of the recipe is left as you set it. Anything it cannot fix is
-    marked `CONFLICT_` rather than silently skipped. Menu only, not on the
-    toolbar, because it does nothing until a replay has run.
+    replayed job that reach into another part's cut path — **or into another
+    lead-in or lead-out** — and moves their start points until they clear.
+    Reaching a cut path re-cuts material; crossing another lead run is the
+    worse of the two on plasma or waterjet, where the arc can drop across a
+    kerf it has already opened. A pierce point within the tool's own radius of
+    the sheet edge is flagged too, since part of the kerf would hang over air.
+    The report names which it found. **A clearance dial** on the same dialog sets
+    how much room a lead-in must keep, as a multiple of the tool radius: 1.00
+    is a cut exactly touching its neighbour, higher finds more, and it is
+    remembered between runs. **The dialog offers report-only first, which writes
+    nothing** — read the report, then decide.
+    Only `StartPoint` is changed; the rest of the recipe is left as you set it.
+    Anything it cannot fix is marked `CONFLICT_` rather than silently skipped.
+    Menu only, not on the toolbar, because it does nothing until a replay has
+    run.
 *   **Create Silhouette:** Generates a 2D projection (outline) of a 3D part
     which can be used in a cam job.
 *   **Manual Nester:** Drag parts in the 3D view to move them; **OK** saves,
