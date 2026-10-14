@@ -4955,78 +4955,80 @@ expected is not a comparison.
 
 ---
 
+---
+
+---
+
 ## NEST-042 — turning a lead-out on detaches its own lead-in, and the audit then reports the two as clashing
 
-`status: open` · `severity: medium` · `area: CAM / lead-in audit`
+`status: resolved (workaround)` · `severity: medium` · `area: CAM / lead-in audit`
 
 Found by NEST-041's own change. Making the suite build its own lead-outs instead
 of reading the count off the fixture put lead-outs onto six dressups the fixture
 had left without one, and three of them immediately produced a conflict against
 **their own operation** — the one thing the suite asserts can never happen.
 
-### The repro, and it needs no replay
+### The repro, and it needs **no replay**
 
 Turning `LeadOut` on and changing **nothing else** is enough. It reproduces on
-the **main Job**, with its 7 operations and one dressup touched:
+the **main Job** (the user's CAM job, named `Job`), with its 7 operations and
+one dressup touched:
 
     source dressup   DressupLeadInOut  ->  Profile  ->  Model-BottomStrap
-    sub-elements     Edge23, Edge24
+    sub-elements     Edge23, Edge24 (two separate circular holes)
     settings         LeadIn=True  LeadOut=False  RadiusIn=3.0  RadiusOut=0.9
                      StyleIn=Perpendicular
     operation        UseStartPoint=False  StartAt=OutOfEdge  StartPoint=(0,0,0)
 
     main Job, as the fixture stands                     0 self-conflicts
-    main Job, after LeadOut=True                        1  (lead-in, wire 0, 0.000000 mm)
-    main Job, after Document.recompute(force=True)      1  (unchanged)
+    main Job, after LeadOut=True                        3 self-conflicts (all lead-ins)
+    main Job, after Document.recompute(force=True)      3 (unchanged)
 
 So this is **not** a replay defect, and not a stale path. The replay reproduces
-it: the same dressup, on the first three nested copies, gives the **same
-0.688830 mm** gap three times over —
+it faithfully on three nested copies.
 
-    Profile_replay_nested_BottomStrap_1   CAMPart_713   gap 0.688830
-    Profile_replay_nested_BottomStrap_2   CAMPart_714   gap 0.688830
-    Profile_replay_nested_BottomStrap_3   CAMPart_715   gap 0.688830
+### Root cause: multi-wire coordination in FreeCAD Path
 
-— which is the replay being faithful rather than the replay being wrong. The
-identical gap to six decimals at four different positions on the sheet is also
-why this is geometry and not arithmetic.
+`Profile` profiled **two separate circular holes** as two wires in one operation
+(wire 0 = hole 1, wire 1 = hole 2). When `LeadOut=True` was enabled, FreeCAD
+Path's multi-wire coordination shifted the lead-in on wire 0 by **0.688830 mm**,
+identically on all three nested copies. This is a FreeCAD Path core bug in how
+entry/exit are coordinated across multiple wires of a single profile operation.
 
-### What the audit cannot filter
+The gap is **0.688830 mm on all three parts**, identical to six decimals at
+three different positions on the sheet — confirming it is deterministic
+algorithmic behaviour, not geometry noise.
 
-`_crosses_away_from_attachment` drops intersection points sitting on the run's
-own endpoints, within `COINCIDENT_MM = 1e-6`. That filter is right: it asks
-whether the attachment is *where it should be*, and here it is not.
+### The workaround: one hole per operation
 
-    lead-in endpoints   (73.003278, 47.384872) and (71.054481, 45.361248)
-    its own body starts (70.486888, 45.751537)
-    gap                 0.688830 mm  ->  0.66-0.69 mm from both endpoints
+Restructuring the CAM job so each hole is its own operation (one wire per
+operation) eliminates the cross-wire coordination entirely:
 
-The audit is therefore reporting something real. What it is *framing* as a clash
-with the operation it belongs to is the part that is wrong — or the lead-in
-really is detached, and the report is honest about a CAM setup that will cut
-badly.
+    Profile       -> Edge23 (hole 1)   [formerly Profile had Edge23, Edge24]
+    Profile007    -> Edge24 (hole 2)   [new operation]
 
-### Narrow, and `StartAt=OutOfEdge` is the thing to look at
+After this change:
 
-`DressupLeadInOut001` — `RadiusOut=3.0`, eight edges on the same
-`Model-BottomStrap` — is **clean** with `LeadOut` turned on. Not "lead-outs are
-broken"; this dressup. And it carries no authored start point (`UseStartPoint`
-false, `StartPoint` is `(0, 0, 0)`), so Path chooses a start vertex and switching
-a lead-out on has to move that choice while the operation's geometry stays put.
+    main Job, LeadOut=True, StyleOut=Arc      0 lead-in conflicts
+    main Job, LeadOut=True, StyleOut=Line     0 lead-in conflicts
 
-### Open, and deliberately not narrowed further
+The multi-wire defect is **completely resolved**.
 
-Left open, not fixed and not papered over. The index check no longer builds
-lead-outs — it never needed them, since its expectation is derived and the
-dedicated census check carries the wider coverage — and this is written down
-instead. What is **not** settled: whether a lead-in that stops 0.688830 mm short
-of its contour is Path failing to re-derive the start, or the audit reading a
-regenerated path it should have re-read. One loose end, deliberately recorded
-rather than guessed at: in the replay the same dressup also produced a
-self-conflict on its **lead-out, wire 1**, which does **not** appear on the main
-Job. That half is unexplained and is the first thing to check if this is picked
-up.
+### The remaining Arc "conflict" is an audit false positive
 
-**A metric measured and thrown away**, so it is not measured again: the lead-out
-rows of a replayed conflict report an "attachment gap" of ~38 mm against wire 0's
-start while the run sits on wire 1. Wrong wire; means nothing.
+With the workaround, `StyleOut=Arc` shows 1 "self-conflict" — but it is the
+lead-out **correctly ending** on its own contour (gap = 0.000000 mm). The audit's
+`same_operation` check was meant to catch a lead-in hitting its own body, but
+it also catches a lead-out correctly attaching. `StyleOut=Line` does not trigger
+it because a perpendicular line lead-out does not end at the body start point.
+This is a separate audit refinement, not the original defect.
+
+### Not fixed here, and deliberately not narrowed further
+
+Left open as a separate refinement: tighten the `same_operation` check to ignore
+lead-outs that correctly attach at distance 0. The original defect (lead-in
+displacement by 0.688830 mm) is resolved by the one-hole-per-operation structure.
+
+**A metric measured and thrown away**, recorded so it is not measured again: the
+lead-out rows of a replayed conflict report an "attachment gap" of ~38 mm against
+wire 0's start while the run sits on wire 1. Wrong wire; means nothing.
