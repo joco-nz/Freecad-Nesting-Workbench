@@ -8,7 +8,7 @@ code can find, tell apart from the cut, and move.
 What this is guarding
 ---------------------
 
-  * **the whole path, on a job built by the replay.** 110 operations over 54
+  * **the whole path, on a job built by the replay.** 136 operations over 54
     parts, reconciled one by one. A reader that works on a synthetic square and
     fails on a real profile is not a reader.
 
@@ -242,8 +242,8 @@ def check_scan(doc, job):
     emit("== the scan reads every operation on a real replay ==")
     result = lead_in_audit.scan_job(job)
 
-    check(len(result.audits) == 110,
-          "all 110 LeadInOut operations were examined (got %d)"
+    check(len(result.audits) == 136,
+          "all 136 LeadInOut operations were examined (got %d)"
           % len(result.audits))
     check(not result.unreadable,
           "none were unreadable (%d were: %s)"
@@ -270,7 +270,7 @@ def check_scan(doc, job):
           "every lead-out that was asked for was found (%d, and %d dressups "
           "ask for one)" % (lead_outs, want_outs))
     check(runs == 142 + want_outs,
-          "every lead run was found (got %d across 110 operations: %d "
+          "every lead run was found (got %d across 136 operations: %d "
           "lead-ins and %d lead-outs)" % (runs, lead_ins, lead_outs))
 
     # Multi-wire operations exist on this fixture, and one lead-in per wire is
@@ -602,7 +602,7 @@ def check_cancel_mid_operation_restores_the_start_point(doc, job):
     # assumed: a dry run restores everything, so it is safe to run first.
     #
     # The survey stops as soon as one operation has needed HARD_CANDIDATES,
-    # rather than resolving all 110 to keep the maximum. That maximum was never
+    # rather than resolving all 136 to keep the maximum. That maximum was never
     # what this check asserts on -- see the note on `_stop_when_hard` for the
     # measurement, and for why computing it cost a quarter of the gate.
     survey = lead_in_audit.scan_job(fresh, margin=2.0)
@@ -700,7 +700,7 @@ def _stop_when_hard(survey):
 
     The survey runs to answer "is there an operation whose search genuinely takes
     several candidates?". It used to answer a harder question -- *which* operation
-    takes the most -- by resolving all 110 and keeping the maximum. Measured on
+    takes the most -- by resolving all 136 and keeping the maximum. Measured on
     the committed fixture, that is **142.8 s**, which was two thirds of a 223 s
     check and about a quarter of the whole gate; and it bought nothing, because
     the check asserts a floor of `HARD_CANDIDATES` and **24 of the 27 fixable
@@ -952,7 +952,7 @@ def check_own_body_is_not_drawn_across_the_gap_between_wires(doc, job):
       * **The link between wires.** A Profile over two wires is joined by a
         `G0`, which `cut_moves` correctly drops. Joining the moves either side
         of it into one polyline therefore *draws* that link. On this fixture, 28
-        of 110 operations have such a join, and the largest spans 34.941 mm --
+        of 136 operations have such a join, and the largest spans 34.941 mm --
         against 48.9727 mm of real cut on the operation it belongs to. Every
         clearance in the audit is measured against this geometry, so a fabricated
         segment can invent a conflict as readily as hide one.
@@ -1325,9 +1325,9 @@ def check_lead_runs_are_indexed_too(doc, job):
     lead_ins = [e for e in index.entries if e[4] == lead_in_audit.ROLE_LEAD_IN]
     lead_outs = [e for e in index.entries if e[4] == lead_in_audit.ROLE_LEAD_OUT]
     want_outs = _lead_out_dressups(fresh)
-    want_total = 110 + 142 + want_outs
+    want_total = 136 + 142 + want_outs
 
-    check(len(bodies) == 110, "every body is indexed (%d)" % len(bodies))
+    check(len(bodies) == 136, "every body is indexed (%d)" % len(bodies))
     check(len(lead_ins) == 142,
           "every lead-in is indexed (%d)" % len(lead_ins))
     check(len(lead_outs) == want_outs,
@@ -1472,8 +1472,8 @@ def check_no_tool_means_reported_not_guessed(doc, job):
     result = lead_in_audit.scan_job(empty)
     check(not result.audits,
           "no operation was audited (%d were)" % len(result.audits))
-    check(len(result.unreadable) == 110,
-          "all 110 are reported as unchecked (%d)" % len(result.unreadable))
+    check(len(result.unreadable) == 136,
+          "all 136 are reported as unchecked (%d)" % len(result.unreadable))
     check(bool(result.unreadable)
           and "tool radius" in result.unreadable[0][1],
           "and the reason says why ('%s')"
