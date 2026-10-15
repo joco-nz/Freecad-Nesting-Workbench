@@ -551,6 +551,7 @@ class TestNfpIsIndependentOfThePartition:
         assert len(coarse) < len(fine), (
             f"merge did not coarsen: {len(fine)} -> {len(coarse)}")
 
+    @pytest.mark.slow
     def test_nfp_is_the_same_region_for_both_partitions(self, monkeypatch):
         """A coarse partition and a fine one give the same NFP region."""
         fine, coarse = self._both_partitions(monkeypatch)
@@ -582,6 +583,7 @@ class TestNfpIsIndependentOfThePartition:
         # placements the fine one rejects, and that is the unsafe direction.
         assert coarse_nfp.area >= fine_nfp.area - 1e-6
 
+    @pytest.mark.slow
     def test_mixed_partitions_also_agree(self, monkeypatch):
         """One side merged is enough; the identity is per-partition.
 

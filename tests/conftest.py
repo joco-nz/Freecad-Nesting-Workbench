@@ -72,3 +72,10 @@ STUBBED_MODULES = ensure_freecad_importable()
 # executes a real nesting run and then calls sys.exit() -- pytest aborts with
 # "INTERNALERROR> SystemExit". They are driven by tests/freecad_harness/run.sh.
 collect_ignore = ["freecad_harness"]
+
+
+# Register the slow marker so pytest doesn't warn about unknown markers
+def pytest_configure(config):
+    config.addinivalue_line(
+        "markers", "slow: marks tests as slow (deselect with '-m \"not slow\"')"
+    )
