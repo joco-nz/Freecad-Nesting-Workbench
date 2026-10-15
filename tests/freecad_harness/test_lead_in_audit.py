@@ -144,6 +144,56 @@ def check(condition, message, detail=None):
     return False
 
 
+#: `(seconds, label)` per top-level check, in completion order. Printed as a
+#: table by `finish` -- and by the crash handler, because "the harness died"
+#: is exactly when knowing which check was running matters most.
+_TIMINGS = []
+
+#: Wall clock from the start of `main()`, so the summary can state how long
+#: the whole run took rather than leaving it to `time(1)`.
+_RUN_STARTED = None
+
+
+def timed(label, fn, *args):
+    """Run `fn(*args)`, recording how long it took under `label`.
+
+    **Why this exists.** This suite's cost is dominated by full replays of a
+    136-operation fixture (~15 s each), and several checks do their own fresh
+    replay because they need a job nobody else has mutated. Before anyone
+    restructures the suite to run faster -- grouping checks onto shared
+    replays, or splitting it across processes -- the honest first step is a
+    table saying which checks actually cost what. Guessing at the bottleneck
+    and "optimizing" it is how two cache experiments in this file that both made
+    things worse.
+
+    Only *top-level* checks are timed; a check's own internal replays are
+    charged to it, which is the point -- the table should name the checks
+    doing the replaying.
+    """
+    started = time.time()
+    try:
+        return fn(*args)
+    finally:
+        _TIMINGS.append((time.time() - started, label))
+
+
+def emit_timings():
+    """Print the per-check timing table, worst first."""
+    emit("")
+    emit("== timing ==")
+    if not _TIMINGS:
+        emit("  nothing was timed")
+        return
+    wall = (time.time() - _RUN_STARTED) if _RUN_STARTED else sum(
+        seconds for seconds, _ in _TIMINGS)
+    accounted = sum(seconds for seconds, _ in _TIMINGS)
+    for seconds, label in sorted(_TIMINGS, reverse=True):
+        emit("  %7.1f s  %3.0f%%  %s"
+             % (seconds, 100.0 * seconds / wall if wall else 0.0, label))
+    emit("  %7.1f s  accounted for, %.1f s wall clock"
+         % (accounted, wall))
+
+
 @contextmanager
 def group(items, description):
     """`check` a property of every item in `items`, and fail if there are none.
@@ -175,7 +225,17 @@ def group(items, description):
 
 
 def replay(doc):
-    """Run a replay and return its job."""
+    """Run a replay and return its job.
+
+    **Never cached.** Several checks in this file deliberately mutate the job
+    they are handed -- `check_the_fix` resolves its conflicts, the
+    no-readable-tool check blanks every tool radius, the lead-out check flips
+    `LeadOut` -- and each replay builds a *new* job object, so those mutations
+    do not leak into the next check. A module-level cache handed every check
+    the same object instead, and the checks then read each other's damage: the
+    unfixable check scanned an already-fixed job and got `None` from `_worst`,
+    and the lead-out check found every margin unreadable.
+    """
     layout, _warnings = cam_replay.resolve_layout_group(doc)
     outcomes = cam_replay.replay_layout(doc, layout, doc.getObject("Job"))
     for outcome in outcomes:
@@ -1931,38 +1991,56 @@ def check_command_is_importable():
 
 
 def main():
-    doc = FreeCAD.openDocument(FIXTURE)
+    global _RUN_STARTED
+    _RUN_STARTED = time.time()
+    doc = timed("open the fixture document", FreeCAD.openDocument, FIXTURE)
     emit("Lead-in audit check on %s" % os.path.basename(FIXTURE))
 
-    job = replay(doc)
+    job = timed("replay (the shared job)", replay, doc)
     if not check(job is not None, "the fixture replays"):
         return finish()
 
-    result = check_scan(doc, job)
-    check_known_conflict(result)
-    check_margin_is_the_tool_radius(result, job)
-    check_dry_run_writes_nothing(doc, job)
-    check_dry_run_says_what_is_fixable(doc, job)
-    check_dry_run_writes_no_marks(doc, job)
-    check_unfixable_marking_happens_on_a_real_run(doc, job)
-    check_the_fix(doc, job)
-    check_progress_is_reported(doc, job)
-    check_cancel_stops_between_operations(doc, job)
-    check_cancel_mid_operation_restores_the_start_point(doc, job)
-    check_a_cancelled_progress_widget_is_not_a_crash(doc, job)
-    check_no_tool_means_reported_not_guessed(doc, job)
-    check_unfixable_is_marked(doc, job)
-    check_lead_out_is_judged_too(doc, job)
-    check_a_lead_in_crossing_a_lead_in_is_found_and_fixed()
-    check_the_lead_run_count_is_always_stated(job)
+    result = timed("check_scan", check_scan, doc, job)
+    timed("check_known_conflict", check_known_conflict, result)
+    timed("check_margin_is_the_tool_radius", check_margin_is_the_tool_radius,
+          result, job)
+    timed("check_dry_run_writes_nothing", check_dry_run_writes_nothing, doc,
+          job)
+    timed("check_dry_run_says_what_is_fixable",
+          check_dry_run_says_what_is_fixable, doc, job)
+    timed("check_dry_run_writes_no_marks", check_dry_run_writes_no_marks, doc,
+          job)
+    timed("check_unfixable_marking_happens_on_a_real_run",
+          check_unfixable_marking_happens_on_a_real_run, doc, job)
+    timed("check_the_fix", check_the_fix, doc, job)
+    timed("check_progress_is_reported", check_progress_is_reported, doc, job)
+    timed("check_cancel_stops_between_operations",
+          check_cancel_stops_between_operations, doc, job)
+    timed("check_cancel_mid_operation_restores_the_start_point",
+          check_cancel_mid_operation_restores_the_start_point, doc, job)
+    timed("check_a_cancelled_progress_widget_is_not_a_crash",
+          check_a_cancelled_progress_widget_is_not_a_crash, doc, job)
+    timed("check_no_tool_means_reported_not_guessed",
+          check_no_tool_means_reported_not_guessed, doc, job)
+    timed("check_unfixable_is_marked", check_unfixable_is_marked, doc, job)
+    timed("check_lead_out_is_judged_too", check_lead_out_is_judged_too, doc,
+          job)
+    timed("check_a_lead_in_crossing_a_lead_in_is_found_and_fixed",
+          check_a_lead_in_crossing_a_lead_in_is_found_and_fixed)
+    timed("check_the_lead_run_count_is_always_stated",
+          check_the_lead_run_count_is_always_stated, job)
     # These read the geometry itself rather than a report, and they must run
     # before anything mutates the shared `job` -- `check_the_fix` above has
     # already moved start points on it.
-    check_own_body_is_not_drawn_across_the_gap_between_wires(doc, job)
-    check_lead_runs_are_indexed_too(doc, job)
-    check_the_census_with_built_lead_outs(doc)
-    check_the_sheet_edge_is_checked(doc, job)
-    check_command_is_importable()
+    timed("check_own_body_is_not_drawn_across_the_gap_between_wires",
+          check_own_body_is_not_drawn_across_the_gap_between_wires, doc, job)
+    timed("check_lead_runs_are_indexed_too", check_lead_runs_are_indexed_too,
+          doc, job)
+    timed("check_the_census_with_built_lead_outs",
+          check_the_census_with_built_lead_outs, doc)
+    timed("check_the_sheet_edge_is_checked", check_the_sheet_edge_is_checked,
+          doc, job)
+    timed("check_command_is_importable", check_command_is_importable)
 
     return finish()
 
@@ -2019,6 +2097,7 @@ def finish():
             emit("   - %s" % message)
     else:
         emit("all %d checks passed" % _checks[0])
+    emit_timings()
     try:
         with open(_STATUS_FILE, "w") as handle:
             handle.write("1" if _failures else "0")
@@ -2034,6 +2113,9 @@ if __name__ in ("__main__", "test_lead_in_audit"):
         emit("harness raised:")
         for line in traceback.format_exc().split("\n"):
             emit("   %s" % line)
+        # The crash is the one moment a reader most wants to know which check
+        # was running and how long the run had taken, and `finish` never ran.
+        emit_timings()
         with open(_STATUS_FILE, "w") as handle:
             handle.write("1")
         raise
