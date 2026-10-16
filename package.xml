@@ -2,8 +2,8 @@
 <package format="1" xmlns="https://wiki.freecad.org/Package_Metadata">
   <name>Jet-Nesting</name>
   <description>A workbench for 2D nesting of shapes, using no-fit-polygon (Minkowski sum) placement with a genetic algorithm optimizer. Includes a manual nester, sheet stacking, DXF export and CAM job creation.</description>
-  <version>1.0.3</version>
-  <date>2026-10-13</date>
+  <version>1.0.4</version>
+  <date>2026-10-17</date>
   <maintainer email="petersfinewoodcraft@gmail.com">Steve Peters</maintainer>
   <maintainer email="james@snaggingpixels.com">James Walker</maintainer>
   <license file="LICENSE">LGPL-2.1-or-later</license>

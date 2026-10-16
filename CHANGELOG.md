@@ -5,6 +5,74 @@ All notable changes to Jet-Nesting will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.4] - 2026-10-17
+
+Mostly the lead-in/lead-out audit: a new command that finds lead runs reaching a
+neighbouring part's cut path and moves their start points until they clear, plus
+the measurement and test defects found while building it. Long form in
+[Unreleased] below.
+
+### Added
+- **`Nesting > Check Lead-ins Against Nesting`**, on a replayed CAM job. It finds
+  lead-ins and lead-outs that reach another part's cut path **or another
+  operation's lead-in or lead-out** -- the two are tested together, since one
+  start point places both ends -- and moves their start points until they clear.
+  Report-only first, which writes nothing; what cannot be fixed is marked
+  `CONFLICT_` and left to cut. See [NEST-033](issues.md#nest-033).
+- **An adjustable clearance on that check**, a multiple of the tool radius,
+  remembered in preferences and stated in the report, since the counts are a
+  function of it.
+- **`Replay CAM Setup`** carries a job's operations, dressups, per-feature
+  settings and order across to the nested copies.
+- Panel dimensions follow the document's unit system, including fractional and
+  compound inch entry; `Nesting Settings`, `Helpers` and `Logging` collapse and
+  start collapsed, taking 167px off the panel.
+
+### Fixed
+- **A replayed job's start point was carried to the wrong place on the part.**
+  The nesting side bakes its frame shift into the geometry, so all 54 `part_*`
+  objects carry an identity placement and the shift is invisible to the
+  transform that was being built: a replayed cut path sat **2.094006 mm** from
+  the rigid image of its source's. Translation is now measured between the two
+  solids, putting the 110 replayed paths within **0.0336 mm**. See
+  [NEST-040](issues.md#nest-040).
+- **The sheet-edge check was measuring the wrong distance, and the zero margin
+  was hiding it.** Shapely reports 0 between geometries of different dimensions
+  that intersect, so every pierce point on the material read "0 mm from the
+  edge". It now measures to the *boundary* with the operation's own tool radius,
+  and a pierce inside that radius is a finding -- the kerf has to have material
+  on both sides of it. See [NEST-038](issues.md#nest-038).
+- **The fix no longer verifies candidates against geometry that has already
+  moved**, nor can it report a clean sheet with two lead-ins crossing on it; a
+  fix run re-reads the finished job before reporting.
+- **`Replay CAM` carried no `StartPoint` onto the nested copies** (the part moved
+  while the point did not), and a `Boundary` dressup clipped against a solid
+  belonging to the source job, producing no cutting motion at all. See
+  [NEST-024](issues.md#nest-024) and [NEST-009](issues.md#nest-009).
+- A check loop that iterates zero times now fails loudly. See
+  [NEST-041](issues.md#nest-041).
+
+### Performance
+- A replay of the committed fixture went **43.5s -> 27.5s -> 10.6s**, caching the
+  footprint slices that were being recomputed for shapes already in hand, and
+  splitting the per-target-part work.
+- The Manual Nester's drawing path went **150.60s -> 127.90s**, drawing only the
+  placements that are actually drawn, with an identical result.
+- The lead-in audit's suite runs its copy-only checks across `cpu_count() - 1`
+  worker processes: **205 s -> 82 s** on the four-vCPU development box.
+
+### Known issues
+- **Turning a lead-out on can detach its own lead-in**, leaving it 0.688830 mm off
+  the contour it belongs to. Not a replay defect and not a stale path. Open; see
+  [NEST-042](issues.md#nest-042).
+
+### Notes
+- **The 1.0.3 "identical results across platforms" claim is narrower than it
+  reads.** The deterministic tie-break closes most of the gap, not all of it: a
+  fixed-direction run is reproducible within a platform, library set and seed,
+  but the last part or two can still differ across them. See
+  [NEST-032](issues.md#nest-032).
+
 ## [1.0.3] - 2026-10-13
 
 ### Fixed
