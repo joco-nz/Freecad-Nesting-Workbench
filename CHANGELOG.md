@@ -301,6 +301,19 @@ asks what the job cannot say. One job per sheet, every sheet replayed.
   and the per-target-part split above. 98 operations, all 98 with cutting motion,
   0 failures. (A later measurement of the same run reads 10.7s; the box is four
   CPUs and these figures move by a few tenths between runs.)
+- **The lead-in audit's suite runs its copy-only checks in parallel.** The suite
+  is now a table of checks tagged `serial` (they read or mutate the one shared
+  replay) or `farmed` (each reopens its own copy of the pristine replay
+  template). A coordinator runs the serial chain on the shared job while
+  `cpu_count() - 1` worker processes claim the farmed checks from a shared
+  queue, largest first, and their results are merged back. Every check still
+  runs exactly once, so the reported count is unchanged (**177**). Measured on
+  the four-vCPU development box: **205 s in one process -> 82 s** in the best
+  run (2.5x), with runs spread to ~115 s when the shared host is busy. Each
+  worker also closes its template copies after every check instead of holding
+  them all, which drops the coordinator's peak RSS from **1567 MB to 373 MB**.
+  `LEADIN_WORKERS=N` sets the count; `1` runs everything in one process, which
+  is what `run.sh` uses because it already fans its twenty suites across groups.
 
 ### Fixed
 

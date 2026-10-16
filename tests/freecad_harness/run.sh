@@ -97,6 +97,16 @@ rm -f "$BENCH_STATUS" "$TEST_STATUS" "$GA_STATUS" "$PANEL_STATUS" \
 
 cd "$REPO_ROOT"
 
+# The lead-in audit can farm its copy-only checks out to worker processes, but
+# this script already runs $JOBS groups at once. Nesting the two puts more
+# runnable processes on the box than it has cores, and this workload -- a full
+# CAM replay, memory-hungry -- does not gain from that. So when the groups
+# already use the machine, run every suite in one process; when they do not
+# (`--jobs 1`), leave the default so the lead-in audit can use the cores itself.
+if [ "$JOBS" -gt 1 ]; then
+    export LEADIN_WORKERS=1
+fi
+
 # Build the test list: each entry is "interpreter|script|status_file|description"
 # Interpreter: "cmd" for freecadcmd, "gui" for GUI_FREECAD
 # The suites are independent - each writes its own status file.

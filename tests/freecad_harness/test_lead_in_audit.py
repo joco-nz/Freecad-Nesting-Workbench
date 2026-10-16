@@ -41,12 +41,30 @@ What this is guarding
 
 Run directly, or via tests/freecad_harness/run.sh. Writes
 `.last_status_leadin`; 0 pass, 1 fail.
+
+Farmed across processes
+-----------------------
+
+Most of this suite's cost is in checks that open their own copy of the pristine
+replay (see the template notes below) and never look at the shared job. Those
+can run in worker processes, so the suite is written as a table of checks tagged
+"serial" or "farmed": the coordinator runs the serial chain on the shared job
+while `cpu_count() - 1` workers claim the farmed checks from a shared queue.
+
+The default leaves a core for the coordinator's chain. `LEADIN_WORKERS=N`
+overrides it, and `LEADIN_WORKERS=1` runs everything in one process -- which is
+what `run.sh` uses, because it already fans the twenty suites across groups and
+nesting a second level of parallelism on one box only oversubscribes it. Every
+check still runs exactly once, so a fanned-out run reports the same "N checks
+passed" as a serial one.
 """
 import glob
+import json
 import math
 import os
 import resource
 import shutil
+import subprocess
 import sys
 import tempfile
 import time
@@ -125,14 +143,29 @@ MAX_ARC_SAG_MM = 14.5239
 DISTANCE_TOL_MM = 0.0005
 
 
+#: When set, `emit` writes here instead of to the FreeCAD console. That is how
+#: a farmed-check worker records its output: the coordinator replays each
+#: worker's log in turn, so a fanned-out run still reads as one suite rather
+#: than four interleaved ones.
+_WORKER_LOG = None
+
+
 def emit(message=""):
+    text = str(message)
+    if _WORKER_LOG is not None:
+        try:
+            _WORKER_LOG.write(text + "\n")
+            _WORKER_LOG.flush()
+            return
+        except Exception:
+            pass
     try:
         if FreeCAD is not None and hasattr(FreeCAD, "Console"):
-            FreeCAD.Console.PrintMessage(str(message) + "\n")
+            FreeCAD.Console.PrintMessage(text + "\n")
         else:
-            print(message)
+            print(text)
     except Exception:
-        print(message)
+        print(text)
 
 
 def check(condition, message, detail=None):
@@ -156,6 +189,15 @@ _TIMINGS = []
 #: Wall clock from the start of `main()`, so the summary can state how long
 #: the whole run took rather than leaving it to `time(1)`.
 _RUN_STARTED = None
+
+#: Set when the farmed checks run in other processes, so the timing table and
+#: the footprint can say so: the accounted total is then summed across those
+#: processes and honestly exceeds the wall clock.
+_PARALLEL_WORKERS = 0
+
+#: Template copies reported by the workers, added to this process's own so the
+#: footprint line states the whole run's, not just the coordinator's.
+_REMOTE_COPIES = 0
 
 
 def timed(label, fn, *args):
@@ -196,6 +238,10 @@ def emit_timings():
              % (seconds, 100.0 * seconds / wall if wall else 0.0, label))
     emit("  %7.1f s  accounted for, %.1f s wall clock"
          % (accounted, wall))
+    if _PARALLEL_WORKERS > 1:
+        emit("  (farmed across %d worker processes, so the accounted total is "
+             "summed across them and exceeds the wall clock)"
+             % _PARALLEL_WORKERS)
 
 
 def emit_footprint():
@@ -214,7 +260,10 @@ def emit_footprint():
     peak_mb = (peak_rss / (1024.0 * 1024.0) if sys.platform == "darwin"
                else peak_rss / 1024.0)
     emit("  %d document(s) open, %.0f MB peak RSS, %d template copy(ies)"
-         % (open_documents, peak_mb, _TEMPLATE_COPIES))
+         % (open_documents, peak_mb, _TEMPLATE_COPIES + _REMOTE_COPIES))
+    if _PARALLEL_WORKERS > 1:
+        emit("  farmed across %d worker process(es), each one's peak unmeasured"
+             % _PARALLEL_WORKERS)
 
 
 @contextmanager
@@ -292,6 +341,11 @@ _TEMPLATE_PATH = os.path.join(tempfile.gettempdir(),
 _TEMPLATE_READY = False
 _TEMPLATE_COPIES = 0
 
+#: `(document name, file)` for every copy `pristine_job()` has opened and not
+#: yet released. A worker closes its copies after each check, so ten farmed
+#: checks do not hold ten 68 MB documents open at once.
+_OPENED_COPIES = []
+
 
 def save_replay_template(doc):
     """Snapshot `doc` -- freshly replayed and still pristine -- for reuse."""
@@ -339,16 +393,40 @@ def pristine_job():
             "template has to be a snapshot taken before any check mutates the "
             "job, and taking it later would bake in that damage")
     _TEMPLATE_COPIES += 1
-    path = "%s-%03d.FCStd" % (os.path.splitext(_TEMPLATE_PATH)[0],
-                              _TEMPLATE_COPIES)
+    # The pid is in the name because several processes share one template and
+    # each counts its copies from 1: without it two workers would race for
+    # `...-001.FCStd` and one would reopen the other's.
+    path = "%s-%d-%03d.FCStd" % (os.path.splitext(_TEMPLATE_PATH)[0],
+                                 os.getpid(), _TEMPLATE_COPIES)
     shutil.copy(_TEMPLATE_PATH, path)
     doc = FreeCAD.openDocument(path)
+    _OPENED_COPIES.append((doc.Name, path))
     best = None
     for obj in doc.Objects:
         operations = getattr(getattr(obj, "Operations", None), "Group", None)
         if operations and (best is None or len(operations) > best[0]):
             best = (len(operations), obj)
     return None if best is None else best[1]
+
+
+def release_copies():
+    """Close and delete every document `pristine_job()` has opened.
+
+    Only ever touches copies -- never the fixture document, which no caller
+    replaced with one, and never the template. Each check's copy is dropped by
+    the time it returns, so a worker running ten of them holds one at a time
+    rather than accumulating 68 MB per check.
+    """
+    opened, _OPENED_COPIES[:] = list(_OPENED_COPIES), []
+    for name, path in opened:
+        try:
+            FreeCAD.closeDocument(name)
+        except Exception:
+            pass
+        try:
+            os.remove(path)
+        except OSError:
+            pass
 
 
 #: How many extra lead-outs the suite turns on for itself. Six on top of
@@ -2105,6 +2183,363 @@ def check_command_is_importable():
         check(False, "the command imports", traceback.format_exc())
 
 
+# -- the suite as data, and the runners that share it ----------------------
+#
+# The suite is two lists. **Serial** checks read or mutate the one shared job:
+# `check_scan` produces the `result` the next two consume, `check_the_fix`
+# moves that job's start points, and `check_lead_out_is_judged_too` turns a
+# lead-out on for one of its operations and leaves it on. **Farmed** checks
+# never touch it -- every one reopens its own copy from the pristine template --
+# so they can run in other processes with no shared state at all.
+#
+# This split is the basis of the parallel runner, so it is written down once
+# here rather than inferred from the argument lists, and the single-process path
+# runs the same table end to end. A check that starts reading the shared job
+# must be moved to "serial", or a worker will hand it `None`.
+
+#: `(label, kind, argument slots)`, in the order the serial suite ran them.
+#: Slots: "doc"/"job" are the shared pair -- every farmed check takes them and
+#: ignores them, so a worker passes `None` -- and "scan" is `check_scan`'s
+#: result, which the coordinator keeps and threads through.
+_ORDER = [
+    ("check_scan", "serial", ("doc", "job")),
+    ("check_known_conflict", "serial", ("scan",)),
+    ("check_margin_is_the_tool_radius", "serial", ("scan", "job")),
+    ("check_dry_run_writes_nothing", "farmed", ("doc", "job")),
+    ("check_dry_run_says_what_is_fixable", "farmed", ("doc", "job")),
+    ("check_dry_run_writes_no_marks", "farmed", ("doc", "job")),
+    ("check_unfixable_marking_happens_on_a_real_run", "farmed", ("doc", "job")),
+    ("check_the_fix", "serial", ("doc", "job")),
+    ("check_progress_is_reported", "farmed", ("doc", "job")),
+    ("check_cancel_stops_between_operations", "farmed", ("doc", "job")),
+    ("check_cancel_mid_operation_restores_the_start_point", "farmed",
+     ("doc", "job")),
+    ("check_a_cancelled_progress_widget_is_not_a_crash", "farmed",
+     ("doc", "job")),
+    ("check_no_tool_means_reported_not_guessed", "farmed", ("doc", "job")),
+    ("check_unfixable_is_marked", "farmed", ("doc", "job")),
+    ("check_lead_out_is_judged_too", "serial", ("doc", "job")),
+    ("check_a_lead_in_crossing_a_lead_in_is_found_and_fixed", "farmed", ()),
+    ("check_the_lead_run_count_is_always_stated", "serial", ("job",)),
+    ("check_own_body_is_not_drawn_across_the_gap_between_wires", "farmed",
+     ("doc", "job")),
+    ("check_lead_runs_are_indexed_too", "farmed", ("doc", "job")),
+    ("check_the_census_with_built_lead_outs", "farmed", ("doc",)),
+    ("check_the_sheet_edge_is_checked", "farmed", ("doc", "job")),
+    ("check_command_is_importable", "farmed", ()),
+    ("check_the_pristine_copy_is_isolated", "farmed", ()),
+]
+
+_SLOTS = {label: slots for label, _kind, slots in _ORDER}
+
+#: Rough single-process cost of each farmed check, in seconds. It is used for
+#: **nothing but ordering the work queue**: workers claim the largest remaining
+#: check, which makes the assignment longest-processing-time-first and keeps the
+#: 30 s conflict search from landing next to the other big ones on one worker.
+#: A stale figure costs load balance and never correctness, so a check with no
+#: entry here simply sorts last and a wrong entry just sorts wrongly.
+_FARM_WEIGHT = {
+    "check_unfixable_is_marked": 30.0,
+    "check_a_lead_in_crossing_a_lead_in_is_found_and_fixed": 21.0,
+    "check_progress_is_reported": 17.6,
+    "check_a_cancelled_progress_widget_is_not_a_crash": 17.2,
+    "check_dry_run_writes_nothing": 16.1,
+    "check_dry_run_says_what_is_fixable": 15.9,
+    "check_unfixable_marking_happens_on_a_real_run": 10.8,
+    "check_dry_run_writes_no_marks": 10.8,
+    "check_the_sheet_edge_is_checked": 8.6,
+    "check_cancel_mid_operation_restores_the_start_point": 3.2,
+    "check_the_pristine_copy_is_isolated": 2.3,
+    "check_cancel_stops_between_operations": 1.9,
+    "check_lead_runs_are_indexed_too": 1.4,
+    "check_the_census_with_built_lead_outs": 1.3,
+    "check_no_tool_means_reported_not_guessed": 1.3,
+    "check_own_body_is_not_drawn_across_the_gap_between_wires": 1.3,
+    "check_command_is_importable": 0.0,
+}
+
+
+def _farmed_labels():
+    return [label for label, kind, _slots in _ORDER if kind == "farmed"]
+
+
+def _invoke(label, context):
+    args = [context["scan"] if slot == "scan" else context.get(slot)
+            for slot in _SLOTS[label]]
+    return globals()[label](*args)
+
+
+def _run_one(label, context, release=False):
+    """Run one `_ORDER` check, timing it and threading `check_scan`'s result.
+
+    `release` is for the workers: drop the copies the check opened as soon as it
+    returns, so a process that runs ten of them does not hold ten documents.
+    """
+    try:
+        result = timed(label, _invoke, label, context)
+    finally:
+        if release:
+            release_copies()
+    if label == "check_scan":
+        context["scan"] = result
+
+
+def _run_units(kinds, context, release=False):
+    for label, kind, _slots in _ORDER:
+        if kind in kinds:
+            _run_one(label, context, release=release)
+
+
+# -- farming the copy-only checks out to worker processes ------------------
+
+def _worker_count():
+    """How many worker processes to run the farmed checks in.
+
+    `LEADIN_WORKERS` overrides. The default leaves **one core for the
+    coordinator** -- `cpu_count() - 1`, capped at the number of farmed checks
+    and floored at one. The coordinator is not idle while the workers run: it is
+    running the serial checks on the shared job, and pushing the box past its
+    core count is a losing trade for this workload. Fewer than two means run
+    everything in one process, which is the right answer when the caller is
+    already using the machine: `run.sh` fans twenty suites across four groups,
+    so it sets `LEADIN_WORKERS=1` rather than nesting two levels of parallelism
+    on one box.
+
+    On the four-vCPU development box the whole suite is **205 s** in one
+    process and the fan-out has measured **82 s to 115 s**. That spread is the
+    host -- a shared desktop VM whose spare capacity moves -- not the worker
+    count, so it is not worth reading a "best" worker count out of any single
+    pair of runs. `cpu_count() - 1` produced the fastest run (82.5 s, 2.5x) and
+    is the count that leaves the coordinator's serial chain a core of its own.
+    """
+    fallback = max(1, min((os.cpu_count() or 1) - 1, len(_farmed_labels())))
+    raw = os.environ.get("LEADIN_WORKERS")
+    if raw is None or not raw.strip():
+        return fallback
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        emit("  (LEADIN_WORKERS=%r is not an integer; using %d)" % (raw, fallback))
+        return fallback
+
+
+def _make_workdir():
+    workdir = tempfile.mkdtemp(prefix="opencode-leadin-workers-")
+    for name in ("queue", "claimed", "workers"):
+        os.mkdir(os.path.join(workdir, name))
+    return workdir
+
+
+def _fill_queue(workdir):
+    """One file per farmed check: a worker claims a check by renaming its file."""
+    queue = os.path.join(workdir, "queue")
+    for label in _farmed_labels():
+        with open(os.path.join(queue, label + ".check"), "w") as handle:
+            handle.write(label)
+
+
+def _claim_one(workdir):
+    """Atomically claim the largest remaining farmed check, or `None`.
+
+    `os.rename` within one directory is atomic, so two workers racing for the
+    same file cannot both win; the loser gets `OSError` and picks again. Claiming
+    the biggest first makes the assignment longest-processing-time-first: every
+    worker starts on a big check, and whoever finishes earliest comes back for
+    the next biggest. The checks are independent, so only the balance depends on
+    the order.
+    """
+    queue = os.path.join(workdir, "queue")
+    claimed = os.path.join(workdir, "claimed")
+    while True:
+        try:
+            names = [n for n in os.listdir(queue) if n.endswith(".check")]
+        except OSError:
+            return None
+        if not names:
+            return None
+        names.sort(key=lambda n: _FARM_WEIGHT.get(n[:-len(".check")], 0.0),
+                   reverse=True)
+        name = names[0]
+        try:
+            os.rename(os.path.join(queue, name),
+                      os.path.join(claimed, "%d-%s" % (os.getpid(), name)))
+        except OSError:
+            continue
+        return name[:-len(".check")]
+
+
+def _write_worker_result(workdir, index, extra=None):
+    """Publish this worker's running totals, atomically.
+
+    Written after every check, not only at the end, so a worker that dies
+    mid-run still leaves the counts it had -- and so the coordinator can tell
+    "finished with no failures" from "never wrote anything".
+    """
+    data = {
+        "index": index,
+        "pid": os.getpid(),
+        "checks": _checks[0],
+        "failures": list(_failures),
+        "timings": [list(item) for item in _TIMINGS],
+        "copies": _TEMPLATE_COPIES,
+    }
+    if extra:
+        data.update(extra)
+    path = os.path.join(workdir, "workers", "worker-%d.json" % index)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as handle:
+        json.dump(data, handle)
+    os.replace(tmp, path)
+
+
+def _run_worker():
+    """Entry point for a worker process: claim farmed checks until none are left."""
+    global _RUN_STARTED, _WORKER_LOG, _TEMPLATE_READY
+    _RUN_STARTED = time.time()
+    index = int(os.environ["LEADIN_WORKER_INDEX"])
+    workdir = os.environ["LEADIN_WORKER_DIR"]
+    _WORKER_LOG = open(os.path.join(workdir, "workers",
+                                    "worker-%d.log" % index), "w")
+    crashed = False
+    try:
+        if not os.path.exists(_TEMPLATE_PATH):
+            crashed = True
+            emit("worker %d: no template at %s" % (index, _TEMPLATE_PATH))
+        else:
+            # The template exists because the coordinator saved it before it
+            # spawned anyone; there is nothing to snapshot here.
+            _TEMPLATE_READY = True
+            context = {"doc": None, "job": None}
+            while True:
+                label = _claim_one(workdir)
+                if label is None:
+                    break
+                _run_one(label, context, release=True)
+                _write_worker_result(workdir, index)
+    except Exception:
+        crashed = True
+        emit("worker %d raised:" % index)
+        for line in traceback.format_exc().split("\n"):
+            emit("   %s" % line)
+    finally:
+        try:
+            _write_worker_result(workdir, index, {"crashed": crashed})
+        except Exception:
+            pass
+        try:
+            _WORKER_LOG.close()
+        except Exception:
+            pass
+    return 1 if crashed else 0
+
+
+def _spawn_workers(workdir, count):
+    runner = os.environ.get("FREECADCMD") or sys.executable
+    workers_dir = os.path.join(workdir, "workers")
+    procs = []
+    for index in range(count):
+        env = dict(os.environ)
+        env["LEADIN_WORKER"] = "1"
+        env["LEADIN_WORKER_INDEX"] = str(index)
+        env["LEADIN_WORKER_DIR"] = workdir
+        env.pop("LEADIN_WORKERS", None)
+        out = open(os.path.join(workers_dir, "worker-%d.out" % index), "wb")
+        err = open(os.path.join(workers_dir, "worker-%d.err" % index), "wb")
+        proc = subprocess.Popen([runner, os.path.abspath(__file__)],
+                                cwd=_REPO, env=env, stdout=out, stderr=err)
+        procs.append((proc, out, err))
+    return procs
+
+
+def _read_worker_result(workdir, index):
+    path = os.path.join(workdir, "workers", "worker-%d.json" % index)
+    try:
+        with open(path) as handle:
+            return json.load(handle)
+    except (OSError, ValueError):
+        return None
+
+
+def _tail(path, limit=20):
+    try:
+        with open(path) as handle:
+            lines = handle.read().splitlines()
+    except OSError:
+        return "no log at %s" % path
+    return "\n".join(lines[-limit:])
+
+
+def _worker_log_path(workdir, index):
+    return os.path.join(workdir, "workers", "worker-%d.log" % index)
+
+
+def _collect_workers(workdir, procs, count):
+    """Wait for the workers, merge their results, then print their logs in turn."""
+    global _PARALLEL_WORKERS, _REMOTE_COPIES
+    _PARALLEL_WORKERS = count
+    for proc, out, err in procs:
+        proc.wait()
+        out.close()
+        err.close()
+
+    # Merge before printing, so a worker that died is reported as a failed
+    # check rather than only as a missing block of output.
+    for index in range(count):
+        data = _read_worker_result(workdir, index)
+        if data is None:
+            check(False, "worker %d reported its results" % index,
+                  "no result file in %s" % os.path.join(workdir, "workers"))
+            continue
+        if data.get("crashed"):
+            check(False, "worker %d finished without crashing" % index,
+                  _tail(os.path.join(workdir, "workers",
+                                     "worker-%d.err" % index)))
+        _checks[0] += int(data.get("checks", 0))
+        _failures.extend(data.get("failures", []))
+        _TIMINGS.extend((float(seconds), str(label))
+                        for seconds, label in data.get("timings", []))
+        _REMOTE_COPIES += int(data.get("copies", 0))
+
+    for index in range(count):
+        emit("")
+        emit("== worker %d ==" % index)
+        try:
+            with open(_worker_log_path(workdir, index)) as handle:
+                for line in handle:
+                    emit(line.rstrip("\n"))
+        except OSError:
+            emit("  (no log from worker %d)" % index)
+
+
+def _cleanup_workdir(workdir):
+    # Keep the directory when something failed, so the per-worker logs and the
+    # raw stdout survive for a post-mortem; otherwise the harness would litter
+    # /tmp one run at a time.
+    if _failures:
+        emit("  worker logs kept in %s" % workdir)
+        return
+    try:
+        shutil.rmtree(workdir)
+    except OSError:
+        pass
+
+
+def _run_fanned_out(doc, job, workers):
+    workdir = _make_workdir()
+    _fill_queue(workdir)
+    emit("")
+    emit("== %d farmed check(s) across %d worker process(es) =="
+         % (len(_farmed_labels()), workers))
+    procs = _spawn_workers(workdir, workers)
+    try:
+        _run_units(("serial",), {"doc": doc, "job": job})
+    finally:
+        # Runs even if a serial check raised: the workers are already doing
+        # their share, and dropping their results would hide failures.
+        _collect_workers(workdir, procs, workers)
+    _cleanup_workdir(workdir)
+
+
 def main():
     global _RUN_STARTED
     _RUN_STARTED = time.time()
@@ -2123,49 +2558,11 @@ def main():
     # bake in that damage and hand it to every check that reopens a copy.
     timed("save the replay template", save_replay_template, doc)
 
-    result = timed("check_scan", check_scan, doc, job)
-    timed("check_known_conflict", check_known_conflict, result)
-    timed("check_margin_is_the_tool_radius", check_margin_is_the_tool_radius,
-          result, job)
-    timed("check_dry_run_writes_nothing", check_dry_run_writes_nothing, doc,
-          job)
-    timed("check_dry_run_says_what_is_fixable",
-          check_dry_run_says_what_is_fixable, doc, job)
-    timed("check_dry_run_writes_no_marks", check_dry_run_writes_no_marks, doc,
-          job)
-    timed("check_unfixable_marking_happens_on_a_real_run",
-          check_unfixable_marking_happens_on_a_real_run, doc, job)
-    timed("check_the_fix", check_the_fix, doc, job)
-    timed("check_progress_is_reported", check_progress_is_reported, doc, job)
-    timed("check_cancel_stops_between_operations",
-          check_cancel_stops_between_operations, doc, job)
-    timed("check_cancel_mid_operation_restores_the_start_point",
-          check_cancel_mid_operation_restores_the_start_point, doc, job)
-    timed("check_a_cancelled_progress_widget_is_not_a_crash",
-          check_a_cancelled_progress_widget_is_not_a_crash, doc, job)
-    timed("check_no_tool_means_reported_not_guessed",
-          check_no_tool_means_reported_not_guessed, doc, job)
-    timed("check_unfixable_is_marked", check_unfixable_is_marked, doc, job)
-    timed("check_lead_out_is_judged_too", check_lead_out_is_judged_too, doc,
-          job)
-    timed("check_a_lead_in_crossing_a_lead_in_is_found_and_fixed",
-          check_a_lead_in_crossing_a_lead_in_is_found_and_fixed)
-    timed("check_the_lead_run_count_is_always_stated",
-          check_the_lead_run_count_is_always_stated, job)
-    # These read the geometry itself rather than a report, and they must run
-    # before anything mutates the shared `job` -- `check_the_fix` above has
-    # already moved start points on it.
-    timed("check_own_body_is_not_drawn_across_the_gap_between_wires",
-          check_own_body_is_not_drawn_across_the_gap_between_wires, doc, job)
-    timed("check_lead_runs_are_indexed_too", check_lead_runs_are_indexed_too,
-          doc, job)
-    timed("check_the_census_with_built_lead_outs",
-          check_the_census_with_built_lead_outs, doc)
-    timed("check_the_sheet_edge_is_checked", check_the_sheet_edge_is_checked,
-          doc, job)
-    timed("check_command_is_importable", check_command_is_importable)
-    timed("check_the_pristine_copy_is_isolated",
-          check_the_pristine_copy_is_isolated)
+    workers = _worker_count()
+    if workers >= 2:
+        _run_fanned_out(doc, job, workers)
+    else:
+        _run_units(("serial", "farmed"), {"doc": doc, "job": job})
 
     return finish()
 
@@ -2272,6 +2669,11 @@ def finish():
         emit("all %d checks passed" % _checks[0])
     emit_timings()
     emit_footprint()
+    # The template and this process's copies are scratch: drop them so a run
+    # leaves nothing in /tmp but worker logs a failure kept, and so no later run
+    # can inherit a snapshot this one did not take.
+    release_copies()
+    forget_template()
     try:
         with open(_STATUS_FILE, "w") as handle:
             handle.write("1" if _failures else "0")
@@ -2281,6 +2683,8 @@ def finish():
 
 
 if __name__ in ("__main__", "test_lead_in_audit"):
+    if os.environ.get("LEADIN_WORKER"):
+        sys.exit(_run_worker())
     try:
         main()
     except Exception:
