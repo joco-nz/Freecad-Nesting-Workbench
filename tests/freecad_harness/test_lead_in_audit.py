@@ -261,7 +261,8 @@ def replay(doc):
 
     For the fixture itself, most checks want a *pristine replay* and should call
     `pristine_job()` instead -- see the template notes below for why that is
-    ~14x cheaper and still isolated.
+    ~14x cheaper and still isolated. `main` is this function's only remaining
+    caller: it builds the one shared job and snapshots the template from it.
     """
     layout, _warnings = cam_replay.resolve_layout_group(doc)
     outcomes = cam_replay.replay_layout(doc, layout, doc.getObject("Job"))
@@ -934,13 +935,17 @@ def check_a_cancelled_progress_widget_is_not_a_crash(doc, job):
 def check_dry_run_writes_nothing(doc, job):
     emit("")
     emit("== report-only mode writes nothing at all ==")
+    # Its own copy. This is a dry run: it needs a job that still has conflicts
+    # and asserts that nothing was written -- neither of which depends on the
+    # shared job, so it does not have to sit on the serial chain.
+    fresh = pristine_job()
     # Resolved from a scan rather than by name: see `_worst`.
-    dressup = _worst(lead_in_audit.scan_job(job)).dressup
+    dressup = _worst(lead_in_audit.scan_job(fresh)).dressup
     operation = dressup.Base
     before = (dressup.Label, bool(operation.UseStartPoint),
               FreeCAD.Vector(operation.StartPoint), len(dressup.Path.Commands))
 
-    result = lead_in_audit.scan_job(job)
+    result = lead_in_audit.scan_job(fresh)
     flagged = len(result.offending)
     lead_in_audit.resolve_conflicts(result, dry_run=True)
 
@@ -951,7 +956,7 @@ def check_dry_run_writes_nothing(doc, job):
           "before: %s\nafter:  %s" % (before, after))
     check(not hasattr(dressup, lead_in_audit.PROP_CONFLICT),
           "no conflict property was added")
-    check(len(lead_in_audit.scan_job(job).offending) == flagged,
+    check(len(lead_in_audit.scan_job(fresh).offending) == flagged,
           "the %d conflict(s) are still there, so nothing was quietly fixed"
           % flagged)
 
@@ -1440,15 +1445,18 @@ def _check_the_edge_is_not_checked_when_there_is_no_stock():
     exists to avoid, and the reason this half is kept even now that the first
     half builds its own case.
     """
-    blank_doc = FreeCAD.openDocument(FIXTURE)
-    blank = replay(blank_doc)
+    # Its own copy, not a fresh replay into the fixture document. This check
+    # wants a job whose Stock can be removed, and a reopened copy provides that
+    # in ~1 s where replaying the fixture to get there cost ~14 s. It also stops
+    # this being the one check that mutates the shared fixture document.
+    blank = pristine_job()
+    if not check(blank is not None, "a copy reopens to take the Stock from"):
+        return
     stock = getattr(blank, "Stock", None)
-    check(stock is not None, "the fresh replay has a Stock to remove")
-    # `removeObject` takes the document object and clears the job's reference on
-    # the way, which is what `stock_polygon` looks at. Removing it before the
-    # replay would not work: the replay builds a fresh stock and repoints the
-    # new job at it.
-    blank_doc.removeObject(stock.Name)
+    check(stock is not None, "the job has a Stock to remove")
+    # `removeObject` removes it from the document that holds the job and clears
+    # the job's reference on the way, which is what `stock_polygon` looks at.
+    blank.Document.removeObject(stock.Name)
     blind = lead_in_audit.scan_job(blank)
     check(blind.sheet is None,
           "with no Stock there is no outline to test against")
