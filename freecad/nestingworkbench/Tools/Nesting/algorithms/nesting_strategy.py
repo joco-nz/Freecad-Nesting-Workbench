@@ -753,10 +753,12 @@ class PlacementOptimizer:
         self.rotation_workers_explicit = rotation_workers_explicit
         self.engine = engine
         self.rotation_steps = max(1, rotation_steps)
-        self.search_direction = search_direction
-        self.log_callback = log_callback
-        self.trial_callback = trial_callback  # Called for each trial placement in simulation mode
         self.rng = rng or random  # Seeded random.Random for reproducible runs, or the global module
+        self.search_direction = search_direction
+        if self.search_direction is None:
+            angle_rad = self.rng.uniform(0, 2 * math.pi)
+            self.search_direction = (math.cos(angle_rad), math.sin(angle_rad))
+        self.trial_callback = trial_callback  # Called for each trial placement in simulation mode
         self.verbose = False
         self.performance_logging = performance_logging
         self._perf_lock = threading.Lock()
@@ -896,9 +898,6 @@ class PlacementOptimizer:
             placed_parts_grouped[key].append(p)
             
         direction = self.search_direction
-        if direction is None:
-             angle_rad = self.rng.uniform(0, 2 * math.pi)
-             direction = (math.cos(angle_rad), math.sin(angle_rad))
 
         best_result = {'metric': float('inf')}
         
@@ -930,9 +929,10 @@ class PlacementOptimizer:
         # metric to 10 dp and prefer the candidate closest to origin -- so
         # `score_gravity` no longer reads the rng it is handed and these
         # children no longer move the packing. They are kept because minting
-        # still advances `self.rng`, which feeds the randomised direction drawn
-        # above when `search_direction` is None; dropping them would change those
-        # layouts. Cost is one `getrandbits` per rotation per part placed.
+        # still advances `self.rng` (needed by callers that keep relying on
+        # that stream) and do not change the direction that is now fixed once
+        # at initialisation. Cost is one `getrandbits` per rotation per part
+        # placed.
         rotation_rngs = [random.Random(self.rng.getrandbits(64))
                          for _ in angles]
 

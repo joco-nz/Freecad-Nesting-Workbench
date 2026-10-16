@@ -111,10 +111,10 @@ def fingerprint(seed, workers, algo="Minkowski", physics_shake=True,
     `algo="Physics"` takes no pool: the physics path is single-threaded, so the
     width is meaningless there and is not varied.
 
-    `search_direction=None` reaches the Minkowski nester's randomised direction
-    draw, the one live rng site left on that path (see the module docstring);
-    the default `(0.0, 1.0)` keeps the direction fixed and the path
-    deterministic.
+    `search_direction=None` causes the Minkowski nester to draw a single
+    random direction once at initialisation, the one live rng site left on
+    that path (see the module docstring); the default `(0.0, 1.0)` keeps the
+    direction fixed and the path deterministic.
 
     `NESTING_ROTATION_WORKERS` rather than the `rotation_workers` kwarg, because
     `_rotation_worker_limit` treats an explicit 0 as *unset* and falls back to
@@ -260,7 +260,7 @@ def check_the_seed_still_matters(prints):
     # a *fixed* search direction the greedy path has no rng draw left and two
     # seeds agree -- asserted in 3b, and it is why this section uses the
     # randomised direction instead. `search_direction=None` reaches the one live
-    # Minkowski draw, `nesting_strategy.py:900`.
+    # Minkowski draw, now resolved once at initialisation (`nesting_strategy.py:~760`).
     digest_a, placed = fingerprint(SEED_A, WIDTHS[0], search_direction=None)
     digest_b, _ = fingerprint(SEED_B, WIDTHS[0], search_direction=None)
     emit("  random direction, seed %d -> %s (%d placed)"
@@ -272,8 +272,8 @@ def check_the_seed_still_matters(prints):
           % (placed, EXPECTED_PLACED))
     check(digest_a != digest_b,
           "randomised-direction Minkowski gave the same layout for seeds %d and "
-          "%d (%s). The direction draw at nesting_strategy.py:900 must come from "
-          "the seeded rng; if it does not, the seed is decorative and every "
+          "%d (%s). The initial direction draw must come from the seeded rng; if it "
+          "does not, the seed is decorative and every "
           "other assertion in this file passes trivially."
           % (SEED_A, SEED_B, digest_a))
 
