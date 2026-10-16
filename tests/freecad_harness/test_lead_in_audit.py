@@ -42,9 +42,13 @@ What this is guarding
 Run directly, or via tests/freecad_harness/run.sh. Writes
 `.last_status_leadin`; 0 pass, 1 fail.
 """
+import glob
 import math
 import os
+import resource
+import shutil
 import sys
+import tempfile
 import time
 import traceback
 from contextlib import contextmanager
@@ -194,6 +198,25 @@ def emit_timings():
          % (accounted, wall))
 
 
+def emit_footprint():
+    """State what the run left open, so the reuse's cost is on the record.
+
+    Reopening the saved template trades ~14 s of CAM work for ~1 s of file
+    loading, but every copy is a live document. Naming the open document count
+    and peak memory keeps that trade visible instead of implied.
+    """
+    try:
+        open_documents = len(FreeCAD.listDocuments())
+    except Exception:
+        open_documents = -1
+    peak_rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    # ru_maxrss is KiB on Linux, bytes on macOS.
+    peak_mb = (peak_rss / (1024.0 * 1024.0) if sys.platform == "darwin"
+               else peak_rss / 1024.0)
+    emit("  %d document(s) open, %.0f MB peak RSS, %d template copy(ies)"
+         % (open_documents, peak_mb, _TEMPLATE_COPIES))
+
+
 @contextmanager
 def group(items, description):
     """`check` a property of every item in `items`, and fail if there are none.
@@ -235,6 +258,10 @@ def replay(doc):
     the same object instead, and the checks then read each other's damage: the
     unfixable check scanned an already-fixed job and got `None` from `_worst`,
     and the lead-out check found every margin unreadable.
+
+    For the fixture itself, most checks want a *pristine replay* and should call
+    `pristine_job()` instead -- see the template notes below for why that is
+    ~14x cheaper and still isolated.
     """
     layout, _warnings = cam_replay.resolve_layout_group(doc)
     outcomes = cam_replay.replay_layout(doc, layout, doc.getObject("Job"))
@@ -242,6 +269,85 @@ def replay(doc):
         if outcome.replay_job is not None:
             return outcome.replay_job.job
     return None
+
+
+#: A replay of the 136-operation fixture costs ~15 s, and this suite wanted one
+#: per check. Almost all of that cost is FreeCAD's CAM engine regenerating every
+#: Profile toolpath (`doc.recompute`) and rebuilding 136 operations; measured
+#: once, the same replay can be saved and *reopened* in ~1 s. So the suite
+#: replays the fixture once, saves that pristine document here, and every check
+#: that wants its own un-mutated job reopens a copy instead of rebuilding one.
+#:
+#: **The snapshot has to be pristine.** It is taken in `main` immediately after
+#: the one shared replay and before any check runs, because a job that has
+#: already been audited or fixed is not a valid base for a later check -- the
+#: whole reason `check_unfixable_is_marked` needs its own copy is that the
+#: shared job has been fixed by then.
+#:
+#: `saveCopy` rather than `saveAs`: the fixture document's own `FileName` must
+#: not move, and several checks ask for that document again.
+_TEMPLATE_PATH = os.path.join(tempfile.gettempdir(),
+                              "opencode-leadin-replay-template.FCStd")
+_TEMPLATE_READY = False
+_TEMPLATE_COPIES = 0
+
+
+def save_replay_template(doc):
+    """Snapshot `doc` -- freshly replayed and still pristine -- for reuse."""
+    global _TEMPLATE_READY
+    doc.saveCopy(_TEMPLATE_PATH)
+    _TEMPLATE_READY = True
+
+
+def forget_template():
+    """Drop any template and copies left by an earlier run.
+
+    Called at the top of `main` so a stale snapshot -- of a different fixture,
+    or of a job somebody already fixed -- can never be reopened. Deleting the
+    files is the point; a run never wants to inherit another run's base.
+    """
+    global _TEMPLATE_READY, _TEMPLATE_COPIES
+    _TEMPLATE_READY = False
+    _TEMPLATE_COPIES = 0
+    stem = os.path.splitext(_TEMPLATE_PATH)[0]
+    for path in glob.glob(stem + "*.FCStd"):
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
+def pristine_job():
+    """A fresh replayed job, from a private copy of the saved template.
+
+    Each caller gets its **own copy on disk and its own document**, so a check
+    that mutates its job cannot reach any other check's: reopening the template
+    is not reopening a job somebody has already edited. Copying the file (~0.0 s
+    for 2.5 MB) rather than reopening the same path is what keeps the documents
+    distinct -- `openDocument` on a path that is already open returns the open
+    one.
+
+    The job is found by having the most `Operations`, not by name: FreeCAD
+    suffixes duplicate names, and `_worst` documents at length why nothing here
+    may rely on a name surviving a replay.
+    """
+    global _TEMPLATE_COPIES
+    if not _TEMPLATE_READY:
+        raise RuntimeError(
+            "pristine_job() was called before save_replay_template() -- the "
+            "template has to be a snapshot taken before any check mutates the "
+            "job, and taking it later would bake in that damage")
+    _TEMPLATE_COPIES += 1
+    path = "%s-%03d.FCStd" % (os.path.splitext(_TEMPLATE_PATH)[0],
+                              _TEMPLATE_COPIES)
+    shutil.copy(_TEMPLATE_PATH, path)
+    doc = FreeCAD.openDocument(path)
+    best = None
+    for obj in doc.Objects:
+        operations = getattr(getattr(obj, "Operations", None), "Group", None)
+        if operations and (best is None or len(operations) > best[0]):
+            best = (len(operations), obj)
+    return None if best is None else best[1]
 
 
 #: How many extra lead-outs the suite turns on for itself. Six on top of
@@ -527,7 +633,7 @@ def check_progress_is_reported(doc, job):
     """
     emit("")
     emit("== progress is reported, per operation and per candidate ==")
-    fresh = replay(FreeCAD.openDocument(FIXTURE))
+    fresh = pristine_job()
     events = []
 
     def seam(**kwargs):
@@ -567,7 +673,7 @@ def check_progress_is_reported(doc, job):
 
     # And on a real run it does say fixed.
     events2 = []
-    fresh2 = replay(FreeCAD.openDocument(FIXTURE))
+    fresh2 = pristine_job()
     result2 = lead_in_audit.scan_job(fresh2)
     lead_in_audit.resolve_conflicts(result2, dry_run=False, limit=2,
                                     progress=lambda **kw: events2.append(kw))
@@ -588,7 +694,7 @@ def check_cancel_stops_between_operations(doc, job):
     """
     emit("")
     emit("== cancelling stops the search and keeps what it fixed ==")
-    fresh = replay(FreeCAD.openDocument(FIXTURE))
+    fresh = pristine_job()
     result = lead_in_audit.scan_job(fresh, margin=2.0)
     todo = len(result.offending)
     emit("  %d operation(s) to search" % todo)
@@ -653,7 +759,7 @@ def check_cancel_mid_operation_restores_the_start_point(doc, job):
     """
     emit("")
     emit("== cancelling mid-operation leaves the operation as it was ==")
-    fresh = replay(FreeCAD.openDocument(FIXTURE))
+    fresh = pristine_job()
 
     # Find an operation whose search genuinely takes several candidates. The
     # known offender is fixed on candidate **1**, so a cancel at candidate 3
@@ -798,7 +904,7 @@ def check_a_cancelled_progress_widget_is_not_a_crash(doc, job):
     """
     emit("")
     emit("== a progress seam that raises does not stop the search ==")
-    fresh = replay(FreeCAD.openDocument(FIXTURE))
+    fresh = pristine_job()
     result = lead_in_audit.scan_job(fresh)
 
     def broken_progress(**_kwargs):
@@ -814,7 +920,7 @@ def check_a_cancelled_progress_widget_is_not_a_crash(doc, job):
     def broken_cancel():
         raise RuntimeError("the widget was closed")
 
-    fresh2 = replay(FreeCAD.openDocument(FIXTURE))
+    fresh2 = pristine_job()
     result2 = lead_in_audit.scan_job(fresh2, margin=2.0)
     lead_in_audit.resolve_conflicts(result2, dry_run=False, limit=2,
                                     cancel_check=broken_cancel)
@@ -863,7 +969,7 @@ def check_dry_run_says_what_is_fixable(doc, job):
     """
     emit("")
     emit("== report-only says what could be fixed ==")
-    fresh = replay(FreeCAD.openDocument(FIXTURE))
+    fresh = pristine_job()
     result = lead_in_audit.scan_job(fresh)
     flagged = len(result.offending)
     check(flagged > 0, "the fresh job has %d conflict(s) to classify" % flagged)
@@ -937,7 +1043,7 @@ def check_dry_run_writes_no_marks(doc, job):
     """
     emit("")
     emit("== report-only leaves no CONFLICT_ marks, even on unfixable ones ==")
-    fresh = replay(FreeCAD.openDocument(FIXTURE))
+    fresh = pristine_job()
     # 2.0 mm flags 32; a two-candidate budget cannot clear most of them, so the
     # result is a genuine mix. (The 2 that come out unresolved are a budget
     # artefact, not genuinely unfixable -- the point is that the path is taken.)
@@ -976,7 +1082,7 @@ def check_unfixable_marking_happens_on_a_real_run(doc, job):
     """The counterpart: a real run *does* mark what it could not fix."""
     emit("")
     emit("== a real run marks what it could not fix ==")
-    fresh = replay(FreeCAD.openDocument(FIXTURE))
+    fresh = pristine_job()
     result = lead_in_audit.scan_job(fresh, margin=2.0)
     lead_in_audit.resolve_conflicts(result, dry_run=False, limit=2)
     counts = result.counts()
@@ -1025,9 +1131,9 @@ def check_own_body_is_not_drawn_across_the_gap_between_wires(doc, job):
     """
     emit("")
     emit("== the body geometry is the cut, and nothing else ==")
-    # Its own replay: the shared `job` has been fixed by now, so its lead-ins
+    # Its own copy: the shared `job` has been fixed by now, so its lead-ins
     # have moved and the counts below would not be the fixture's.
-    fresh = replay(FreeCAD.openDocument(FIXTURE))
+    fresh = pristine_job()
     prepared, index, _unreadable = lead_in_audit._prepare(fresh, None)
 
     joined = 0
@@ -1232,11 +1338,12 @@ def check_the_sheet_edge_is_checked(doc, job):
     """
     emit("")
     emit("== the sheet edge is checked, and reports what it could not check ==")
-    # Its own replay. The shared `job` has had its start points moved by
-    # `check_the_fix`, and the operations near the edge are among them -- so a
-    # scan of the fixed job finds the sheet clean, which is the right answer
-    # for a fixed job and the wrong thing to measure here.
-    fresh_job = replay(FreeCAD.openDocument(FIXTURE))
+    # Its own copy, reopened from the pristine template. The shared `job` has
+    # had its start points moved by `check_the_fix`, and the operations near the
+    # edge are among them -- so a scan of the fixed job finds the sheet clean,
+    # which is the right answer for a fixed job and the wrong thing to measure
+    # here.
+    fresh_job = pristine_job()
 
     near, near_saved, near_radius = _force_a_pierce_at_the_sheet_edge(
         fresh_job, want_off_sheet=False)
@@ -1369,7 +1476,7 @@ def check_lead_runs_are_indexed_too(doc, job):
     """
     emit("")
     emit("== lead runs are indexed, not only bodies ==")
-    # Its own replay, because an earlier check turned `LeadOut` on for one of
+    # Its own copy, because an earlier check turned `LeadOut` on for one of
     # the shared job's operations and left it there.
     #
     # **No lead-outs are built here, unlike in
@@ -1379,7 +1486,7 @@ def check_lead_runs_are_indexed_too(doc, job):
     # own-operation check below. That is NEST-042 and it is not this check's
     # subject; the census check carries the wider lead-out coverage, and this
     # one still asserts that both of the fixture's lead-outs are indexed.
-    fresh = replay(FreeCAD.openDocument(FIXTURE))
+    fresh = pristine_job()
     prepared, index, _unreadable = lead_in_audit._prepare(fresh, None)
     bodies = [e for e in index.entries if e[4] == lead_in_audit.ROLE_BODY]
     lead_ins = [e for e in index.entries if e[4] == lead_in_audit.ROLE_LEAD_IN]
@@ -1519,7 +1626,7 @@ def check_no_tool_means_reported_not_guessed(doc, job):
     """
     emit("")
     emit("== no readable tool means nothing is claimed ==")
-    empty = replay(FreeCAD.openDocument(FIXTURE))
+    empty = pristine_job()
     for controller in list(empty.Tools.Group):
         empty.Tools.removeObject(controller)
     for entry in empty.Operations.Group:
@@ -1554,10 +1661,10 @@ def check_unfixable_is_marked(doc, job):
     """
     emit("")
     emit("== an operation that cannot be fixed is marked, not moved ==")
-    # Its own replay. The shared `job` has been fixed by `check_the_fix` by now,
+    # Its own copy. The shared `job` has been fixed by `check_the_fix` by now,
     # so it has no conflicts left to be unable to fix -- which is what the first
     # version of this check hit, as a `NoneType` from `_worst`.
-    fresh = replay(FreeCAD.openDocument(FIXTURE))
+    fresh = pristine_job()
     dressup = _worst(lead_in_audit.scan_job(fresh)).dressup
     operation = dressup.Base
     before_label = dressup.Label
@@ -1702,7 +1809,7 @@ def check_lead_out_is_judged_too(doc, job):
     # question that was actually worth asking.
     emit("")
     emit("== a search cannot fix a lead-in by breaking its lead-out ==")
-    fresh = replay(FreeCAD.openDocument(FIXTURE))
+    fresh = pristine_job()
     target, target_op = _pick_conflicting(fresh, fresh)
     if not check(target is not None,
                  "an operation with a conflict was available to test with"):
@@ -1844,7 +1951,7 @@ def check_a_lead_in_crossing_a_lead_in_is_found_and_fixed():
     """
     emit("")
     emit("== a lead-in reaching another lead-in is found, and fixed ==")
-    fresh = replay(FreeCAD.openDocument(FIXTURE))
+    fresh = pristine_job()
     if not check(fresh is not None, "a fresh document replayed"):
         return
 
@@ -1995,10 +2102,18 @@ def main():
     _RUN_STARTED = time.time()
     doc = timed("open the fixture document", FreeCAD.openDocument, FIXTURE)
     emit("Lead-in audit check on %s" % os.path.basename(FIXTURE))
+    # Never inherit a snapshot from an earlier run -- of a different fixture, or
+    # of a job somebody already fixed.
+    forget_template()
 
     job = timed("replay (the shared job)", replay, doc)
     if not check(job is not None, "the fixture replays"):
         return finish()
+
+    # Snapshot the pristine replay *now*, before `check_scan` or anything after
+    # it has a chance to mutate the shared job: a template taken later would
+    # bake in that damage and hand it to every check that reopens a copy.
+    timed("save the replay template", save_replay_template, doc)
 
     result = timed("check_scan", check_scan, doc, job)
     timed("check_known_conflict", check_known_conflict, result)
@@ -2041,6 +2156,8 @@ def main():
     timed("check_the_sheet_edge_is_checked", check_the_sheet_edge_is_checked,
           doc, job)
     timed("check_command_is_importable", check_command_is_importable)
+    timed("check_the_pristine_copy_is_isolated",
+          check_the_pristine_copy_is_isolated)
 
     return finish()
 
@@ -2052,7 +2169,7 @@ def check_the_census_with_built_lead_outs(doc):
 
     `check_scan` reads the shared job, which several later checks depend on and
     which `check_lead_out_is_judged_too` already mutates, so it cannot be
-    touched here. This is the same count on its own replay with six lead-outs
+    touched here. This is the same count on its own copy with six lead-outs
     turned on -- which is the point: the fixture now carries two, and a reader
     that silently loses *some* lead-outs would pass on two and fail on eight.
 
@@ -2061,7 +2178,7 @@ def check_the_census_with_built_lead_outs(doc):
     """
     emit("")
     emit("== the census holds up with lead-outs the suite built ==")
-    fresh = replay(FreeCAD.openDocument(FIXTURE))
+    fresh = pristine_job()
     if not check(fresh is not None, "the fixture replays a second time"):
         return
 
@@ -2088,6 +2205,54 @@ def check_the_census_with_built_lead_outs(doc):
           "lead-outs, so nothing was actually added" % had)
 
 
+def check_the_pristine_copy_is_isolated():
+    """One check's mutation must not reach the next check's replay.
+
+    `pristine_job()` hands every check its own reopened copy of the saved
+    template rather than one shared job, and that isolation is the property the
+    whole reuse rests on: `check_lead_out_is_judged_too` flips `LeadOut` on its
+    job and never flips it back, so if copies were not isolated the next check
+    would be reading that damage instead of the fixture. That is not
+    hypothetical -- an in-memory cache tried here earlier did exactly that, and
+    the failures it produced (`_worst` returning `None`, an `IndexError` on the
+    wide-margin scan) looked nothing like "a cache".
+
+    Cheap to assert, and worth asserting rather than assuming: "it worked on the
+    run I watched" is how the cache that broke this got in.
+    """
+    emit("")
+    emit("== a check's mutation cannot reach the next check's replay ==")
+    first = pristine_job()
+    if not check(first is not None, "a template copy reopens"):
+        return
+    pairs = lead_in_audit.lead_in_out_dressups(first)
+    if not check(bool(pairs), "the copy has a LeadInOut dressup to mutate"):
+        return
+    pristine_flags = [getattr(dressup, "LeadOut", False)
+                      for dressup, _operation in pairs]
+    dressup = pairs[0][0]
+    dressup.LeadOut = not pristine_flags[0]
+    dressup.recompute()
+    check(dressup.LeadOut != pristine_flags[0],
+          "the copy really was mutated (%s -> %s)"
+          % (pristine_flags[0], dressup.LeadOut))
+
+    second = pristine_job()
+    if not check(second is not None, "a second copy reopens"):
+        return
+    check(second.Document is not first.Document,
+          "it is a *different* document, not the mutated one handed back")
+    other = lead_in_audit.lead_in_out_dressups(second)
+    if not check(bool(other), "the second copy has the same dressups"):
+        return
+    fresh_flags = [getattr(dressup, "LeadOut", False)
+                   for dressup, _operation in other]
+    check(fresh_flags == pristine_flags,
+          "and every one still carries the fixture's own value (%d of %d "
+          "differ)" % (sum(1 for a, b in zip(fresh_flags, pristine_flags)
+                           if a != b), len(pristine_flags)))
+
+
 def finish():
     emit("")
     emit("== summary ==")
@@ -2098,6 +2263,7 @@ def finish():
     else:
         emit("all %d checks passed" % _checks[0])
     emit_timings()
+    emit_footprint()
     try:
         with open(_STATUS_FILE, "w") as handle:
             handle.write("1" if _failures else "0")
@@ -2116,6 +2282,7 @@ if __name__ in ("__main__", "test_lead_in_audit"):
         # The crash is the one moment a reader most wants to know which check
         # was running and how long the run had taken, and `finish` never ran.
         emit_timings()
+        emit_footprint()
         with open(_STATUS_FILE, "w") as handle:
             handle.write("1")
         raise
