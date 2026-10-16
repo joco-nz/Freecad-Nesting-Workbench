@@ -84,7 +84,7 @@ TOOLTIP_STATUS="$HARNESS_DIR/.last_status_tooltip"
 PANELBUILD_STATUS="$HARNESS_DIR/.last_status_panelbuild"
 ROTATIONDET_STATUS="$HARNESS_DIR/.last_status_rotationdet"
 PERSIST_STATUS="$HARNESS_DIR/.last_status_persist"
-VERIFYSTAGE_STATUS="$HARNESS_DIR/.last_status_verifystate"
+VERIFYSTAGE_STATUS="$HARNESS_DIR/.last_status_verifystage"
 
 # Clean previous status files
 rm -f "$BENCH_STATUS" "$TEST_STATUS" "$GA_STATUS" "$PANEL_STATUS" \

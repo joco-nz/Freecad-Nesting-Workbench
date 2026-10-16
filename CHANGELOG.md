@@ -16,6 +16,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **The harness gate no longer stops on a status file that was never missing.**
+  `run.sh` waited for `.last_status_verifystate`, but `test_verify_stage.py`
+  writes `.last_status_verifystage`: a one-word mismatch that was permanent, so
+  the gate always quit at `DID NOT RUN -- did not write ...` and printed no
+  verdict at all, hiding the results of every other suite. The two names now
+  match, so the gate runs to its summary and reports what actually happened.
 - **A replayed job's start point is no longer carried to the wrong place on the
   part.** `source_to_clone_placement` built the transform from the two
   placements alone, but the nesting side bakes its frame shift into the
