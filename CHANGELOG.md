@@ -462,6 +462,16 @@ asks what the job cannot say. One job per sheet, every sheet replayed.
   unshuffled and unrotated, and it wins every generation and seed measured, so
   best-of-N converges on it. A higher default would multiply the cost of every
   first run for no measured gain. Set it as high as you like -- it now sticks.
+- **The `1.0.3` "identical results across platforms" claim is narrower than it
+  reads.** The deterministic tie-break closes most of the gap, not all of it: on
+  a job that spills, the old random tie-break spilled 5-6 parts onto a second
+  sheet on Windows and macOS where Linux fit all 48 on one, and the new rule cuts
+  that to a single part. A fixed-direction Minkowski run is therefore
+  reproducible *within* a platform, library set and seed, but the last part or
+  two can still differ across them. `test_rotation_determinism.py` asserts the
+  properties that do hold -- width-independence and same-seed repetition -- not
+  cross-platform equality, which this code cannot guarantee. See
+  [NEST-032](issues.md#nest-032).
 
 ## [1.0.1] - 2026-08-29
 

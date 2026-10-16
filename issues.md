@@ -3493,6 +3493,25 @@ restored gives exit 0.
 passed as a *kwarg* resolves to `os.cpu_count()`, measured. Only the environment
 variable reaches 0. That is a separate trap, asserted by the suite.
 
+### Superseded: the tie-break no longer draws (`efda9dd`, 1.0.3)
+
+The random tie-break this fix deliberately kept has since been replaced by a
+deterministic one -- round the metric to 10 dp and prefer the candidate closest
+to origin. The reason is that the random tie-break was itself a source of
+cross-platform divergence: with it, a run on Windows and macOS spilled 5-6 parts
+onto a second sheet where Linux fit all 48 on one, and with the deterministic
+rule the spillover fell to a single part. So `score_gravity` no longer reads the
+rng, and the per-rotation rngs minted here no longer move the packing. They are
+kept only because minting still advances the shared rng, which feeds the
+randomised `search_direction=None` draw.
+
+This narrows what the seed guarantees on the Minkowski path: a run is still
+reproducible for a given seed, but with a **fixed** direction two seeds no longer
+produce different layouts. The seed stays live where it is actually drawn -- the
+randomised direction and the Physics path -- and `test_rotation_determinism.py`
+now asserts sensitivity there (section 3) and seed-invariance of the
+fixed-direction path (section 3b).
+
 ## NEST-033 — lead-ins and lead-outs are placed on the nest and nothing accounted for it
 
 `status: resolved` · `severity: medium (measured)` · `area: CAM replay`

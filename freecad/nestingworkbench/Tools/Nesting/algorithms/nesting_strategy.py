@@ -915,20 +915,24 @@ class PlacementOptimizer:
         
         # One rng per rotation, minted here on this thread in `angles` order.
         #
-        # `score_gravity` breaks a metric tie with `rng.randrange`
-        # (minkowski_engine.py:617), and every rotation's evaluation ran that
-        # against the *shared* `self.rng`. Under the pool that draw happens
-        # concurrently from several worker threads, so which tie-index each
-        # rotation received depended on thread interleaving: measured 29
-        # distinct drawing threads for one seeded pooled run, against 1 with
-        # `NESTING_ROTATION_WORKERS=0`. A seeded run was therefore not
-        # reproducible no matter what the fold order did.
+        # These were added for NEST-032. `score_gravity` used to break a metric
+        # tie with `rng.randrange` (minkowski_engine.py:617), and every
+        # rotation's evaluation ran that against the *shared* `self.rng`. Under
+        # the pool that draw happens concurrently from several worker threads, so
+        # which tie-index each rotation received depended on thread
+        # interleaving: measured 29 distinct drawing threads for one seeded
+        # pooled run, against 1 with `NESTING_ROTATION_WORKERS=0`. A seeded run
+        # was therefore not reproducible no matter what the fold order did.
+        # Minting children up front made each rotation's draw depend only on its
+        # own index.
         #
-        # Minting children up front keeps the random tie-break -- which is worth
-        # keeping, since always taking `tied[0]` biases placement toward
-        # whichever candidate happens to be first -- while making each rotation's
-        # draw depend only on its own index. Cost is one `getrandbits` per
-        # rotation per part placed.
+        # `efda9dd` has since made the tie-break deterministic -- round the
+        # metric to 10 dp and prefer the candidate closest to origin -- so
+        # `score_gravity` no longer reads the rng it is handed and these
+        # children no longer move the packing. They are kept because minting
+        # still advances `self.rng`, which feeds the randomised direction drawn
+        # above when `search_direction` is None; dropping them would change those
+        # layouts. Cost is one `getrandbits` per rotation per part placed.
         rotation_rngs = [random.Random(self.rng.getrandbits(64))
                          for _ in angles]
 

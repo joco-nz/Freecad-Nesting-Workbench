@@ -25,24 +25,36 @@ The fix keeps the random tie-break -- always taking `tied[0]` would bias
 placement toward whichever candidate is first -- while making each rotation's
 draw depend only on its own index.
 
-**What this asserts**, same seed 777, on `replay-fixture-CAM.FCStd` with three
-part types at quantities 23/23/2:
+**The tie-break was later made deterministic** (`efda9dd`, released in 1.0.3),
+replacing [NEST-032]'s random draw. The random tie-break was itself a source of
+cross-platform divergence: with it, Windows and macOS spilled 5-6 parts onto a
+second sheet where Linux fit all 48 on one. Rounding the metric to 10 dp and
+breaking ties by "closest to origin" closed most of that gap -- the spillover
+fell to a single part -- so `score_gravity` no longer draws from the rng at all.
+The per-rotation rngs are still minted, and still advance the shared rng, but
+nothing consumes them.
+
+**What this asserts**, seed 777, on `replay-fixture-CAM.FCStd` with three part
+types at quantities 23/23/2:
 
 * pool widths 0, 4, 8 and 16 all produce the **same** 48-placement fingerprint.
   Width independence is the whole claim; a single width proving reproducibility
   would not, because a fixed pool can be accidentally repeatable.
-* two different seeds produce **different** fingerprints -- without this, a
-  frozen rng would pass every assertion above.
+* with a **randomised** search direction -- the one live Minkowski rng draw --
+  two different seeds produce **different** fingerprints. Without this, a frozen
+  rng would pass every other assertion. With a **fixed** direction the greedy
+  path is deterministic, so the two seeds agree, which is asserted too.
 * 48 parts are placed, so the fingerprint is of a real layout and not of a
   partially-failed run.
 
-Injection-verified, five ways. Reintroducing the arrival-order fold the fix
-deliberately does *not* include: **no effect** (`ee223895` at both widths), which
-is the measurement that removed it. One shared rng across all rotations: caught,
-`da8e2bdf` vs `8df33f69`. Every rotation sharing `rotation_rngs[0]`: caught.
-A frozen seed replacing `self.rng.getrandbits(64)`: caught by the seed check,
-since seeds 777 and 778 then agree -- the assertion that makes the rest
-meaningful.
+Injection-verified against the tie-break design, five ways: reintroducing the
+arrival-order fold the fix deliberately does *not* include had **no effect**
+(`ee223895` at both widths), the measurement that removed it; one shared rng
+across all rotations was caught, `da8e2bdf` vs `8df33f69`; every rotation
+sharing `rotation_rngs[0]` was caught; and a frozen seed replacing
+`self.rng.getrandbits(64)` was caught because seeds 777 and 778 then agreed. The
+tie-break injections no longer bite the fixed-direction path, which no longer
+draws -- the randomised-direction check above is what carries the seed guard now.
 
 Reads the placement arrays `nest()` returns, so nothing is measured off a saved
 document.
@@ -93,11 +105,16 @@ def check(condition, detail):
 
 
 def fingerprint(seed, workers, algo="Minkowski", physics_shake=True,
-               physics_direction=(0.0, 1.0)):
+               physics_direction=(0.0, 1.0), search_direction=(0.0, 1.0)):
     """Nest once and return a digest of every placed part's (id, angle, x, y).
 
     `algo="Physics"` takes no pool: the physics path is single-threaded, so the
     width is meaningless there and is not varied.
+
+    `search_direction=None` reaches the Minkowski nester's randomised direction
+    draw, the one live rng site left on that path (see the module docstring);
+    the default `(0.0, 1.0)` keeps the direction fixed and the path
+    deterministic.
 
     `NESTING_ROTATION_WORKERS` rather than the `rotation_workers` kwarg, because
     `_rotation_worker_limit` treats an explicit 0 as *unset* and falls back to
@@ -156,7 +173,7 @@ def fingerprint(seed, workers, algo="Minkowski", physics_shake=True,
                 "use_random_direction": False,
             }
             algo_kwargs = {"verbose": False, "performance_logging": False,
-                           "spacing": 4.0, "search_direction": (0.0, 1.0)}
+                           "spacing": 4.0, "search_direction": search_direction}
             if workers == 0:
                 # Belt and braces: the kwarg path cannot express "no pool" (see
                 # the docstring above), so it is only set when it agrees with the
@@ -239,18 +256,48 @@ def check_width_independence():
 def check_the_seed_still_matters(prints):
     emit("")
     emit("-- 3. a different seed gives a different nest --")
-    digest_a, placed = fingerprint(SEED_A, WIDTHS[0])
-    digest_b, _ = fingerprint(SEED_B, WIDTHS[0])
-    emit("  seed %d -> %s" % (SEED_A, digest_a))
-    emit("  seed %d -> %s" % (SEED_B, digest_b))
+    # `score_gravity` breaks metric ties deterministically now (efda9dd), so with
+    # a *fixed* search direction the greedy path has no rng draw left and two
+    # seeds agree -- asserted in 3b, and it is why this section uses the
+    # randomised direction instead. `search_direction=None` reaches the one live
+    # Minkowski draw, `nesting_strategy.py:900`.
+    digest_a, placed = fingerprint(SEED_A, WIDTHS[0], search_direction=None)
+    digest_b, _ = fingerprint(SEED_B, WIDTHS[0], search_direction=None)
+    emit("  random direction, seed %d -> %s (%d placed)"
+         % (SEED_A, digest_a, placed))
+    emit("  random direction, seed %d -> %s" % (SEED_B, digest_b))
+    check(placed == EXPECTED_PLACED,
+          "the randomised-direction nest placed %d part(s), expected %d -- a "
+          "partial run would make the fingerprint comparison meaningless"
+          % (placed, EXPECTED_PLACED))
     check(digest_a != digest_b,
-          "seeds %d and %d produced the same layout (%s). If the rng is not "
-          "reaching the nester at all, every other assertion in this file "
-          "passes trivially." % (SEED_A, SEED_B, digest_a))
-    check(digest_a == prints.get(WIDTHS[0]),
-          "re-running seed %d at width %d gave %s, not %s -- the suite itself "
-          "is not repeatable" % (SEED_A, WIDTHS[0], digest_a,
-                                 prints.get(WIDTHS[0])))
+          "randomised-direction Minkowski gave the same layout for seeds %d and "
+          "%d (%s). The direction draw at nesting_strategy.py:900 must come from "
+          "the seeded rng; if it does not, the seed is decorative and every "
+          "other assertion in this file passes trivially."
+          % (SEED_A, SEED_B, digest_a))
+
+    again, _ = fingerprint(SEED_A, WIDTHS[0], search_direction=None)
+    check(digest_a == again,
+          "re-running randomised-direction seed %d gave %s, not %s -- the suite "
+          "itself is not repeatable" % (SEED_A, again, digest_a))
+
+    emit("")
+    emit("-- 3b. a fixed direction is deterministic, so the seed does not "
+         "move it --")
+    fixed_a, _ = fingerprint(SEED_A, WIDTHS[0])
+    fixed_b, _ = fingerprint(SEED_B, WIDTHS[0])
+    emit("  fixed direction, seed %d -> %s" % (SEED_A, fixed_a))
+    emit("  fixed direction, seed %d -> %s" % (SEED_B, fixed_b))
+    check(fixed_a == fixed_b,
+          "with a fixed search direction the greedy nester is deterministic "
+          "(score_gravity breaks ties without an rng), so seeds %d and %d must "
+          "agree; got %s and %s. An rng has been reintroduced into the "
+          "placement path." % (SEED_A, SEED_B, fixed_a, fixed_b))
+    check(fixed_a == prints.get(WIDTHS[0]),
+          "re-running fixed-direction seed %d at width %d gave %s, not %s -- the "
+          "suite itself is not repeatable"
+          % (SEED_A, WIDTHS[0], fixed_a, prints.get(WIDTHS[0])))
 
 
 def check_physics_reproducible():
